@@ -1,0 +1,11 @@
+{
+  "model": "claude",
+  "messages": [{
+    "role": "user",
+    "content": [
+      {"type": "text", "text": "What"},
+      {"type": "image_url", "image_url": {"url": "data:image/png;base64,aaa"}}
+    ]
+  }],
+  "max_tokens": 10
+}

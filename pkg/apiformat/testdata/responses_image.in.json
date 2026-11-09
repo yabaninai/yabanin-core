@@ -1,0 +1,12 @@
+{
+  "model": "gpt-4.1",
+  "input": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "input_text", "text": "see"},
+        {"type": "input_image", "image_url": "https://example.com/a.png", "detail": "low"}
+      ]
+    }
+  ]
+}

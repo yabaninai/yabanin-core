@@ -1,0 +1,14 @@
+{
+  "GITLAB_CI": "true",
+  "CI_PIPELINE_ID": "100",
+  "CI_PIPELINE_URL": "https://gitlab.example/p/1",
+  "CI_JOB_ID": "9",
+  "CI_JOB_NAME": "test",
+  "CI_JOB_STAGE": "test",
+  "CI_PIPELINE_SOURCE": "push",
+  "CI_PROJECT_PATH": "group/proj",
+  "CI_COMMIT_REF_NAME": "feature/PAY-10-api",
+  "CI_COMMIT_SHA": "abc123def456",
+  "CI_COMMIT_MESSAGE": "fix: note\n\nIssue: PAY-1\n",
+  "GITLAB_USER_LOGIN": "ada"
+}

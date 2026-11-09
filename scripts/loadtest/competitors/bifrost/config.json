@@ -1,0 +1,33 @@
+{
+  "$schema": "https://www.getbifrost.ai/schema",
+  "_bench_note": "N18-P01-T02 pinned competitor config. Purpose: serve the SAME deterministic gatewayoverhead mock (scripts/loadtest/gatewayoverhead, 127.0.0.1:14650) under the SAME OpenAI-compatible chat surface so the accepted bench client measures this competitor gateway without changing request bytes. File-only mode (config_store disabled): no governance, no virtual keys, no gateway auth \u2014 the loopback bind (APP_HOST=127.0.0.1) is the only guard; parity conditions are T03's concern. Never point network_config.base_url at anything but the local bench mock in this file; 'allow_private_network' is REQUIRED here only because the bench upstream is on loopback.",
+  "client": {
+    "drop_excess_requests": false,
+    "enable_logging": false
+  },
+  "config_store": {
+    "enabled": false
+  },
+  "providers": {
+    "openai": {
+      "keys": [
+        {
+          "name": "bench-upstream",
+          "value": "env.BIFROST_BENCH_UPSTREAM_KEY",
+          "models": [
+            "*"
+          ],
+          "weight": 1.0,
+          "aliases": {
+            "bench-model": "openai/bench-model"
+          }
+        }
+      ],
+      "network_config": {
+        "base_url": "http://127.0.0.1:14650",
+        "allow_private_network": true,
+        "default_request_timeout_in_seconds": 120
+      }
+    }
+  }
+}

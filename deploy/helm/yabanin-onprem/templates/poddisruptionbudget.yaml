@@ -1,0 +1,53 @@
+{{- /* N11-P02-T03: PodDisruptionBudgets for the stateless tiers.
+
+     maxUnavailable (not minAvailable) keeps 1-replica profiles drainable —
+     minAvailable: 1 against a 1-replica Deployment blocks EVERY voluntary
+     eviction (node drains hang forever; R056 defect D2 in the cloud chart).
+
+     The bundled postgres/redis StatefulSets deliberately get NO PDB: they
+     are single-replica, local-storage, non-HA services (bundled.chart
+     postgres StatefulSet `replicas: 1` is explicitly NOT the replicated
+     RPO=0 tier of deploy/helm/yabanin/HA-TOPOLOGY.md — local fsync is not
+     replication). A PDB there would only block drains without adding any
+     durability or failover. */}}
+{{- if .Values.pdb.gateway.enabled }}
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ template "yabanin.fullname" . }}-gateway-pdb
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.gateway.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: gateway
+{{- end }}
+{{- if .Values.pdb.admin.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ template "yabanin.fullname" . }}-admin-pdb
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.admin.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: admin
+{{- end }}
+{{- if .Values.pdb.loggerd.enabled }}
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: {{ template "yabanin.fullname" . }}-loggerd-pdb
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  maxUnavailable: {{ .Values.pdb.loggerd.maxUnavailable }}
+  selector:
+    matchLabels:
+      app: loggerd
+{{- end }}

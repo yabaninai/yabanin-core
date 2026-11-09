@@ -1,0 +1,15 @@
+{
+  "id": "msg_fixed",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-test",
+  "content": [{"type": "text", "text": "Hi"}],
+  "stop_reason": "end_turn",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 6,
+    "output_tokens": 3,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 4
+  }
+}

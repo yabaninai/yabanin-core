@@ -1,0 +1,16 @@
+{
+  "model": "m",
+  "messages": [
+    {"role": "user", "content": "Edit main.go"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "apply_patch",
+        "description": "Apply a patch",
+        "parameters": {"type": "object", "properties": {"input": {"type": "string"}}}
+      }
+    }
+  ]
+}

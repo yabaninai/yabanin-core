@@ -1,0 +1,1325 @@
+{
+  "schema_version": 1,
+  "scope": "Pinned Alpine 3.24.4 base lower layers and actual runtime APK rehearsal notices; final rebuilt Yabanin image still requires installed inventory reconciliation.",
+  "base_index_digest": "sha256:f59abe656b692d901e184be3445e084786602108599d2a51d229c0f5a48c71bf",
+  "base_manifest_digest": "sha256:0f49f331d9212aff11b932863be4eb01cdf962969aa86dab7d1ee21ac6f5f52b",
+  "base_apk_db_sha256": "7dad9312ea31880bffb2d50c224e41432467474568b5418060e7ae2a0075361b",
+  "base_packages": [
+    {
+      "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "alpine-baselayout",
+      "origin": "alpine-baselayout",
+      "url": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/master/main/alpine-baselayout",
+      "version": "3.7.2-r1"
+    },
+    {
+      "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "alpine-baselayout-data",
+      "origin": "alpine-baselayout",
+      "url": "https://gitlab.alpinelinux.org/alpine/aports/-/tree/master/main/alpine-baselayout",
+      "version": "3.7.2-r1"
+    },
+    {
+      "aports_commit": "b9f23becced4d7b3ccc0fa0f28530243ccd314a0",
+      "architecture": "x86_64",
+      "license": "MIT",
+      "name": "alpine-keys",
+      "origin": "alpine-keys",
+      "url": "https://alpinelinux.org",
+      "version": "2.6-r0"
+    },
+    {
+      "aports_commit": "105b835acd9971b9770fb61f5a1ddcc133c180dc",
+      "architecture": "x86_64",
+      "license": "MIT",
+      "name": "alpine-release",
+      "origin": "alpine-base",
+      "url": "https://alpinelinux.org",
+      "version": "3.24.4-r0"
+    },
+    {
+      "aports_commit": "13685e8f2cf1c103cbba2fb9efcfcf19f4918df0",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "apk-tools",
+      "origin": "apk-tools",
+      "url": "https://gitlab.alpinelinux.org/alpine/apk-tools",
+      "version": "3.0.9-r0"
+    },
+    {
+      "aports_commit": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "busybox",
+      "origin": "busybox",
+      "url": "https://busybox.net/",
+      "version": "1.37.0-r31"
+    },
+    {
+      "aports_commit": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "busybox-binsh",
+      "origin": "busybox",
+      "url": "https://busybox.net/",
+      "version": "1.37.0-r31"
+    },
+    {
+      "aports_commit": "e78f5987166c6ffbe23f6472e2e8f040298fe2da",
+      "architecture": "x86_64",
+      "license": "MPL-2.0 AND MIT",
+      "name": "ca-certificates-bundle",
+      "origin": "ca-certificates",
+      "url": "https://www.mozilla.org/en-US/about/governance/policies/security-group/certs/",
+      "version": "20261020-r0"
+    },
+    {
+      "aports_commit": "13685e8f2cf1c103cbba2fb9efcfcf19f4918df0",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "libapk",
+      "origin": "apk-tools",
+      "url": "https://gitlab.alpinelinux.org/alpine/apk-tools",
+      "version": "3.0.9-r0"
+    },
+    {
+      "aports_commit": "29b9ec24b1b5b39aeef51fa2a044210e2ec5258e",
+      "architecture": "x86_64",
+      "license": "Apache-2.0",
+      "name": "libcrypto3",
+      "origin": "openssl",
+      "url": "https://www.openssl.org/",
+      "version": "3.5.9-r0"
+    },
+    {
+      "aports_commit": "29b9ec24b1b5b39aeef51fa2a044210e2ec5258e",
+      "architecture": "x86_64",
+      "license": "Apache-2.0",
+      "name": "libssl3",
+      "origin": "openssl",
+      "url": "https://www.openssl.org/",
+      "version": "3.5.9-r0"
+    },
+    {
+      "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e",
+      "architecture": "x86_64",
+      "license": "MIT",
+      "name": "musl",
+      "origin": "musl",
+      "url": "https://musl.libc.org/",
+      "version": "1.2.6-r3"
+    },
+    {
+      "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e",
+      "architecture": "x86_64",
+      "license": "MIT AND BSD-2-Clause AND GPL-2.0-or-later",
+      "name": "musl-utils",
+      "origin": "musl",
+      "url": "https://musl.libc.org/",
+      "version": "1.2.6-r3"
+    },
+    {
+      "aports_commit": "c61801eeacb3ffcd9c2025b09e402153bb93fb39",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "scanelf",
+      "origin": "pax-utils",
+      "url": "https://wiki.gentoo.org/wiki/Hardened/PaX_Utilities",
+      "version": "1.3.9-r1"
+    },
+    {
+      "aports_commit": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19",
+      "architecture": "x86_64",
+      "license": "GPL-2.0-only",
+      "name": "ssl_client",
+      "origin": "busybox",
+      "url": "https://busybox.net/",
+      "version": "1.37.0-r31"
+    },
+    {
+      "aports_commit": "0afa2da0e8c8051c6f8f64a7a388e5a259904245",
+      "architecture": "x86_64",
+      "license": "Zlib",
+      "name": "zlib",
+      "origin": "zlib",
+      "url": "https://zlib.net/",
+      "version": "1.3.2-r1"
+    }
+  ],
+  "runtime_snapshot_sha256": "849f0341ba66b0977df69662af33c69d5dfb2e634803308be1a780aa3d99de5a",
+  "runtime_installed_db_sha256": "bdfbc7ac06edb1a22e73cbded9bc70e7f1ac161a44be4b766d78528f4835209e",
+  "runtime_inputs": [
+    {
+      "origin": "alpine-base",
+      "version": "3.24.4-r0",
+      "aports_commit": "105b835acd9971b9770fb61f5a1ddcc133c180dc",
+      "packages": [
+        "alpine-release"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/105b835acd9971b9770fb61f5a1ddcc133c180dc/main/alpine-base/APKBUILD"
+    },
+    {
+      "origin": "alpine-baselayout",
+      "version": "3.7.2-r1",
+      "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f",
+      "packages": [
+        "alpine-baselayout",
+        "alpine-baselayout-data"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-only"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/APKBUILD"
+    },
+    {
+      "origin": "alpine-keys",
+      "version": "2.6-r0",
+      "aports_commit": "b9f23becced4d7b3ccc0fa0f28530243ccd314a0",
+      "packages": [
+        "alpine-keys"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/b9f23becced4d7b3ccc0fa0f28530243ccd314a0/main/alpine-keys/APKBUILD"
+    },
+    {
+      "origin": "apk-tools",
+      "version": "3.0.9-r0",
+      "aports_commit": "13685e8f2cf1c103cbba2fb9efcfcf19f4918df0",
+      "packages": [
+        "apk-tools",
+        "libapk"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-only"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/13685e8f2cf1c103cbba2fb9efcfcf19f4918df0/main/apk-tools/APKBUILD"
+    },
+    {
+      "origin": "brotli",
+      "version": "1.2.1-r0",
+      "aports_commit": "8313352127992a9d82e2c2024494f6c38a4dffb4",
+      "packages": [
+        "brotli-libs"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/8313352127992a9d82e2c2024494f6c38a4dffb4/main/brotli/APKBUILD"
+    },
+    {
+      "origin": "busybox",
+      "version": "1.37.0-r31",
+      "aports_commit": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19",
+      "packages": [
+        "busybox",
+        "busybox-binsh",
+        "ssl_client"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-only"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/c3ef5d10e6ef6528852c51f0564963e2f8c1be19/main/busybox/APKBUILD"
+    },
+    {
+      "origin": "c-ares",
+      "version": "1.34.9-r0",
+      "aports_commit": "50f178d7a4c30ea44b54b7d4731ab58558c38b14",
+      "packages": [
+        "c-ares"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/50f178d7a4c30ea44b54b7d4731ab58558c38b14/main/c-ares/APKBUILD"
+    },
+    {
+      "origin": "ca-certificates",
+      "version": "20261020-r0",
+      "aports_commit": "e78f5987166c6ffbe23f6472e2e8f040298fe2da",
+      "packages": [
+        "ca-certificates",
+        "ca-certificates-bundle"
+      ],
+      "declared_licenses": [
+        "MPL-2.0 AND MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/e78f5987166c6ffbe23f6472e2e8f040298fe2da/main/ca-certificates/APKBUILD"
+    },
+    {
+      "origin": "curl",
+      "version": "8.23.0-r0",
+      "aports_commit": "c65a7b3f6d6bc4b3c0a8a6fff759d8fd05a167ce",
+      "packages": [
+        "curl",
+        "libcurl"
+      ],
+      "declared_licenses": [
+        "curl"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/c65a7b3f6d6bc4b3c0a8a6fff759d8fd05a167ce/main/curl/APKBUILD"
+    },
+    {
+      "origin": "libidn2",
+      "version": "2.3.8-r0",
+      "aports_commit": "8240e09aa2fdd8f9979b2016be082273965aff0c",
+      "packages": [
+        "libidn2"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-or-later OR LGPL-3.0-or-later"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/8240e09aa2fdd8f9979b2016be082273965aff0c/main/libidn2/APKBUILD"
+    },
+    {
+      "origin": "libpsl",
+      "version": "0.21.5-r3",
+      "aports_commit": "6bd45b53fb316dc01bda59f5feaf1e127eb64f22",
+      "packages": [
+        "libpsl"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/6bd45b53fb316dc01bda59f5feaf1e127eb64f22/main/libpsl/APKBUILD"
+    },
+    {
+      "origin": "libunistring",
+      "version": "1.4.2-r0",
+      "aports_commit": "30d9f19340385b2cd16eaf1cc6a9a8b30c4afe1c",
+      "packages": [
+        "libunistring"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-or-later OR LGPL-3.0-or-later"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/30d9f19340385b2cd16eaf1cc6a9a8b30c4afe1c/main/libunistring/APKBUILD"
+    },
+    {
+      "origin": "musl",
+      "version": "1.2.6-r3",
+      "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e",
+      "packages": [
+        "musl",
+        "musl-utils"
+      ],
+      "declared_licenses": [
+        "MIT",
+        "MIT AND BSD-2-Clause AND GPL-2.0-or-later"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl/APKBUILD"
+    },
+    {
+      "origin": "nghttp2",
+      "version": "1.70.0-r0",
+      "aports_commit": "d5a34efc88bbe8d18737fda28125071c4aef8517",
+      "packages": [
+        "nghttp2-libs"
+      ],
+      "declared_licenses": [
+        "MIT"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/d5a34efc88bbe8d18737fda28125071c4aef8517/main/nghttp2/APKBUILD"
+    },
+    {
+      "origin": "openssl",
+      "version": "3.5.9-r0",
+      "aports_commit": "29b9ec24b1b5b39aeef51fa2a044210e2ec5258e",
+      "packages": [
+        "libcrypto3",
+        "libssl3"
+      ],
+      "declared_licenses": [
+        "Apache-2.0"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/29b9ec24b1b5b39aeef51fa2a044210e2ec5258e/main/openssl/APKBUILD"
+    },
+    {
+      "origin": "pax-utils",
+      "version": "1.3.9-r1",
+      "aports_commit": "c61801eeacb3ffcd9c2025b09e402153bb93fb39",
+      "packages": [
+        "scanelf"
+      ],
+      "declared_licenses": [
+        "GPL-2.0-only"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/c61801eeacb3ffcd9c2025b09e402153bb93fb39/main/pax-utils/APKBUILD"
+    },
+    {
+      "origin": "zlib",
+      "version": "1.4-r0",
+      "aports_commit": "bdf501c870a92a05c097857401f69c48c4810384",
+      "packages": [
+        "zlib"
+      ],
+      "declared_licenses": [
+        "Zlib"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/bdf501c870a92a05c097857401f69c48c4810384/main/zlib/APKBUILD"
+    },
+    {
+      "origin": "zstd",
+      "version": "1.5.7-r2",
+      "aports_commit": "3c6e2ee2b16f403d53eab39c4426eb61f003c322",
+      "packages": [
+        "zstd-libs"
+      ],
+      "declared_licenses": [
+        "BSD-3-Clause OR GPL-2.0-or-later"
+      ],
+      "apkbuild_url": "https://raw.githubusercontent.com/alpinelinux/aports/3c6e2ee2b16f403d53eab39c4426eb61f003c322/main/zstd/APKBUILD"
+    }
+  ],
+  "base_only_packages": [
+    {
+      "aports_commit": "0afa2da0e8c8051c6f8f64a7a388e5a259904245",
+      "architecture": "x86_64",
+      "license": "Zlib",
+      "name": "zlib",
+      "origin": "zlib",
+      "url": "https://zlib.net/",
+      "version": "1.3.2-r1"
+    }
+  ],
+  "files": [
+    {
+      "path": "additional-notices/MIT-reference.txt",
+      "sha256": "b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5",
+      "bytes": 1078,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/spdx/license-list-data/main/text/MIT.txt",
+        "role": "reference-text; original ca-certificates source retains its named author/copyright; this template adds no grant"
+      }
+    },
+    {
+      "path": "additional-notices/MPL-2.0.txt",
+      "sha256": "fab3dd6bdab226f1c08630b1dd917e11fcb4ec5e1e020e2c16f83a0a13863e85",
+      "bytes": 16726,
+      "provenance": {
+        "source": "https://www.mozilla.org/media/MPL/2.0/index.815ca599c9df.txt",
+        "role": "reference-text-or-attribution; does not replace exact-source-file notices"
+      }
+    },
+    {
+      "path": "additional-notices/curl-copyright.html",
+      "sha256": "8c404d1465ad207f867a7d2590dcd5e2b5ebdc47505c0d44ff874c236785b0a5",
+      "bytes": 7650,
+      "provenance": {
+        "source": "https://curl.se/docs/copyright.html",
+        "role": "reference-text-or-attribution; does not replace exact-source-file notices"
+      }
+    },
+    {
+      "path": "additional-notices/netbase-v6.4-debian-copyright",
+      "sha256": "795b66147ea5ad692991caa7008ece551fb0fa88b9c53656223bd1518dc58ab2",
+      "bytes": 1234,
+      "provenance": {
+        "source": "https://salsa.debian.org/md/netbase/-/raw/v6.4/debian/copyright",
+        "role": "reference-text-or-attribution; does not replace exact-source-file notices"
+      }
+    },
+    {
+      "path": "base/aports/alpine-base/105b835acd9971b9770fb61f5a1ddcc133c180dc/APKBUILD",
+      "sha256": "dd9dbeb82fe510aadd75305f9999dc7c0fc81c4b4476db0bbb73da3e167b3b05",
+      "bytes": 1507,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/105b835acd9971b9770fb61f5a1ddcc133c180dc/main/alpine-base/APKBUILD",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "105b835acd9971b9770fb61f5a1ddcc133c180dc"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/20locale.sh",
+      "sha256": "284a6ef56ab97a13a777c6b01ae14f2cc3d2b7a29c19e750e622e70cc3c73186",
+      "bytes": 97,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/20locale.sh",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/APKBUILD",
+      "sha256": "aef255516b71e39109860b92eb027a0986d90197427fb93ec91ebcd04bf59763",
+      "bytes": 8670,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/APKBUILD",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/aliases.conf",
+      "sha256": "3ebaba946f213670170c7d69949f690a3854553bd0b1560f1d980cba4c83a942",
+      "bytes": 1545,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/aliases.conf",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/alpine-baselayout.post-install",
+      "sha256": "dd30b63bfbe4f7d8085f57840e15b84015b3518d6f282a3e0924f73a61000016",
+      "bytes": 453,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/alpine-baselayout.post-install",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/alpine-baselayout.post-upgrade",
+      "sha256": "53f570f015ac2086597ab62accc6ad08600e2994577ac622263f17e9de39d2e2",
+      "bytes": 30,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/alpine-baselayout.post-upgrade",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/alpine-baselayout.pre-install",
+      "sha256": "28ecff91a36f438ca26bc8cc08d857863378aa94eab399a1f413e52501b86f85",
+      "bytes": 56,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/alpine-baselayout.pre-install",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/alpine-baselayout.pre-upgrade",
+      "sha256": "3f35fa5402d397389f366e8934ba0f800a017a149f4281dc8c22762419e47e10",
+      "bytes": 944,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/alpine-baselayout.pre-upgrade",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/blacklist.conf",
+      "sha256": "0e9ab848289bfb20b9b066d05c8b1383a7c92b97ff8072a50806054b5d3fd739",
+      "bytes": 2247,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/blacklist.conf",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/color_prompt.sh.disabled",
+      "sha256": "ba24425c6864a5d17fa0fdaf914c4d21419e47c4d62080c33830af059fe46617",
+      "bytes": 447,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/color_prompt.sh.disabled",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/crontab",
+      "sha256": "575d810a9fae5f2f0671c9b2c0ce973e46c7207fbe5cb8d1b0d1836a6a0470e3",
+      "bytes": 283,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/crontab",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/group",
+      "sha256": "6fb6ab5a5526e6f4896b70c7e3c350fd475158a1f0d7b5fc0f3f9bd57f1c3be8",
+      "bytes": 510,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/group",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/hier.7",
+      "sha256": "8a91913d8a05ad57316355ee74d966210a6eae7bd850d46dac53e799d3981cc2",
+      "bytes": 6855,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/hier.7",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/i386.conf",
+      "sha256": "6c46c4cbfb8b7594f19eb94801a350fa2221ae9ac5239a8819d15555caa76ae8",
+      "bytes": 122,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/i386.conf",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/inittab",
+      "sha256": "7326d8ad56bf5fea63b1ca516a747ff6e6723e25ae84a93c31620b03de6c001d",
+      "bytes": 570,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/inittab",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/passwd",
+      "sha256": "31a94f06f17bc3b9085fccab1d0fa6ee9e79c4a1e4d91f617fa5de95863be015",
+      "bytes": 702,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/passwd",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/profile",
+      "sha256": "87e8643d3ce156de0c09370d4d39446f30bd00d264bea248abc191c4d7b9df3e",
+      "bytes": 547,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/profile",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/protocols-6.4",
+      "sha256": "4959498abbadaa1e50894a266f8d0d94500101cfe5b5f09dcad82e9d5bdfab46",
+      "bytes": 3144,
+      "provenance": {
+        "source": null,
+        "role": "recipe-source-input",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/services-6.4",
+      "sha256": "f6183055fd949f9c53d49ee620f85d0150123ea691d25ed1bba0c641b4ee2f48",
+      "bytes": 12813,
+      "provenance": {
+        "source": null,
+        "role": "recipe-source-input",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-baselayout/60a7585bbab2fa0f762504eb617dbca90216e31f/usr_merge_nag.sh",
+      "sha256": "ffab41e32add88a13483309172c22da013f50a82bc552b488765254a6e92115c",
+      "bytes": 677,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/60a7585bbab2fa0f762504eb617dbca90216e31f/main/alpine-baselayout/usr_merge_nag.sh",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "60a7585bbab2fa0f762504eb617dbca90216e31f"
+      }
+    },
+    {
+      "path": "base/aports/alpine-keys/b9f23becced4d7b3ccc0fa0f28530243ccd314a0/APKBUILD",
+      "sha256": "cb352e13b9e481b424763bd36d3afdb81ac308e508abed15eb7175530050bd3f",
+      "bytes": 5259,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/b9f23becced4d7b3ccc0fa0f28530243ccd314a0/main/alpine-keys/APKBUILD",
+        "role": "exact-aports-directory-file",
+        "aports_commit": "b9f23becced4d7b3ccc0fa0f28530243ccd314a0"
+      }
+    },
+    {
+      "path": "base/aports/musl/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/getconf.c",
+      "sha256": "d87d0cbb3690ae2c5d8cc218349fd8278b93855dd625deaf7ae50e320aad247c",
+      "bytes": 11614,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl/getconf.c",
+        "role": "Alpine-source-patch-config-input",
+        "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e"
+      }
+    },
+    {
+      "path": "base/aports/musl/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/getent.c",
+      "sha256": "a6171c2db641cdd99c164169d3c5c6ca323617483cedec4cbbe3eb39c5834df0",
+      "bytes": 11656,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl/getent.c",
+        "role": "Alpine-source-patch-config-input",
+        "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e"
+      }
+    },
+    {
+      "path": "base/aports/musl/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/iconv.c",
+      "sha256": "f79a2930a2e5bb0624321589edf8b889d1e9b603e01e6b7ae214616605b3fdd7",
+      "bytes": 2577,
+      "provenance": {
+        "source": "https://raw.githubusercontent.com/alpinelinux/aports/8f79d39391b46d6dbf1800fb68b8212a21d5ee2e/main/musl/iconv.c",
+        "role": "Alpine-source-patch-config-input",
+        "aports_commit": "8f79d39391b46d6dbf1800fb68b8212a21d5ee2e"
+      }
+    },
+    {
+      "path": "embedded-busybox-provenance.json",
+      "sha256": "b87ba16b9649c326eda6c4fe24d6252d484f891608b4a5cedc62e36973a89ec5",
+      "bytes": 1174,
+      "provenance": {
+        "role": "same-version official build log and exact recipe corroboration; not independent binary reproduction"
+      }
+    },
+    {
+      "path": "notices/apk-tools/apk-tools-v3.0.9/AUTHORS",
+      "sha256": "c238557e70557a79ea0ac30ea6d05342144f02b07ae4e9988171f70de3d66f2e",
+      "bytes": 61,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/apk-tools/-/archive/v3.0.9/apk-tools-v3.0.9.tar.gz",
+        "archive_sha512": "933f9a3645e225a8e433951e57fce979d68a933b5cc066591f5da35c561c07ea476c0ada184fa81ab8eea1431f9b475735ad68c598072e26c0a74debf65a680f",
+        "archive_member": "apk-tools-v3.0.9/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/apk-tools/apk-tools-v3.0.9/LICENSE",
+      "sha256": "b3c87315aae4c9f276c37168f2655dd8bd990544d7a0bbfb929664155c7ab257",
+      "bytes": 17622,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/apk-tools/-/archive/v3.0.9/apk-tools-v3.0.9.tar.gz",
+        "archive_sha512": "933f9a3645e225a8e433951e57fce979d68a933b5cc066591f5da35c561c07ea476c0ada184fa81ab8eea1431f9b475735ad68c598072e26c0a74debf65a680f",
+        "archive_member": "apk-tools-v3.0.9/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/brotli/brotli-1.2.1/LICENSE",
+      "sha256": "3d180008e36922a4e8daec11c34c7af264fed5962d07924aea928c38e8663c94",
+      "bytes": 1084,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/google/brotli/archive/refs/tags/v1.2.1.tar.gz",
+        "archive_sha512": "460591287d428c8b5a8a2766b5b424d14501fcda12c7118b8f3cc4bfae44b90ac75ca156557f07b6e22542612724d904533e5f70019be07dbbb604c46f03ab69",
+        "archive_member": "brotli-1.2.1/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/busybox/busybox-1.37.0/AUTHORS",
+      "sha256": "384fc3a9cfc7c435bdd9d169e5ec60a7d898d9ef9557ec859394d7f97b4b6f07",
+      "bytes": 5386,
+      "provenance": {
+        "upstream_archive_url": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+        "archive_sha512": "ad8fd06f082699774f990a53d7a73b189ed404fe0a2166aff13eae4d9d8ee5c9239493befe949c98801fe7897520dbff3ed0224faa7205854ce4fa975e18467e",
+        "archive_member": "busybox-1.37.0/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/busybox/busybox-1.37.0/LICENSE",
+      "sha256": "bbfc9843646d483c334664f651c208b9839626891d8f17604db2146962f43548",
+      "bytes": 18348,
+      "provenance": {
+        "upstream_archive_url": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+        "archive_sha512": "ad8fd06f082699774f990a53d7a73b189ed404fe0a2166aff13eae4d9d8ee5c9239493befe949c98801fe7897520dbff3ed0224faa7205854ce4fa975e18467e",
+        "archive_member": "busybox-1.37.0/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/busybox/busybox-1.37.0/archival/libarchive/bz/LICENSE",
+      "sha256": "b5a136ed67798e51fe2e0ca0b2a21cb01b904ff0c9f7d563a6292e276607e58f",
+      "bytes": 1999,
+      "provenance": {
+        "upstream_archive_url": "https://busybox.net/downloads/busybox-1.37.0.tar.bz2",
+        "archive_sha512": "ad8fd06f082699774f990a53d7a73b189ed404fe0a2166aff13eae4d9d8ee5c9239493befe949c98801fe7897520dbff3ed0224faa7205854ce4fa975e18467e",
+        "archive_member": "busybox-1.37.0/archival/libarchive/bz/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/c-ares/c-ares-1.34.9/AUTHORS",
+      "sha256": "10274d04e1aa59b340e84dbef26550bfc9827fc70908f78bfa755e1a8729939b",
+      "bytes": 1258,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/c-ares/c-ares/releases/download/v1.34.9/c-ares-1.34.9.tar.gz",
+        "archive_sha512": "f4be5818d14cec48e96cc66d3f7dea3de60e3ae3d990972cf2e055140ad995a3bbf38f2a6ffd5c671f04b5f105f28ef022af721477a2d126be0803355c7c297a",
+        "archive_member": "c-ares-1.34.9/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/c-ares/c-ares-1.34.9/LICENSE.md",
+      "sha256": "460f5e768fda3752ca2169a95df062578a10fb126bfd65f3b9b1a1bed2f84807",
+      "bytes": 1211,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/c-ares/c-ares/releases/download/v1.34.9/c-ares-1.34.9.tar.gz",
+        "archive_sha512": "f4be5818d14cec48e96cc66d3f7dea3de60e3ae3d990972cf2e055140ad995a3bbf38f2a6ffd5c671f04b5f105f28ef022af721477a2d126be0803355c7c297a",
+        "archive_member": "c-ares-1.34.9/LICENSE.md",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/Makefile",
+      "sha256": "f1a076623b2ba6fbd45e84a9f0b0ba0cc7f07e8654754191962ce948533ea759",
+      "bytes": 1585,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/Makefile",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/README.md",
+      "sha256": "f035dad569493e311659b9b79be908ce75a5363a958e8ada9b3c37b58707b913",
+      "bytes": 548,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/README.md",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/c_rehash.c",
+      "sha256": "a68fedc0edd976b9f35ecfdcb252d80dc12084b1bc4e945be7dc42c437d8b540",
+      "bytes": 9533,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/c_rehash.c",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/certdata.txt",
+      "sha256": "3ec2b4d240dc12c747eaf450061db84af757c483bbda302f9e29ceb5d70be510",
+      "bytes": 1356175,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/certdata.txt",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/mk-ca-bundle.pl",
+      "sha256": "8e278f4982210b37e4f9a048bd6ed23df41e4a054085bd73f8242628f03d09ca",
+      "bytes": 24902,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/mk-ca-bundle.pl",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/ca-certificates/ca-certificates-20261020/update-ca.c",
+      "sha256": "fff6ee69a2f5705e0ae5a0214f0e1fff029b14adef49359160cf9a5c867d5df4",
+      "bytes": 7736,
+      "provenance": {
+        "upstream_archive_url": "https://gitlab.alpinelinux.org/alpine/ca-certificates/-/archive/20261020/ca-certificates-20261020.tar.bz2",
+        "archive_sha512": "d28eb01751b1a914ffb5d8cb99e662f0a35a95148c21dcf98de1ab3108b54db9714a99472d07715023867f4f76a21f2a79a2bc1c7e9876ce5167fdd865ad2dd7",
+        "archive_member": "ca-certificates-20261020/update-ca.c",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/curl/curl-8.23.0/COPYING",
+      "sha256": "82f2f4427d6545ee5aaac4f0b80428da6cc8ba41c2cf5da3a03680ec327b9681",
+      "bytes": 1088,
+      "provenance": {
+        "upstream_archive_url": "https://curl.se/download/curl-8.23.0.tar.xz",
+        "archive_sha512": "69cf0feafdc79fbad007cf2fc977b777ce6ccb05d01afd17b5a42f8bedbfcc342fc3a48193faa7f3eafe6800cd7d07948916e8733db1b9de60287ed06219b840",
+        "archive_member": "curl-8.23.0/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libidn2/libidn2-2.3.8/AUTHORS",
+      "sha256": "7719304df806ca5cd68c1f1c7e0139e0c11ed14fede560ae192d3c4d1989e839",
+      "bytes": 212,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+        "archive_sha512": "4d8427c0f115268132f7544e80a808c883ab1406338f6c529b1a586b016d57aedb0857f66166eb8d9f37d70efc9dccf907b673b43b17bcf258c8797db1e829ce",
+        "archive_member": "libidn2-2.3.8/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libidn2/libidn2-2.3.8/COPYING",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "bytes": 35149,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+        "archive_sha512": "4d8427c0f115268132f7544e80a808c883ab1406338f6c529b1a586b016d57aedb0857f66166eb8d9f37d70efc9dccf907b673b43b17bcf258c8797db1e829ce",
+        "archive_member": "libidn2-2.3.8/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libidn2/libidn2-2.3.8/COPYING.LESSERv3",
+      "sha256": "e3a994d82e644b03a792a930f574002658412f62407f5fee083f2555c5f23118",
+      "bytes": 7652,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+        "archive_sha512": "4d8427c0f115268132f7544e80a808c883ab1406338f6c529b1a586b016d57aedb0857f66166eb8d9f37d70efc9dccf907b673b43b17bcf258c8797db1e829ce",
+        "archive_member": "libidn2-2.3.8/COPYING.LESSERv3",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libidn2/libidn2-2.3.8/COPYING.unicode",
+      "sha256": "01d621eef165cf4d3d3dbb737aa0699178d94c6f18cf87e9dde6db3ca7790f46",
+      "bytes": 8782,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libidn/libidn2-2.3.8.tar.gz",
+        "archive_sha512": "4d8427c0f115268132f7544e80a808c883ab1406338f6c529b1a586b016d57aedb0857f66166eb8d9f37d70efc9dccf907b673b43b17bcf258c8797db1e829ce",
+        "archive_member": "libidn2-2.3.8/COPYING.unicode",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libpsl/libpsl-0.21.5/AUTHORS",
+      "sha256": "f8583862f775c397643c7eac9c6645abfdd3f6d2918311e35f0fba719f8fa818",
+      "bytes": 916,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz",
+        "archive_sha512": "c14d575cecc0f1693894dd79565b6b9220084ddfa43b908a1cefe16d147cdd5ec47796eb0c2135e2f829a951abaf39d8a371ab5c1352f57b36e610e25adf91f5",
+        "archive_member": "libpsl-0.21.5/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libpsl/libpsl-0.21.5/COPYING",
+      "sha256": "322392e6001b2b3b0fca705dc9f11f26e12441188ecde50eb1d22909980b2925",
+      "bytes": 1060,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz",
+        "archive_sha512": "c14d575cecc0f1693894dd79565b6b9220084ddfa43b908a1cefe16d147cdd5ec47796eb0c2135e2f829a951abaf39d8a371ab5c1352f57b36e610e25adf91f5",
+        "archive_member": "libpsl-0.21.5/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libpsl/libpsl-0.21.5/LICENSE",
+      "sha256": "322392e6001b2b3b0fca705dc9f11f26e12441188ecde50eb1d22909980b2925",
+      "bytes": 1060,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz",
+        "archive_sha512": "c14d575cecc0f1693894dd79565b6b9220084ddfa43b908a1cefe16d147cdd5ec47796eb0c2135e2f829a951abaf39d8a371ab5c1352f57b36e610e25adf91f5",
+        "archive_member": "libpsl-0.21.5/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libpsl/libpsl-0.21.5/list/public_suffix_list.dat",
+      "sha256": "8a99ee709c83a545413c0ad81033681696fddd3ed2b7296d9a88a11235fe5c6f",
+      "bytes": 304626,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz",
+        "archive_sha512": "c14d575cecc0f1693894dd79565b6b9220084ddfa43b908a1cefe16d147cdd5ec47796eb0c2135e2f829a951abaf39d8a371ab5c1352f57b36e610e25adf91f5",
+        "archive_member": "libpsl-0.21.5/list/public_suffix_list.dat",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/libpsl/libpsl-0.21.5/src/LICENSE.chromium",
+      "sha256": "1d7f52747a9169751cdf2641a8299c0098e9ecdf9429296ffd55bdb14c9ed5b3",
+      "bytes": 1664,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/rockdaboot/libpsl/releases/download/0.21.5/libpsl-0.21.5.tar.gz",
+        "archive_sha512": "c14d575cecc0f1693894dd79565b6b9220084ddfa43b908a1cefe16d147cdd5ec47796eb0c2135e2f829a951abaf39d8a371ab5c1352f57b36e610e25adf91f5",
+        "archive_member": "libpsl-0.21.5/src/LICENSE.chromium",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libunistring/libunistring-1.4.2/AUTHORS",
+      "sha256": "9877ee5d24b5fa059fcc3ff2f4af36918f7c5676de000b9cb5ec11efa6aac149",
+      "bytes": 444,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz",
+        "archive_sha512": "0215f7f40f426227eca5174140654a3fa43ac1520eeb212c2ba08043470f905687b2703afdda12e9635359a6187643900136b6bb11b422bd7567d17ca71b555f",
+        "archive_member": "libunistring-1.4.2/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libunistring/libunistring-1.4.2/COPYING",
+      "sha256": "3972dc9744f6499f0f9b2dbf76696f2ae7ad8af9b23dde66d6af86c9dfb36986",
+      "bytes": 35149,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz",
+        "archive_sha512": "0215f7f40f426227eca5174140654a3fa43ac1520eeb212c2ba08043470f905687b2703afdda12e9635359a6187643900136b6bb11b422bd7567d17ca71b555f",
+        "archive_member": "libunistring-1.4.2/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/libunistring/libunistring-1.4.2/COPYING.LIB",
+      "sha256": "a853c2ffec17057872340eee242ae4d96cbf2b520ae27d903e1b2fef1a5f9d1c",
+      "bytes": 7639,
+      "provenance": {
+        "upstream_archive_url": "https://ftp.gnu.org/gnu/libunistring/libunistring-1.4.2.tar.xz",
+        "archive_sha512": "0215f7f40f426227eca5174140654a3fa43ac1520eeb212c2ba08043470f905687b2703afdda12e9635359a6187643900136b6bb11b422bd7567d17ca71b555f",
+        "archive_member": "libunistring-1.4.2/COPYING.LIB",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/musl/musl-1.2.6/COPYRIGHT",
+      "sha256": "b870108ec5e7790e9f9919064f1b9421d62d5f9b0e6c230c6adf7ea2da62e97b",
+      "bytes": 6196,
+      "provenance": {
+        "upstream_archive_url": "https://musl.libc.org/releases/musl-1.2.6.tar.gz",
+        "archive_sha512": "1adad96eddb3a2eb0cacb3e363b0046568925fcdd75cf8b0503f2139df1f693d64730779ca0ce8131b7624ab2d37f4247bb1d3393c523de6e30d2b1d7732555c",
+        "archive_member": "musl-1.2.6/COPYRIGHT",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/AUTHORS",
+      "sha256": "f626fcc7413bc00c930ec8e4e62dcd9fe2485be141f503f7ce03ddc0ef4d341c",
+      "bytes": 2870,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/COPYING",
+      "sha256": "6b94f3abc1aabd0c72a7c7d92a77f79dda7c8a0cb3df839a97890b4116a2de2a",
+      "bytes": 1156,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/doc/_exts/rubydomain/LICENSE.rubydomain",
+      "sha256": "2dee6027d254030e382dd8e9f0f1b4ac2c186bd409c85ca2bef80d38b4da283c",
+      "bytes": 1418,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/doc/_exts/rubydomain/LICENSE.rubydomain",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/tests/munit/COPYING",
+      "sha256": "551a04ab9278e48e3d4ef8b0381ad54e54e84fac1a225c50247fa3669dfdef75",
+      "bytes": 1106,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/tests/munit/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/third-party/mruby/AUTHORS",
+      "sha256": "491fa84d35e6a7757e557c16833de8a94b48c1b93fecbdfe36302257aeb82529",
+      "bytes": 11848,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/third-party/mruby/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/third-party/mruby/LICENSE",
+      "sha256": "07dc3c033f3f0ee600f76ac52211a04cbb67e722f8da44767687e86151586170",
+      "bytes": 1061,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/third-party/mruby/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/nghttp2/nghttp2-1.70.0/third-party/mruby/mrbgems/mruby-set/LICENSE",
+      "sha256": "2c78d80cafa36acdd728d6a5ddd68aef42e603ae246b3d0c9ac85f09d87d7e17",
+      "bytes": 1131,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/nghttp2/nghttp2/releases/download/v1.70.0/nghttp2-1.70.0.tar.xz",
+        "archive_sha512": "8d8a95dcd05dfe8a032b78d99b7d32a9f0ad2c952c4548de4c6b4af0d2f3c584b0a2854b31516eca20b0c9c30f20d0d040edfe9961a3084e96353012f711b9d1",
+        "archive_member": "nghttp2-1.70.0/third-party/mruby/mrbgems/mruby-set/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/AUTHORS.md",
+      "sha256": "b9f638dfc06b59c2d3b808186c3b30f713805a5db390f5b77b1703ac58acb83e",
+      "bytes": 1022,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/AUTHORS.md",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/LICENSE.txt",
+      "sha256": "7d5450cb2d142651b8afa315b5f238efc805dad827d91ba367d8516bc9d49e7a",
+      "bytes": 10175,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/LICENSE.txt",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/external/perl/Text-Template-1.56/LICENSE",
+      "sha256": "9837f05336ef3cbacb6a96e1672a0426d81ad01191f214b8d48e22ca62338181",
+      "bytes": 18412,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/external/perl/Text-Template-1.56/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/external/perl/Text-Template-1.56/t/author-pod-syntax.t",
+      "sha256": "305c657c6b73f10767a0ea286b8a73d693940f4cbb8b6a0a4d34e2b5a1c04635",
+      "bytes": 300,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/external/perl/Text-Template-1.56/t/author-pod-syntax.t",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/external/perl/Text-Template-1.56/t/author-signature.t",
+      "sha256": "9a339818bc8fe7f23595b06538321f26436cb3318c81446d88cd8af2d2ff4806",
+      "bytes": 431,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/external/perl/Text-Template-1.56/t/author-signature.t",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/openssl/openssl-3.5.9/util/perl/OpenSSL/copyright.pm",
+      "sha256": "04213b69dbebc8ba0dd8a6216af1d9422f9b63619c1cf2f1d8aa107b83bbb608",
+      "bytes": 1145,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/openssl/openssl/releases/download/openssl-3.5.9/openssl-3.5.9.tar.gz",
+        "archive_sha512": "c4c8136fd2c98d13bb85a57bfb0def25c906f47f1fe97675cd114594944eab957b5b81a3e0f48826e1a0f093afff5e83766b539d49768f6db68310fd678d7de6",
+        "archive_member": "openssl-3.5.9/util/perl/OpenSSL/copyright.pm",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/pax-utils/pax-utils-1.3.9/COPYING",
+      "sha256": "e6d6a009505e345fe949e1310334fcb0747f28dae2856759de102ab66b722cb4",
+      "bytes": 18011,
+      "provenance": {
+        "upstream_archive_url": "https://dev.gentoo.org/~sam/distfiles/app-misc/pax-utils/pax-utils-1.3.9.tar.xz",
+        "archive_sha512": "96caf7f2087bedc7949db828d966835f7d691e29ef8177dee00605c10d433d4c5b5770a3d7f2e25e3c0218f5b9a6c6967669a3dea18cf138d6f0111d2bb5288b",
+        "archive_member": "pax-utils-1.3.9/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/pax-utils/pax-utils-1.3.9/README.md",
+      "sha256": "375388792c9ac895efecf9415073d52f56393868c22aac93d48032d704da420a",
+      "bytes": 3055,
+      "provenance": {
+        "upstream_archive_url": "https://dev.gentoo.org/~sam/distfiles/app-misc/pax-utils/pax-utils-1.3.9.tar.xz",
+        "archive_sha512": "96caf7f2087bedc7949db828d966835f7d691e29ef8177dee00605c10d433d4c5b5770a3d7f2e25e3c0218f5b9a6c6967669a3dea18cf138d6f0111d2bb5288b",
+        "archive_member": "pax-utils-1.3.9/README.md",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/pax-utils/pax-utils-1.3.9/scanelf.c",
+      "sha256": "11290bef26ff8f40e6151f8928a63a84d26031a9a119414b513b309bed8ef971",
+      "bytes": 69337,
+      "provenance": {
+        "upstream_archive_url": "https://dev.gentoo.org/~sam/distfiles/app-misc/pax-utils/pax-utils-1.3.9.tar.xz",
+        "archive_sha512": "96caf7f2087bedc7949db828d966835f7d691e29ef8177dee00605c10d433d4c5b5770a3d7f2e25e3c0218f5b9a6c6967669a3dea18cf138d6f0111d2bb5288b",
+        "archive_member": "pax-utils-1.3.9/scanelf.c",
+        "role": "original-source-context"
+      }
+    },
+    {
+      "path": "notices/skalibs/skalibs-2.14.5.0/AUTHORS",
+      "sha256": "2331b837563d1d1e14229fff4b12523a7cfccd8b2f06b41c89a352c9438cf858",
+      "bytes": 2019,
+      "provenance": {
+        "upstream_archive_url": "https://skarnet.org/software/skalibs/skalibs-2.14.5.0.tar.gz",
+        "archive_sha512": "a14801ec44cfc302b17265184f82f06032b429d82adac7f7e870cf740ff3712d33cd47802ca0bf803b151719a86130976da331e514bc446ad81ffad1af37c49a",
+        "archive_member": "skalibs-2.14.5.0/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/skalibs/skalibs-2.14.5.0/COPYING",
+      "sha256": "cadf2c7d05a2c425250211c01db2ff33fa2bc31e293c8c040227b046ce1cb77f",
+      "bytes": 760,
+      "provenance": {
+        "upstream_archive_url": "https://skarnet.org/software/skalibs/skalibs-2.14.5.0.tar.gz",
+        "archive_sha512": "a14801ec44cfc302b17265184f82f06032b429d82adac7f7e870cf740ff3712d33cd47802ca0bf803b151719a86130976da331e514bc446ad81ffad1af37c49a",
+        "archive_member": "skalibs-2.14.5.0/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/skalibs/skalibs-2.14.5.0/doc/license.html",
+      "sha256": "a7064c26c31bf7e0373f94a3d0097c43502fea1476a8aa6f3cdee906bbff92f6",
+      "bytes": 2981,
+      "provenance": {
+        "upstream_archive_url": "https://skarnet.org/software/skalibs/skalibs-2.14.5.0.tar.gz",
+        "archive_sha512": "a14801ec44cfc302b17265184f82f06032b429d82adac7f7e870cf740ff3712d33cd47802ca0bf803b151719a86130976da331e514bc446ad81ffad1af37c49a",
+        "archive_member": "skalibs-2.14.5.0/doc/license.html",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/utmps/utmps-0.1.3.2/AUTHORS",
+      "sha256": "e9aa044a07a5c91b380ef3656062759705c435c085c5a43940d1c0785d3bc865",
+      "bytes": 249,
+      "provenance": {
+        "upstream_archive_url": "https://skarnet.org/software/utmps/utmps-0.1.3.2.tar.gz",
+        "archive_sha512": "2fbb3b26f58ea7b0d732a4d0f9e1638f510693a43599846b58bc2cf68ce491833c33b7afe15a28a47acfac9a907b02792e0d435a24cc14f0ac33219f873a5042",
+        "archive_member": "utmps-0.1.3.2/AUTHORS",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/utmps/utmps-0.1.3.2/COPYING",
+      "sha256": "0f415da77eb45ab52dad82f23c1f46e827bacb0b68d6f42c919ae8f3d254fb97",
+      "bytes": 760,
+      "provenance": {
+        "upstream_archive_url": "https://skarnet.org/software/utmps/utmps-0.1.3.2.tar.gz",
+        "archive_sha512": "2fbb3b26f58ea7b0d732a4d0f9e1638f510693a43599846b58bc2cf68ce491833c33b7afe15a28a47acfac9a907b02792e0d435a24cc14f0ac33219f873a5042",
+        "archive_member": "utmps-0.1.3.2/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.3.2/LICENSE",
+      "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2",
+      "bytes": 1002,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz",
+        "archive_sha512": "70963771ea5d763614278a69b474f09b7d237ef8f53b675a10fe31d9923aeef601504b35d7ebd1b1e7f347e9ebb048e6b3b47fffdf137e7bdc7e8d5eb4ec4692",
+        "archive_member": "zlib-1.3.2/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.3.2/contrib/dotzlib/LICENSE_1_0.txt",
+      "sha256": "36266a8fd073568394cb81cdb2b124f7fdae2c64c1a7ed09db34b4d22efa2951",
+      "bytes": 1359,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz",
+        "archive_sha512": "70963771ea5d763614278a69b474f09b7d237ef8f53b675a10fe31d9923aeef601504b35d7ebd1b1e7f347e9ebb048e6b3b47fffdf137e7bdc7e8d5eb4ec4692",
+        "archive_member": "zlib-1.3.2/contrib/dotzlib/LICENSE_1_0.txt",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.3.2/contrib/minizip/LICENSE.Info-Zip",
+      "sha256": "fc686023047ce5ce3a18a9b8a777156f0e475929d3de06bac279f3c025d2b2ca",
+      "bytes": 3509,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.3.2.tar.gz",
+        "archive_sha512": "70963771ea5d763614278a69b474f09b7d237ef8f53b675a10fe31d9923aeef601504b35d7ebd1b1e7f347e9ebb048e6b3b47fffdf137e7bdc7e8d5eb4ec4692",
+        "archive_member": "zlib-1.3.2/contrib/minizip/LICENSE.Info-Zip",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.4/LICENSE",
+      "sha256": "e32ff4e00d9d94930537635291da39e7e612703334bf6fde8c7f1686fe8a45a2",
+      "bytes": 1002,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.4.tar.gz",
+        "archive_sha512": "13f02285da85956ff722d814695b96807aff7a511ebf4b6d98cf708c353920666093cc18b6653cd7992c8e75c103f7b4baf2de3a105c2db9dcd62bab2c940859",
+        "archive_member": "zlib-1.4/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.4/contrib/dotzlib/LICENSE_1_0.txt",
+      "sha256": "36266a8fd073568394cb81cdb2b124f7fdae2c64c1a7ed09db34b4d22efa2951",
+      "bytes": 1359,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.4.tar.gz",
+        "archive_sha512": "13f02285da85956ff722d814695b96807aff7a511ebf4b6d98cf708c353920666093cc18b6653cd7992c8e75c103f7b4baf2de3a105c2db9dcd62bab2c940859",
+        "archive_member": "zlib-1.4/contrib/dotzlib/LICENSE_1_0.txt",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zlib/zlib-1.4/contrib/minizip/LICENSE.Info-Zip",
+      "sha256": "fc686023047ce5ce3a18a9b8a777156f0e475929d3de06bac279f3c025d2b2ca",
+      "bytes": 3509,
+      "provenance": {
+        "upstream_archive_url": "https://zlib.net/fossils/zlib-1.4.tar.gz",
+        "archive_sha512": "13f02285da85956ff722d814695b96807aff7a511ebf4b6d98cf708c353920666093cc18b6653cd7992c8e75c103f7b4baf2de3a105c2db9dcd62bab2c940859",
+        "archive_member": "zlib-1.4/contrib/minizip/LICENSE.Info-Zip",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zstd/zstd-1.5.7/COPYING",
+      "sha256": "f9c375a1be4a41f7b70301dd83c91cb89e41567478859b77eef375a52d782505",
+      "bytes": 18091,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/facebook/zstd/archive/v1.5.7.tar.gz",
+        "archive_sha512": "26e441267305f6e58080460f96ab98645219a90d290a533410b1b0b1d2f870721c95f8384e342ee647c5e968385a5b7e30c2d04340c37f59b3e6d86762c3260c",
+        "archive_member": "zstd-1.5.7/COPYING",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zstd/zstd-1.5.7/LICENSE",
+      "sha256": "7055266497633c9025b777c78eb7235af13922117480ed5c674677adc381c9d8",
+      "bytes": 1549,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/facebook/zstd/archive/v1.5.7.tar.gz",
+        "archive_sha512": "26e441267305f6e58080460f96ab98645219a90d290a533410b1b0b1d2f870721c95f8384e342ee647c5e968385a5b7e30c2d04340c37f59b3e6d86762c3260c",
+        "archive_member": "zstd-1.5.7/LICENSE",
+        "role": "original-legal-text"
+      }
+    },
+    {
+      "path": "notices/zstd/zstd-1.5.7/build/LICENSE",
+      "sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+      "bytes": 0,
+      "provenance": {
+        "upstream_archive_url": "https://github.com/facebook/zstd/archive/v1.5.7.tar.gz",
+        "archive_sha512": "26e441267305f6e58080460f96ab98645219a90d290a533410b1b0b1d2f870721c95f8384e342ee647c5e968385a5b7e30c2d04340c37f59b3e6d86762c3260c",
+        "archive_member": "zstd-1.5.7/build/LICENSE",
+        "role": "original-legal-text"
+      }
+    }
+  ],
+  "limitations": [
+    "Final rebuilt image installed database must be reconciled to these exact version/commit tuples; APK rehearsal is not final-image acceptance.",
+    "Base zlib 1.3.2-r1 and runtime zlib 1.4-r0 notices both remain because source/base layers are distinct distribution inputs.",
+    "Conventional notices conservatively include upstream build/test material; inclusion does not claim every file is linked into runtime.",
+    "Alpine keys/release exact recipes declare MIT but no standalone project-specific grant was found; generic MIT reference invents no copyright holder or approval.",
+    "BusyBox embedded ISC inputs use same-version build-log/exact-recipe corroboration with the limitations in embedded-busybox-provenance.json.",
+    "Recipient access to complete corresponding sources and human legal/policy dispositions remain separate; no waiver or publication authorization is granted."
+  ]
+}

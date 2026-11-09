@@ -1,0 +1,12 @@
+{
+  "created": 1700000000,
+  "model": "gpt-4.1",
+  "choices": [
+    {
+      "index": 0,
+      "message": {"role": "assistant", "content": "partial"},
+      "finish_reason": "length"
+    }
+  ],
+  "usage": {"prompt_tokens": 3, "completion_tokens": 8, "total_tokens": 11}
+}

@@ -1,0 +1,3 @@
+openai-api-base: "https://gw.example/v1"
+model: gpt
+export AIDER_OPENAI_API_KEY="$YABANIN_API_KEY"

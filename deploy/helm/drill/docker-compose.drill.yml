@@ -1,0 +1,94 @@
+# N11-P02-T04 failover drill: three isolated failure domains on one docker host.
+#
+# Each service models ONE cluster node's data tier (Patroni + PostgreSQL in the
+# HA-TOPOLOGY.md sense: the stateless tiers are excluded from this drill — they
+# hold no persistent state and were covered by N11-P02-T01/T02).
+#
+# Container policy compliance:
+#   - image is built locally from the pinned Dockerfile (build:), no :latest;
+#   - NO ports are published to the host (probe traffic is `docker exec` +
+#     127.0.0.1 inside the containers), so there is no host-port collision
+#     surface and no exposure outside the compose network;
+#   - `internal: true` network: no outbound connectivity at runtime (all
+#     python packages are baked in at build time);
+#   - no secrets in this file or in the mounted configs: the drill network is
+#     trust-authenticated by design and documented as drill-only in README.md.
+#
+# The drill scripts manage this project's lifecycle; do not run two drill
+# scripts concurrently (they take /tmp/opencode/n11p02-drill.lock).
+name: n11p02-drill
+
+services:
+  node-a:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: n11p02-drill:local
+    hostname: node-a
+    container_name: n11p02-drill-node-a
+    networks: [drillnet]
+    volumes:
+      - pgdata-a:/pgdata
+      - ./patroni/node-a.yml:/etc/patroni-drill/patroni.yml:ro
+      - ./post_bootstrap.sh:/etc/patroni-drill/post_bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      # first-boot initdb + basebackup clone take 1-2 min; do not count
+      # failures during that window against the healthcheck
+      start_period: 150s
+    stop_grace_period: 10s
+
+  node-b:
+    image: n11p02-drill:local
+    hostname: node-b
+    container_name: n11p02-drill-node-b
+    # no depends_on: raft members converge in any start order; ordering the
+    # boot behind node-a's healthcheck deadlocks the initialize lock
+    networks: [drillnet]
+    volumes:
+      - pgdata-b:/pgdata
+      - ./patroni/node-b.yml:/etc/patroni-drill/patroni.yml:ro
+      - ./post_bootstrap.sh:/etc/patroni-drill/post_bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      # first-boot initdb + basebackup clone take 1-2 min; do not count
+      # failures during that window against the healthcheck
+      start_period: 150s
+    stop_grace_period: 10s
+
+  node-c:
+    image: n11p02-drill:local
+    hostname: node-c
+    container_name: n11p02-drill-node-c
+    # no depends_on: raft members converge in any start order; ordering the
+    # boot behind node-a's healthcheck deadlocks the initialize lock
+    networks: [drillnet]
+    volumes:
+      - pgdata-c:/pgdata
+      - ./patroni/node-c.yml:/etc/patroni-drill/patroni.yml:ro
+      - ./post_bootstrap.sh:/etc/patroni-drill/post_bootstrap.sh:ro
+    healthcheck:
+      test: ["CMD", "wget", "-q", "-O", "/dev/null", "http://127.0.0.1:8008/health"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      # first-boot initdb + basebackup clone take 1-2 min; do not count
+      # failures during that window against the healthcheck
+      start_period: 150s
+    stop_grace_period: 10s
+
+networks:
+  drillnet:
+    name: n11p02-drill-net
+    internal: true
+
+volumes:
+  pgdata-a:
+  pgdata-b:
+  pgdata-c:

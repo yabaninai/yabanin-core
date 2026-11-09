@@ -1,0 +1,64 @@
+{
+ "schema_version": "1",
+ "description": "Fixtures captured from REAL client protocol traffic, anonymized. Each entry records the tested client version, capture date, gateway endpoint and known limitations so the compatibility matrix rows can cite fixture-level tested evidence without turning an old badge into a guarantee for a newer client version: a row is bound to (client_version, captured_at); any client update invalidates it until recaptured.",
+ "anonymization_contract": {
+  "provenance": "Real wire bodies captured on 2026-11-03 from the actual client binaries driving a loopback capture server; request headers were never recorded (no API key can leak), bodies were scrubbed by a deterministic mapping before entering the repository.",
+  "rules": [
+   "no API keys: the capture harness never persisted headers; fixtures must contain no credential-bearing strings",
+   "no PII: emails, usernames, hostnames, IP literals are removed",
+   "no customer content: capture prompts were the generic protocol-verification prompts shipped with the e2e tests; client-owned system prompts and tool definitions are the clients' own public protocol surface, not customer data",
+   "machine paths replaced: real capture workdirs -> /home/agent/project, skill roots -> /home/agent/.codex/skills/.system; absolute path fragments anchored at other machine-local roots are mapped into the /home/agent tree as well, and the anonymization scanner fails loud on any surviving absolute path fragment outside the /home/agent tree",
+   "session identifiers replaced: every client-generated UUID (session/thread/turn/window/installation/message ids, prompt_cache_key) mapped to a fixed anonymized 00000000-0000-4000-8000-… value; equal real ids map to equal anonymized ids",
+   "everything else is byte-for-byte the captured protocol shape, so gateway behavior against the fixture is behavior against the real client request"
+  ],
+  "scanner": "TestClientCompatRealProtocolFixtures/anonymization re-runs the scrub scan on every file in this directory and fails loud on any violation."
+ },
+ "fixtures": [
+  {
+   "file": "opencode_title_probe.json",
+   "client": "opencode",
+   "client_version": "1.19.5",
+   "endpoint": "POST /v1/chat/completions",
+   "streaming": true,
+   "captured_at": "2026-11-03",
+   "what_it_pins": "opencode's secondary thread-title request: separate system-only completion alongside the main turn, max_tokens=32000, stream=true, stream_options.include_usage=true, quoted user message",
+   "matrix_row": "OpenCode-shaped client (secondary title probe)",
+   "limitations": [
+    "probe-only turn: no tools attached; the main-turn fixture covers tool passthrough",
+    "mock capture upstream answered a canned SSE title; no live model upstream involved"
+   ],
+   "scrub_stats": {"paths_replaced": 0, "uuids_replaced": 0}
+  },
+  {
+   "file": "opencode_main_turn.json",
+   "client": "opencode",
+   "client_version": "1.19.5",
+   "endpoint": "POST /v1/chat/completions",
+   "streaming": true,
+   "captured_at": "2026-11-03",
+   "what_it_pins": "the main opencode turn against an OpenAI-compatible provider: full @ai-sdk/openai-compatible body with opencode's own system prompt, 10 real tool definitions (bash/edit/glob/grep/read/skill/task/todowrite/webfetch/write), tool_choice=auto, max_tokens=32000, stream_options.include_usage=true",
+   "matrix_row": "OpenCode-shaped client",
+   "limitations": [
+    "captured against a mock SSE upstream; no live model upstream involved",
+    "user turn is the generic protocol-verification prompt, not a real user task"
+   ],
+   "scrub_stats": {"paths_replaced": 2, "uuids_replaced": 0}
+  },
+  {
+   "file": "codex_responses_turn.json",
+   "client": "codex",
+   "client_version": "0.166.0",
+   "endpoint": "POST /v1/responses",
+   "streaming": true,
+   "captured_at": "2026-11-03",
+   "what_it_pins": "codex-cli 0.166.0 Responses wire body: developer+user input items with msg ids, client_metadata (session/thread/turn/window/installation ids), prompt_cache_key, store=false, reasoning.summary=auto, include=reasoning.encrypted_content, 9 real tool defs (function/namespace/web_search types)",
+   "matrix_row": "Codex CLI (real-binary protocol capture)",
+   "limitations": [
+    "captured against a mock Responses SSE upstream; no live model upstream involved",
+    "newer than the last live-binary e2e row (0.163.0, 2026-10-28): this fixture pins the 0.166.0 wire shape only; the live-binary e2e row is NOT auto-refreshed by it",
+    "client_metadata/prompt_cache_key are passthrough-observed, not interpreted by the gateway"
+   ],
+   "scrub_stats": {"paths_replaced": 4, "uuids_replaced": 8}
+  }
+ ]
+}

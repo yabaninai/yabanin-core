@@ -1,0 +1,6 @@
+{
+  "plugin": [
+    "other"
+  ],
+  "user-kept": true
+}

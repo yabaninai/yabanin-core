@@ -1,0 +1,224 @@
+singleTenant: true
+orgId: "default"
+
+bundled:
+  postgres: true      # true = statefulset in chart; false = external host
+  redis: true
+
+image:
+  # repository: the multi-service image name (local docker load or a
+  # registry-qualified name with tag, e.g. registry.local:5000/yabanin:1.0.0
+  # via values-airgap). The empty default works with docker load.
+  tag: "1.0.0-local"
+  pullPolicy: IfNotPresent
+
+airgap:
+  enabled: true
+  telemetryEnabled: false
+  egressBlockAll: true
+
+kms:
+  provider: "file"    # "file" | "vault" | "local"
+  kekPath: /etc/yabanin/kek
+  # operator-managed Secret holding the `kek` key; set = chart does not render
+  # its own -kek Secret and secrets.kek must stay empty (fail-closed)
+  existingSecret: ""
+
+license:
+  enabled: true
+  tokenPath: /etc/yabanin/license
+  # operator-managed Secret holding the `license` key; set = chart does not
+  # render its own -license Secret and secrets.license must stay empty
+  existingSecret: ""
+
+config:
+  region: onprem
+  homeRegion: ONPREM
+  # for registered MCP server URLs (admin registry + gateway invoke). The
+  # list is comma-separated exact domains or *.suffix wildcards
+  # (docs/mcp-gateway.md); empty = fail-closed (every host rejected). Both
+  # services receive the same value — one operator-managed dial-out list.
+  mcpGatewayEnabled: false
+  mcpAllowedUpstreams: ""
+
+gateway:
+  replicas: 2
+  resources:
+    requests: { memory: "256Mi", cpu: "250m" }
+    limits:   { memory: "512Mi", cpu: "1000m" }
+loggerd:
+  replicas: 1
+  resources:
+    requests: { memory: "128Mi", cpu: "100m" }
+    limits:   { memory: "256Mi", cpu: "500m" }
+admin:
+  replicas: 1
+  resources:
+    requests: { memory: "128Mi", cpu: "100m" }
+    limits:   { memory: "256Mi", cpu: "250m" }
+
+# N11-P02-T03: HA placement knobs (same contract as the cloud chart,
+# deploy/helm/yabanin/HA-TOPOLOGY.md). ha.enabled=true enforces >=2 replicas
+# for gateway AND admin at render time and adds a HARD topology spread across
+# ha.topology_key — a 1-replica "HA" install is fake HA. Default profile is
+# unchanged (soft placement only).
+ha:
+  enabled: false
+  topology_key: "kubernetes.io/hostname"
+  when_unsatisfiable: "DoNotSchedule" # ScheduleAnyway = documented degraded fallback
+
+# readiness must hold this long before a rollout proceeds to the next pod;
+# with strategy.maxUnavailable=0 this is what keeps an upgrade zero-downtime
+# instead of racing an unready pod into the Service endpoints.
+minReadySeconds: 5
+
+# unpinned RollingUpdate 25/25 default could replace all pods at once during
+# a helm upgrade). maxUnavailable: 0 + maxSurge: 1 = zero-downtime for the
+# stateless gateway; single-replica admin/loggerd roll via surge pods.
+strategy:
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# N11-P02-T03: PDBs for the stateless tiers. maxUnavailable (not minAvailable)
+# so 1-replica profiles stay drainable — minAvailable: 1 at replicas=1 blocks
+# EVERY voluntary eviction. The bundled postgres/redis StatefulSets
+# deliberately get NO PDB: they are single-replica, non-HA (see
+# HA-TOPOLOGY.md "Bundled data services"); a PDB there would only hang node
+# drains without adding durability.
+pdb:
+  gateway:
+    enabled: true
+    maxUnavailable: 1
+  admin:
+    enabled: true
+    maxUnavailable: 1
+  loggerd:
+    enabled: true
+    maxUnavailable: 1
+
+# N11-P02-T03: values-driven probes (liveness/readiness/startup) for every
+# workload, including the bundled data services. startupProbe gates liveness
+# so a slow first migration/cold cache cannot get the pod kill-looped.
+probes:
+  gateway:
+    readiness:
+      enabled: true
+      httpGet: { path: /healthz, port: 8082 }
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      httpGet: { path: /healthz, port: 8082 }
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      httpGet: { path: /healthz, port: 8082 }
+      periodSeconds: 5
+      failureThreshold: 12
+  admin:
+    readiness:
+      enabled: true
+      httpGet: { path: /health, port: 9086 }
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      httpGet: { path: /health, port: 9086 }
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      httpGet: { path: /health, port: 9086 }
+      periodSeconds: 5
+      failureThreshold: 12
+  loggerd:
+    readiness:
+      enabled: true
+      tcpSocket: { port: 8085 }
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      tcpSocket: { port: 8085 }
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      tcpSocket: { port: 8085 }
+      periodSeconds: 5
+      failureThreshold: 12
+  postgres:
+    startup:
+      enabled: true
+      tcpSocket: { port: 5432 }
+      periodSeconds: 5
+      failureThreshold: 36 # cold initdb + first migrations can be slow
+  redis:
+    startup:
+      enabled: true
+      tcpSocket: { port: 6379 }
+      periodSeconds: 5
+      failureThreshold: 12
+
+postgres:
+  image: pgvector/pgvector:pg16
+  storage: 10Gi
+  # N11-P02-T03: data-tier resources are values-driven (defaults = the
+  # previously hardcoded render) so an air-gap sizing can be tuned without
+  # editing templates.
+  resources:
+    requests: { memory: "256Mi", cpu: "250m" }
+    limits:   { memory: "1Gi", cpu: "500m" }
+redis:
+  image: redis:7-alpine
+  storage: 1Gi
+  resources:
+    requests: { memory: "64Mi", cpu: "50m" }
+    limits:   { memory: "128Mi", cpu: "100m" }
+
+# N11-P02-T03: migration/backup hook jobs get explicit resources and a
+# bounded migration lock wait — see pre-upgrade-hook.yaml / post-*-hook.yaml
+# and HA-TOPOLOGY.md "Migration locking" for what the chart enforces and what
+# stays a documented limitation.
+migration:
+  # pg_advisory lock tag serialized on in the chart-level guards
+  # (hashtext of this string); keep in sync with HA-TOPOLOGY.md.
+  lockTag: "yabanin:migrations"
+  waitTimeoutSeconds: 300
+  activeDeadlineSeconds: 900
+  resources:
+    requests: { memory: "128Mi", cpu: "100m" }
+    limits:   { memory: "512Mi", cpu: "500m" }
+
+# Secrets — pg_password is auto-generated; others must be provided externally.
+secrets:
+  # N11-P02-T03 secret injection: set to the name of an operator-managed
+  # Secret containing pg_uri, cache_hmac_secret, encryption_key, session_key
+  # and (for the bundled postgres) pg_password. When set, the chart does NOT
+  # render its own -secrets Secret and inline `secrets.*` values MUST be left
+  # empty (render-time fail otherwise — no ambiguity about which source wins).
+  # Same pattern for kms.existingSecret and license.existingSecret below.
+  existingSecret: ""
+  # create cluster roles (the pg_dump baseline cannot carry them); provision
+  # the role from the deploy layer first, e.g. via
+  # deploy/quickstart/bootstrap-app-role.sql, then enable LOGIN and set a
+  # password on it. Migration and upgrade jobs keep the owner login from
+  # pg_password. The app pools additionally SET ROLE yabanin_app on every
+  # connection.
+  pg_uri: ""
+  cache_hmac_secret: ""
+  encryption_key: ""
+  session_key: ""
+  kek: ""
+  license: ""
+
+service:
+  type: ClusterIP

@@ -1,0 +1,33 @@
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      tpm: 0
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      rpm: -5
+  - model_name: duo
+    litellm_params:
+      model: openai/gpt-4o
+    model_info:
+      mode: chat
+  - model_name: duo
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+  - model_name: solo
+    litellm_params:
+      model: mistral/mistral-large-latest
+  - model_name: noprovider
+    litellm_params:
+      model: custom-model-x
+router_settings:
+  model_group_alias:
+    ghost: missing-group
+    mistral-large-latest: solo
+    duo: duo
+litellm_settings:
+  unknown_future_switch: true
+general_settings:
+  master_key: sk-aaaabbbbccccdddd
+  master_key: sk-eeeeffffgggghhhh

@@ -1,0 +1,22 @@
+{
+  "model": "claude-3-5-sonnet",
+  "max_tokens": 256,
+  "system": [
+    {"type": "text", "text": "You are Claude Code.", "cache_control": {"type": "ephemeral"}}
+  ],
+  "tools": [
+    {"name": "bash", "description": "Run a command", "input_schema": {"type": "object", "properties": {"cmd": {"type": "string"}}}}
+  ],
+  "messages": [
+    {"role": "user", "content": "List files"},
+    {"role": "assistant", "content": [
+      {"type": "text", "text": "Listing"},
+      {"type": "tool_use", "id": "toolu_1", "name": "bash", "input": {"cmd": "ls"}}
+    ]},
+    {"role": "user", "content": [
+      {"type": "tool_result", "tool_use_id": "toolu_1", "content": "a.go"},
+      {"type": "text", "text": "Now patch"}
+    ]}
+  ],
+  "stream": true
+}

@@ -1,0 +1,73 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "yabanin.fullname" . }}-loggerd
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  ports:
+    - { port: 8085, targetPort: 8085 }
+  selector:
+    app: loggerd
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ template "yabanin.fullname" . }}-loggerd
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.loggerd.replicas }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+  selector:
+    matchLabels:
+      app: loggerd
+  template:
+    metadata:
+      labels:
+        app: loggerd
+    spec:
+      containers:
+        - name: loggerd
+          image: "{{ .Values.image.repository | default "yabanin" }}:{{ .Values.image.tag }}"
+          args: ["loggerd"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { containerPort: 8085, name: http }
+          envFrom:
+            - configMapRef:
+                name: {{ template "yabanin.fullname" . }}-config
+          env:
+            - { name: YABANIN_PG_URI_FILE, value: "/etc/yabanin/secrets/pg_uri" }
+          volumeMounts:
+            - name: secrets
+              mountPath: /etc/yabanin/secrets
+              readOnly: true
+            - name: kek
+              mountPath: {{ .Values.kms.kekPath }}/kek
+              subPath: kek
+              readOnly: true
+          {{- if .Values.probes.loggerd.readiness.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "readinessProbe" "probe" .Values.probes.loggerd.readiness) | nindent 10 }}
+          {{- end }}
+          {{- if .Values.probes.loggerd.liveness.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "livenessProbe" "probe" .Values.probes.loggerd.liveness) | nindent 10 }}
+          {{- end }}
+          {{- if .Values.probes.loggerd.startup.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "startupProbe" "probe" .Values.probes.loggerd.startup) | nindent 10 }}
+          {{- end }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources: {{ toYaml .Values.loggerd.resources | nindent 12 }}
+      volumes:
+        - name: secrets
+          secret: { secretName: {{ include "yabanin.onprem.appSecretName" . }} }
+        - name: kek
+          secret: { secretName: {{ include "yabanin.onprem.kekSecretName" . }} }

@@ -1,0 +1,64 @@
+name: "Developer Preview feedback — Platform / DevOps"
+description: "Voluntary feedback from operators running the single-host preview stack: bug, config gap, or feature signal"
+labels: ["preview-feedback", "audience-platform"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for operating the Yabanin Developer Preview. Feedback is
+        **voluntary** — report only what you want to report, and redact all
+        keys, secrets and infrastructure addresses before submitting.
+        Documentation for this audience: `docs/preview/getting-started-platform.md`
+        and `docs/quickstart.md`. The support bundle (`yb support-bundle preview`)
+        contains only build/runtime metadata and env-var *presence* booleans —
+        preview it before attaching. Security vulnerabilities do NOT belong
+        here — use the private security-advisory flow (see SECURITY.md).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Feedback kind
+      description: "Bug = something broke; Config gap = documented procedure did not work as written; Feature signal = an operational capability you need is missing."
+      options:
+        - Bug
+        - Configuration gap
+        - Feature signal
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Install / quickstart (Docker Compose, single host)
+        - First request / smoke
+        - Budgets, caps or routing
+        - Upgrade / restart / data volume
+        - Admin console
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: "OS/platform, Docker/Compose version, and gateway build/commit if known (`yb support-bundle preview` shows build version and commit). No secrets."
+      placeholder: "Linux x86_64, Docker 2x.x / Compose v2, gateway commit abc1234 (or 'unknown')"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: "Which documented step failed (or what you expected the stack to do), error output with secrets redacted, and what you did as a workaround."
+    validations:
+      required: true
+  - type: textarea
+    id: upgrade-notes
+    attributes:
+      label: Upgrade / restore notes (optional)
+      description: "If this involves moving between preview builds or restoring the Postgres volume: what you attempted and whether data survived. Note: no upgrade path is verified until drill evidence is published."
+  - type: checkboxes
+    id: sanitize
+    attributes:
+      label: Sanitization check
+      options:
+        - label: "This report contains no keys, secrets, tokens, or internal hostnames I cannot share."
+          required: true

@@ -1,0 +1,30 @@
+# reconcile never reads it (directories starting with "_" are namespaces,
+# never orgs). Copy it to deploy/policies/<your-org-slug>/ to declare a
+# policy for a real organization.
+apiVersion: ypp/v1
+kind: Policy
+name: pii-guard
+mode: shadow
+hooks:
+  - pre_upstream
+steps:
+  - id: scan
+    parallel: [pii, secrets]
+  - id: pii
+    detector: builtin/pii
+  - id: secrets
+    detector: builtin/secrets
+  - id: verdict
+    decide: |
+      deny  if findings.any(f -> f.severity == 'high')
+      mask  if findings.any(f -> f.action == 'mask')
+      flag  otherwise
+---
+# Reconcile block: attached to every key/model on the chat endpoint of the
+# declaring org; delivered detached until enabled explicitly.
+enabled: false
+attachments:
+  - key_label: ""
+    model_pattern: "*"
+    endpoint: chat
+    priority: 100

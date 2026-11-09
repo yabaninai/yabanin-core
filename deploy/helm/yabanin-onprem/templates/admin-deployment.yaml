@@ -1,0 +1,98 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "yabanin.fullname" . }}-admin
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  ports:
+    - { port: 9086, targetPort: 9086 }
+  selector:
+    app: admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ template "yabanin.fullname" . }}-admin
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  replicas: {{ .Values.admin.replicas }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+  selector:
+    matchLabels:
+      app: admin
+  template:
+    metadata:
+      labels:
+        app: admin
+    spec:
+      containers:
+        - name: admin
+          image: "{{ .Values.image.repository | default "yabanin" }}:{{ .Values.image.tag }}"
+          args: ["admin"]
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - { containerPort: 9086, name: http }
+          envFrom:
+            - configMapRef:
+                name: {{ template "yabanin.fullname" . }}-config
+          env:
+            - { name: YABANIN_PG_URI_FILE, value: "/etc/yabanin/secrets/pg_uri" }
+            - { name: YABANIN_SESSION_KEY_FILE, value: "/etc/yabanin/secrets/session_key" }
+            - { name: YABANIN_ENCRYPTION_KEY_FILE, value: "/etc/yabanin/secrets/encryption_key" }
+          volumeMounts:
+            - name: secrets
+              mountPath: /etc/yabanin/secrets
+              readOnly: true
+            - name: kek
+              mountPath: {{ .Values.kms.kekPath }}/kek
+              subPath: kek
+              readOnly: true
+          {{- if .Values.probes.admin.readiness.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "readinessProbe" "probe" .Values.probes.admin.readiness) | nindent 10 }}
+          {{- end }}
+          {{- if .Values.probes.admin.liveness.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "livenessProbe" "probe" .Values.probes.admin.liveness) | nindent 10 }}
+          {{- end }}
+          {{- if .Values.probes.admin.startup.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "startupProbe" "probe" .Values.probes.admin.startup) | nindent 10 }}
+          {{- end }}
+          securityContext:
+            readOnlyRootFilesystem: true
+            allowPrivilegeEscalation: false
+            capabilities: { drop: ["ALL"] }
+          resources: {{ toYaml .Values.admin.resources | nindent 12 }}
+      {{- /* admin shares the gateway failure-domain budget (ha guard above
+            pins both at >=2 replicas when ha.enabled=true) */}}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - admin
+                topologyKey: kubernetes.io/hostname
+      {{- if .Values.ha.enabled }}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.ha.topology_key }}
+          whenUnsatisfiable: {{ .Values.ha.when_unsatisfiable }}
+          labelSelector:
+            matchLabels:
+              app: admin
+      {{- end }}
+      volumes:
+        - name: secrets
+          secret: { secretName: {{ include "yabanin.onprem.appSecretName" . }} }
+        - name: kek
+          secret: { secretName: {{ include "yabanin.onprem.kekSecretName" . }} }

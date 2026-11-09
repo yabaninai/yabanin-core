@@ -1,0 +1,286 @@
+{{- /* N11-P02-T02: documented HA topology (deploy/helm/yabanin/HA-TOPOLOGY.md).
+A 1-replica "HA" install is fake HA — one node loss would leave zero serving
+replicas; fail the render instead of rendering an un-appliable HA profile. */}}
+{{- if and .Values.ha.enabled (lt (int .Values.replicaCount) 2) }}
+{{- fail (printf "ha.enabled=true requires at least 2 replicas (replicaCount=%v); the documented HA topology spreads one node-loss failure domain per replica (deploy/helm/yabanin/HA-TOPOLOGY.md)" .Values.replicaCount) }}
+{{- end }}
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    app: yabinin
+    region: {{ .Values.gateway.region | default "sg" }}
+spec:
+  type: {{ .Values.service.type }}
+  ports:
+    - port: {{ .Values.service.port }}
+      targetPort: 8082
+      name: http
+  selector:
+    app: yabinin-gateway
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-gateway
+  labels:
+    app: yabinin-gateway
+    region: {{ .Values.gateway.region | default "sg" }}
+spec:
+  replicas: {{ .Values.replicaCount }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+  selector:
+    matchLabels:
+      app: yabinin-gateway
+  template:
+    metadata:
+      labels:
+        app: yabinin-gateway
+        region: {{ .Values.gateway.region | default "sg" }}
+    spec:
+      serviceAccountName: {{ .Release.Name }}-yabinin
+      securityContext:
+        runAsNonRoot: true
+        fsGroup: 1000
+      initContainers:
+        - name: migrate
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["migrate"]
+          envFrom:
+            - secretRef:
+                name: {{ .Release.Name }}-secrets
+          env:
+            - name: YABANIN_REGION
+              value: {{ .Values.gateway.region | default "sg" }}
+      containers:
+        - name: gateway
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["gateway"]
+          ports:
+            - containerPort: 8082
+              name: http
+            - containerPort: 9090
+              name: admin
+          env:
+            - name: YABANIN_CONFIG
+              value: /etc/yabinin/config.yaml
+            - name: YABANIN_REGION
+              value: {{ .Values.gateway.region | default "sg" }}
+            - name: YABANIN_HOME_REGION
+              value: {{ .Values.gateway.home_region | default "SG" }}
+            - name: YABANIN_KMS_PROVIDER
+              value: {{ .Values.gateway.kms_provider | default "local" }}
+            - name: YABANIN_KMS_KEY_ID
+              value: {{ .Values.gateway.kms_key_id | default "" }}
+            - name: YABANIN_KMS_LOCAL_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: kms_local_key
+            - name: YABANIN_PG_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: pg_uri
+            - name: YABANIN_CACHE_HMAC_SECRET
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: cache_hmac_secret
+            - name: YABANIN_ENCRYPTION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: encryption_key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          volumeMounts:
+            - name: config
+              mountPath: /etc/yabinin/config.yaml
+              subPath: config.yaml
+        {{- if .Values.probes.gateway.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.gateway.readiness.path }}
+              port: {{ .Values.probes.gateway.readiness.port }}
+            initialDelaySeconds: {{ .Values.probes.gateway.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.gateway.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.gateway.readiness.failureThreshold }}
+        {{- end }}
+        {{- if and .Values.probes.gateway.liveness.enabled .Values.probes.gateway.liveness }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.gateway.liveness.path }}
+              port: {{ .Values.probes.gateway.liveness.port }}
+            initialDelaySeconds: {{ .Values.probes.gateway.liveness.initialDelaySeconds | default 15 }}
+            periodSeconds: {{ .Values.probes.gateway.liveness.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.probes.gateway.liveness.failureThreshold | default 3 }}
+        {{- end }}
+        {{- if and .Values.probes.gateway.startup.enabled .Values.probes.gateway.startup }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.gateway.startup.path }}
+              port: {{ .Values.probes.gateway.startup.port }}
+            initialDelaySeconds: {{ .Values.probes.gateway.startup.initialDelaySeconds | default 30 }}
+            periodSeconds: {{ .Values.probes.gateway.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.gateway.startup.failureThreshold | default 12 }}
+        {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - yabinin-gateway
+                topologyKey: kubernetes.io/hostname
+      {{- if .Values.ha.enabled }}
+      {{- /* hard failure-domain spread: one node loss keeps >=1 serving replica (I42/I43) */}}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.ha.topology_key }}
+          whenUnsatisfiable: {{ .Values.ha.when_unsatisfiable }}
+          labelSelector:
+            matchLabels:
+              app: yabinin-gateway
+      {{- end }}
+      volumes:
+        - name: config
+          configMap:
+            name: {{ .Release.Name }}-config
+---
+# Admin Service + Deployment
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-admin
+  labels:
+    app: yabinin-admin
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9086
+      targetPort: 9086
+      name: http
+  selector:
+    app: yabinin-admin
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-admin
+  labels:
+    app: yabinin-admin
+spec:
+  replicas: {{ .Values.replicaCount | default 1 }}
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+  selector:
+    matchLabels:
+      app: yabinin-admin
+  template:
+    metadata:
+      labels:
+        app: yabinin-admin
+    spec:
+      serviceAccountName: {{ .Release.Name }}-yabinin
+      containers:
+        - name: admin
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["admin"]
+          ports:
+            - containerPort: 9086
+              name: http
+          env:
+            - name: YABANIN_MCP_ALLOWED_UPSTREAMS
+              value: {{ .Values.gateway.mcp_allowed_upstreams | default (list) | join "," | quote }}
+            - name: YABANIN_PG_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: pg_uri
+            - name: YABANIN_SESSION_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: session_key
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+        {{- /* N11-P02-T03: admin previously had NO readinessProbe — an admin
+              pod joined Service endpoints before it could serve, so a rollout
+              could route into a still-starting pod (defeats maxUnavailable:0
+              zero-downtime intent). */}}
+        {{- if .Values.probes.admin.readiness.enabled }}
+          readinessProbe:
+            httpGet:
+              path: {{ .Values.probes.admin.readiness.path }}
+              port: {{ .Values.probes.admin.readiness.port }}
+            initialDelaySeconds: {{ .Values.probes.admin.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.admin.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.admin.readiness.failureThreshold }}
+        {{- end }}
+        {{- if and .Values.probes.admin.liveness.enabled .Values.probes.admin.liveness }}
+          livenessProbe:
+            httpGet:
+              path: {{ .Values.probes.admin.liveness.path }}
+              port: {{ .Values.probes.admin.liveness.port }}
+            initialDelaySeconds: {{ .Values.probes.admin.liveness.initialDelaySeconds | default 10 }}
+            periodSeconds: {{ .Values.probes.admin.liveness.periodSeconds | default 10 }}
+            failureThreshold: {{ .Values.probes.admin.liveness.failureThreshold | default 3 }}
+        {{- end }}
+        {{- if and .Values.probes.admin.startup.enabled .Values.probes.admin.startup }}
+          startupProbe:
+            httpGet:
+              path: {{ .Values.probes.admin.startup.path }}
+              port: {{ .Values.probes.admin.startup.port }}
+            initialDelaySeconds: {{ .Values.probes.admin.startup.initialDelaySeconds | default 20 }}
+            periodSeconds: {{ .Values.probes.admin.startup.periodSeconds | default 5 }}
+            failureThreshold: {{ .Values.probes.admin.startup.failureThreshold | default 12 }}
+        {{- end }}
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                labelSelector:
+                  matchExpressions:
+                    - key: app
+                      operator: In
+                      values:
+                        - yabinin-admin
+                topologyKey: kubernetes.io/hostname
+      {{- if .Values.ha.enabled }}
+      {{- /* admin shares the gateway failure-domain budget (same replicaCount) */}}
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: {{ .Values.ha.topology_key }}
+          whenUnsatisfiable: {{ .Values.ha.when_unsatisfiable }}
+          labelSelector:
+            matchLabels:
+              app: yabinin-admin
+      {{- end }}

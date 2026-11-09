@@ -1,0 +1,37 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "yabanin.fullname" . }}-post-upgrade-migrate
+  annotations:
+    "helm.sh/hook": post-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "5"
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        {{- include "yabanin.onprem.waitPostgres" . | nindent 8 }}
+        {{- include "yabanin.onprem.waitMigrationLock" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository | default "yabanin" }}:{{ .Values.image.tag }}"
+          args: ["migrate"]
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          env:
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "yabanin.onprem.appSecretName" . }}
+                  key: pg_password
+            - name: YABANIN_PG_URI
+              value: "postgres://yabanin:$(PG_PASSWORD)@{{ .Release.Name }}-postgres:5432/yabanin?sslmode=disable"
+            # Region is an env var, not a flag (install-guide
+            # troubleshooting: RLS errors when migrations run without region).
+            - name: YABANIN_REGION
+              value: {{ .Values.config.region | default "onprem" }}

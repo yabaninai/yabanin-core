@@ -1,0 +1,8 @@
+models:
+  - name: gpt
+    provider: openai
+    apiBase: "https://gw.example/v1"
+    apiKey: "${YABANIN_API_KEY}"
+    requestOptions:
+      headers:
+        X-Yabanin-Labels: team=payments

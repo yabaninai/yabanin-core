@@ -1,0 +1,13 @@
+[hex]
+[utils]
+[site]
+[render]
+pkg/costsim/render.go:78:const htmlStyle = `body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f2efe6;color:#292d24;margin:0;padding:0;overflow-wrap:anywhere}
+pkg/costsim/render.go:80:h1{font-size:1.5rem;margin:0 0 .5rem}h2{font-size:1.2rem;border-bottom:1px solid #d2d3c4;padding-bottom:.3rem;margin-top:2rem}
+pkg/costsim/render.go:82:code{background:#e8e5d9;padding:.1rem .3rem;overflow-wrap:anywhere}
+pkg/costsim/render.go:83:.banner{background:#f3ecd8;border:1px solid #d2d3c4;padding:.6rem .8rem;margin:1rem 0}
+pkg/costsim/render.go:84:.scroll{overflow-x:auto;margin:1rem 0;border:1px solid #d2d3c4;border-radius:4px}
+pkg/costsim/render.go:85:.scroll:focus-visible{outline:2px solid #4c6236;outline-offset:1px}
+pkg/costsim/render.go:87:th,td{border-bottom:1px solid #d2d3c4;padding:.45rem .6rem;text-align:left;font-size:.9rem}
+pkg/costsim/render.go:88:th{background:#e8e5d9;border-bottom:2px solid #808570}
+pkg/costsim/render.go:90:.unknown{color:#626657;font-style:italic}`

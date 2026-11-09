@@ -1,0 +1,253 @@
+# ADL-02 / TP-14: evals as a PR gate.
+#
+# Reusable composite action `yb-eval`. On a PR (or dispatch) it builds the `yb`
+# binary from the repo in the runner (no network — the routing/guards evals are
+# in-process and deterministic), runs both eval suites against the committed
+# baselines, and:
+#   - records each eval's status and exit code independently (a routing
+#     regression still leaves the guards verdict and the report available);
+#   - writes a Markdown summary plus a compact machine-readable JSON to an
+#     artifact that uploads on success AND failure (evals are bounded by
+#     `timeout`, so a hung command cannot block the upload);
+#   - posts (or annotates) a PR summary comment — reporting only: a publish
+#     refusal (fork read-only token, 403) is a warning, never a status change;
+#   - fails the check in a single final gate when any eval is not a pass.
+#
+# Wiring (consumer workflow, see docs/evaluation.md):
+#   - on: pull_request
+#   - path filters: routing / pricing / guard-hook source + the eval datasets.
+#
+# Inputs are all optional with repo defaults so the action is drop-in.
+
+name: yb-eval
+description: >-
+  Run the Yabanin routing + guard-hook eval suites as a PR gate. Builds the yb
+  binary in the runner, runs `yb evaluate routing --against baseline
+  --max-mismatch 0` and `yb evaluate guards`, emits Markdown + JSON summary
+  artifacts, posts a PR comment, and fails CI when a gate is red.
+
+inputs:
+  go-version:
+    description: Go version used to build the yb binary.
+    required: false
+    default: '1.26.x'
+  routing-golden:
+    description: Path to the golden routing JSONL set.
+    required: false
+    default: datasets/eval/golden_routing.jsonl
+  routing-baseline:
+    description: Path to the committed routing snapshot baseline.
+    required: false
+    default: datasets/eval/routing_baseline.json
+  routing-max-mismatch:
+    description: Maximum allowed routing class mismatches vs the baseline (0 = fail on any).
+    required: false
+    default: '0'
+  guards-corpus:
+    description: Path to the labeled guard corpus JSONL.
+    required: false
+    default: datasets/eval/guards_labeled.jsonl
+  guards-min-precision:
+    description: Minimum guard-detection precision gate.
+    required: false
+    default: '0.98'
+  guards-min-recall:
+    description: Minimum guard-detection recall gate.
+    required: false
+    default: '0.90'
+  comment:
+    description: Post a PR summary comment (true) or leave a workflow annotation only (false).
+    required: false
+    default: 'true'
+  github-token:
+    description: Token used to post the PR comment. Defaults to the workflow's GITHUB_TOKEN.
+    required: false
+    default: ''
+
+outputs:
+  routing:
+    description: "'pass', 'fail' or 'not_run' for the routing gate."
+    value: ${{ steps.report.outputs.routing }}
+  guards:
+    description: "'pass', 'fail' or 'not_run' for the guards gate."
+    value: ${{ steps.report.outputs.guards }}
+  overall:
+    description: "'pass' or 'fail' for the combined gate."
+    value: ${{ steps.report.outputs.overall }}
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Go
+      uses: actions/setup-go@v5
+      with:
+        go-version: ${{ inputs.go-version }}
+
+    - name: Build yb
+      id: build
+      shell: bash
+      run: |
+        # TP-14: the build outcome decides whether evals run; a failure here
+        # must surface as not_run statuses downstream, not as missing steps.
+        # Bounded so a wedged toolchain cannot block the artifact upload.
+        if timeout 300 go build -trimpath -o yb ./cmd/yb; then
+          echo "status=pass" >> "$GITHUB_OUTPUT"
+        else
+          rc=$?
+          echo "status=fail" >> "$GITHUB_OUTPUT"
+          exit "$rc"
+        fi
+
+    # The two evals are independent: each records its own status and exit
+    # code (continue-on-error keeps the pipeline alive) and the FINAL gate
+    # turns any non-pass into the check's verdict. Thresholds and corpus are
+    # inputs only — this action never relaxes them to go green.
+    - name: Run routing eval
+      id: routing
+      if: ${{ steps.build.outputs.status == 'pass' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -o pipefail
+        timeout 600 ./yb evaluate routing \
+            --golden "${{ inputs.routing-golden }}" \
+            --against "${{ inputs.routing-baseline }}" \
+            --max-mismatch "${{ inputs.routing-max-mismatch }}" \
+            > routing-eval.txt 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then status=pass; else status=fail; fi
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+        if [ "$rc" -eq 124 ]; then
+          echo "::warning::routing eval exceeded the 600s bound and was terminated"
+        fi
+        if [ "$rc" -ne 0 ]; then
+          # Show the diff table in the log before the report step; the
+          # artifact keeps the full output either way.
+          cat routing-eval.txt
+        fi
+        exit "$rc"
+
+    - name: Run guards eval
+      id: guards
+      if: ${{ steps.build.outputs.status == 'pass' }}
+      continue-on-error: true
+      shell: bash
+      run: |
+        set -o pipefail
+        timeout 600 ./yb evaluate guards \
+            --corpus "${{ inputs.guards-corpus }}" \
+            --min-precision "${{ inputs.guards-min-precision }}" \
+            --min-recall "${{ inputs.guards-min-recall }}" \
+            > guards-eval.txt 2>&1
+        rc=$?
+        if [ "$rc" -eq 0 ]; then status=pass; else status=fail; fi
+        echo "status=$status" >> "$GITHUB_OUTPUT"
+        echo "exit_code=$rc" >> "$GITHUB_OUTPUT"
+        if [ "$rc" -eq 124 ]; then
+          echo "::warning::guards eval exceeded the 600s bound and was terminated"
+        fi
+        if [ "$rc" -ne 0 ]; then
+          cat guards-eval.txt
+        fi
+        exit "$rc"
+
+    - name: Build summary
+      id: report
+      if: always()
+      shell: bash
+      run: |
+        routing="${{ steps.routing.outputs.status }}"
+        guards="${{ steps.guards.outputs.status }}"
+        routing_rc="${{ steps.routing.outputs.exit_code }}"
+        guards_rc="${{ steps.guards.outputs.exit_code }}"
+        # Skipped steps (build failure) have no outputs: not_run, not pass.
+        [ -n "$routing" ] || routing=not_run
+        [ -n "$guards" ] || guards=not_run
+        [ -n "$routing_rc" ] || routing_rc=null
+        [ -n "$guards_rc" ] || guards_rc=null
+        if [ "$routing" = "pass" ] && [ "$guards" = "pass" ]; then overall=pass; else overall=fail; fi
+        render() {
+          case "$1" in pass) echo PASS ;; fail) echo FAIL ;; *) echo NOT RUN ;; esac
+        }
+        {
+          echo "## Yabanin eval gate (yb-eval)"
+          echo
+          echo "| Gate | Result |"
+          echo "|------|--------|"
+          echo "| Routing (vs baseline, max-mismatch ${{ inputs.routing-max-mismatch }}) | $(render "$routing") |"
+          echo "| Guards (precision ≥ ${{ inputs.guards-min-precision }}, recall ≥ ${{ inputs.guards-min-recall }}) | $(render "$guards") |"
+          echo
+          if [ "$overall" = pass ]; then
+            echo "**Overall: PASS** — routing and guard detection are within their gates."
+          else
+            echo "**Overall: FAIL** — a gate is red or did not run. See the eval logs / artifact for the diff."
+          fi
+          echo
+          echo "<details><summary>Routing eval output</summary>"
+          echo
+          echo '```'
+          cat routing-eval.txt 2>/dev/null || echo "(not run)"
+          echo '```'
+          echo
+          echo "</details>"
+          echo "<details><summary>Guards eval output</summary>"
+          echo
+          echo '```'
+          cat guards-eval.txt 2>/dev/null || echo "(not run)"
+          echo '```'
+          echo
+          echo "</details>"
+        } > yb-eval-summary.md
+        # Compact machine-readable twin of the Markdown summary.
+        printf '{"overall":"%s","routing":{"status":"%s","exit_code":%s},"guards":{"status":"%s","exit_code":%s},"thresholds":{"routing_max_mismatch":"%s","guards_min_precision":"%s","guards_min_recall":"%s"}}\n' \
+          "$overall" "$routing" "$routing_rc" "$guards" "$guards_rc" \
+          "${{ inputs.routing-max-mismatch }}" "${{ inputs.guards-min-precision }}" "${{ inputs.guards-min-recall }}" \
+          > yb-eval-summary.json
+        echo "routing=${routing}" >> "$GITHUB_OUTPUT"
+        echo "guards=${guards}" >> "$GITHUB_OUTPUT"
+        echo "overall=${overall}" >> "$GITHUB_OUTPUT"
+
+    # Always: the report is exactly what a failed run needs most. The eval
+    # steps are `timeout`-bounded, so this never waits on a hung command.
+    - name: Upload summary artifact
+      if: always()
+      uses: actions/upload-artifact@v4
+      with:
+        name: yb-eval
+        path: |
+          yb-eval-summary.md
+          yb-eval-summary.json
+          routing-eval.txt
+          guards-eval.txt
+        if-no-files-found: error
+
+    # TP-15: publishing is reporting-only. The marker search is scoped to the
+    # current PR, matches the exact marker and the expected author, and a
+    # refused publish (fork read-only token / 403) is a warning below — the
+    # eval verdict and the artifact stay as they are.
+    - name: Post PR comment
+      id: comment
+      if: ${{ always() && inputs.comment == 'true' && github.event_name == 'pull_request' && github.token != '' }}
+      continue-on-error: true
+      shell: bash
+      env:
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
+      run: |
+        pr="${{ github.event.pull_request.number }}"
+        scripts/ci/yb-eval-comment.sh "$pr" yb-eval-summary.md
+
+    - name: Report comment failure
+      if: ${{ always() && steps.comment.outcome == 'failure' }}
+      shell: bash
+      run: |
+        echo "::warning::PR comment publishing failed (read-only token or API refusal). The workflow summary, the artifact and the eval verdict are unaffected."
+
+    # TP-14: the single honest verdict. Build failures already failed the
+    # job; this gate makes eval regressions (and not_run evals) red too.
+    - name: Fail CI when a gate is red
+      if: ${{ always() && steps.report.outputs.overall == 'fail' }}
+      shell: bash
+      run: |
+        echo "::error::Yabanin eval gate FAILED (routing=${{ steps.report.outputs.routing }}, guards=${{ steps.report.outputs.guards }}). See the yb-eval artifact and the routing/guards eval logs for the diff."
+        exit 1

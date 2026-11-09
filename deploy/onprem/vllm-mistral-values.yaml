@@ -1,0 +1,24 @@
+replicas: 1
+image:
+  repository: vllm/vllm-openai
+  tag: latest
+command:
+  - "--model"
+  - "mistralai/Mistral-7B-Instruct"
+  - "--served-model-name"
+  - "local-mistral-7b"
+  - "--port"
+  - "8000"
+service:
+  port: 8000
+resources:
+  limits:
+    nvidia.com/gpu: 1
+    memory: 32Gi
+persistence:
+  enabled: true
+  size: 60Gi
+  mountPath: /root/.cache/huggingface
+extraEnv:
+  - name: HF_HUB_OFFLINE
+    value: "1"

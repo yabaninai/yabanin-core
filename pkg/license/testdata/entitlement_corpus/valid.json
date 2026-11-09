@@ -1,0 +1,9 @@
+{
+  "v": "2",
+  "c": "corpus-customer-valid",
+  "d": "corpus-deployment",
+  "m": ["internal-loop", "media-persistence"],
+  "i": "2026-11-01T00:00:00Z",
+  "me": "2027-11-01T00:00:00Z",
+  "n": "corpus-valid-nonce"
+}

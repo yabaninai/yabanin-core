@@ -1,0 +1,6 @@
+apiVersion: v2
+name: yabanin
+description: Yabanin — Your Agnostic Bridge Across Numerous Inference Networks; multi-region LLM gateway with sovereignty controls
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

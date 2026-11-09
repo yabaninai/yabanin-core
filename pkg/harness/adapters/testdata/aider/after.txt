@@ -1,0 +1,5 @@
+theme: dark
+# >>> yabanin:aider:config (managed by `yb harness`; undo: `yb harness disconnect aider`) >>>
+openai-api-base: "https://gw.example/v1"
+model: gpt
+# <<< yabanin:aider:config <<<

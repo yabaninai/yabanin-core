@@ -1,0 +1,61 @@
+# Patroni config for drill node-a. Validated shape (Patroni 4.1.5, raft DCS):
+# the DCS partner list key is `partner_addrs` (snake_case) — `partners` is
+# silently ignored and yields three single-node raft clusters (the failure
+# this drill initially hit and documented in the T04 record).
+#
+# Trust authentication + no passwords: drill-only, on an internal compose
+# network with no published ports (see docker-compose.drill.yml and README).
+scope: n11p02-drill
+namespace: /drill/
+name: node-a
+restapi:
+  listen: 0.0.0.0:8008
+  connect_address: node-a:8008
+raft:
+  data_dir: /pgdata/raft
+  self_addr: node-a:2222
+  connect_address: node-a:2222
+  bind_addr: 0.0.0.0:2222
+  partner_addrs:
+    - 'node-b:2222'
+    - 'node-c:2222'
+bootstrap:
+  dcs:
+    ttl: 30
+    loop_wait: 5
+    retry_timeout: 10
+    synchronous_mode: true
+    synchronous_mode_strict: true
+    postgresql:
+      use_pg_rewind: true
+      parameters:
+        wal_level: replica
+        hot_standby: "on"
+        max_wal_senders: 10
+        max_replication_slots: 10
+        wal_keep_size: 128MB
+      pg_hba:
+        - local all all trust
+        - host all all 127.0.0.1/32 trust
+        - host all all 0.0.0.0/0 trust
+        - host replication replication 0.0.0.0/0 trust
+  initdb:
+    - encoding: UTF8
+    - data-checksums
+  post_bootstrap: /etc/patroni-drill/post_bootstrap.sh
+postgresql:
+  listen: 0.0.0.0:5432
+  connect_address: node-a:5432
+  data_dir: /pgdata/pg
+  authentication:
+    superuser:
+      username: postgres
+    replication:
+      username: replication
+  parameters:
+    unix_socket_directories: /tmp
+tags:
+  nofailover: false
+  noloadbalance: false
+  clonefrom: false
+  nosync: false

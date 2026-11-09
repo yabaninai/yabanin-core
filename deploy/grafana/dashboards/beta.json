@@ -1,0 +1,293 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "refresh": "1m",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["yabanin", "beta", "feedback"],
+  "templating": { "list": [] },
+  "time": { "from": "now-7d", "to": "now" },
+  "title": "Yabanin — Beta metrics (W-FEED)",
+  "uid": "yabanin-beta",
+  "version": 1,
+  "weekStart": "",
+  "panels": [
+    {
+      "title": "Requests per org, last 24h (beta_requests_daily)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(SUM(requests), 0) AS requests_24h FROM beta_requests_daily WHERE day >= (now() - interval '24 hours')"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Active orgs, last 24h (beta_requests_daily)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COUNT(DISTINCT org_id) AS active_orgs_24h FROM beta_requests_daily WHERE day >= (now() - interval '24 hours')"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null }
+            ]
+          },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Cache hit-rate by org (beta_cache_hit_rate_daily)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT COALESCE(SUM(hits)::float8 / NULLIF(SUM(requests), 0), 0) AS cache_hit_rate_24h FROM beta_cache_hit_rate_daily WHERE day >= (now() - interval '24 hours')"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "red", "value": null },
+              { "color": "yellow", "value": 0.2 },
+              { "color": "green", "value": 0.5 }
+            ]
+          },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    },
+    {
+      "title": "Median time to first request after onboarding (beta_onboarding_ttfq)",
+      "type": "stat",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT percentile_cont(0.5) WITHIN GROUP (ORDER BY seconds_to_first_request) AS median_ttfq_seconds FROM beta_onboarding_ttfq WHERE first_request_at IS NOT NULL AND onboarded_at >= (now() - interval '30 days')"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "yellow", "value": 3600 },
+              { "color": "red", "value": 86400 }
+            ]
+          },
+          "unit": "s"
+        }
+      }
+    },
+    {
+      "title": "Daily active users by org (beta_dau_daily)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT day AS \"time\", org_id::text AS metric, active_users AS value FROM beta_dau_daily WHERE $__timeFilter(day) ORDER BY day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 12, "lineWidth": 2, "showPoints": "never" },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Requests by org per day (beta_requests_daily)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 4 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT day AS \"time\", org_id::text AS metric, requests AS value FROM beta_requests_daily WHERE $__timeFilter(day) ORDER BY day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 12, "lineWidth": 2, "showPoints": "never" },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Provider distribution — BYOK vs global (beta_provider_distribution)",
+      "type": "piechart",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 8, "x": 0, "y": 12 },
+      "options": {
+        "pieType": "pie",
+        "displayLabels": ["name", "percent"],
+        "legend": { "displayMode": "table", "placement": "right", "showValue": true }
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "table",
+          "rawQuery": true,
+          "rawSql": "SELECT provider || CASE WHEN byok THEN ' (BYOK)' ELSE '' END AS provider, SUM(requests) AS requests FROM beta_provider_distribution WHERE $__timeFilter(day) GROUP BY 1 ORDER BY requests DESC"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short"
+        }
+      }
+    },
+    {
+      "title": "Errors by provider, error rate (beta_provider_errors)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 8, "x": 8, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT day AS \"time\", provider AS metric, error_rate AS value FROM beta_provider_errors WHERE $__timeFilter(day) ORDER BY day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1,
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "p95 latency by org, ms (beta_latency_daily)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 8, "x": 16, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT day AS \"time\", org_id::text AS metric, p95_ms AS value FROM beta_latency_daily WHERE $__timeFilter(day) ORDER BY day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" },
+          "unit": "ms"
+        }
+      }
+    },
+    {
+      "title": "Cache hit-rate by org per day (beta_cache_hit_rate_daily)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 20 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT day AS \"time\", org_id::text AS metric, hit_rate AS value FROM beta_cache_hit_rate_daily WHERE $__timeFilter(day) ORDER BY day"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 8, "lineWidth": 2, "showPoints": "never" },
+          "unit": "percentunit",
+          "min": 0,
+          "max": 1
+        }
+      }
+    },
+    {
+      "title": "Time to first request by org, seconds (beta_onboarding_ttfq)",
+      "type": "timeseries",
+      "datasource": { "type": "postgres", "uid": "beta-postgres" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 20 },
+      "targets": [
+        {
+          "refId": "A",
+          "format": "time_series",
+          "rawQuery": true,
+          "rawSql": "SELECT first_request_at AS \"time\", org_id::text AS metric, seconds_to_first_request AS value FROM beta_onboarding_ttfq WHERE $__timeFilter(first_request_at) AND first_request_at IS NOT NULL ORDER BY first_request_at"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "custom": { "fillOpacity": 8, "lineWidth": 0, "showPoints": "always", "pointSize": 6 },
+          "unit": "s"
+        }
+      }
+    }
+  ]
+}

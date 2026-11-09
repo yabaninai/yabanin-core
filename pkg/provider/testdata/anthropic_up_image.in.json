@@ -1,0 +1,13 @@
+{
+  "model": "claude",
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "see"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}}
+      ]
+    }
+  ]
+}

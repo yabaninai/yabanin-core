@@ -1,0 +1,171 @@
+{
+  "annotations": { "list": [] },
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "liveNow": false,
+  "panels": [
+    {
+      "title": "OTel Export — Dropped Records (cumulative)",
+      "description": "yabanin_otel_logs_dropped_total: request-log records dropped because the bounded export queue was full (backpressure) or during shutdown. Flat line = healthy; any sustained growth means the OTLP collector is unreachable or too slow. Consumer latency is never affected — see docs/observability/otel-export.md.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 0 },
+      "targets": [
+        {
+          "expr": "yabanin_otel_logs_dropped_total",
+          "legendFormat": "dropped records",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 }
+        }
+      }
+    },
+    {
+      "title": "OTel Export — Drop Rate (saturation)",
+      "description": "Rate of export-queue drops over 5m. Zero = the sink keeps up. A positive rate is the saturation signal for the export pipeline: sink down, network broken, or backpressure (the queue itself is bounded — memory cannot grow).",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 0 },
+      "targets": [
+        {
+          "expr": "rate(yabanin_otel_logs_dropped_total[5m])",
+          "legendFormat": "drops/s (5m)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Export Health — Drops Last Hour",
+      "description": "Export status at a glance: 0 drops over the last hour = healthy export. Any nonzero value means request-log records were discarded instead of exported.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 8 },
+      "targets": [
+        {
+          "expr": "sum(increase(yabanin_otel_logs_dropped_total[1h]))",
+          "legendFormat": "drops (1h)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Dropped Records by Instance (24h)",
+      "description": "Cumulative drops per loggerd instance over 24h — splits a fleet-wide sink outage from a single bad replica.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 8 },
+      "targets": [
+        {
+          "expr": "increase(yabanin_otel_logs_dropped_total[24h])",
+          "legendFormat": "{{instance}}",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "short",
+          "custom": { "lineWidth": 1, "fillOpacity": 0 }
+        }
+      }
+    },
+    {
+      "title": "OTel Export — Failed Attempts (rate)",
+      "description": "yabanin_otel_export_errors_total: failed Export attempts (network errors or non-200 responses from the OTLP collector). This is the OUTAGE signal: exporter failure is visible here without ever affecting consumer latency. A positive rate while drops stay flat means the failure is being absorbed by the bounded queue; sustained failure eventually saturates it — pair this panel with the drop panels above. See docs/observability/otel-export.md.",
+      "type": "timeseries",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(rate(yabanin_otel_export_errors_total[5m]))",
+          "legendFormat": "failed attempts/s (5m)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "palette-classic" },
+          "unit": "ops",
+          "custom": { "lineWidth": 2, "fillOpacity": 10 },
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 0.01 }
+            ]
+          }
+        }
+      }
+    },
+    {
+      "title": "Export Health — Failed Attempts (1h)",
+      "description": "Exporter status at a glance: 0 failed attempts over the last hour = the OTLP sink is accepting every batch. Nonzero = the sink is (or was) failing; the queue bounded the damage, but the outage must be investigated.",
+      "type": "stat",
+      "datasource": { "type": "prometheus", "uid": "PBFA97CFB590B2093" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [
+        {
+          "expr": "sum(increase(yabanin_otel_export_errors_total[1h]))",
+          "legendFormat": "failed attempts (1h)",
+          "refId": "A"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "color": { "mode": "thresholds" },
+          "unit": "short",
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      }
+    }
+  ],
+  "refresh": "10s",
+  "schemaVersion": 39,
+  "style": "dark",
+  "tags": ["yabanin", "observability", "otel", "export"],
+  "templating": { "list": [] },
+  "time": { "from": "now-1h", "to": "now" },
+  "title": "Yabanin — Observability Export",
+  "uid": "yabanin-observability-export"
+}

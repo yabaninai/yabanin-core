@@ -1,0 +1,12 @@
+{
+  "GITLAB_CI": "true",
+  "CI_PIPELINE_ID": "200",
+  "CI_PIPELINE_SOURCE": "merge_request_event",
+  "CI_PROJECT_PATH": "group/proj",
+  "CI_MERGE_REQUEST_SOURCE_BRANCH_NAME": "feature/OTHER-1",
+  "CI_MERGE_REQUEST_TARGET_BRANCH_NAME": "main",
+  "CI_MERGE_REQUEST_IID": "42",
+  "CI_MERGE_REQUEST_TITLE": "Add PAY-77 support",
+  "CI_COMMIT_SHA": "deadbeef",
+  "CI_COMMIT_REF_NAME": "refs/merge-requests/42/head"
+}

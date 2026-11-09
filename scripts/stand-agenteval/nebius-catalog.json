@@ -1,0 +1,106 @@
+{
+  "schema_version": 1,
+  "provider": "nebius-token-factory",
+  "api_base": "https://api.tokenfactory.nebius.com/v1",
+  "as_of": "2026-09-08",
+  "catalog_source": "GET /v1/models под рабочим ключом; снимок: private/agent-eval/nebius/2026-09-08-models-list.json (22 модели)",
+  "flavor_policy": "Base (БЕЗ суффикса -fast) для обеих arms: идентичные выходы, дешевле; -fast — отдельное исследование latency",
+  "compatibility_evidence": "private/agent-eval/nebius/2026-09-08-compat-microcheck.md — обе arms дают finish_reason=tool_calls c корректными аргументами",
+  "arms": {
+    "G1": {
+      "role": "anchor (дорогая точка сравнения)",
+      "model": "zai-org/GLM-5.2",
+      "tools_verified": true,
+      "prices_usd_per_1m": {
+        "input": 1.4,
+        "output": 4.4
+      },
+      "prices_status": "VERIFIED_CONSOLE",
+      "console_metadata_2026_09_08": {
+        "precision": "FP4 | FP8",
+        "params": "750B",
+        "context_tokens": "432K (FP4) / 1024K (FP8); для капов брать 432K — вариант precision через model id не выбирается",
+        "modality_console": "Text-to-text"
+      },
+      "prices_effective_from": "2026-06-01",
+      "prices_billing_name": "GLM-5.2",
+      "prices_as_of": "2026-09-08"
+    },
+    "G2": {
+      "role": "cheap candidate, та же семья (главная гипотеза: замена внутри семейства)",
+      "model": "zai-org/GLM-5.3-Flash",
+      "tools_verified": true,
+      "notes": "мыслящая: reasoning_tokens billed как output — включать в бюджет выхода",
+      "prices_usd_per_1m": {
+        "input": 0.15,
+        "output": 0.5
+      },
+      "prices_status": "VERIFIED_CONSOLE",
+      "console_metadata_2026_09_08": {
+        "precision": "FP8",
+        "params": "—",
+        "context_tokens": "1024K",
+        "modality_console": "Vision (мультимодальная; задачи стенка — текстовые)"
+      },
+      "prices_effective_from": "2026-08-01",
+      "prices_billing_name": "GLM-5.3 Flash",
+      "prices_as_of": "2026-09-08"
+    },
+    "G2_ALT": {
+      "role": "кросс-семейная альтернатива, если G2 не пройдёт S01",
+      "model": "deepseek-ai/DeepSeek-V4-Flash-0731",
+      "tools_verified": false,
+      "prices_usd_per_1m": {
+        "input": 0.14,
+        "output": 0.28
+      },
+      "prices_status": "VERIFIED_CONSOLE",
+      "console_metadata_2026_09_08": {
+        "precision": "FP8",
+        "params": "304B",
+        "context_tokens": "1024K",
+        "modality_console": "Text-to-text"
+      },
+      "prices_effective_from": "2026-07-01",
+      "prices_billing_name": "DeepSeek-V4-Flash (строка WITHOUT -0731 — сверить по первому списанию)",
+      "prices_as_of": "2026-09-08"
+    }
+  },
+  "avoid": [
+    {
+      "model": "meta-llama/Llama-3.3-70B-Instruct",
+      "reason": "deprecated 2026-08-31; замена nvidia/Nemotron-3_5-Lightning"
+    },
+    {
+      "model": "deepseek-ai/DeepSeek-V4-Flash",
+      "reason": "deprecated 2026-08-31; использовать DeepSeek-V4-Flash-0731"
+    }
+  ],
+  "budget_usd": {
+    "topped_up": 20,
+    "trial_credit_note": "возможен +$1 trial-кредит; фактический баланс снять в консоли до первого платного вызова",
+    "sublimits": {
+      "s01_compatibility": 2,
+      "agent_episodes": 5,
+      "coding_episodes": 8,
+      "reserve": 5,
+      "total": 20
+    }
+  },
+  "provider_facts": {
+    "usage_cost_field": "ОТСУТСТВУЕТ: observed cost = usage(токены) x prices из этого каталога",
+    "balance_api": "НЕТ публичного API: сверка через Usage/Balance консоль (ручной шаг владельца)",
+    "request_correlation": "поле id ответа; отдельного generation-lookup нет",
+    "rate_limits": "динамические RPM/TPM, 429 c Retry-After, заголовки x-ratelimit-* — снимать на S01",
+    "region": "публичные эндпоинты Global, БЕЗ гарантии региона — фиксировать в evidence честно; для региона — только dedicated endpoints",
+    "native_prompt_cache": "наблюдаемо через prompt_cache_hit_tokens/prompt_cache_miss_tokens — не приписывать скидку Yabanin"
+  },
+  "public_catalog_note": "Публичный каталог консоли (~90 моделей, снимок private/agent-eval/nebius/2026-09-08-console-catalog-paste.md) шире списка ключа (22 модели через GET /v1/models); список ключа — авторитет для доступности под ключом. ЦЕНЫ в консольной вставке отсутствовали (колонки не скопировались): по-прежнему TO_VERIFY_CONSOLE.",
+  "prices_source": "Вставка владельца из консоли Token Factory (страница Pricing), 2026-09-08; регион строк eu-north1; выдержка: private/agent-eval/nebius/2026-09-08-pricing-paste.md",
+  "pricing_notes": [
+    "G2_ALT: в прайс-листе строка 'DeepSeek-V4-Flash' без суффикса; при первом платном вызове -0731 сверить фактическое списание с $0.14/$0.28 (P0-10, иначе пометить uncertain).",
+    "Batch-варианты (×0.5) существуют, но стенд использует синхронные вызовы — Batch вне scope.",
+    "Отдельных ставок cache-hit в прайс-листе нет: если native prompt cache даёт скидку, это проявится только сверкой баланса (фиксировать в P0-10).",
+    "Нулевые цены некоторых строк (charai/genesis/Prosus) — партнёрские исключения, НЕ наш случай; напоминание, почему $0 не означает 'бесплатно' без проверки."
+  ]
+}

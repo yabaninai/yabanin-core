@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "note": "NEXT-10 protected command registry. Trusted-harness meta-policy: the exact commands and command prefixes trusted tooling may execute on behalf of evaluated candidates. Fixture- and task-declared commands are valid ONLY when they match a profile below; a tampered fixture cannot widen execution. The registry hash is recorded in evidence v2 manifests and episode evidence, so any post-run modification is detectable. Protection is tamper-evidence + scope limiting, not an OS sandbox.",
+  "profiles": {
+    "bootstrap": {
+      "exact": [
+        "go mod download",
+        "for d in sdks/go deploy/mock-provider deploy/mock-embedder scripts/loadtest/http; do (cd $d && go mod download); done",
+        "npm --prefix web/dashboard ci",
+        "npm --prefix web/site ci",
+        "npm --prefix sdks/node ci",
+        "npm --prefix services/subscription-bridge ci",
+        "npx playwright install chromium",
+        "make install-analysis-tools"
+      ]
+    },
+    "coding_tests": {
+      "prefix": ["node --test "],
+      "exact": ["node --test"]
+    },
+    "workspace_git": {
+      "prefix": ["git worktree ", "git status", "git diff", "git -C "],
+      "exact": []
+    }
+  }
+}

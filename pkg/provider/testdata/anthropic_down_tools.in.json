@@ -1,0 +1,12 @@
+{
+  "id": "msg_1",
+  "model": "claude",
+  "stop_reason": "tool_use",
+  "content": [
+    {"type": "text", "text": "ok"},
+    {"type": "tool_use", "id": "toolu_1", "name": "get_weather", "input": {"city": "Paris"}},
+    {"type": "thinking", "thinking": "hidden"},
+    {"type": "tool_use", "id": "toolu_2", "name": "get_time", "input": {"tz": "UTC"}}
+  ],
+  "usage": {"input_tokens": 3, "output_tokens": 4}
+}

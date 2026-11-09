@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent-eval verdict record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["verdict_id", "episode_id", "task_outcome"],
+  "properties": {
+    "verdict_id": {"type": "string", "minLength": 1},
+    "episode_id": {"type": "string", "minLength": 1},
+    "task_outcome": {"enum": ["success", "failure", "clarification", "refusal", "safe_stop", "uncertain"]},
+    "notes": {"type": ["string", "null"]}
+  }
+}

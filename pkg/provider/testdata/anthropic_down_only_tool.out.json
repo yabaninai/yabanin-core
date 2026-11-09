@@ -1,0 +1,20 @@
+{
+  "id": "msg_2",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "claude",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "tool_calls",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "tool_calls": [
+          {"id": "toolu_9", "type": "function", "function": {"name": "lookup", "arguments": "{}"}}
+        ]
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 1, "completion_tokens": 1, "total_tokens": 2}
+}

@@ -1,0 +1,31 @@
+{
+  "schema_version": 1,
+  "updated": "2026-09-16",
+  "source": "NEXT-19. Machine-checked by pkg/gateway/api_contract_test.go (gateway) and per-SDK parity tests (sdks/go). Every SDK and client MAY rely on these shapes; changes are breaking and require a schema_version bump.",
+  "error_envelope": {
+    "shape": { "error": { "message": "string (required, non-empty)", "type": "string (required, non-empty)", "param": "string|null omitted", "code": "string|null omitted" } },
+    "http": "Every non-2xx JSON body uses this envelope — no bare strings, no nested deviations.",
+    "sse": "Stream errors ride the SAME envelope as a data event: data: {\"error\":{message,type}}\\n\\n, always followed by data: [DONE]."
+  },
+  "success_body": {
+    "chat.completion": "id, object, choices[] non-empty; choices[0].message.content non-null; usage tokens are JSON numbers.",
+    "chat.completion.chunk": "SSE chunks carry object=chat.completion.chunk; stream ends with the literal data: [DONE] line, including after errors."
+  },
+  "pagination": {
+    "shape": { "page": "int >= 1", "page_size": "int", "total": "int (from COUNT, honest)", "total_pages": "int" },
+    "consumers": "Admin list endpoints (organizations, requests, keys); the dashboard client types pin this shape."
+  },
+  "units": {
+    "usd": "All money crossing the API is a float named *_usd (cost_usd, cost_in_usd). Micro-USD (cost_microusd) is INTERNAL to ledger fixtures only and never crosses the API.",
+    "tokens": "usage tokens are JSON numbers (integers)."
+  },
+  "nullability": {
+    "unknown_cost": "A cost the system could not compute is null / absent — never 0 (0 is a real free/local cost).",
+    "content": "assistant content is non-null on success; reasoning-only models still emit a (possibly empty) string."
+  },
+  "fixtures": {
+    "error_401": { "error": { "message": "invalid api key", "type": "invalid_request_error" } },
+    "error_upstream": { "error": { "message": "upstream provider unavailable", "type": "api_error", "code": "service_unavailable" } },
+    "sse_error_event": "data: {\"error\":{\"message\":\"boom\",\"type\":\"upstream_error\"}}\n\ndata: [DONE]\n\n"
+  }
+}

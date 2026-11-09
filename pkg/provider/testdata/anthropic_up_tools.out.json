@@ -1,0 +1,35 @@
+{
+  "model": "claude-3-5-sonnet",
+  "max_tokens": 4096,
+  "messages": [
+    {"role": "user", "content": "what's the weather"},
+    {
+      "role": "assistant",
+      "content": [
+        {"type": "text", "text": "I'll check."},
+        {"type": "tool_use", "id": "call_1", "name": "get_weather", "input": {"city": "Paris"}},
+        {"type": "tool_use", "id": "call_2", "name": "get_time", "input": {"tz": "UTC"}}
+      ]
+    },
+    {
+      "role": "user",
+      "content": [
+        {"type": "tool_result", "tool_use_id": "call_1", "content": "sunny"},
+        {"type": "tool_result", "tool_use_id": "call_2", "content": "12:00"},
+        {"type": "text", "text": "thanks"}
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "name": "get_weather",
+      "description": "Weather",
+      "input_schema": {"type": "object", "properties": {"city": {"type": "string"}}}
+    },
+    {
+      "name": "get_time",
+      "description": "Time",
+      "input_schema": {"type": "object"}
+    }
+  ]
+}

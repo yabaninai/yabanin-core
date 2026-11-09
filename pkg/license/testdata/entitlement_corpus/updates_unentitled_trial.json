@@ -1,0 +1,10 @@
+{
+  "v": "2",
+  "c": "corpus-customer-trial",
+  "d": "corpus-deployment",
+  "m": ["history-export"],
+  "i": "2026-05-01T00:00:00Z",
+  "me": "2026-10-09T00:00:00Z",
+  "te": "2026-11-15T00:00:00Z",
+  "n": "corpus-trial-nonce"
+}

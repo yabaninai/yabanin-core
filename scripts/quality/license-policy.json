@@ -1,0 +1,24 @@
+{
+  "schema_version": 1,
+  "target_model": "Apache-2.0 current project-authored core; future explicitly scoped proprietary enterprise",
+  "decision": "approved",
+  "enterprise_paths": [
+    "enterprise/"
+  ],
+  "notes": [
+    "Owner selected Apache core; initial release sells support only. Current project-authored code receives the root LICENSE grant; future proprietary boundaries require explicit notices.",
+    "Apache core permits commercial SaaS, OEM and forks. Trademark rules and paid support do not restrict these granted rights.",
+    "Third-party dependency policy remains permissive-only; copyleft is review-required, not automatically unlawful.",
+    "Boundary: 'enterprise/' is the reserved root prefix for future separately-licensed modules; the designated boundary is exactly this prefix: files under 'enterprise/' carry proprietary enterprise terms, everything outside stays Apache-2.0; the list below is final, not provisional. Enterprise terms require legal approval before any enterprise file is added. Detectors (public-export-gate.sh section g, enterprise_scope.py, license_manifest.py) read this field as the single source of truth.",
+    "The current release ships no Python wheels; the wheels-equivalent deliverable surface for scanners is the classifier image's pip environment, pinned by deploy/python-constraints.txt and inventoried via 'make licenses-image' (pip inspect bound with --python-env classifier-image=...). The equivalence extends scanner scope; it does not waive or weaken any check.",
+    "This approval records the own-license choice, not human release clearance for ownership, dependencies, models, assets or distribution.",
+    "Release evidence must cover exact versions, image digests, model revisions, notices and actual shipped artifacts.",
+    "enterprise/loop/ is the first designated proprietary module (versioned executor-loop engine on the open pkg/loopexec SPI); its terms are enterprise/LICENSE. enterprise_paths remains the whole reserved 'enterprise/' prefix; further designations are separate owner decisions. The open SPI (pkg/loopexec) stays Apache-2.0 core."
+  ],
+  "core_license_candidates": [
+    "Apache-2.0"
+  ],
+  "core_license": "Apache-2.0",
+  "copyright_holder": "Dmitry Lakhvich",
+  "copyright_year": 2026
+}

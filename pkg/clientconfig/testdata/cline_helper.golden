@@ -1,0 +1,6 @@
+Cline stores its provider in VS Code extension state, so yb does not edit it.
+In Cline, choose an OpenAI-compatible provider.
+Base URL: https://gw.example/v1
+Model: gpt
+Do not paste the API key. Put the output of `yb key print` into Cline's key field, or export YABANIN_API_KEY.
+Custom header: X-Yabanin-Labels: team=payments

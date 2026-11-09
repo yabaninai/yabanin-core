@@ -1,0 +1,6 @@
+{
+  "theme": "dark",
+  "env": {
+    "ANTHROPIC_API_KEY": "foreign-token"
+  }
+}

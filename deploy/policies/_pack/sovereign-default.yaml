@@ -1,0 +1,49 @@
+#
+# SHIPS OFF: `yb policies reconcile` ignores _pack/ unless --include-pack is
+# passed; enabling it for an environment is one flag on the reconcile line.
+# Coverage: national PII (RU+9 jurisdictions), secrets, prompt injection —
+# all built-in detector steps, shadow mode (never mutates, never raises the
+# verdict), attached org-wide (every key, every model).
+#
+# Detector names pinned to the OP-1 builtin/ registry (builtins.Registry()).
+# Until the builtins are available, this document is schema-valid and
+# compilation happens gateway-side at load (unknown names fail loudly in
+# the decision log, never silently).
+apiVersion: ypp/v1
+kind: Policy
+name: sovereign-default
+mode: shadow
+hooks:
+  - pre_upstream
+steps:
+  # OP-8 fix: the core requires every step to carry exactly one kind — the
+  # former kindless group head ("scan") failed policy LOAD. The pii_national
+  # detector is now the parallel-group head; semantics are unchanged (the
+  # three detectors still join one read-only group).
+  - id: pii_national
+    detector: builtin/national-pii
+    parallel: [secrets, injection]
+    params:
+      jurisdictions: [ru, kz, by, am, kg, uz, tj, az, ge, md]
+  - id: secrets
+    detector: builtin/secrets
+  - id: injection
+    detector: builtin/injection
+  - id: verdict
+    decide: |
+      deny  if findings.any(f -> f.category matches 'secrets.*' and f.severity == 'high')
+      mask  if findings.any(f -> f.action == 'mask')
+      flag  otherwise
+---
+# Reconcile block: attached org-wide, delivered detached (enabled=false —
+# flip to true in an org declaration or via the admin API to enforce).
+enabled: false
+attachments:
+  - key_label: ""
+    model_pattern: "*"
+    endpoint: chat
+    priority: 10
+  - key_label: ""
+    model_pattern: "*"
+    endpoint: messages
+    priority: 10

@@ -1,0 +1,43 @@
+model_list:
+  - model_name: gpt-4o
+    litellm_params:
+      model: openai/gpt-4o
+      api_key: os.environ/OPENAI_API_KEY
+      tpm: 20000
+      rpm: 200
+      timeout: 30
+    model_info:
+      mode: chat
+      max_output_tokens: 16384
+      max_input_tokens: 128000
+  - model_name: fast-openai
+    litellm_params:
+      model: openai/gpt-4o-mini
+      api_base: https://internal-proxy.example/v1
+    model_info:
+      id: deploy-fast-1
+  - model_name: claude
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+    model_info:
+      mode: chat
+  - model_name: claude-fast
+    litellm_params:
+      model: anthropic/claude-sonnet-4-5
+    model_info:
+      mode: chat
+router_settings:
+  model_group_alias:
+    sonnet: claude
+  fallbacks:
+    - "*": ["claude"]
+    - claude: ["gpt-4o"]
+litellm_settings:
+  drop_params: true
+  request_timeout: 600
+general_settings:
+  master_key: sk-1234abcdef123456
+  database_url: postgres://admin:hunter2@db.internal:5432/litellm
+environment_variables:
+  REDIS_URL: redis://cache.internal:6379
+  SLACK_WEBHOOK_URL: https://hooks.slack.com/services/T000/B000/XXXX

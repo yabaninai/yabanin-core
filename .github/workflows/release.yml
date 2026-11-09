@@ -1,0 +1,599 @@
+name: Release
+
+# A09 (BUILD29-CONTRACT C-6/C-7/C-8/C-9) — build → verify → controlled promote.
+#
+# Pipeline contract (pinned by
+# scripts/release/test_release_scripts.py::ReleaseWorkflowTests):
+#
+#   build   — ALWAYS runs (v* tag push or workflow_dispatch, any branch).
+#             Builds the ONE unified image payload, NEVER publishes
+#             (push: false, no packages: write, no registry login), exports
+#             the payload tar plus a digest file whose CONTENT is the build
+#             digest, and uploads both as run artifacts. The build carries
+#             the unified recipe input (integer SOURCE_DATE_EPOCH = HEAD
+#             commit time, fail-loud validated BEFORE docker runs), so the
+#             payload is a pure function of (source SHA, epoch).
+#   verify  — ALWAYS runs after build. Re-validates the digest file CONTENT
+#             and cross-checks it against the build job's own digest output
+#             (C-6: two transports of one value must agree), loads the payload,
+#             generates the SBOM from the BUILT image, and attaches build
+#             provenance for the built digest to this workflow run
+#             (push-to-registry: false). Cannot publish (no packages: write).
+#   promote — The ONLY publish path. needs: [build, verify]; the `if` below
+#             admits only trusted refs (v* tag push or the release branch),
+#             and every promotion waits on the `release-promotion` GitHub
+#             environment. Reachability (triggers are push-tags + dispatch
+#             ONLY — a plain push to `release` never starts this workflow):
+#             a v* tag push runs the full path; a workflow_dispatch on the
+#             release branch DOES reach this job (still environment-gated);
+#             a workflow_dispatch on any other branch stops after verify.
+#             Publishes THE SAME verified payload bytes (docker load of the
+#             artifact, no rebuild), FAILS unless the published registry
+#             digest equals the verified digest, then signs and attests
+#             exactly that digest.
+#   deploy-helm — Staging helm deploy; needs: promote, so it can never run
+#             without a successful verify + publish of the verified digest.
+#
+# C-7 honesty: the Dockerfile builds ONE payload; the three GHCR names
+# (…-gateway / …-loggerd / …-admin) are three TAGS of that same payload,
+# published by one build. The names are load-bearing (Helm values reference
+# them) and stay unchanged. The build declares its platform explicitly
+# (linux/amd64 — the only platform this workflow claims; a multi-platform
+# claim is a separate owner decision, BUILD29-CONTRACT Q3).
+#
+# Recipe-input alignment (FIX-19 round 2, imp-fix19 2026-11-05): the build
+# inputs align with the unified Dockerfile recipe (FIX-17 @0894de61,
+# pending promotion) — integer SOURCE_DATE_EPOCH = HEAD commit time is
+# passed via build-args, the same commit-time recipe every other caller
+# already uses (Makefile docker-build-all, scripts/deploy-public-stand.sh,
+# scripts/security/scan_images.sh, scripts/release/release-artifacts.sh).
+# The fail-loud Dockerfile stages make a missing epoch a build failure on
+# the unified recipe; BuildKit ignores undeclared build-args, so carrying
+# the value here is forward-compatible on a pre-promotion tree.
+#
+# C-8: `attestations: write` (and `id-token: write`) are granted ONLY in the
+# jobs that actually attest (verify: run-attached provenance; promote: cosign
+# attest + registry-attached provenance).
+#
+# NOTE: the `release-promotion` environment must have required reviewers
+# configured in repo Settings → Environments; that reviewer gate is repository
+# settings and cannot be expressed in YAML.
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+# OWNER-DECISION pending (push-triggered promotion for the release branch):
+# see artifacts/internal-delivery-program/wave1-reviews/A09-review-2026-11-01.md, finding 1.
+
+# Actions are pinned to full commit SHAs (C-2 / REPRODUCIBLE-BUILDS:14).
+# Mapping verified 2026-11-01 via `git ls-remote` (peeled ^{} commits for
+# annotated tags; lightweight tags point at their commit directly), and each
+# SHA confirmed to be a commit object via the GitHub `git/commits` API:
+#   actions/checkout                      v4  -> 11d5960a326750d5838078e36cf38b85af677262
+#   docker/setup-buildx-action            v3  -> 8d2750c68a42422c14e847fe6c8ac0403b4cbd6f
+#   docker/login-action                   v3  -> c94ce9fb468520275223c153574b00df6fe4bcc9
+#   docker/build-push-action              v5  -> ca052bb54ab0790a636c9b5f226502c73d547a25
+#   actions/upload-artifact               v4  -> ea165f8d65b6e75b540449e92b4886f43607fa02
+#   actions/download-artifact             v4  -> d3f86a106a0bac45b974a628896c90dbdf5c8093
+#   sigstore/cosign-installer             v3  -> 398d4b0eeef1380460a10c8013a76f728fb906ac
+#   anchore/sbom-action/download-syft     v0  -> e22c389904149dbc22b58101806040fa8d37a610
+#   actions/attest-build-provenance       v1  -> ef244123eb79f2f7a7e75d99086184180e6d0018
+#   azure/setup-helm                      v3  -> 5119fcb9089d432beecbf79bb2c7915207344b78
+# docker/metadata-action was dropped: publish tags are derived explicitly in
+# the promote job (one fewer third-party action to pin and audit).
+
+# Default-deny baseline; every job re-grants exactly what it needs.
+permissions:
+  contents: read
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: ${{ github.repository }}
+  # Local-only tag for the unified payload inside the build/verify/promote
+  # daemons; it is never pushed anywhere.
+  LOCAL_IMAGE: yabanin-ci:ci
+
+jobs:
+  build:
+    name: Build image (no publish)
+    runs-on: ubuntu-latest
+    # C-9: this job has NO publish capability — no packages: write, no
+    # registry login — so it can never publish, whatever started the run.
+    # Dispatches from non-release branches get only build+verify end to end;
+    # only the promote job (tag push, or dispatch on the release branch)
+    # publishes.
+    permissions:
+      contents: read
+    outputs:
+      # hex form of the built image digest (second transport of the value
+      # that also travels in the digest file content; verify cross-checks
+      # both against each other).
+      digest: ${{ steps.digest.outputs.digest }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Resolve SOURCE_DATE_EPOCH (recipe input)
+        id: epoch
+        shell: bash
+        run: |
+          # Unified image recipe input (FIX-17 @0894de61,
+          # REPRODUCIBLE-BUILDS §2): the Dockerfile's reproducible stages
+          # require an integer SOURCE_DATE_EPOCH and fail the build loudly
+          # without one. Same commit-time recipe as every other caller —
+          # Makefile docker-build-all, scripts/deploy-public-stand.sh,
+          # scripts/security/scan_images.sh,
+          # scripts/release/release-artifacts.sh: the value is the last
+          # COMMIT time of the checked-out commit, a pure function of the
+          # source SHA — identical for a v* tag push, a release-branch
+          # dispatch and a local make build of the same commit. Fail loud
+          # BEFORE docker runs; BuildKit ignores undeclared build-args, so
+          # on a tree where the fail-loud ARG declaration (FIX-17) is not
+          # yet promoted this value is carried forward-compatible.
+          EPOCH="$(git log -1 --pretty=format:%ct)"
+          case "$EPOCH" in
+            ''|*[!0-9]*)
+              echo "FATAL: SOURCE_DATE_EPOCH must be an integer unix timestamp (got: '${EPOCH}')" >&2
+              exit 1
+              ;;
+          esac
+          echo "epoch=${EPOCH}" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build image (no publish)
+        uses: docker/build-push-action@ca052bb54ab0790a636c9b5f226502c73d547a25 # v5
+        id: build
+        with:
+          context: .
+          file: ./Dockerfile
+          # C-9: build NEVER publishes. The image is loaded into the local
+          # daemon and exported as an artifact; only the promote job (trusted
+          # refs + protected environment) publishes these bytes.
+          push: false
+          load: true
+          # C-7: one declared platform, one payload.
+          platforms: linux/amd64
+          tags: ${{ env.LOCAL_IMAGE }}
+          # Unified recipe input (FIX-19 round 2): the epoch validated by
+          # the previous step — the value the reproducible Dockerfile
+          # stages consume (fail-loud on missing/non-integer). buildx
+          # provenance records it as a build input, so the attested
+          # provenance names the exact recipe input used.
+          build-args: |
+            SOURCE_DATE_EPOCH=${{ steps.epoch.outputs.epoch }}
+          # provenance: false keeps the payload a single plain manifest, so
+          # the digest output stays comparable to the later registry push
+          # (promote's digest-assert step fails closed on any mismatch).
+          # Provenance is attested in verify/promote on the same digest.
+          provenance: false
+          labels: |
+            org.opencontainers.image.source=https://github.com/${{ github.repository }}
+          # BUILD29-CONTRACT §5.5 / REPRODUCIBLE-BUILDS:15: independent A/B
+          # rebuild workers must not share build caches — no cache-from /
+          # cache-to here, and the Dockerfile carries no --mount=type=cache.
+
+      - name: Export digest
+        id: digest
+        shell: bash
+        run: |
+          # Producer contract (FIX-17 delivery record §(e), unchanged by A09):
+          # the digest travels in file CONTENT, never in a file name. Exactly
+          # ONE digest file — artifacts/release/image-digests.txt — LF line
+          # endings, one `sha256:<64 hex>` line, no progress text, no markers,
+          # no blank lines, no comments — written ATOMICALLY (temp file in the
+          # same directory + mv) so a reader never observes a partial or
+          # polluted file. Source of truth: the build output digest of the
+          # built manifest (R078 D-B) — never a local `docker images` lookup
+          # and never a hash of raw manifest JSON bytes.
+          DIGESTS_FILE="artifacts/release/image-digests.txt"
+          mkdir -p "$(dirname "$DIGESTS_FILE")"
+          DIGEST="${{ steps.build.outputs.digest }}"
+          case "$DIGEST" in
+            sha256:*) ;;
+            *) echo "FATAL: invalid registry digest from build output: '${DIGEST}'" >&2; exit 1 ;;
+          esac
+          HEX="${DIGEST#sha256:}"
+          case "$HEX" in
+            *[!0-9a-f]*|'') echo "FATAL: invalid registry digest hex: '${HEX}'" >&2; exit 1 ;;
+          esac
+          if [ "${#HEX}" -ne 64 ]; then
+            echo "FATAL: registry digest is not 64 hex chars: '${HEX}'" >&2; exit 1
+          fi
+          echo "digest=${HEX}" >> "$GITHUB_OUTPUT"
+          # Atomic write per the producer contract: write the temp file in the
+          # target directory, then rename. The digest file itself is only ever
+          # produced by this single printf + mv — nothing appends or echoes
+          # build-log text into it.
+          tmp_file="$(mktemp "$(dirname "$DIGESTS_FILE")/.image-digests.XXXXXX")"
+          trap 'rm -f "$tmp_file"' EXIT
+          printf 'sha256:%s\n' "$HEX" > "$tmp_file"
+          mv "$tmp_file" "$DIGESTS_FILE"
+          trap - EXIT
+
+      - name: Export image payload
+        shell: bash
+        run: |
+          # The payload itself travels to verify/promote as an artifact, so
+          # promotion publishes THE SAME bytes without any rebuild.
+          docker save -o "${RUNNER_TEMP}/yabanin-image.tar" "$LOCAL_IMAGE"
+          test -s "${RUNNER_TEMP}/yabanin-image.tar"
+
+      - name: Upload image payload
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-payload
+          path: ${{ runner.temp }}/yabanin-image.tar
+          if-no-files-found: error
+          retention-days: 1
+
+      - name: Upload digest
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: image-digest
+          # Single explicit file upload: the file lands at the artifact root,
+          # so consumers read exactly one well-known file — no glob, no marker
+          # files. if-no-files-found: error keeps a missing digest file from
+          # degrading into a silent no-op upload (fail closed).
+          path: artifacts/release/image-digests.txt
+          if-no-files-found: error
+          retention-days: 1
+
+  verify:
+    name: Verify built digest (no publish)
+    needs: build
+    runs-on: ubuntu-latest
+    # C-8: id-token + attestations are granted here (run-attached provenance
+    # for the built digest) and in promote (cosign attest + registry-attached
+    # provenance) — and nowhere else. NO packages: write: this job cannot
+    # publish anything.
+    permissions:
+      contents: read
+      id-token: write
+      attestations: write
+    steps:
+      - name: Download digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-digest
+          path: ${{ runner.temp }}/digests
+
+      - name: Download image payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-payload
+          path: ${{ runner.temp }}/payload
+
+      - name: Validate digest against build output
+        id: digest
+        shell: bash
+        run: |
+          # Consumer contract: consume EXACTLY what the producer wrote. The
+          # producer file must contain exactly one LF-terminated
+          # `sha256:<64 hex>` line — no blank lines, no comments, no build-log
+          # pollution. An empty or wrong digest fails the job before anything
+          # is verified, attested, or promoted (REPRODUCIBLE-BUILDS FIX-19).
+          DIGESTS_FILE="${{ runner.temp }}/digests/image-digests.txt"
+          if [ ! -f "$DIGESTS_FILE" ]; then
+            ls -la "${{ runner.temp }}/digests" >&2 || true
+            echo "FATAL: producer digest file not found at the expected path: $DIGESTS_FILE" >&2
+            exit 1
+          fi
+          # wc -l counts LF characters: the contract file ends with exactly
+          # one LF after its single line, so any extra/blank/comment line or a
+          # missing final LF moves this off 1 and fails the job.
+          lines="$(wc -l < "$DIGESTS_FILE")"
+          valid="$(grep -c -E '^sha256:[0-9a-f]{64}$' "$DIGESTS_FILE" || true)"
+          if [ "$lines" -ne 1 ] || [ "$valid" -ne 1 ]; then
+            echo "FATAL: digest file violates the producer contract (expected exactly one LF-terminated 'sha256:<64 hex>' line, found ${valid} valid line(s) among ${lines} LF-terminated line(s)): $DIGESTS_FILE" >&2
+            exit 1
+          fi
+          DIGEST="$(grep -E '^sha256:[0-9a-f]{64}$' "$DIGESTS_FILE")"
+          HEX="${DIGEST#sha256:}"
+          # C-6: the transported file content must EQUAL the build job's own
+          # second transport of the same value (needs.build.outputs.digest).
+          BUILD_DIGEST="${{ needs.build.outputs.digest }}"
+          case "$BUILD_DIGEST" in
+            *[!0-9a-f]*|'') echo "FATAL: invalid build-output digest: '${BUILD_DIGEST}'" >&2; exit 1 ;;
+          esac
+          if [ "${#BUILD_DIGEST}" -ne 64 ]; then
+            echo "FATAL: build-output digest is not 64 hex chars: '${BUILD_DIGEST}'" >&2; exit 1
+          fi
+          if [ "$HEX" != "$BUILD_DIGEST" ]; then
+            echo "FATAL: digest artifact content does not match build output (artifact '${HEX}' != build '${BUILD_DIGEST}')" >&2
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Load image payload
+        shell: bash
+        run: |
+          docker load -i "${{ runner.temp }}/payload/yabanin-image.tar"
+          # Fail closed if the payload did not load into the daemon.
+          docker image inspect "$LOCAL_IMAGE" > /dev/null
+
+      - name: Install syft
+        uses: anchore/sbom-action/download-syft@e22c389904149dbc22b58101806040fa8d37a610 # v0
+
+      - name: Generate SBOM from the built image
+        shell: bash
+        run: |
+          # SBOM of the BUILT payload (local image, not a registry ref) — the
+          # same bytes promotion later publishes.
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          syft "$LOCAL_IMAGE" -o spdx-json > "${RUNNER_TEMP}/sbom-image.spdx.json"
+          if [ ! -s "${RUNNER_TEMP}/sbom-image.spdx.json" ]; then
+            echo "FATAL: syft produced an empty SBOM for $LOCAL_IMAGE (digest ${DIGEST})" >&2; exit 1
+          fi
+          echo "sbom: $(wc -c < "${RUNNER_TEMP}/sbom-image.spdx.json") bytes for digest ${DIGEST}"
+
+      - name: Upload SBOM
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        with:
+          name: sbom-image
+          path: ${{ runner.temp }}/sbom-image.spdx.json
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Attest build provenance (run-attached)
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}
+          # sha256:<64 hex> — the validated producer digest-file content,
+          # cross-checked against the build output in the previous step.
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          # push-to-registry: false — nothing is published yet; the provenance
+          # attestation attaches to THIS workflow run for the built digest.
+          push-to-registry: false
+
+  promote:
+    name: Promote verified image (only publish path)
+    needs: [build, verify]
+    runs-on: ubuntu-latest
+    # C-9: the condition below admits ONLY trusted refs: v* tag pushes (full
+    # pipeline) and the release branch. Triggers are push-tags + dispatch, so
+    # the release-branch arm is reachable ONLY via workflow_dispatch on that
+    # branch (a plain push to `release` never triggers this workflow); a
+    # dispatch from any other branch skips this job (build+verify only).
+    # Either entry path still waits on the release-promotion environment.
+    if: startsWith(github.ref, 'refs/tags/v') || github.ref == 'refs/heads/release'
+    # Manual gate: the release-promotion environment MUST have required
+    # reviewers configured (repo Settings → Environments → release-promotion);
+    # the environment reference makes a promotion run wait for that approval.
+    environment: release-promotion
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      # C-7: ONE verified payload, THREE published names (unchanged names —
+      # Helm values reference them). Every matrix entry promotes the same
+      # digest of the same artifact bytes; no matrix entry rebuilds anything.
+      matrix:
+        service: [gateway, loggerd, admin]
+    steps:
+      - name: Download digest
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-digest
+          path: ${{ runner.temp }}/digests
+
+      - name: Download image payload
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: image-payload
+          path: ${{ runner.temp }}/payload
+
+      - name: Download SBOM
+        uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4
+        with:
+          name: sbom-image
+          path: ${{ runner.temp }}/sbom
+
+      - name: Validate digest (promotion side)
+        id: digest
+        shell: bash
+        run: |
+          # Promotion re-validates the digest independently (C-6: both sides
+          # of the transport validate): the only publishable value is the
+          # verified built digest, and it must also match the build job's
+          # output — a corrupted or switched artifact fails closed here.
+          DIGESTS_FILE="${{ runner.temp }}/digests/image-digests.txt"
+          if [ ! -f "$DIGESTS_FILE" ]; then
+            ls -la "${{ runner.temp }}/digests" >&2 || true
+            echo "FATAL: producer digest file not found at the expected path: $DIGESTS_FILE" >&2
+            exit 1
+          fi
+          lines="$(wc -l < "$DIGESTS_FILE")"
+          valid="$(grep -c -E '^sha256:[0-9a-f]{64}$' "$DIGESTS_FILE" || true)"
+          if [ "$lines" -ne 1 ] || [ "$valid" -ne 1 ]; then
+            echo "FATAL: digest file violates the producer contract (expected exactly one LF-terminated 'sha256:<64 hex>' line, found ${valid} valid line(s) among ${lines} LF-terminated line(s)): $DIGESTS_FILE" >&2
+            exit 1
+          fi
+          DIGEST="$(grep -E '^sha256:[0-9a-f]{64}$' "$DIGESTS_FILE")"
+          HEX="${DIGEST#sha256:}"
+          BUILD_DIGEST="${{ needs.build.outputs.digest }}"
+          case "$BUILD_DIGEST" in
+            *[!0-9a-f]*|'') echo "FATAL: invalid build-output digest: '${BUILD_DIGEST}'" >&2; exit 1 ;;
+          esac
+          if [ "${#BUILD_DIGEST}" -ne 64 ] || [ "$HEX" != "$BUILD_DIGEST" ]; then
+            echo "FATAL: promotion digest does not match build output (artifact '${HEX}' != build '${BUILD_DIGEST}')" >&2
+            exit 1
+          fi
+          echo "digest=${DIGEST}" >> "$GITHUB_OUTPUT"
+
+      - name: Load image payload
+        shell: bash
+        run: |
+          # No rebuild: the verified payload from the build job IS what gets
+          # published.
+          docker load -i "${{ runner.temp }}/payload/yabanin-image.tar"
+          docker image inspect "$LOCAL_IMAGE" > /dev/null
+
+      - name: Login to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish, then assert the published digest
+        shell: bash
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}-${{ matrix.service }}"
+          # The validated producer digest-file content, cross-checked against
+          # the build output above.
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          case "$GITHUB_REF" in
+            refs/tags/v*) PUBLISH_TAGS=("${GITHUB_REF_NAME#v}") ;;
+            refs/heads/release) PUBLISH_TAGS=("sha-${GITHUB_SHA::7}" "latest") ;;
+            *) echo "FATAL: promotion refused for ref '${GITHUB_REF}'" >&2; exit 1 ;;
+          esac
+          for t in "${PUBLISH_TAGS[@]}"; do
+            docker tag "$LOCAL_IMAGE" "${IMAGE}:${t}"
+            docker push "${IMAGE}:${t}"
+          done
+          # C-6/C-9: what landed in the registry MUST be the verified built
+          # digest — promotion publishes THE SAME digest, never a rebuild.
+          PUBLISHED="$(docker buildx imagetools inspect "${IMAGE}:${PUBLISH_TAGS[0]}" --format '{{json .Manifest.Digest}}' | tr -d '"')"
+          case "$PUBLISHED" in
+            sha256:*) ;;
+            *) echo "FATAL: invalid published digest from registry: '${PUBLISHED}'" >&2; exit 1 ;;
+          esac
+          PH="${PUBLISHED#sha256:}"
+          case "$PH" in
+            *[!0-9a-f]*|'') echo "FATAL: invalid published digest hex: '${PH}'" >&2; exit 1 ;;
+          esac
+          if [ "${#PH}" -ne 64 ]; then
+            echo "FATAL: published digest is not 64 hex chars: '${PH}'" >&2; exit 1
+          fi
+          if [ "$PUBLISHED" != "$DIGEST" ]; then
+            echo "FATAL: published digest does not match the verified built digest (registry '${PUBLISHED}' != verified '${DIGEST}')" >&2
+            exit 1
+          fi
+          echo "published ${IMAGE}@${DIGEST} (published == verified built digest)"
+          # NOTE: the signature/attestation steps below attach to the registry
+          # ref, so publication necessarily precedes signing INSIDE this one
+          # gated job. A failure between them leaves the run red — a v* tag
+          # can never reach a green-but-unsigned state.
+
+      - name: Sign the published digest
+        env:
+          # R078 D-A: owner cosign key-pair. When the COSIGN_KEY secret is set
+          # it is used for signing (path or PEM contents); otherwise the job
+          # falls back to keyless OIDC. COSIGN_PASSWORD only matters for
+          # encrypted keys.
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}-${{ matrix.service }}"
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          KEY_ARGS=(--oidc-issuer https://token.actions.githubusercontent.com)
+          if [ -n "$COSIGN_KEY" ]; then
+            key_file=$(mktemp)
+            trap 'rm -f "$key_file"' EXIT
+            if [ -f "$COSIGN_KEY" ]; then
+              cp "$COSIGN_KEY" "$key_file"
+            else
+              printf '%s' "$COSIGN_KEY" > "$key_file"
+            fi
+            KEY_ARGS=(--key "$key_file")
+            echo "signing with owner cosign key-pair (D-A)"
+          else
+            echo "COSIGN_KEY secret not set — signing keyless OIDC"
+          fi
+          # The signed subject is the VALIDATED digest — sha256:<64 hex> that
+          # matches the digest file content AND the registry digest asserted
+          # in the previous step. No glob, no interpolated build-log text can
+          # reach the signed ref.
+          cosign sign --yes "${KEY_ARGS[@]}" "${IMAGE}@${DIGEST}"
+
+      - name: Attach SBOM attestation
+        env:
+          COSIGN_KEY: ${{ secrets.COSIGN_KEY }}
+          COSIGN_PASSWORD: ${{ secrets.COSIGN_PASSWORD }}
+        run: |
+          IMAGE="${REGISTRY}/${IMAGE_NAME}-${{ matrix.service }}"
+          DIGEST="${{ steps.digest.outputs.digest }}"
+          SBOM="${{ runner.temp }}/sbom/sbom-image.spdx.json"
+          if [ ! -s "$SBOM" ]; then
+            echo "FATAL: SBOM artifact missing or empty at $SBOM" >&2; exit 1
+          fi
+          KEY_ARGS=(--oidc-issuer https://token.actions.githubusercontent.com)
+          if [ -n "$COSIGN_KEY" ]; then
+            key_file=$(mktemp)
+            trap 'rm -f "$key_file"' EXIT
+            if [ -f "$COSIGN_KEY" ]; then cp "$COSIGN_KEY" "$key_file"; else printf '%s' "$COSIGN_KEY" > "$key_file"; fi
+            KEY_ARGS=(--key "$key_file")
+          fi
+          # The SBOM was generated in verify from the BUILT image; it is
+          # attested here against the SAME digest that was published.
+          cosign attest --yes --predicate "$SBOM" \
+            --type spdxjson "${KEY_ARGS[@]}" "${IMAGE}@${DIGEST}"
+
+      - name: Attest build provenance (registry-attached)
+        uses: actions/attest-build-provenance@ef244123eb79f2f7a7e75d99086184180e6d0018 # v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}-${{ matrix.service }}
+          # sha256:<64 hex> — the validated, published == verified digest.
+          subject-digest: ${{ steps.digest.outputs.digest }}
+          push-to-registry: true
+
+  deploy-helm:
+    name: Deploy staging (helm)
+    # No deploy without prior verify success: the needs chain is
+    # build -> verify -> promote -> deploy-helm, and promote publishes only
+    # the verified digest.
+    needs: promote
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/v')
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+
+      - name: Install helm
+        uses: azure/setup-helm@5119fcb9089d432beecbf79bb2c7915207344b78 # v3
+        with:
+          version: v3.14.0
+
+      - name: Deploy (staging)
+        env:
+          # Base64-encoded kubeconfig. Without it the job FAILS — the old
+          # pseudo-deploy (helm upgrade without any cluster access, silently
+          # doing nothing) is gone (BUILD29-CONTRACT §2.5).
+          KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+        run: |
+          VERSION="${GITHUB_REF_NAME#v}"
+          if [ -z "$KUBE_CONFIG" ]; then
+            echo "FATAL: KUBE_CONFIG secret is not set; refusing to pretend a deployment happened" >&2
+            exit 1
+          fi
+          kube="$(mktemp)"
+          trap 'rm -f "$kube"' EXIT
+          printf '%s' "$KUBE_CONFIG" | base64 -d > "$kube"
+          if [ ! -s "$kube" ]; then
+            echo "FATAL: KUBE_CONFIG did not decode to a non-empty kubeconfig" >&2
+            exit 1
+          fi
+          # Real values paths (BUILD29-CONTRACT §2.5): the chart consumes the
+          # single .Values.image block (deploy/helm/yabanin/templates/*:
+          # {{ .Values.image.repository }}:{{ .Values.image.tag }}). The old
+          # gateway.image.tag / loggerd.image.tag / admin.image.tag --set
+          # paths do not exist in the chart and were silently dead. All chart
+          # components run the ONE unified payload, published under the
+          # -gateway name.
+          helm upgrade --install yabanin-staging deploy/helm/yabanin/ \
+            --kubeconfig "$kube" \
+            --set "image.repository=${REGISTRY}/${IMAGE_NAME}-gateway" \
+            --set "image.tag=${VERSION}" \
+            --namespace yabanin-staging \
+            --create-namespace \
+            --wait

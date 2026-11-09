@@ -1,0 +1,19 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "model": "yabanin/YOUR_MODEL_ID",
+  "provider": {
+    "yabanin": {
+      "npm": "@ai-sdk/openai-compatible",
+      "name": "Yabanin",
+      "options": {
+        "baseURL": "{env:YABANIN_OPENAI_BASE_URL}",
+        "apiKey": "{env:YABANIN_GATEWAY_API_KEY}"
+      },
+      "models": {
+        "YOUR_MODEL_ID": {
+          "name": "Your configured Yabanin model"
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,13 @@
+Yabanin Gateway
+Copyright 2026 Dmitry Lakhvich
+
+Project-authored code is licensed under the Apache License, Version 2.0.
+Files under the designated enterprise/ prefix carry their own proprietary
+terms in enterprise/LICENSE (owner decision D1 of November 2026; see LICENSING.md for the exact date)
+and are not covered by the root Apache-2.0 grant; every file outside that
+prefix stays Apache-2.0.
+Third-party components retain their own copyright and license notices.
+The public release excludes the LiteLLM price corpus and its derived prices.
+The upstream MIT notice is retained in pkg/pricing/NOTICE-litellm.txt as
+historical attribution; it does not indicate that the corpus is bundled.
+This notice is not a complete third-party license bundle.

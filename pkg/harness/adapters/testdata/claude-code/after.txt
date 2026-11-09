@@ -1,0 +1,9 @@
+{
+  "apiKeyHelper": "yb harness key --tool claude-code",
+  "env": {
+    "ANTHROPIC_BASE_URL": "https://gw.example",
+    "ANTHROPIC_CUSTOM_HEADERS": "X-Yabanin-Labels: team=payments",
+    "CLAUDE_CODE_GATEWAY_HINT_HEADERS": "1"
+  },
+  "theme": "dark"
+}

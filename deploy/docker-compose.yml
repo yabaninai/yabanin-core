@@ -1,0 +1,477 @@
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    env_file:
+      - .env
+    environment:
+      POSTGRES_USER: yabanin
+      POSTGRES_DB: yabanin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yabanin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    read_only: true
+    tmpfs:
+      - /tmp
+      - /var/run/postgresql
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.50"
+    networks:
+      - app-internal
+
+  redis:
+    image: redis:7-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541  # pinned 2026-10-25 (was: redis:7-alpine)
+    command: redis-server --appendonly yes
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 128M
+          cpus: "0.50"
+    read_only: true
+    tmpfs:
+      - /tmp
+    networks:
+      - app-internal
+
+  # --- Migrations (runs once on first up) ---
+  migrate:
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ../migrations:/migrations:ro
+    secrets:
+      - pg_uri
+    environment:
+      PG_URI_FILE: /run/secrets/pg_uri
+    command: >-
+      bash -c "until pg_isready -h postgres -U yabanin -d yabanin; do sleep 1; done && for f in /migrations/*.sql; do case \"$$f\" in *.down.sql) continue;; esac; psql \"$(cat /run/secrets/pg_uri)\" -v ON_ERROR_STOP=1 -f \"$$f\"; done"
+    restart: "no"
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 64M
+          cpus: "0.25"
+    networks:
+      - app-internal
+
+  loggerd:
+    image: yabanin-loggerd:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: loggerd
+        HEALTH_PORT: 8085
+    command: loggerd
+    secrets:
+      - pg_uri
+      - cache_hmac
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      YABANIN_PG_URI_FILE: /run/secrets/pg_uri
+      YABANIN_REDIS_ADDR: "redis:6379"
+      YABANIN_LOGGERD_STREAM: "events:queue"
+      YABANIN_CACHE_HMAC_SECRET_FILE: /run/secrets/cache_hmac
+    ports:
+      - "8085:8085"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8085/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.00"
+    networks:
+      - app-internal
+
+  gateway:
+    image: yabanin-gateway:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: gateway
+        HEALTH_PORT: 8082
+    command: gateway
+    secrets:
+      - pg_uri
+      - cache_hmac
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      bge-embedder:
+        condition: service_healthy
+      mock-openai:
+        condition: service_healthy
+    environment:
+      YABANIN_GATEWAY_LISTEN: ":8082"
+      YABANIN_GATEWAY_ADMIN: ":9090"
+      # Point the gateway at the in-stack mock provider by compose service name.
+      # Override to route to a real provider (must include the http:// scheme).
+      YABANIN_PROVIDER_ADDR: "http://mock-openai:8081"
+      # V9 shadow-mode (demo): off by default. `make demo SHADOW=1` mirrors
+      # gpt-4o-mini traffic to gpt-4o on the same mock provider so the
+      # /api/analytics/shadow comparison has data to show.
+      # ${VAR:-false} interpolates at config-render time, so the demo script
+      # must export YABANIN_SHADOW_ENABLED (SHADOW=1 make demo does) BEFORE
+      # docker compose runs; a later recreate does NOT re-read the export.
+      YABANIN_SHADOW_ENABLED: "${YABANIN_SHADOW_ENABLED:-false}"
+      YABANIN_SHADOW_MODEL: "gpt-4o"
+      YABANIN_SHADOW_UPSTREAM_URL: "http://mock-openai:8081"
+      YABANIN_SHADOW_SAMPLE_RATE: "1.0"
+      YABANIN_SHADOW_DAILY_BUDGET_USD: "100"
+      # Bearer key for the gateway admin listener (/metrics + /admin/shadow/*).
+      YABANIN_METRICS_BEARER_KEY: "demo-shadow-key"
+      YABANIN_PG_URI_FILE: /run/secrets/pg_uri
+      YABANIN_REDIS_ADDR: "redis:6379"
+      YABANIN_EVENT_STREAM: "events:queue"
+      YABANIN_CACHE_HMAC_SECRET_FILE: /run/secrets/cache_hmac
+      YABANIN_EMBEDDER_ENABLED: "true"
+      YABANIN_EMBEDDER_BASE_URL: "http://bge-embedder:6006"
+      YABANIN_EMBEDDER_MODEL: "mock-embedder"
+      YABANIN_EMBEDDER_ENDPOINT: "openai"
+      YABANIN_CLASSIFIER_SERVICE_URL: "http://classifier:8080"
+      # Local KMS master key (32 bytes for AES-256) — dev only. Override in production via env/secrets.
+      YABANIN_KMS_LOCAL_KEY: "dev-only-key-do-not-use-prod-32!"
+    ports:
+      - "8082:8082"
+      # Gateway admin listener (:9090) on host :9092 — :9090 is taken by
+      # Prometheus in this stack. Hosts /metrics + /admin/shadow/*.
+      - "9092:9090"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/healthz || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.00"
+    networks:
+      - app-internal
+
+  admin:
+    image: yabanin-admin:latest
+    build:
+      context: ..
+      dockerfile: Dockerfile
+      args:
+        SERVICE: admin
+        HEALTH_PORT: 8086
+    command: admin
+    secrets:
+      - pg_uri
+      - session_key_raw
+    volumes:
+      - ../config.yaml:/app/config.yaml:ro
+    depends_on:
+      postgres:
+        condition: service_healthy
+    environment:
+      YABANIN_PG_URI_FILE: /run/secrets/pg_uri
+      YABANIN_SESSION_KEY_FILE: /run/secrets/session_key_raw
+      YABANIN_ADMIN_LISTEN: ":8086"
+      YABANIN_ADMIN_DOMAIN: "localhost"
+    ports:
+      - "9091:8086"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8086/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    restart: unless-stopped
+    read_only: true
+    security_opt:
+      - no-new-privileges:true
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "1.00"
+    networks:
+      - app-internal
+
+  bge-embedder:
+    build:
+      context: ../deploy/mock-embedder
+      dockerfile: Dockerfile
+    ports:
+      - "6006:6006"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:6006/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+    networks:
+      - app-internal
+
+  # Real multilingual embedder (384-dim, JA/EN/RU + 90 more languages) for
+  # semantic cache on non-English traffic. Optional profile — does not start
+  # with `make docker-up`. Pair with gateway env:
+  #   YABANIN_EMBEDDER_BASE_URL=http://embedder-multilingual:6006
+  #   YABANIN_EMBEDDER_MODEL=intfloat/multilingual-e5-small
+  #   YABANIN_EMBEDDER_QUERY_PREFIX="query: "
+  # Hub mode: first boot downloads the model (~470MB) — not air-gap safe.
+  #
+  # Pack mode (R058, owner decisions 2026-10-14 D1/D2/D4): serve a verified
+  # versioned model pack instead — bake it into the TEI image or bind-mount
+  # it read-only, and point TEI at the local dir so nothing is downloaded:
+  #   volumes:
+  #     - ../artifacts/packs/intfloat-multilingual-e5-small:/pack:ro
+  #   command: ["--model-id", "/pack", "--dtype", "float32", "--port", "6006"]
+  # Give the gateway the same pack mount and set YABANIN_ML_PACK_DIR=/pack:
+  # the gateway verifies pack.json + per-file sha256 at startup and refuses
+  # to start on weights-missing / digest-mismatch / unknown-origin. No new
+  # service: this profile stays the serving path (D4).
+  embedder-multilingual:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8@sha256:8de25e75ce39617f17f2f6c77d60a4f75b65e779ed5005420eb1400072a15c1c  # pinned 2026-10-25 (was: ...:cpu-1.8)
+    command: ["--model-id", "intfloat/multilingual-e5-small", "--dtype", "float32", "--port", "6006"]
+    profiles: ["multilingual"]
+    ports:
+      - "6007:6006"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6006/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.00"
+    networks:
+      - app-internal
+
+  # Real English embedder (bge-small-en-v1.5, 384-dim) for cache-precision
+  # measurements. Optional profile; first boot downloads the model.
+  embedder-bge:
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8@sha256:8de25e75ce39617f17f2f6c77d60a4f75b65e779ed5005420eb1400072a15c1c  # pinned 2026-10-25 (was: ...:cpu-1.8)
+    command: ["--model-id", "Xenova/bge-small-en-v1.5", "--dtype", "float32", "--port", "6006"]
+    profiles: ["bge"]
+    ports:
+      - "6008:6006"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:6006/health || exit 1"]
+      interval: 15s
+      timeout: 5s
+      start_period: 120s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.00"
+    networks:
+      - app-internal
+
+  mock-openai:
+    build:
+      context: ../deploy/mock-provider
+      dockerfile: Dockerfile
+    ports:
+      - "8091:8081"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/healthz || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 5s
+      retries: 3
+    deploy:
+      resources:
+        limits:
+          memory: 256M
+          cpus: "0.25"
+    networks:
+      - app-internal
+
+  # P5.7: ML classifier v1 service — bge-small-en-v1.5 with 3-class task complexity head
+  classifier:
+    build:
+      context: ..
+      dockerfile: deploy/classifier/Dockerfile
+    environment:
+      MODEL_PATH: /app/model.pt
+    ports:
+      - "8090:8080"
+    networks:
+      - app-internal
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s  # model loading takes time
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: 2G
+          cpus: "2.0"
+
+  # P6.4: React dashboard — frontend for cost/classifier/cache analytics
+  dashboard:
+    # The Dockerfile is written for a repo-root context (COPY web/dashboard
+    # …, COPY design …); a ../web/dashboard context makes `compose build`
+    # fail on missing paths — the image silently fell back to a stale one.
+    build:
+      context: ..
+      dockerfile: web/dashboard/Dockerfile
+    ports:
+      - "3000:8080"
+    depends_on:
+      admin:
+        condition: service_started
+    networks:
+      - app-internal
+
+  # Prometheus — scrapes /metrics from gateway, admin, loggerd.
+  prometheus:
+    image: prom/prometheus:v2.53.0@sha256:075b1ba2c4ebb04bc3a6ab86c06ec8d8099f8fda1c96ef6d104d9bb1def1d8bc  # pinned 2026-10-25 (was: prom/prometheus:v2.53.0)
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      # Rule files are referenced by relative path in prometheus.yml, which is
+      # resolved against the container CWD (/etc/prometheus). Mount them there
+      # so the shadow + gateway alert rules are actually evaluated.
+      - ./prometheus/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      # Bearer key for the gateway /metrics scrape (see credentials_file in
+      # prometheus.yml). The demo script writes this file before bringing the
+      # stack up; when absent, Prometheus sends no Authorization header.
+      - ./secrets/metrics-bearer.key:/etc/prometheus/metrics-bearer.key:ro
+      - prom_data:/prometheus
+    networks:
+      - app-internal
+
+  # Grafana — dashboards + alerting UI, provisioned from datasources/.
+  grafana:
+    image: grafana/grafana:11.0.0@sha256:0dc5a246ab16bb2c38a349fb588174e832b4c6c2db0981d0c3e6cd774ba66a54  # pinned 2026-10-25 (was: grafana/grafana:11.0.0)
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: yabanin
+      GF_INSTALL_PLUGINS: grafana-clock-panel
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/etc/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    depends_on:
+      - prometheus
+    networks:
+      - app-internal
+
+  # Alertmanager — routes Prometheus alerts to email/webhook.
+  alertmanager:
+    image: prom/alertmanager:v0.27.0@sha256:e13b6ed5cb929eeaee733479dce55e10eb3bc2e9c4586c705a4e8da41e5eacf5  # pinned 2026-10-25 (was: prom/alertmanager:v0.27.0)
+    ports:
+      - "9093:9093"
+    volumes:
+      - ./alertmanager/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+    networks:
+      - app-internal
+
+  # llama.cpp profile (dev on-prem inference)
+  # Usage: docker compose --profile llamacpp up -d
+  # CPU mode (default): docker compose --profile llamacpp up -d
+  # GPU mode: requires NVIDIA Container Toolkit + deploy/helm/yabanin-onprem/llamacpp-values.yaml
+  llama-server:
+    profiles:
+      - llamacpp
+    image: ghcr.io/ggerganov/llama.cpp:server
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./models:/models:ro
+    command: >-
+      /app/server
+      --host 0.0.0.0
+      --port 8080
+      --model /models/llama-3-8b-instruct.Q4_K_M.gguf
+      --ctx-size 8192
+      --n-gpu-layers 0
+    healthcheck:
+      test: ["CMD-SHELL", "curl -sf http://localhost:8080/health || exit 1"]
+      interval: 10s
+      timeout: 5s
+      start_period: 30s
+      retries: 5
+    deploy:
+      resources:
+        limits:
+          memory: "4G"
+          cpus: "4.0"
+    security_opt:
+      - no-new-privileges:true
+    networks:
+      - app-internal
+
+volumes:
+  pg_data:
+  prom_data:
+  grafana_data:
+
+networks:
+  app-internal:
+    driver: bridge
+
+secrets:
+  pg_uri:
+    file: ../deploy/secrets/pg_uri
+  session_key_raw:
+    file: ../deploy/secrets/session_key
+  cache_hmac:
+    file: ../deploy/secrets/cache_hmac

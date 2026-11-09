@@ -1,0 +1,9 @@
+{
+  "v": "2",
+  "c": "corpus-customer-ended",
+  "d": "corpus-deployment",
+  "m": ["internal-loop"],
+  "i": "2026-05-01T00:00:00Z",
+  "me": "2026-10-09T00:00:00Z",
+  "n": "corpus-ended-nonce"
+}

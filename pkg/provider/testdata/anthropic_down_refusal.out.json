@@ -1,0 +1,18 @@
+{
+  "id": "msg_refusal",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "claude",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "content_filter",
+      "message": {
+        "role": "assistant",
+        "content": null,
+        "refusal": "I can't help with that request."
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 5, "completion_tokens": 9, "total_tokens": 14}
+}

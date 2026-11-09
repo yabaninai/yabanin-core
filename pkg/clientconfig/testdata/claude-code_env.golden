@@ -1,0 +1,4 @@
+export ANTHROPIC_BASE_URL='https://gw.example'
+export CLAUDE_CODE_GATEWAY_HINT_HEADERS=1
+export ANTHROPIC_AUTH_TOKEN="$YABANIN_API_KEY"
+export ANTHROPIC_CUSTOM_HEADERS='X-Yabanin-Labels: team=payments'

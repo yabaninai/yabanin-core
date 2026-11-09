@@ -1,0 +1,6 @@
+alias ll='ls'
+# >>> yabanin:shell:env (managed by `yb harness`; undo: `yb harness disconnect shell`) >>>
+export YABANIN_GATEWAY_URL="https://gw.example"
+export YABANIN_API_KEY="$(yb key print 2>/dev/null)"
+export YABANIN_LABELS="team=payments"
+# <<< yabanin:shell:env <<<

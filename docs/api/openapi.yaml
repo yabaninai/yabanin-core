@@ -1,0 +1,2111 @@
+openapi: "3.0.3"
+info:
+  title: Yabanin API
+  description: |
+    OpenAI-compatible LLM gateway plus the admin control-plane API.
+
+    Two service bases are involved:
+    - **gateway** (default servers): inference — POST /v1/chat/completions,
+      /v1/completions, /v1/responses, /v1/embeddings, /v1/images/generations,
+      /v1/audio/speech, /v1/audio/transcriptions, /v1/rerank, /v1/moderations,
+      /v1/realtime, POST /v1/messages (+/count_tokens, Anthropic-compatible),
+      GET /v1/models, the /v1/yabanin session-key/usage/label-policy surface,
+      GET /v1/healthz.
+    - **admin** (path-level servers on /api/* paths): control plane — lineage, credits, analytics.
+
+    The gateway /v1 surface is kept in lock-step with the walked gateway
+    router by the drift gate `TestGatewayOpenAPIDrift` (pkg/gateway).
+
+    Auth everywhere: `Authorization: Bearer <api-key>`.
+  version: "1.0.0"
+servers:
+  - url: https://api.yabanin.io/v1
+    description: Gateway (production)
+  - url: http://localhost:8082/v1
+    description: Gateway (local dev)
+
+security:
+  - bearerAuth: []
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: API_KEY
+
+  schemas:
+    Error:
+      type: object
+      description: OpenAI-compatible error envelope ({"error":{...}}).
+      properties:
+        error:
+          type: object
+          properties:
+            message: {type: string}
+            type: {type: string}
+            param: {type: string, nullable: true}
+            code: {type: string, nullable: true, description: "Stable machine code when present (unsupported_feature, key_expired, *_not_supported_for_provider, ...)"}
+
+    Message:
+      type: object
+      required: [role, content]
+      properties:
+        role: {enum: [system, user, assistant, tool]}
+        content: {type: string}
+
+    ChatCompletionRequest:
+      type: object
+      required: [messages]
+      properties:
+        model: {type: string, description: Model name (routing alias like "smart" or a concrete model)}
+        messages:
+          type: array
+          items:
+            $ref: "#/components/schemas/Message"
+        max_tokens: {type: integer, nullable: true}
+        temperature: {type: number, default: 1.0}
+        stream: {type: boolean, default: false, description: true = SSE stream of chunks}
+
+    Usage:
+      type: object
+      properties:
+        prompt_tokens: {type: integer}
+        completion_tokens: {type: integer}
+        total_tokens: {type: integer}
+        cost_usd: {type: number, description: Estimated cost in USD}
+
+    ChatCompletionResponse:
+      type: object
+      properties:
+        id: {type: string}
+        object: {type: string}
+        created: {type: integer}
+        model: {type: string}
+        choices:
+          type: array
+          items:
+            type: object
+            properties:
+              index: {type: integer}
+              message:
+                $ref: "#/components/schemas/Message"
+              finish_reason: {type: string}
+        usage:
+          $ref: "#/components/schemas/Usage"
+
+    MessageRequest:
+      type: object
+      required: [model, max_tokens, messages]
+      properties:
+        model: {type: string, description: Model name (routing alias or concrete model)}
+        messages:
+          type: array
+          description: Anthropic message turns (user/assistant; tool_use and tool_result content blocks supported)
+          items: {type: object}
+        max_tokens: {type: integer}
+        system:
+          description: Anthropic system prompt — a plain string or an array of text blocks (optionally with cache_control)
+          oneOf:
+            - type: string
+              description: Plain system prompt text.
+            - type: array
+              description: System as Anthropic text content blocks.
+              items: {type: object}
+        tools:
+          type: array
+          description: Tool definitions with input_schema
+          items: {type: object}
+        stream: {type: boolean, default: false, description: true = Anthropic SSE event stream}
+
+    CompletionsRequest:
+      type: object
+      required: [model]
+      description: Legacy OpenAI text completions. Unlisted OpenAI parameters pass through to the upstream verbatim.
+      properties:
+        model: {type: string, description: Model name (routing alias or concrete model)}
+        prompt:
+          description: Prompt text or array of prompts; shape is upstream-owned.
+          oneOf:
+            - type: string
+            - type: array
+              items: {}
+        max_tokens: {type: integer, nullable: true}
+        stream: {type: boolean, default: false, description: true = SSE stream of chunks}
+
+    EmbeddingsRequest:
+      type: object
+      required: [model, input]
+      description: OpenAI-compatible embeddings. Unlisted parameters (encoding_format, dimensions, ...) pass through verbatim.
+      properties:
+        model: {type: string}
+        input:
+          description: Text, array of texts, or tokenized input; shape is upstream-owned.
+          oneOf:
+            - type: string
+            - type: array
+              items: {}
+        encoding_format: {type: string}
+        dimensions: {type: integer, nullable: true}
+
+    ImagesGenerationsRequest:
+      type: object
+      required: [model, prompt]
+      description: OpenAI-compatible image generation (non-streaming only). n/size and every other OpenAI parameter are upstream-owned passthrough — no per-parameter validation.
+      properties:
+        model: {type: string}
+        prompt: {type: string}
+        n: {type: integer}
+        size: {type: string}
+        quality: {type: string}
+        response_format: {type: string}
+
+    SpeechRequest:
+      type: object
+      required: [model, input, voice]
+      description: OpenAI-compatible text-to-speech (JSON in, binary audio out). Other OpenAI parameters (response_format, speed, ...) pass through verbatim.
+      properties:
+        model: {type: string}
+        input: {type: string, description: Text to synthesize}
+        voice: {type: string}
+        stream:
+          type: boolean
+          default: false
+          description: Must be false/absent — SSE audio streaming is rejected 400 unsupported_feature before any upstream call.
+
+    ResponsesRequest:
+      type: object
+      required: [model]
+      description: |
+        OpenAI Responses API. The gateway translates the request to its
+        chat-completions pipeline and translates the result back into a
+        Responses envelope (SSE event stream when `stream: true`). Fields the
+        translation cannot represent are dropped and reported in the
+        `X-Yabanin-Unsupported` response header. Providers configured as native
+        Responses providers (and orgs without deny tool policies) get a
+        byte-for-byte upstream passthrough instead.
+      properties:
+        model: {type: string}
+        input:
+          description: string, message array or item array — translated to chat turns.
+        instructions: {type: string}
+        stream: {type: boolean, default: false}
+        tools:
+          type: array
+          description: Tool definitions; shape follows the Responses API.
+          items: {type: object}
+        prompt_cache_key: {type: string, description: Reused as the session id for prompt-cache affinity when valid}
+
+    FileObject:
+      type: object
+      description: R048 org-scoped stored file (Postgres bytea payload, ratified D2). expires_at is the 30-day retention horizon (ratified D3).
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [file]}
+        bytes: {type: integer}
+        created_at: {type: integer, description: Unix seconds}
+        expires_at: {type: integer, description: Unix seconds retention horizon}
+        filename: {type: string}
+        purpose: {type: string, enum: [batch, batch.output, batch.error]}
+        status: {type: string}
+
+    FileListObject:
+      type: object
+      properties:
+        object: {type: string, enum: [list]}
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/FileObject"
+
+    FileDeleteObject:
+      type: object
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [file]}
+        deleted: {type: boolean}
+
+    BatchCreateRequest:
+      type: object
+      required: [input_file_id]
+      description: Batch submission. The input file must be an org-owned purpose=batch JSONL of OpenAI-shaped request lines (custom_id/method/url/body). Only /v1/chat/completions bodies are supported; streaming requests are refused.
+      properties:
+        input_file_id: {type: string}
+        endpoint: {type: string, default: /v1/chat/completions}
+        metadata: {type: object, additionalProperties: true}
+
+    BatchObject:
+      type: object
+      description: R048 batch job (Postgres claim/lease queue, ratified D1). Status lifecycle validating → in_progress → finalizing → completed | failed | cancelled | expired; cancelling is the cancel-requested intermediate state.
+      properties:
+        id: {type: string}
+        object: {type: string, enum: [batch]}
+        endpoint: {type: string}
+        status: {type: string, enum: [validating, in_progress, finalizing, completed, failed, cancelling, cancelled, expired]}
+        request_counts:
+          type: object
+          properties:
+            total: {type: integer}
+            completed: {type: integer}
+            failed: {type: integer}
+        input_file_id: {type: string}
+        output_file_id: {type: string}
+        error_file_id: {type: string}
+        created_at: {type: integer, description: Unix seconds}
+        expires_at: {type: integer, description: Unix seconds retention horizon}
+        completed_at: {type: integer, description: Unix seconds, terminal state only}
+        metadata: {type: object, additionalProperties: true}
+
+    BatchListObject:
+      type: object
+      properties:
+        object: {type: string, enum: [list]}
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/BatchObject"
+
+    ModelObject:
+      type: object
+      properties:
+        id: {type: string}
+        object: {type: string, example: model}
+        created: {type: integer, description: Unix timestamp}
+        owned_by: {type: string}
+
+    ModelList:
+      type: object
+      properties:
+        object: {type: string, example: list}
+        data:
+          type: array
+          items:
+            $ref: "#/components/schemas/ModelObject"
+
+    SessionKeyMintRequest:
+      type: object
+      description: Mints a short-lived session key under the parent API key. Unknown fields are rejected.
+      properties:
+        name: {type: string, description: "Pattern [A-Za-z0-9 ._:/-], at most 64 characters"}
+        ttl_seconds: {type: integer, default: 7200, minimum: 60, maximum: 43200}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        lock_labels: {type: boolean, default: false, description: Locks the merged label set against later session-level overrides}
+        max_tokens: {type: integer, nullable: true, minimum: 1, maximum: 10000000000}
+        max_cost_usd: {type: number, nullable: true, exclusiveMinimum: 0, maximum: 1000000}
+
+    SessionKeyCreated:
+      type: object
+      properties:
+        id: {type: string}
+        key: {type: string, description: "Plaintext ybs_ session key — shown exactly once"}
+        expires_at: {type: string, description: RFC3339}
+        labels:
+          type: object
+          additionalProperties: {type: string}
+        dropped:
+          type: array
+          description: Label entries dropped by the org label policy.
+          items:
+            type: object
+            properties:
+              key: {type: string}
+              reason: {type: string}
+
+    SessionFinishRequest:
+      type: object
+      required: [status]
+      properties:
+        status: {enum: [success, failed, canceled]}
+        exit_code: {type: integer, nullable: true}
+        duration_ms: {type: integer, nullable: true}
+
+    UsageTotals:
+      type: object
+      description: Aggregated usage over request logs (shadow traffic excluded). cost_usd sums priced requests only; unpriced_requests counts unknown_price/no_usage outcomes.
+      properties:
+        requests: {type: integer}
+        tokens_in: {type: integer}
+        tokens_out: {type: integer}
+        cache_read_tokens: {type: integer}
+        cost_usd: {type: number}
+        unpriced_requests: {type: integer}
+        by_model:
+          type: array
+          items:
+            type: object
+            properties:
+              model: {type: string}
+              requests: {type: integer}
+              tokens_in: {type: integer}
+              tokens_out: {type: integer}
+              cost_usd: {type: number}
+        complete: {type: boolean, description: true once the queried window has settled (closed ≥10s ago)}
+        groups:
+          type: array
+          description: Present only when group_by is requested.
+          items:
+            type: object
+            properties:
+              value: {type: string, description: Model name or label value (empty when null)}
+              requests: {type: integer}
+              tokens_in: {type: integer}
+              tokens_out: {type: integer}
+              cost_usd: {type: number}
+
+    DeriveRule:
+      type: object
+      properties:
+        from: {type: string}
+        regex: {type: string}
+        to: {type: string}
+        template: {type: string}
+
+    LabelPolicy:
+      type: object
+      description: Effective org label policy (defaults when none is configured).
+      properties:
+        allowed_keys: {type: array, items: {type: string}}
+        denied_keys: {type: array, items: {type: string}}
+        required_keys: {type: array, items: {type: string}}
+        on_invalid: {type: string}
+        on_missing: {type: string}
+        aliases:
+          type: object
+          additionalProperties: {type: string}
+        derive:
+          type: array
+          items:
+            $ref: "#/components/schemas/DeriveRule"
+        rollup_keys: {type: array, items: {type: string}}
+        max_labels: {type: integer}
+        value_max_len: {type: integer}
+
+    CreditBalance:
+      type: object
+      properties:
+        org_id: {type: string}
+        balance_cents: {type: integer}
+        balance_usd: {type: number}
+        updated_at: {type: string}
+
+    TopUpRequest:
+      type: object
+      required: [amount_cents]
+      properties:
+        amount_cents: {type: integer, minimum: 1}
+        invoice_ref: {type: string}
+
+    TopUpResponse:
+      type: object
+      properties:
+        status: {type: string, example: topped_up}
+        org_id: {type: string}
+        amount_cents: {type: integer}
+        increase_usd: {type: number}
+
+    LineageRecord:
+      type: object
+      description: Ed25519-signed per-request attestation of where inference ran.
+      properties:
+        request_id: {type: string}
+        model: {type: string}
+        region: {type: string}
+        signed_at: {type: string}
+
+    SavingsReport:
+      type: object
+      description: Cost/savings analytics (lab-benchmark-derived figures, not an SLA).
+      additionalProperties: true
+
+paths:
+  /chat/completions:
+    post:
+      summary: Create chat completion (OpenAI-compatible)
+      description: |
+        Non-stream returns a single JSON completion. `stream: true` returns
+        `text/event-stream` with OpenAI-style chunks terminated by `[DONE]`.
+        Fail-closed semantics: 403 model not whitelisted / budget not configured,
+        429 budget exceeded, 503 budget or whitelist datastore unavailable.
+      operationId: createChatCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ChatCompletionRequest"
+      responses:
+        "200":
+          description: Completion (JSON) or chunk stream (SSE)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ChatCompletionResponse"
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403": {description: Model not allowed for this key, or team has no budget configured, $ref: "#/components/schemas/Error"}
+        "429":
+          description: "Team budget hard limit reached"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /messages:
+    post:
+      summary: Create a message (Anthropic Messages-compatible)
+      description: |
+        Anthropic Messages endpoint for Claude Code and Anthropic SDK clients.
+        Accepts an Anthropic Messages request (`model`, `messages`, `max_tokens`,
+        optional `system`, `tools`, `stream`) and answers with an Anthropic
+        envelope; errors use the Anthropic `{"type":"error",...}` shape.
+
+        Routing: models whose provider is `anthropic` are served as a native
+        byte-for-byte passthrough (headers `anthropic-version`/`anthropic-beta`
+        forwarded, `x-api-key` upstream auth). Every other model takes the
+        adapted path: the request is translated to an OpenAI-compatible chat
+        call and the chat stream is translated back into Anthropic SSE events.
+
+        Streaming (`stream: true`) emits the Anthropic SSE sequence
+        (`message_start`, `content_block_start`/`content_block_delta`/
+        `content_block_stop`, `message_delta`, `message_stop`, `ping`).
+
+        Event semantics on interrupted streams (canonical asymmetry):
+        - Native path: a client disconnect or mid-stream upstream break still
+          records the request as completed; the partial token usage seen in
+          `message_start`/`message_delta` is billed, and the termination reason
+          (`client_cancel` vs completed) distinguishes who ended the stream.
+        - Adapted path: the same interruption records the request as failed.
+
+        Stream error shape (adapted path): a terminal `event: error` is the
+        last SSE event; an open content block is closed with `content_block_stop`
+        first so partial text renders correctly, while buffered tool calls that
+        were never announced stay dropped. Native-path errors (non-200 or
+        upstream `event: error`) pass through unchanged.
+      operationId: createMessage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageRequest"
+      responses:
+        "200":
+          description: Message (JSON) or Anthropic event stream (SSE)
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "400":
+          description: "Malformed request (invalid_request_error) or organization policy denial (message prefixed [content_policy_violation])"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Team budget hard limit reached; also the upstream rate-limit passthrough (Retry-After forwarded)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "Upstream api_error passthrough (status and body unchanged)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream unreachable or failed (gateway Anthropic envelope)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Upstream overloaded_error passthrough"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /messages/count_tokens:
+    post:
+      summary: Count tokens for a Messages request
+      description: |
+        Anthropic count-tokens endpoint. Served natively for `anthropic`
+        models; other providers get a local estimate flagged
+        `X-Yabanin-Estimated: true` (no upstream call).
+      operationId: countMessageTokens
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/MessageRequest"
+      responses:
+        "200":
+          description: Token count
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  input_tokens: {type: integer}
+        "400":
+          description: "Malformed request body (model is required)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+        "429":
+          description: "Upstream rate limit passthrough (Retry-After preserved)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure (api_error; x-should-retry hint)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /rerank:
+    post:
+      summary: Rerank documents against a query (OpenAI-compatible passthrough)
+      description: |
+        R105 (ratified D1/D2/D3): forwards `{model, query, documents[]}` to the
+        OpenAI-compat upstream `/v1/rerank` and relays the ranked results
+        byte-identically. OpenAI-compat providers only — other providers are
+        refused 400 `rerank_not_supported_for_provider`. Usage accounting is
+        actual: provider tokens when the upstream reports a `usage` block,
+        `no_usage` (zero tokens) otherwise; without a price row the cost stays
+        `unknown_price` — never a fabricated estimate. Limits: 10 MiB request
+        body (413), at most 512 documents (400), 64 MiB upstream response
+        (502, never truncated).
+      operationId: rerankDocuments
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, query, documents]
+              properties:
+                model: {type: string}
+                query: {type: string}
+                documents:
+                  type: array
+                  maxItems: 512
+                  description: String or object documents; shape is upstream-owned.
+                  items: {}
+                top_n: {type: integer, nullable: true}
+      responses:
+        "200":
+          description: Ranked results (upstream JSON passed through verbatim)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Malformed request, missing fields, >512 documents, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /moderations:
+    post:
+      summary: Moderate content (OpenAI-compatible passthrough)
+      description: |
+        R105 (ratified D1/D2/D3): forwards `{model, input}` to the OpenAI-compat
+        upstream `/v1/moderations` and relays the categories/scores payload
+        byte-identically. OpenAI-compat providers only — other providers are
+        refused 400 `moderations_not_supported_for_provider`. OpenAI
+        moderations carry no usage block: such responses account as zero
+        tokens / `no_usage`; a provider-reported `usage` block bills as actual
+        tokens with an explicit `unknown_price` when no price row exists.
+        Limits: 10 MiB request body (413), input a non-empty string or an
+        array of at most 256 items (400), 64 MiB upstream response (502).
+      operationId: moderateContent
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model, input]
+              properties:
+                model: {type: string}
+                input:
+                  oneOf:
+                    - type: string
+                      description: Plain text to classify.
+                    - type: array
+                      maxItems: 256
+                      description: Items to classify; shape is upstream-owned.
+                      items: {}
+      responses:
+        "200":
+          description: Moderation results (upstream JSON passed through verbatim)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Malformed request, invalid input shape, >256 items, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /realtime:
+    post:
+      summary: Realtime session (SSE-only proxy)
+      description: |
+        R105 (ratified D1/D3/D4): POST-only SSE session proxy. The request
+        body is forwarded to the OpenAI-compat upstream `/v1/realtime`; the
+        upstream event stream is relayed to the client byte-identically as
+        `text/event-stream`. WebSocket transport is NOT supported in the
+        first release — an upgrade request is refused 400
+        `unsupported_feature` before any admission or upstream work. Usage
+        accounting is actual (D3): the last usage-bearing SSE event
+        (top-level `usage` or realtime `response.usage`) bills. A client
+        disconnect mid-stream settles the consumed prefix with
+        `client_cancel` — usage already reported by the upstream is never
+        lost (G3 parity); an upstream break settles `upstream_error` and a
+        stalled stream is aborted by the idle watchdog (`idle_timeout`).
+        Limits: 10 MiB request body (413), 64 MiB relayed stream (aborted,
+        never truncated), session bounded by the model's upstream timeout
+        (5 min default fallback).
+      operationId: createRealtimeSession
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [model]
+              properties:
+                model: {type: string}
+                session:
+                  type: object
+                  description: Session configuration; shape is upstream-owned.
+                input: {description: Session input; shape is upstream-owned.}
+      responses:
+        "200":
+          description: Realtime event stream (SSE, relayed byte-identically)
+          content:
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: "Malformed request, missing model, WebSocket upgrade (SSE-only), or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure before the stream started"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /completions:
+    post:
+      summary: Create a legacy text completion (OpenAI-compatible)
+      description: |
+        Legacy OpenAI text completions pipeline (R102-02 public spec, handler
+        since the completions endpoint card): alias-remapped model, guard
+        pipeline, budget reservation, then a forward to the OpenAI-compat
+        upstream `/v1/completions`. Non-stream returns the upstream JSON
+        byte-identically; `stream: true` returns `text/event-stream` with
+        OpenAI-style chunks. Usage accounting is actual: provider-reported
+        tokens, explicit `unknown_price` cost when no price row exists.
+        OpenAI-compat providers only — other providers are refused 400
+        `completions_not_supported_for_provider`.
+      operationId: createCompletion
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CompletionsRequest"
+      responses:
+        "200":
+          description: Completion (JSON) or chunk stream (SSE)
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: "Malformed request, missing model, provider not supported, or response blocked by organization policy"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /embeddings:
+    post:
+      summary: Create embeddings (OpenAI-compatible)
+      description: |
+        OpenAI-compatible embeddings: JSON in, upstream JSON out
+        byte-identically. OpenAI-compat providers only — other providers are
+        refused 400 `embeddings_not_supported_for_provider`. Usage is actual:
+        the upstream usage block bills as provider tokens; without one the
+        request accounts as zero tokens (`no_usage`), never a fabricated
+        estimate. Limits: 10 MiB request body (413), 64 MiB upstream response
+        (502, never truncated).
+      operationId: createEmbedding
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/EmbeddingsRequest"
+      responses:
+        "200":
+          description: Embeddings (upstream JSON passed through verbatim)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Malformed request, missing model/input, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Request body exceeds the 10 MiB gateway cap"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /images/generations:
+    post:
+      summary: Generate images (OpenAI-compatible)
+      description: |
+        R050: non-streaming OpenAI-compat images pipeline. One egress to the
+        resolved upstream host; `data[].url` items are relayed verbatim and
+        never dereferenced by the gateway. Edits and streaming are not
+        offered. OpenAI-compat providers only — other providers are refused
+        400 `images_not_supported_for_provider`. Usage is actual: the upstream
+        usage block bills as provider tokens (cached-token detail included);
+        an absent block accounts as zero tokens (`no_usage`). Limits:
+        10 MiB request body (413), 64 MiB upstream response (502, never
+        truncated).
+      operationId: createImage
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ImagesGenerationsRequest"
+      responses:
+        "200":
+          description: Image generations (upstream JSON passed through verbatim)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Malformed request, missing model/prompt, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Request body exceeds the 10 MiB gateway cap"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /audio/speech:
+    post:
+      summary: Generate spoken audio (OpenAI-compatible)
+      description: |
+        R049 §4.1: OpenAI-shaped JSON in, upstream binary audio out
+        byte-identically with the upstream Content-Type. SSE audio streaming
+        is outside the v1 subset — a `stream: true` or
+        `Accept: text/event-stream` request is refused 400
+        `unsupported_feature` before any admission or upstream work.
+        OpenAI-compat providers only — other providers are refused 400
+        `speech_not_supported_for_provider`. Token usage does not exist for
+        speech: the request accounts as zero tokens with cost status
+        `no_usage` — never a fabricated per-minute/per-character cost.
+        Limits: 10 MiB request body (413), 64 MiB upstream response (502,
+        never truncated).
+      operationId: createSpeech
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SpeechRequest"
+      responses:
+        "200":
+          description: Audio bytes (upstream Content-Type, relayed verbatim)
+          content:
+            application/octet-stream:
+              schema:
+                type: string
+                format: binary
+        "400":
+          description: "Malformed request, missing model/input/voice, audio streaming, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Request body exceeds the 10 MiB gateway cap"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /audio/transcriptions:
+    post:
+      summary: Transcribe audio (OpenAI-compatible)
+      description: |
+        R049 §4.2: multipart/form-data in, upstream JSON out
+        byte-identically. The multipart stream is parsed without
+        full-buffering beyond the 10 MiB gateway cap; admission runs on a
+        metadata-only text projection — raw audio bytes are never persisted
+        and egress guards scan the text fields only. The form is rebuilt with
+        the model field rewritten to the resolved registry model name; every
+        other field (language, prompt, response_format, temperature, ...)
+        passes through verbatim. OpenAI-compat providers only — other
+        providers are refused 400 `transcriptions_not_supported_for_provider`.
+        Usage is actual: a provider-reported usage block bills as tokens; an
+        absent block accounts as zero tokens (`no_usage`). Limits: 10 MiB
+        request body (413), 64 MiB upstream response (502, never truncated).
+      operationId: createTranscription
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [model, file]
+              properties:
+                model: {type: string, description: Model name (routing alias or concrete model)}
+                file:
+                  type: string
+                  format: binary
+                  description: Audio file part.
+                language: {type: string}
+                prompt: {type: string}
+                response_format: {type: string}
+                temperature: {type: number}
+      responses:
+        "200":
+          description: Transcription (upstream JSON passed through verbatim)
+          content:
+            application/json:
+              schema:
+                type: object
+        "400":
+          description: "Expected multipart/form-data, missing model/file, or provider not supported"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "Request body exceeds the 10 MiB gateway cap"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /batches:
+    post:
+      summary: Create a batch (R048; org-scoped)
+      description: |
+        Submits a batch of chat-completions requests for asynchronous
+        execution. The input must reference a previously uploaded file
+        (`POST /v1/files` with purpose `batch`): an OpenAI-shaped JSONL
+        where every line is `{"custom_id","method":"POST",
+        "url":"/v1/chat/completions","body":{model,...}}` (streaming
+        requests are refused explicitly). Limits (ratified R048 D3): max
+        1000 requests per batch, 30-day retention. Lines execute through
+        the same admission/reservation/settlement path as interactive
+        traffic (ratified D4) and each line's result lands in an
+        org-scoped output file; failed lines in an error file.
+      operationId: createBatch
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchCreateRequest"
+      responses:
+        "200":
+          description: The created batch (status validating)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchObject"
+        "400":
+          description: "Invalid batch file (bad JSONL, custom_id/method/url/model violations, streaming request, too many lines)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "input_file_id does not resolve for this org (foreign ids are indistinguishable from missing ones)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: List batches (own org only)
+      operationId: listBatches
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, default: 100, maximum: 1000}
+      responses:
+        "200":
+          description: Batch list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchListObject"
+
+  /batches/{id}:
+    get:
+      summary: Retrieve a batch (status + request counts)
+      description: "Org-scoped: a foreign batch id answers 404 (existence hidden)."
+      operationId: retrieveBatch
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The batch object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchObject"
+        "404":
+          description: "Unknown or foreign batch id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /batches/{id}/cancel:
+    post:
+      summary: Cancel a batch (idempotent for cancellable states)
+      description: |
+        Repeated-cancel semantics: cancelling and
+        already-cancelled batches return the same object with no second
+        side effect; a terminal completed/failed/expired batch refuses
+        with 409 batch_already_terminal. An in-progress batch flips to
+        `cancelling` and the executor finalizes it between lines.
+      operationId: cancelBatch
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The batch object (cancelling or cancelled)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchObject"
+        "404":
+          description: "Unknown or foreign batch id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "batch_already_terminal — the batch finished; it is never restarted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /batches/{id}/results:
+    get:
+      summary: Download the batch output (JSONL)
+      description: |
+        The output file of a finalized batch: one JSONL entry per
+        successful line `{"id","custom_id","response":{status_code,
+        request_id,body},"error":null}`. Failed lines live in the error
+        file (batch object's error_file_id, via /files/{id}/content).
+      operationId: retrieveBatchResults
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Output JSONL
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "404":
+          description: "Unknown or foreign batch id, or the results file is gone (retention)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "409":
+          description: "results_not_ready — the batch has not reached a terminal state"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /files:
+    post:
+      summary: Upload a file (multipart/form-data; R048)
+      description: |
+        Org-scoped file upload for the Batch API. Fields: `file` (the
+        payload) and `purpose` (only `batch` is accepted for client
+        uploads; result files are written by the gateway with internal
+        purposes). Ratified limits (D3): 100 MiB per file (413 above),
+        30-day retention. Storage backend is Postgres bytea (ratified D2).
+      operationId: uploadFile
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file, purpose]
+              properties:
+                file: {type: string, format: binary, description: File payload (≤ 100 MiB)}
+                purpose: {type: string, enum: [batch]}
+      responses:
+        "200":
+          description: The stored file object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileObject"
+        "400":
+          description: "Malformed multipart body, missing fields, or unsupported purpose"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "413":
+          description: "file_too_large — the payload exceeds the 100 MiB cap; nothing is persisted"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    get:
+      summary: List files (own org only)
+      operationId: listFiles
+      parameters:
+        - name: limit
+          in: query
+          schema: {type: integer, default: 100, maximum: 1000}
+      responses:
+        "200":
+          description: File list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileListObject"
+
+  /files/{id}:
+    get:
+      summary: Retrieve a file's metadata
+      description: "Org-scoped: a foreign file id answers 404 (existence hidden)."
+      operationId: retrieveFile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: The file object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileObject"
+        "404":
+          description: "Unknown or foreign file id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+    delete:
+      summary: Delete a file
+      description: "Deletes the org's file row and payload; a repeated delete answers 404."
+      operationId: deleteFile
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Deletion confirmation
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/FileDeleteObject"
+        "404":
+          description: "Unknown or foreign file id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /files/{id}/content:
+    get:
+      summary: Download a file's content (authorized)
+      description: "Org-scoped binary download; a foreign file id answers 404."
+      operationId: retrieveFileContent
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: File payload
+          content:
+            application/octet-stream:
+              schema: {type: string, format: binary}
+        "404":
+          description: "Unknown or foreign file id"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /responses:
+    post:
+      summary: Create a response (OpenAI Responses-compatible)
+      description: |
+        OpenAI Responses API surface. Adapted path (default): the request is
+        translated to the gateway's chat-completions pipeline and the result
+        is translated back into a Responses envelope — `stream: true` yields
+        the Responses SSE event sequence. Fields the translation cannot
+        represent are dropped and listed in the `X-Yabanin-Unsupported`
+        response header; `prompt_cache_key` is reused as the session id for
+        prompt-cache affinity when valid. Native path: providers configured
+        as native Responses providers (orgs without deny tool policies) are
+        forwarded byte-for-byte. The surface is stateless (R046 D1):
+        `previous_response_id` is rejected with 400 on BOTH paths — resend
+        the full conversation in `input` with `store=false`. Errors from the
+        translation itself use the
+        Responses error envelope (`{"error":{message,type,param,code}}` with
+        explicit nulls); delegated pipeline errors use the gateway's OpenAI
+        error envelope.
+      operationId: createResponse
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ResponsesRequest"
+      responses:
+        "200":
+          description: Response (JSON) or Responses event stream (SSE)
+          headers:
+            X-Yabanin-Unsupported:
+              description: Comma-separated Responses fields dropped by the translation (present only when something was dropped) — the drop is never silent (R046 D2).
+              schema: {type: string}
+          content:
+            application/json:
+              schema:
+                type: object
+            text/event-stream:
+              schema:
+                type: string
+        "400":
+          description: "Malformed request, untranslatable Responses shape, or previous_response_id (stateless surface: resend the full history)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "Model not allowed for this key / residency policy violation"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit or budget exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "502":
+          description: "Upstream failure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Budget or whitelist check unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /models:
+    get:
+      summary: List visible models
+      description: |
+        Enabled registry models plus routing aliases, filtered to what the
+        presented key's whitelist allows. Default shape is the OpenAI list
+        (`{"object":"list","data":[...]}`); sending an `anthropic-version`
+        header switches to the Anthropic model-list shape
+        (`{data:[{type,id,display_name,created_at}],has_more,first_id,last_id}`).
+        The list is cached for 30s server-side.
+      operationId: listModels
+      parameters:
+        - name: limit
+          in: query
+          required: false
+          description: Max entries returned (1..1000; default 1000; out-of-range falls back to 1000).
+          schema: {type: integer, default: 1000}
+      responses:
+        "200":
+          description: Model list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelList"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Model list or whitelist check temporarily unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /models/{id}:
+    get:
+      summary: Get a visible model by id
+      description: |
+        One model or routing alias from the whitelist-filtered set — the same
+        visibility rules as the list. Unknown, disabled and not-whitelisted
+        ids are indistinguishable (404). The `anthropic-version` header
+        switches the shape to the Anthropic model object.
+      operationId: getModel
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Model object
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/ModelObject"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "402":
+          description: "Org wallet exhausted or not configured (insufficient_credits / no_billing_setup)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Model not found (or not visible for this key)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Rate limit exceeded"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: "Model list or whitelist check temporarily unavailable (fail-closed)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/session-keys:
+    post:
+      summary: Mint a session key under the parent API key
+      description: |
+        AT-14: mints a short-lived `ybs_` session key bound to the parent
+        API key. Only keys allowed to mint sessions may call this (403
+        `session_mint_not_allowed` otherwise); mints are rate-limited to 60
+        per minute per parent key (429 `rate_limited`). Labels are merged
+        through the org label policy — rejected merges answer 400 with the
+        policy's reject code and the dropped keys. The plaintext key is
+        returned exactly once. Requires the database-backed deployment (501
+        `session_keys_unavailable` otherwise).
+      operationId: mintSessionKey
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionKeyMintRequest"
+      responses:
+        "201":
+          description: Session key minted
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SessionKeyCreated"
+        "400":
+          description: "Malformed body (unknown fields rejected), invalid name/ttl/limits, or label policy rejection"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "This key cannot mint session keys"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "429":
+          description: "Session key mint rate exceeded (60/min per parent key)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "Mint failure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/session-keys/{id}:
+    delete:
+      summary: Revoke a session key
+      description: |
+        Revokes the session key immediately (idempotent — revoking an
+        already-revoked key is still 204). Only the minting parent key (or
+        the session key itself) can see it; anything else is an
+        indistinguishable 404 — no cross-tenant leakage.
+      operationId: revokeSessionKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "204":
+          description: Revoked (or already revoked)
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Session key not found (or not visible for this key)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "Revoke failure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/session-keys/{id}/finish:
+    post:
+      summary: Finish a session key with an outcome
+      description: |
+        Records the terminal outcome of the session (`success`, `failed` or
+        `canceled`) plus optional exit code and duration, and revokes the
+        key. Idempotent — finishing an already-finished key is 204 without
+        changes. Same visibility boundary as revoke (404 otherwise).
+      operationId: finishSessionKey
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SessionFinishRequest"
+      responses:
+        "204":
+          description: Finished (or already finished)
+        "400":
+          description: "Malformed body or invalid status"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Session key not found (or not visible for this key)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "500":
+          description: "Finish failure"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/session-keys/{id}/usage:
+    get:
+      summary: Usage totals for one session key
+      description: |
+        Aggregated request/token/cost totals plus per-model breakdown for the
+        session key, from request logs (shadow traffic excluded). `complete`
+        turns true once the session has been finished and settled for ≥10s —
+        before that the totals may still grow. Same visibility boundary as
+        revoke (404 otherwise).
+      operationId: getSessionKeyUsage
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Usage totals (no groups on this endpoint)
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageTotals"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "404":
+          description: "Session key not found (or not visible for this key)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/usage:
+    get:
+      summary: Usage totals for the calling API key
+      description: |
+        Aggregated request/token/cost totals for the parent API key over a
+        time window (default: last 24h, at most 31 days), with optional
+        `label.<key>=value` filters and `group_by` breakdown
+        (`model` or `label:<key>`). Requires a key allowed to read usage
+        (403 `usage_read_not_allowed` otherwise); session keys cannot call
+        it. `complete` turns true once the window end is ≥10s in the past.
+      operationId: getOwnUsage
+      parameters:
+        - name: from
+          in: query
+          required: false
+          description: Window start (RFC3339; default now-24h).
+          schema: {type: string, format: date-time}
+        - name: to
+          in: query
+          required: false
+          description: Window end, exclusive (RFC3339; default now).
+          schema: {type: string, format: date-time}
+        - name: group_by
+          in: query
+          required: false
+          description: "Breakdown dimension: model or label:<key>."
+          schema: {type: string}
+        - name: label.<key>
+          in: query
+          required: false
+          description: Exact-match label filters (repeatable, e.g. label.env=prod).
+          schema: {type: string}
+      responses:
+        "200":
+          description: Usage totals
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/UsageTotals"
+        "400":
+          description: "Invalid from/to (must be RFC3339, window at most 31 days) or invalid label/group_by parameter"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "401":
+          description: "Missing/invalid API key"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "403":
+          description: "This key cannot read usage"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /yabanin/label-policy:
+    get:
+      summary: Effective org label policy
+      description: |
+        The org's compiled label policy as stored (allowed/denied/required
+        keys, aliases, derive rules, rollup keys, limits); the default
+        policy when none is configured. Determined by the org resolved from
+        the API key.
+      operationId: getLabelPolicy
+      responses:
+        "200":
+          description: Label policy
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LabelPolicy"
+        "401":
+          description: "Missing/invalid API key or org resolution failed"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "501":
+          description: "Session keys require a database (not wired in this deployment)"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /healthz:
+    servers:
+      - url: https://api.yabanin.io
+      - url: http://localhost:8082
+    get:
+      summary: Gateway health check
+      security: []
+      operationId: gatewayHealth
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+
+  /health:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    get:
+      summary: Admin control-plane health check
+      security: []
+      operationId: adminHealth
+      responses:
+        "200":
+          description: OK
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: {type: string, example: ok}
+
+  /api/lineage/{request_id}:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    get:
+      summary: Get lineage attestation by request ID
+      operationId: getLineage
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Lineage record
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/LineageRecord"
+        "404":
+          description: "No lineage for request ID"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/lineage/{request_id}/verify:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    post:
+      summary: Verify lineage attestation signature
+      operationId: verifyLineage
+      parameters:
+        - name: request_id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Verification result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  verified: {type: boolean}
+
+  /api/orgs/{id}/credits/balance:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    get:
+      summary: Get prepaid credit balance for an org
+      operationId: getCreditBalance
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      responses:
+        "200":
+          description: Current balance
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/CreditBalance"
+
+  /api/orgs/{id}/credits/topup:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    post:
+      summary: Top up prepaid credits for an org
+      operationId: topUpCredits
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema: {type: string}
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/TopUpRequest"
+      responses:
+        "201":
+          description: Credited
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TopUpResponse"
+        "400":
+          description: "amount_cents must be positive"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
+  /api/analytics/savings:
+    servers:
+      - url: https://admin.yabanin.io
+      - url: http://localhost:9091
+    get:
+      summary: Savings report
+      description: Cost/savings analytics. Figures derive from benchmarks (`make bench-cache`), not a customer SLA.
+      operationId: getSavingsReport
+      parameters:
+        - name: days
+          in: query
+          required: false
+          schema: {type: integer, default: 7}
+      responses:
+        "200":
+          description: Savings report
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SavingsReport"

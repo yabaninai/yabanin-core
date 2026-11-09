@@ -1,0 +1,65 @@
+name: "Developer Preview feedback — AI-application developers"
+description: "Voluntary feedback from developers building on the gateway API and SDKs: bug, config gap, or feature signal"
+labels: ["preview-feedback", "audience-developers"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for building on the Yabanin Developer Preview. Feedback is
+        **voluntary** — report only what you want to report, and redact all
+        API keys, raw prompts and completions before submitting.
+        Documentation for this audience: `docs/preview/getting-started-developers.md`,
+        `docs/api/CONTRACT.md` and `docs/clients/sdk-versions.md`.
+        Security vulnerabilities do NOT belong here — use the private
+        security-advisory flow (see SECURITY.md).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Feedback kind
+      description: "Bug = API/SDK misbehaves; Config gap = contract/docs/SDK disagree with actual behavior; Feature signal = an API/SDK capability you need is missing."
+      options:
+        - Bug
+        - Configuration gap
+        - Feature signal
+    validations:
+      required: true
+  - type: dropdown
+    id: surface
+    attributes:
+      label: Surface
+      options:
+        - Go SDK (sdks/go)
+        - Python SDK (tokenrouter)
+        - Node SDK (@yabanin/tr-node)
+        - Chat Completions endpoint (REST)
+        - Responses endpoint (REST)
+        - Messages endpoint (REST)
+        - Admin API (REST)
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: SDK / spec version and gateway build
+      description: "SDK package version (or 'stdlib REST'), the spec/schema version if relevant (contracts/api-contract.json schema_version), and gateway commit if known. No keys."
+      placeholder: "tokenrouter 0.1.0, contract schema_version 1, gateway commit abc1234 (or 'unknown')"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: "Minimal description of the call (shapes and status codes, not real payloads): expected contract behavior vs observed. For refusals, include the exact error envelope and code you got."
+    validations:
+      required: true
+  - type: textarea
+    id: contract-mismatch
+    attributes:
+      label: Contract or docs reference (optional)
+      description: "If behavior differs from docs/api/CONTRACT.md or docs/clients/sdk-versions.md, quote the section you built against."
+  - type: checkboxes
+    id: sanitize
+    attributes:
+      label: Sanitization check
+      options:
+        - label: "This report contains no API keys, raw prompts or completions."
+          required: true

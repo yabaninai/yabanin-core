@@ -1,0 +1,8 @@
+{
+  "org_id": "corpus-org",
+  "seats": 10,
+  "features": ["protection-pack"],
+  "expires_at": "2026-11-05T00:00:00Z",
+  "issued_at": "2026-08-05T00:00:00Z",
+  "nonce": "corpus-grace-nonce"
+}

@@ -1,0 +1,188 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://yabanin.ai/schemas/example-set.v1.schema.json",
+  "title": "Yabanin example set bundle (schema v1)",
+  "description": "A versioned, data-only interchange document for one prepared evaluation example set. A bundle embeds the exact canonical revision document bytes (revision_json), the SHA-256 digest over exactly those bytes (content_sha256) and the digest-bound provenance sidecar. Verification is portable: decode revision_json as UTF-8 bytes, hash them with SHA-256 and compare to content_sha256, then parse and validate the revision document. Importers validate data only: no field is executed, dereferenced or fetched, unknown fields are rejected everywhere, and provenance sources are attribution metadata only (never resolved against stored history or media).",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "kind",
+    "set_id",
+    "content_sha256",
+    "revision_json",
+    "provenance"
+  ],
+  "properties": {
+    "schema_version": {
+      "description": "Interchange schema version. Only 1 is defined; readers must reject other values fail-closed.",
+      "const": 1
+    },
+    "kind": {
+      "description": "Fixed document type marker.",
+      "const": "yabanin.example-set"
+    },
+    "set_id": {
+      "description": "Stable operator-facing set identifier. Must equal the dataset_id of the embedded revision document and the dataset_id of the provenance sidecar.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256
+    },
+    "content_sha256": {
+      "description": "Lowercase hex SHA-256 of the exact UTF-8 bytes of the revision_json string value (the canonical revision document, including its single trailing newline). Not a digest of the escaped representation inside the bundle. Must equal provenance.revision_sha256.",
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "revision_json": {
+      "description": "The canonical revision document as exact bytes transported in a JSON string: compact UTF-8 JSON, members in schema order (schema_version, dataset_id, samples; each sample: id, payload), one trailing newline (\\n), which is part of the digested bytes. Payloads keep their source key order and are opaque JSON objects. Canonical producers (Yabanin tools) emit strings with minimal JSON escaping plus the fixed escapes \\u003c, \\u003e, \\u0026, \\u2028 and \\u2029; verifiers never re-encode, they hash and parse the decoded bytes.",
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 8388608
+    },
+    "provenance": {
+      "$ref": "#/$defs/provenance"
+    }
+  },
+  "$defs": {
+    "revision": {
+      "type": "object",
+      "description": "The immutable dataset revision document (parsed from revision_json): schema_version 1, a non-empty dataset_id equal to set_id, and 1..10000 samples with unique non-blank ids.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "dataset_id",
+        "samples"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "dataset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "samples": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 10000,
+          "items": {
+            "$ref": "#/$defs/sample"
+          }
+        }
+      }
+    },
+    "sample": {
+      "type": "object",
+      "description": "One example: a stable non-blank unique id and an opaque JSON object payload. The interchange layer applies no payload policy; media/originals defaults are enforced upstream by the permitted read path.",
+      "additionalProperties": false,
+      "required": [
+        "id",
+        "payload"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 4096
+        },
+        "payload": {
+          "type": "object"
+        }
+      }
+    },
+    "provenance": {
+      "type": "object",
+      "description": "Digest-bound attribution sidecar. Identifiers and digests only — never sample content. Sources are historical metadata: importers must not resolve them.",
+      "additionalProperties": false,
+      "required": [
+        "schema_version",
+        "revision_sha256",
+        "dataset_id",
+        "sample_count",
+        "created_at",
+        "creator",
+        "sources"
+      ],
+      "properties": {
+        "schema_version": {
+          "const": 1
+        },
+        "revision_sha256": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "dataset_id": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "sample_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "created_at": {
+          "description": "RFC3339 UTC timestamp with second precision.",
+          "type": "string",
+          "format": "date-time"
+        },
+        "creator": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "sources": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 20000,
+          "items": {
+            "$ref": "#/$defs/source"
+          }
+        }
+      }
+    },
+    "source": {
+      "type": "object",
+      "description": "One origin record. kind=history attributes exactly one sample to one permitted history read (org/request identifiers plus the per-read content-policy flags, omitted when false); kind=import attributes a batch with its size and optional source-bytes digest.",
+      "additionalProperties": false,
+      "required": [
+        "kind",
+        "samples"
+      ],
+      "properties": {
+        "kind": {
+          "enum": [
+            "history",
+            "import"
+          ]
+        },
+        "org_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "request_id": {
+          "type": "string",
+          "maxLength": 256
+        },
+        "import_digest": {
+          "type": "string",
+          "pattern": "^[0-9a-f]{64}$"
+        },
+        "samples": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 10000
+        },
+        "contains_originals": {
+          "type": "boolean",
+          "description": "History sources only: the attributed sample payload includes retained original text. Present (true) only when original-content retention was explicitly enabled for the preparation run; absent or false means processed content only. Consumers must enforce their own originals permission before displaying or redistributing such content."
+        },
+        "media_bytes": {
+          "type": "boolean",
+          "description": "History sources only: the attributed sample payload embeds inline media file bytes (for example base64 or data URLs) instead of metadata and references only. Present (true) only when media persistence was explicitly enabled for the preparation run; absent or false means the metadata-only media default held and nothing was fetched."
+        }
+      }
+    }
+  }
+}

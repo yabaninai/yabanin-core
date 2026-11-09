@@ -1,0 +1,1 @@
+{"model":"m","max_tokens":4096,"messages":[{"role":"user","content":"hi"}],"tool_choice":{"type":"auto"}}

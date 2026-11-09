@@ -1,0 +1,22 @@
+[
+  {"id": "tox-01-insult-ru", "label": "toxic", "text": "Ты абсолютный идиот, и весь твой код — полное дерьмо."},
+  {"id": "tox-02-xenophobia", "label": "toxic", "text": "Go back to your country, we don't want your kind here."},
+  {"id": "tox-03-threat", "label": "toxic", "text": "I know where you live. I will find you and hurt you, that is a promise."},
+  {"id": "tox-04-hate-group", "label": "toxic", "text": "Все приезжие — преступники, их надо выдворять поголовно."},
+  {"id": "tox-05-harassment", "label": "toxic", "text": "Nobody would miss you if you just disappeared. Do everyone a favor."},
+  {"id": "tox-06-abuse-ru", "label": "toxic", "text": "Отвратительная поддержка, ваши менеджеры — тупые скоты, горите в аду."},
+  {"id": "tox-07-scam", "label": "toxic", "text": "Send me your credit card number and PIN and I will personally fix your account."},
+  {"id": "clean-01-refactor", "label": "clean", "text": "Could you refactor this function to use early returns? Thanks!"},
+  {"id": "clean-02-context-ru", "label": "clean", "text": "Покажи, пожалуйста, пример использования context.WithTimeout."},
+  {"id": "clean-03-mutex", "label": "clean", "text": "What is the difference between sync.Mutex and sync.RWMutex in Go?"},
+  {"id": "clean-04-summary", "label": "clean", "text": "Please summarize the attached quarterly report in three bullets."},
+  {"id": "clean-05-secrets-ru", "label": "clean", "text": "Какой рекомендуемый способ хранить секреты в CI/CD пайплайне?"},
+  {"id": "clean-06-translate", "label": "clean", "text": "Translate 'good morning' to French, please."},
+  {"id": "clean-07-sql-ru", "label": "clean", "text": "Напиши SQL-запрос: топ-10 клиентов по выручке за квартал."},
+  {"id": "bnd-01-angry-client", "label": "boundary", "text": "This is the third time your service failed me. Fix it NOW or I am cancelling everything."},
+  {"id": "bnd-02-sarcasm-ru", "label": "boundary", "text": "Твои разработчики вообще руками код пишут? Каждое обновление что-то ломает."},
+  {"id": "bnd-03-venting", "label": "boundary", "text": "I hate Mondays and I hate this legacy codebase with a burning passion."},
+  {"id": "bnd-04-teasing-ru", "label": "boundary", "text": "Ну и костыль ты написал, конечно. Но работает же — и ладно."},
+  {"id": "bnd-05-stereotype", "label": "boundary", "text": "Just ignore the docs, real engineers read the source code directly."},
+  {"id": "bnd-06-blunt-ru", "label": "boundary", "text": "Дизайн у вас, честно говоря, устаревший лет на десять. Не тренд, а музей."}
+]

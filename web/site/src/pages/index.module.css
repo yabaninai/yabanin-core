@@ -1,0 +1,259 @@
+/* Astra editorial composition (design/reference.html) on --astra-* tokens.
+   Paper/ink light landing; global navbar/footer chrome stays site-wide. */
+
+.page {
+  max-width: 1440px;
+  margin: auto;
+  background: var(--astra-paper);
+  color: var(--astra-ink);
+  font: var(--astra-font-body)/1.55 var(--astra-font-ui);
+}
+.page h1, .page h2, .page h3, .page h4 { color: var(--astra-ink); }
+.page p { line-height: 1.7; }
+.page a { color: var(--astra-action); }
+.page a:focus-visible, .page button:focus-visible, .page select:focus-visible {
+  outline: 3px solid var(--astra-focus);
+  outline-offset: 4px;
+}
+.page button, .page select { font: inherit; cursor: pointer; }
+
+.kicker {
+  font: 11px/1.4 var(--astra-font-code);
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--astra-text-muted);
+}
+.kickerMuted { composes: kicker; color: var(--astra-text-muted); }
+
+/* --- Hero + folio --- */
+.hero {
+  padding: 96px 5% 72px;
+  display: grid;
+  grid-template-columns: 1.1fr 1fr;
+  gap: 8%;
+  align-items: start;
+}
+.hero h1 {
+  font: 400 clamp(38px, 5vw, 68px)/1.06 var(--astra-font-editorial);
+  letter-spacing: -.045em;
+  margin: 22px 0;
+}
+.hero h1 em { color: var(--astra-accent); }
+.nameKey { font: 12px/1.5 var(--astra-font-code); letter-spacing: .06em; color: var(--astra-text-muted); margin: 12px 0 0; }
+.lead { max-width: 460px; font-size: 17px; color: var(--astra-text-muted); margin-top: 10px; }
+.actions { display: flex; gap: 12px; flex-wrap: wrap; margin-top: 28px; align-items: center; }
+.caption { font-size: 12px; color: var(--astra-text-muted); margin-top: 14px; }
+
+.page .primary, .page .secondary {
+  display: inline-flex; justify-content: center; align-items: center; gap: 10px;
+  min-height: 44px; padding: 8px 16px;
+  border-radius: var(--astra-radius-control);
+  font-size: 14px; font-weight: 600; text-decoration: none;
+  border: 1px solid var(--astra-rule-strong);
+}
+.page .primary { background: var(--astra-action); border-color: var(--astra-action); color: var(--astra-on-action); }
+.page .primary:hover { background: var(--astra-action-hover); color: var(--astra-on-action); text-decoration: none; }
+.page .secondary { color: var(--astra-ink); background: transparent; }
+.page .secondary:hover { background: var(--astra-surface-muted); text-decoration: none; }
+
+.folio { padding: 26px; border: 1px solid var(--astra-rule-strong); background: var(--astra-surface); }
+.folioHead { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; margin-bottom: 18px; }
+.folio h2 { font: 400 30px/1.15 var(--astra-font-editorial); letter-spacing: -.02em; margin-bottom: 20px; }
+.folioRow { display: flex; gap: 14px; padding: 13px 0; border-top: 1px solid var(--astra-rule); }
+.folioRow strong { font-size: 14px; }
+.folioRow p { margin: 3px 0 0; font-size: 13px; color: var(--astra-text-muted); }
+.index {
+  font: 12px var(--astra-font-code);
+  color: var(--astra-accent);
+  border: 1px solid var(--astra-rule-strong);
+  width: 30px; height: 30px; flex: none;
+  display: inline-grid; place-items: center;
+}
+.folioLink { display: inline-block; margin-top: 16px; font-size: 14px; font-weight: 600; }
+
+/* --- Principles strip --- */
+.principles {
+  display: flex; justify-content: space-between; flex-wrap: wrap; gap: 18px;
+  padding: 22px 5%;
+  border-block: 1px solid var(--astra-rule-strong);
+  font-size: 13px;
+}
+.principles b { font: 12px var(--astra-font-code); color: var(--astra-accent); margin-right: 10px; }
+
+/* --- Chapters --- */
+.chapter { padding: 72px 5%; border-bottom: 1px solid var(--astra-rule); }
+.chapterHead {
+  display: flex; justify-content: space-between; align-items: flex-end;
+  gap: 24px; flex-wrap: wrap; margin-bottom: 34px;
+}
+.chapterHead h2, .close h2 {
+  font: 400 clamp(28px, 3vw, 40px)/1.15 var(--astra-font-editorial);
+  letter-spacing: -.02em;
+  margin: 8px 0 0;
+}
+.chapterNote { max-width: 520px; color: var(--astra-text-muted); font-size: 14px; }
+
+/* --- Workspace specimen --- */
+.app { display: grid; grid-template-columns: 208px 1fr; border: 1px solid var(--astra-rule-strong); background: var(--astra-surface); }
+.sidebar {
+  border-right: 1px solid var(--astra-rule);
+  padding: 18px; display: flex; flex-direction: column; gap: 10px;
+  font-size: 13px;
+}
+.sidebar a { text-decoration: none; padding: 6px 0; color: var(--astra-ink); }
+.sidebar a:hover { text-decoration: underline; }
+.sidebar p { margin: 14px 0 0; font-size: 11px; color: var(--astra-text-muted); }
+.workspace { padding: 22px; min-width: 0; }
+.scope { display: flex; justify-content: space-between; align-items: flex-end; gap: 16px; flex-wrap: wrap; }
+.scope h3 { margin: 4px 0 2px; font-size: 18px; }
+.scopeText { margin: 0; font-size: 12px; color: var(--astra-text-muted); }
+.scopeLabel { display: flex; flex-direction: column; gap: 6px; font-size: 12px; color: var(--astra-text-muted); }
+.scopeLabel select {
+  min-height: 44px; border: 1px solid var(--astra-rule-strong); border-radius: var(--astra-radius-control);
+  background: var(--astra-paper); color: var(--astra-ink); padding: 8px 12px;
+}
+.metrics { display: grid; grid-template-columns: repeat(3, 1fr); margin: 20px 0; border-block: 1px solid var(--astra-rule); }
+.metric { padding: 16px 14px; }
+.metric + .metric { border-left: 1px solid var(--astra-rule); }
+.metricLabel {
+  font: var(--astra-font-label)/1.4 var(--astra-font-ui);
+  letter-spacing: .05em; text-transform: uppercase; color: var(--astra-text-muted);
+}
+.metricValue, .metricValueText {
+  font: 500 28px/1.2 var(--astra-font-code);
+  font-variant-numeric: tabular-nums;
+  color: var(--astra-ink);
+  margin-top: 6px;
+}
+.metricValueText { font-size: 22px; line-height: 1.5; }
+.metric small { display: block; margin-top: 4px; font-size: 11px; color: var(--astra-text-muted); }
+
+.split { display: grid; grid-template-columns: 1.4fr 1fr; gap: 26px; }
+.listTitle { display: flex; justify-content: space-between; align-items: baseline; gap: 12px; margin-bottom: 10px; }
+.listTitle strong { font-size: 15px; }
+.monoMuted { font: 11px var(--astra-font-code); color: var(--astra-text-muted); }
+.mono { font-family: var(--astra-font-code); font-variant-numeric: tabular-nums; }
+.scroll {
+  overflow-x: auto; border: 1px solid var(--astra-rule);
+  background: var(--astra-surface);
+}
+.scroll table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.scroll th {
+  text-align: left; font: 11px var(--astra-font-ui); text-transform: uppercase; letter-spacing: .06em;
+  color: var(--astra-text-muted);
+  padding: 9px 12px; border-bottom: 1px solid var(--astra-rule-strong);
+  position: sticky; top: 0; background: var(--astra-surface);
+}
+.scroll td { padding: 11px 12px; border-bottom: 1px solid var(--astra-rule); vertical-align: top; }
+.scroll tr.selected td { background: var(--astra-accent-surface); }
+.rowButton {
+  /* Keep request buttons large enough for touch input. */
+  border: 0; background: none; padding: 0; min-height: 44px;
+  font: 13px var(--astra-font-code); color: var(--astra-action);
+  text-decoration: underline; text-underline-offset: 3px;
+}
+.notice { display: flex; gap: 8px; margin: 12px 0 0; font-size: 12px; color: var(--astra-text-muted); }
+.notice b { color: var(--astra-accent); }
+
+.inspector { border-left: 1px solid var(--astra-rule); padding-left: 22px; min-width: 0; }
+.inspector h4 { margin: 6px 0 10px; font-size: 15px; }
+.fields { display: flex; flex-direction: column; gap: 10px; margin: 0; }
+.fields > div { display: flex; justify-content: space-between; gap: 12px; border-bottom: 1px dashed var(--astra-rule); padding-bottom: 8px; }
+.fields dt { color: var(--astra-text-muted); font-size: 12px; }
+.fields dd { margin: 0; font: 12px var(--astra-font-code); text-align: right; overflow-wrap: anywhere; }
+.evidence { margin-top: 14px; border-left: 2px solid var(--astra-info); background: var(--astra-info-surface); padding: 10px 12px; }
+.evidence strong {
+  font: 11px var(--astra-font-ui); text-transform: uppercase; letter-spacing: .06em;
+  color: var(--astra-info);
+}
+.evidence p { margin: 5px 0 0; font-size: 12px; }
+
+.decision {
+  margin-top: 22px; padding: 16px 18px; border: 1px solid var(--astra-rule-strong);
+  background: var(--astra-paper);
+  display: flex; justify-content: space-between; align-items: center; gap: 14px; flex-wrap: wrap;
+}
+.decision p { margin: 0; font-size: 14px; }
+.decisionLink { font-weight: 600; font-size: 14px; white-space: nowrap; }
+
+/* --- Audit chapter --- */
+.auditGrid { display: grid; grid-template-columns: 1.2fr 1fr; gap: 40px; align-items: start; }
+.terminal { min-width: 0; border: 1px solid var(--astra-rule-strong); background: var(--astra-ink); color: var(--astra-paper); }
+/* Use shared surface tokens for the terminal header. */
+.terminalTitle {
+  padding: 12px 18px; border-bottom: 1px solid var(--astra-rule-strong);
+  font: 10px var(--astra-font-code); letter-spacing: .1em; color: var(--astra-text-muted);
+}
+.terminalTitle span { margin-right: 16px; letter-spacing: 3px; color: var(--astra-rule-strong); }
+.terminal pre { margin: 0; padding: 22px; font: 13px/1.7 var(--astra-font-code); overflow-x: auto; }
+.auditSide { display: flex; flex-direction: column; gap: 4px; }
+.auditSide .primary { margin-top: 18px; align-self: start; }
+
+/* --- Feature + deploy grids --- */
+.featureGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 36px 64px; }
+.featureGrid article { border-top: 1px solid var(--astra-rule-strong); padding-top: 22px; }
+.featureGrid p { color: var(--astra-text-muted); font-size: 14px; }
+.featureGrid a { font-size: 13px; font-weight: 600; }
+.deployGrid { display: grid; grid-template-columns: 1fr 1fr; gap: 40px; }
+.deployGrid article { border: 1px solid var(--astra-rule-strong); background: var(--astra-surface); padding: 24px; }
+.deployGrid p { color: var(--astra-text-muted); font-size: 14px; }
+.deployGrid a { font-size: 13px; font-weight: 600; }
+.badge, .planned {
+  display: inline-block; margin-bottom: 14px;
+  border: 1px solid var(--astra-rule-strong); border-radius: var(--astra-radius-control);
+  font: 10px var(--astra-font-code); letter-spacing: .08em; text-transform: uppercase;
+  padding: 5px 9px;
+}
+.badge { color: var(--astra-action); }
+.planned { color: var(--astra-text-muted); }
+
+/* --- Close --- */
+.close { padding: 64px 5% 84px; border-top: 1px solid var(--astra-rule); background: var(--astra-accent-surface); }
+.close h2 { margin: 8px 0 14px; }
+.close .chapterNote { max-width: 550px; }
+
+/* --- Responsive (360 → 1440+) --- */
+@media (min-width: 1441px) { .page { border-inline: 1px solid var(--astra-rule-strong); } }
+@media (max-width: 1100px) {
+  .hero { grid-template-columns: 1fr; gap: 40px; padding-top: 64px; }
+  .split { grid-template-columns: 1fr; }
+  .inspector { border-left: 0; border-top: 1px solid var(--astra-rule); padding: 18px 0 0; }
+  .auditGrid { grid-template-columns: 1fr; gap: 28px; }
+}
+@media (max-width: 760px) {
+  .hero { padding: 44px 6% 52px; }
+  .hero h1 { font-size: clamp(38px, 10vw, 48px); }
+  .app { grid-template-columns: 1fr; }
+  .sidebar {
+    border-right: 0; border-bottom: 1px solid var(--astra-rule);
+    flex-direction: row; align-items: center; flex-wrap: wrap; padding: 12px;
+  }
+  .sidebar p { width: 100%; margin: 8px 0 0; }
+  .sidebar a { padding: 8px 10px 8px 0; }
+  .metrics { grid-template-columns: 1fr; }
+  .metric + .metric { border-left: 0; border-top: 1px solid var(--astra-rule); }
+  .chapter { padding: 52px 6%; }
+  .featureGrid, .deployGrid { grid-template-columns: 1fr; gap: 24px; }
+  .close { padding: 44px 6% 60px; }
+}
+@media (prefers-reduced-motion: no-preference) {
+  .page a, .page button, .page select { transition: background var(--astra-duration) ease; }
+}
+
+/* --- Measured chapter (recorded S02 run 2026-09-14) --- */
+/* contain:inline-size stops the table's min-content from propagating
+   through block ancestors into Docusaurus' flex main wrapper (otherwise
+   the whole page scrolls horizontally on narrow viewports). */
+.evalTableWrap { overflow-x: auto; border: 1px solid var(--astra-rule-strong); contain: inline-size; }
+/* Fluid like the specimen table (.scroll): no min-width — the wrapper
+   scrolls only when nowrap numeric cells exceed the viewport. */
+.evalTable { width: 100%; border-collapse: collapse; font-size: 14px; }
+.evalTable th {
+  text-align: left; padding: 10px 14px; font-family: var(--astra-font-code);
+  font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase;
+  color: var(--astra-text-muted); border-bottom: 1px solid var(--astra-rule-strong);
+}
+.evalTable td { padding: 10px 14px; border-bottom: 1px solid var(--astra-rule); vertical-align: top; }
+.evalTable tbody tr:last-child td { border-bottom: 0; }
+.evalTable th.num, .evalTable td.num { text-align: right; font-family: var(--astra-font-code); white-space: nowrap; }
+.evalCaption { margin-top: 12px; font-size: 13px; color: var(--astra-text-muted); max-width: 640px; }

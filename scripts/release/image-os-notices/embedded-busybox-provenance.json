@@ -1,0 +1,26 @@
+[
+  {
+    "apk_path": "alpine/v3.24/main/x86_64/busybox-1.37.0-r31.apk",
+    "apk_sha256": "0e626fa97cf937fda7bba4ed4dde8e2f2dbb5083ac34e02180cec0c4eba9351b",
+    "busybox_version": "1.37.0-r31",
+    "branch": "v3.24",
+    "aports_commit": "c3ef5d10e6ef6528852c51f0564963e2f8c1be19",
+    "pkginfo_builddate_utc": "2026-01-10T15:38:28+00:00",
+    "official_build_log_url": "https://build.alpinelinux.org/buildlogs/build-edge-x86_64/main/busybox/busybox-1.37.0-r31.log",
+    "official_build_log_sha256": "247de0c2bfa28c8c697a0921b546533569c9bf2759fbe5c3ca9f94da144c9b7e",
+    "components": [
+      {
+        "origin": "utmps",
+        "version": "0.1.3.2-r0",
+        "declared_license": "ISC"
+      },
+      {
+        "origin": "skalibs",
+        "version": "2.14.5.0-r0",
+        "declared_license": "ISC"
+      }
+    ],
+    "static_link_arguments_observed": true,
+    "binding": "Official same-version x86_64 build log and exact BusyBox APK-commit recipes corroborate embedded versions. APK builddate and build-log wall-clock timestamps differ and do not prove identity. No independent BusyBox rebuild or cryptographically authenticated log-to-APK link is asserted."
+  }
+]

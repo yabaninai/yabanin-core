@@ -1,0 +1,18 @@
+{
+  "model": "gpt-5-codex",
+  "instructions": "You are Codex.",
+  "input": [
+    {"type": "message", "role": "developer", "content": "Use tools."},
+    {"type": "message", "role": "user", "content": "Patch main.go"}
+  ],
+  "tools": [
+    {"type": "function", "name": "shell", "description": "Run a command", "parameters": {"type": "object", "properties": {}}},
+    {"type": "custom", "name": "apply_patch", "description": "Patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: WORD"}}
+  ],
+  "parallel_tool_calls": false,
+  "reasoning": {"effort": "low", "summary": "auto"},
+  "store": false,
+  "include": ["reasoning.encrypted_content"],
+  "prompt_cache_key": "codex-session",
+  "stream": true
+}

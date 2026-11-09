@@ -1,0 +1,14 @@
+{
+  "v": "2",
+  "c": "corpus-customer-critical",
+  "d": "corpus-deployment",
+  "m": ["protection-pack"],
+  "i": "2026-05-01T00:00:00Z",
+  "me": "2026-10-09T00:00:00Z",
+  "rl": [
+    { "line": "2026.1", "se": "2027-06-30T00:00:00Z", "cf": true },
+    { "line": "2026.0", "se": "2026-06-30T00:00:00Z", "cf": true },
+    { "line": "2027.0", "se": "2028-01-01T00:00:00Z", "cf": false }
+  ],
+  "n": "corpus-critical-nonce"
+}

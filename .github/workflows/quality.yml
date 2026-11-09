@@ -1,0 +1,100 @@
+name: Quality Regression
+
+on:
+  schedule:
+    - cron: '0 6 * * *'  # Daily at 06:00 UTC
+    - cron: '0 6 * * 1'  # Mondays 06:00 UTC — weekly tag-gated suites
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    runs-on: ubuntu-latest
+    # TP-13: the full profile runs 25 gates sequentially (Go static/security/
+    # tests, evals, web builds, SDKs, packaging, DR) — 2h is the honest
+    # ceiling; a timeout must not be able to read as a pass.
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The manifest records HEAD and a source fingerprint; a shallow
+          # clone still satisfies it, but full history keeps merge-base
+          # comparisons possible when the run is reused as evidence.
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Same prerequisite contract as the PR job in ci.yml (TP-13): bootstrap
+      # owns modules/npm trees/chromium/pinned tools; the rest closes the
+      # gaps bootstrap does not own.
+      - name: Bootstrap quality prerequisites
+        run: |
+          make yb
+          ./yb bootstrap --yes
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          python3 -m pip install --disable-pip-version-check pyyaml
+          python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
+
+      # Preserved coverage: the Go quality-tagged regression suite keeps
+      # running (its verdict is independent of the runner's).
+      - name: Run quality regression tests
+        run: go test -race -count=1 -tags=quality ./tests/quality/... -v
+
+      # TP-13: explicit full — never static/fast/self standing in for full.
+      # The runner exits non-zero on any failed gate; the manifest and every
+      # gate log upload below on success AND failure.
+      # NEXT-14: jobs=2 overlaps one light gate (npm builds, docs, sdk leaves)
+      # with the serialized heavy Go lane. GitHub-hosted runners are 2-vCPU
+      # VMs, so 2 is the honest ceiling: heavy gates never overlap by design
+      # regardless of this value, so the Go toolchain still owns full cores.
+      - name: Run full quality profile
+        run: python3 scripts/quality/quality.py run full --jobs 2
+
+      - name: Upload quality evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-full-evidence
+          path: artifacts/quality/
+
+  # Tag-gated suites that must not gate PRs run here on the weekly
+  # cron. Only deterministic in-process suites are wired; the local-only
+  # suites are intentionally omitted from this workflow.
+  sovereignty-weekly:
+    name: Sovereignty suite (weekly)
+    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.27.x'
+          cache: true
+
+      - name: Run sovereignty suite (-tags sovereignty)
+        run: go test -race -count=1 -tags sovereignty ./tests/sovereignty/...

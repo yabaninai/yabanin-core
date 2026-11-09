@@ -1,0 +1,28 @@
+# N18-P01-T02 — Bifrost pinned benchmark launch (validated against this exact digest).
+#
+# Digest pin: maximhq/bifrost v2.4.0 manifest-list digest recorded in
+# ../VERSIONS.md (single source of truth; validate-configs.sh fails on drift).
+#
+# Upstream trap (validated 2026-11-04, image docker-entrypoint.sh): the
+# entrypoint arg parser loops forever on flags it does not know (-app-dir,
+# -log-style ...). Pass host/port ONLY via APP_HOST/APP_PORT env vars — do not
+# add CLI args beyond what the entrypoint handles.
+#
+# Loopback discipline: APP_HOST=127.0.0.1 keeps the gateway off every external
+# interface (upstream image default is 0.0.0.0). File-only mode means no
+# gateway auth; the loopback bind is the only guard. Never expose this on a
+# reachable interface.
+services:
+  bifrost:
+    image: maximhq/bifrost@sha256:a1c90607dcfd13c1fb2f9476ceb3bb24407a50ade7fdf3e61a59fb42b09e5c57
+    network_mode: host
+    environment:
+      APP_HOST: "127.0.0.1"
+      APP_PORT: "14660"
+      LOG_STYLE: pretty
+      # Referenced by config.json as env.BIFROST_BENCH_UPSTREAM_KEY.
+      # The mock ignores credentials: use an obviously-dummy value, never a
+      # real key. Compose fails closed if the variable is unset.
+      BIFROST_BENCH_UPSTREAM_KEY: ${BIFROST_BENCH_UPSTREAM_KEY:?export BIFROST_BENCH_UPSTREAM_KEY before starting (dummy value is fine for the loopback mock)}
+    volumes:
+      - ./config.json:/app/data/config.json:ro

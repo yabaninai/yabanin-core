@@ -1,0 +1,6 @@
+apiVersion: v2
+name: yabanin-onprem
+description: Yabanin — Your Agnostic Bridge Across Numerous Inference Networks; single-tenant air-gap deployment
+type: application
+version: 0.1.0
+appVersion: "1.0.0"

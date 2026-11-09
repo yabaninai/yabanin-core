@@ -1,0 +1,16 @@
+{
+  "model": "gpt-5-codex",
+  "instructions": "You are Codex.",
+  "input": [
+    {"type": "message", "role": "developer", "content": [{"type": "input_text", "text": "Use tools."}]},
+    {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "Hi"}, {"type": "text", "text": "there"}]},
+    {"type": "message", "role": "assistant", "content": [{"type": "output_text", "text": "Ok"}]},
+    {"type": "function_call", "call_id": "call_1", "name": "read", "arguments": "{\"path\":\"a\"}"},
+    {"type": "function_call_output", "call_id": "call_1", "output": "file"},
+    {"type": "reasoning", "summary": [{"type": "summary_text", "text": "think"}]}
+  ],
+  "tools": [
+    {"type": "function", "name": "read", "description": "Read", "parameters": {"type": "object", "properties": {}}, "strict": true},
+    {"type": "custom", "name": "apply_patch", "description": "Patch", "format": {"type": "grammar", "syntax": "lark", "definition": "start: WORD"}}
+  ]
+}

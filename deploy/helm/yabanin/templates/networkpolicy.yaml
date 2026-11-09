@@ -1,0 +1,71 @@
+# Default deny all ingress/egress within namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-default-deny
+spec:
+  podSelector: {}
+  policyTypes:
+    - Ingress
+    - Egress
+---
+# Allow gateway to receive external traffic on port 8082
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-gateway-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: yabinin-gateway
+  policyTypes:
+    - Ingress
+  ingress:
+    - ports:
+        - port: 8082
+          protocol: TCP
+---
+# Allow all pods to communicate within namespace (required for internal calls)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-internal-egress
+spec:
+  podSelector: {}
+  policyTypes:
+    - Egress
+  egress:
+    # DNS resolution
+    - ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # Allow same namespace (internal services)
+    - to:
+        - podSelector: {}
+---
+# Allow gateway/admin to reach PostgreSQL and Redis in other namespaces
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ .Release.Name }}-external-egress
+spec:
+  podSelector:
+    matchLabels:
+      app: yabinin-gateway
+  policyTypes:
+    - Egress
+  egress:
+    # External HTTPS (upstream LLM APIs)
+    - ports:
+        - port: 443
+          protocol: TCP
+    # PostgreSQL (if external)
+    - ports:
+        - port: 5432
+          protocol: TCP
+    # Redis (if external)
+    - ports:
+        - port: 6379
+          protocol: TCP

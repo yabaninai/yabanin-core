@@ -1,0 +1,23 @@
+replicaCount: 1
+
+image:
+  repository: yabanin-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8082
+
+# Per-region overrides: set region, home_region, regions map via env vars.
+env:
+  YABANIN_REGION: sg
+  YABANIN_HOME_REGION: SG
+  YABANIN_KMS_PROVIDER: local
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi

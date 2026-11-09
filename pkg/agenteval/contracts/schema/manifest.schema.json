@@ -1,0 +1,87 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent-eval experiment manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "run_id", "created_at", "profile", "git_commit", "dataset", "arms", "caps", "price_snapshot", "spend", "integrity"],
+  "properties": {
+    "schema_version": {"type": "integer", "const": 1},
+    "run_id": {"type":"string","pattern":"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"},
+    "created_at": {"type": "string", "format": "date-time"},
+    "profile": {"type": "string", "minLength": 1},
+    "git_commit": {"type": "string", "minLength": 1},
+    "dirty_files": {"type": "array", "items": {"type": "string"}},
+    "dataset": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["catalog_id", "selection_file", "sha256", "split"],
+      "properties": {
+        "catalog_id": {"type": "string"},
+        "selection_file": {"type": "string"},
+        "sha256": {"type": "array", "items": {"type": "string"}},
+        "split": {"type": "string"}
+      }
+    },
+    "arms": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object", "additionalProperties": false,
+        "required": ["id", "model_slug", "endpoint_url", "provider_pinning", "headers_allowed"],
+        "properties": {
+          "id": {"type": "string"}, "model_slug": {"type": "string"},
+          "endpoint_url": {"type": "string", "format": "uri"},
+          "provider_pinning": {"type": "string"},
+          "headers_allowed": {"type": "array", "items": {"type": "string"}}
+        }
+      }
+    },
+    "caps": {
+      "type": "object", "additionalProperties": false,
+      "required": ["max_llm_attempts", "max_tool_calls", "max_wall_seconds", "episode_cap_usd", "max_child_agents", "max_concurrent_llm"],
+      "properties": {
+        "max_llm_attempts": {"type": "integer", "minimum": 1},
+        "max_tool_calls": {"type": "integer", "minimum": 0},
+        "max_wall_seconds": {"type": "integer", "minimum": 1},
+        "episode_cap_usd": {"type": ["number", "null"], "minimum": 0},
+        "max_child_agents": {"type": "integer", "minimum": 0},
+        "max_concurrent_llm": {"type": "integer", "minimum": 1}
+      }
+    },
+    "price_snapshot": {
+      "type": "object", "additionalProperties": false,
+      "required": ["source", "as_of", "currency", "entries"],
+      "properties": {
+        "source": {"type": "string"}, "as_of": {"type": "string"}, "currency": {"type": "string"},
+        "entries": {
+          "type": "array",
+          "items": {
+            "type": "object", "additionalProperties": false,
+            "required": ["model", "in_per_1m", "out_per_1m", "cache_write", "cache_read"],
+            "properties": {
+              "model": {"type": "string"},
+              "in_per_1m": {"type": ["number", "null"]},
+              "out_per_1m": {"type": ["number", "null"]},
+              "cache_write": {"type": ["number", "null"]},
+              "cache_read": {"type": ["number", "null"]}
+            }
+          }
+        }
+      }
+    },
+    "spend": {
+      "type": "object", "additionalProperties": false,
+      "required": ["authorized", "limit_usd", "approved_by", "approved_at"],
+      "properties": {
+        "authorized": {"type": "boolean"},
+        "limit_usd": {"type": "number", "minimum": 0},
+        "approved_by": {"type": "string"},
+        "approved_at": {"type": ["string", "null"], "format": "date-time"}
+      }
+    },
+    "replay": {
+      "type": "object", "additionalProperties": false,
+      "required": ["scripts"], "properties": {"scripts": {"type": "array", "items": {"type": "string"}}}
+    },
+    "integrity": {"type": "object", "additionalProperties": {"type": "string"}}
+  }
+}

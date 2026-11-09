@@ -1,0 +1,18 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ .Release.Name }}-config
+data:
+  config.yaml: |
+{{- with .Values.gateway }}
+    gateway:
+{{ toYaml . | indent 6 }}
+{{- end }}
+{{- with .Values.loggerd }}
+    loggerd:
+{{ toYaml . | indent 6 }}
+{{- end }}
+{{- with .Values.admin }}
+    admin:
+{{ toYaml . | indent 6 }}
+{{- end }}

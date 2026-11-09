@@ -1,0 +1,188 @@
+{{- if .Values.bundled.redis }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ template "yabanin.fullname" . }}-postgres-data
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.postgres.storage }}
+---
+# Backup PVC for pre-upgrade/rollback jobs
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ template "yabanin.fullname" . }}-backup
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "yabanin.fullname" . }}-postgres
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  ports:
+    - port: 5432
+      targetPort: 5432
+      name: postgres
+  selector:
+    app: postgres
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "yabanin.fullname" . }}-redis
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  ports:
+    - port: 6379
+      targetPort: 6379
+      name: redis
+  selector:
+    app: redis
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ template "yabanin.fullname" . }}-gateway
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  type: {{ .Values.service.type | default "ClusterIP" }}
+  ports:
+    - port: 8082
+      targetPort: 8082
+      name: http
+  selector:
+    app: gateway
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ template "yabanin.fullname" . }}-postgres
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ template "yabanin.fullname" . }}-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgres
+  template:
+    metadata:
+      labels:
+        app: postgres
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        fsGroup: 999
+      containers:
+        - name: postgres
+          image: {{ .Values.postgres.image }}
+          env:
+            - { name: POSTGRES_USER, value: yabanin }
+            - { name: POSTGRES_DB, value: yabanin }
+            - { name: POSTGRES_PASSWORD_FILE, value: /etc/yabanin/secrets/pg_password }
+            # hostpath mounts are root-owned and uid 999 cannot chmod the
+            # mount root; PGDATA in a subdirectory the entrypoint creates.
+            - { name: PGDATA, value: /var/lib/postgresql/data/pgdata }
+          ports:
+            - containerPort: 5432
+              name: postgres
+          readinessProbe:
+            tcpSocket: { port: 5432 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            tcpSocket: { port: 5432 }
+            initialDelaySeconds: 15
+            periodSeconds: 10
+          {{- if .Values.probes.postgres.startup.enabled }}
+          {{- /* cold initdb + first migrations can exceed the liveness
+                initial delay; the startup probe absorbs that window without
+                a kill loop (N11-P02-T03). */}}
+          {{- include "yabanin.onprem.probe" (dict "style" "startupProbe" "probe" .Values.probes.postgres.startup) | nindent 10 }}
+          {{- end }}
+          resources: {{ toYaml .Values.postgres.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /var/lib/postgresql/data }
+            - { name: secrets, mountPath: /etc/yabanin/secrets, readOnly: true }
+
+      securityContext:
+        # hostpath volumes are root-owned; postgres (uid 999) needs the data dir.
+        fsGroup: 999
+      volumes:
+        - name: secrets
+          secret:
+            secretName: {{ include "yabanin.onprem.appSecretName" . }}
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: {{ .Values.postgres.storage }}
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: {{ template "yabanin.fullname" . }}-redis
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  serviceName: {{ template "yabanin.fullname" . }}-redis
+  replicas: 1
+  selector:
+    matchLabels:
+      app: redis
+  template:
+    metadata:
+      labels:
+        app: redis
+    spec:
+      containers:
+        - name: redis
+          image: {{ .Values.redis.image }}
+          ports:
+            - containerPort: 6379
+              name: redis
+          readinessProbe:
+            tcpSocket: { port: 6379 }
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          {{- if .Values.probes.redis.startup.enabled }}
+          {{- include "yabanin.onprem.probe" (dict "style" "startupProbe" "probe" .Values.probes.redis.startup) | nindent 10 }}
+          {{- end }}
+          resources: {{ toYaml .Values.redis.resources | nindent 12 }}
+          volumeMounts:
+            - { name: data, mountPath: /data }
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: {{ template "yabanin.fullname" . }}-redis-data
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ template "yabanin.fullname" . }}-redis-data
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: {{ .Values.redis.storage }}
+{{- end }}

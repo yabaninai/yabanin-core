@@ -1,0 +1,26 @@
+# N18-P01-T02 pinned competitor config for LiteLLM Proxy 1.108.0.
+#
+# Purpose: serve the SAME deterministic gatewayoverhead mock
+# (scripts/loadtest/gatewayoverhead, 127.0.0.1:14650) under the SAME
+# OpenAI-compatible chat surface so the accepted bench client measures this
+# competitor gateway without changing request bytes.
+#
+# Pinned behavior (validated 2026-11-04 against the pinned image):
+#   - api_base must include /v1 (LiteLLM appends /chat/completions).
+#   - The proxy REFUSES to start without LITELLM_MASTER_KEY (fail-closed by
+#     upstream default — mirrored by docker-compose.yml, which requires the
+#     variable to be set explicitly; a dummy value is fine for the loopback
+#     mock, never reuse a real credential).
+#   - num_workers is pinned to 1 for deterministic single-process overhead.
+#
+# Not pinned here (identical-conditions parity is T03's concern): cache,
+# logging callbacks, budgets/rate limits.
+model_list:
+  - model_name: bench-model
+    litellm_params:
+      model: openai/bench-model
+      api_base: http://127.0.0.1:14650/v1
+      api_key: os.environ/LITELLM_BENCH_UPSTREAM_KEY
+
+litellm_settings:
+  drop_params: true

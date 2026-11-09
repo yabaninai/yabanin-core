@@ -1,0 +1,2973 @@
+openapi: "3.0.3"
+info:
+  title: Yabanin Admin Control-Plane API
+  version: "1.2.0"
+  description: |
+    Route inventory of the admin control plane (services/admin), kept in
+    lock-step with the router by services/admin/handlers/routes_inventory_test.go:
+    the test walks SetupRouter (chi.Walk) and fails on any route that is
+    undocumented, stale, or served under a different permission middleware
+    class than the `x-permission` value below.
+
+    `x-permission` classes mirror the actual middleware chain:
+    - `public` — no auth beyond the global chain (rate limit, body limit, security headers)
+    - `session` — admin cookie session (ChiAuthMiddleware + CSRF)
+    - `portal` — developer-portal session (PortalAuthMiddleware)
+    - `service` — X-Admin-Key header auth (`/internal` read-only service API)
+    - `root` — MustBeRoot (platform operator only)
+    - `scim` — OP-13 SCIM bearer token (scimAuthMiddleware, `/scim/v2`);
+      organization-scoped to the token's org
+    - `org:<perm>` — RequireOrgPermission, org-scoped role permission
+      (pkg/adminstore/permissions.go); root bypasses.
+
+    Intentionally not inventoried here: GET /metrics (Prometheus,
+    methodless registration). The DB-gated groups mount only with a live
+    Postgres pool, so the no-DB lock-step walk cannot see them; the
+    UI-reachable surfaces (org credit wallet + top-up, low-balance report,
+    owner feedback list, org region routing) ARE inventoried below and
+    locked to the fully-wired golden walk (dbGatedAdminRoutes in
+    routes_inventory_test.go). Still golden-tracked without a spec surface:
+    OIDC SSO, GET|PUT /api/orgs/{id}/resale-pricing, sovereign models,
+    GET /api/regions, GET /api/feedback/export, template marketplace,
+    retrain status.
+servers:
+  - url: https://admin.yabanin.io
+  - url: http://localhost:9091
+
+components:
+  schemas:
+    Error:
+      type: object
+      properties:
+        error: {type: string}
+    SecurityIncident:
+      type: object
+      required: [id, org_id, group_key, summary, severity, confidence, status, first_seen, last_seen, event_count, first_event_id, last_event_id, evidence]
+      description: >-
+        One folded finding of the E06-P01 security inbox. Evidence carries
+        references to the source security events, never their content.
+      properties:
+        id: {type: string, format: uuid}
+        org_id: {type: string, format: uuid}
+        group_key: {type: string, description: Fingerprint of the finding class this incident groups}
+        summary: {type: string, description: Latest folded event's human-readable summary}
+        severity: {type: string, enum: [low, medium, high]}
+        confidence: {type: number, format: double, description: Grouping quality, 0..1}
+        status: {type: string, enum: [new, acknowledged, in_progress, resolved, dismissed]}
+        assignee: {type: string, format: uuid, nullable: true, description: Operator member id, null when unassigned}
+        first_seen: {type: string, format: date-time}
+        last_seen: {type: string, format: date-time}
+        event_count: {type: integer, format: int64, minimum: 1}
+        first_event_id: {type: string, description: Source event id of the earliest folded event}
+        last_event_id: {type: string, description: Source event id of the latest folded event}
+        evidence:
+          type: array
+          description: References (not content) into the security-events journal
+          items: {type: object, additionalProperties: true}
+    FleetInstallation:
+      type: object
+      required: [org_id, deployment_id, state, revoked, caps, enrolled_at, caps_updated_at]
+      description: >-
+        One managed installation of the E03-P01 fleet registry: a licensed
+        deployment contour of one org, its negotiated caps document and
+        its lifecycle state. Revoked rows carry the EXPLICIT revoked
+        marker (revoked=true, revoked_at, revocation_reason). The record
+        holds no secrets by construction — revocation is punished at
+        secret issuance, never by storing key material.
+      properties:
+        org_id: {type: string, description: The license org coordinate (TEXT, not a uuid)}
+        deployment_id: {type: string, description: The licensed deployment contour identity}
+        state: {type: string, enum: [enrolled, active, stale, revoked]}
+        revoked: {type: boolean, description: Explicit terminality marker; true exactly when state is revoked}
+        revoked_at: {type: string, format: date-time, nullable: true}
+        revocation_reason: {type: string, description: Audit trail entry of the first revocation}
+        caps:
+          type: object
+          required: [format_version, capabilities]
+          properties:
+            format_version: {type: string}
+            capabilities: {type: array, items: {type: string}}
+            unsupported: {type: array, items: {type: string}, description: Visible remainder of the negotiation, never silently dropped}
+        enrolled_at: {type: string, format: date-time}
+        caps_updated_at: {type: string, format: date-time}
+        last_heartbeat_at: {type: string, format: date-time, nullable: true, description: Monotone liveness clock; absent until the first verified heartbeat}
+    CreditBalance:
+      type: object
+      required: [org_id, balance_cents, balance_usd, updated_at]
+      properties:
+        org_id: {type: string}
+        balance_cents: {type: integer, format: int64, description: whole cents; a wallet-less org answers 0}
+        balance_usd: {type: number, format: double, description: 'balance_cents / 100, display only'}
+        updated_at: {type: string, format: date-time, description: RFC3339 UTC}
+    CreditTransaction:
+      type: object
+      required: [id, org_id, amount_cents, balance_after, type, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        org_id: {type: string}
+        amount_cents: {type: integer, format: int64, description: 'positive=top-up, negative=deduction'}
+        balance_after: {type: integer, format: int64, description: wallet balance in cents after this entry}
+        type: {type: string, enum: [topup, usage]}
+        request_id: {type: string, description: omitted when the entry carries no request}
+        invoice_ref: {type: string, description: omitted when the entry carries no invoice}
+        metadata: {type: object, additionalProperties: true, description: omitted when empty}
+        amount_micro_usd: {type: integer, format: int64, description: exact signed micro-USD; omitted on rows written before AF-05 exact micro accounting — historical rows are never recalculated}
+        created_at: {type: string, format: date-time}
+    CreditTransactionsPage:
+      type: object
+      required: [org_id, limit, count, txns]
+      properties:
+        org_id: {type: string}
+        limit: {type: integer, description: the applied page size}
+        count: {type: integer, description: len(txns)}
+        txns: {type: array, items: {$ref: "#/components/schemas/CreditTransaction"}, description: newest first}
+    CreditTopUpRequest:
+      type: object
+      required: [amount_cents]
+      properties:
+        amount_cents: {type: integer, format: int64, minimum: 1, description: must be positive}
+        invoice_ref: {type: string, description: optional, stored on the ledger row}
+        reason: {type: string, description: operator motive; the X-Audit-Reason header is the fallback; a missing reason still journals the entry}
+    CreditTopUpResponse:
+      type: object
+      required: [status, org_id, amount_cents, increase_usd]
+      properties:
+        status: {type: string, enum: [topped_up]}
+        org_id: {type: string}
+        amount_cents: {type: integer, format: int64, description: the applied increment}
+        increase_usd: {type: number, format: double, description: amount_cents / 100}
+    LowBalanceReport:
+      type: object
+      required: [threshold_cents, count, org_ids]
+      properties:
+        threshold_cents: {type: integer, format: int64, description: the applied threshold (default -500)}
+        count: {type: integer, description: len(org_ids)}
+        org_ids: {type: array, items: {type: string}, description: 'wallets below the threshold, balance ascending'}
+    FeedbackEntry:
+      type: object
+      required: [id, org_id, request_id, prompt_hash, original_class, action, created_at]
+      properties:
+        id: {type: integer, format: int64}
+        org_id: {type: string}
+        request_id: {type: string}
+        prompt_hash: {type: string, description: hashed prompt — never the raw text}
+        original_class: {type: string}
+        action: {type: string, enum: [thumbs_up, thumbs_down, regenerate]}
+        created_at: {type: string, format: date-time}
+    FeedbackPage:
+      type: object
+      required: [feedback, total, page, page_size]
+      properties:
+        feedback: {type: array, items: {$ref: "#/components/schemas/FeedbackEntry"}}
+        total: {type: integer, format: int64, description: 'full filtered count, not the page size'}
+        page: {type: integer}
+        page_size: {type: integer, description: the applied page size}
+    OrgRegionState:
+      type: object
+      required: [home_region, residency_pinned]
+      properties:
+        home_region: {type: string, description: '"sg" when no assignment row exists yet'}
+        residency_pinned: {type: boolean}
+    OrgRegionUpdate:
+      type: object
+      required: [home_region]
+      properties:
+        home_region: {type: string}
+        residency_pinned: {type: boolean, description: pin the residency (default false)}
+
+paths:
+  # ── Public ────────────────────────────────────────────────────────────
+  /health:
+    get:
+      summary: Admin process liveness probe
+      operationId: adminHealth
+      security: []
+      x-permission: public
+      responses: { "200": { description: OK } }
+  /auth/login:
+    get:
+      summary: Admin console login page
+      operationId: adminLoginPage
+      security: []
+      x-permission: public
+      responses: { "200": { description: HTML login form } }
+    post:
+      summary: Submit admin credentials and start a session
+      operationId: adminLogin
+      security: []
+      x-permission: public
+      responses:
+        "200": { description: Session cookie set }
+        "401": { description: Invalid credentials }
+        "429": { description: Login rate limit exceeded }
+  /auth/logout:
+    get:
+      summary: End the admin session (GET compatibility path)
+      operationId: adminLogoutGet
+      security: []
+      x-permission: public
+      responses: { "200": { description: Session cleared } }
+    post:
+      summary: End the admin session (CSRF-validated form action)
+      operationId: adminLogout
+      security: []
+      x-permission: public
+      responses: { "200": { description: Session cleared } }
+  /portal/login:
+    get:
+      summary: Developer portal OIDC login redirect
+      operationId: portalLogin
+      security: []
+      x-permission: public
+      responses: { "302": { description: Redirect to the OIDC provider } }
+  /portal/callback:
+    get:
+      summary: Developer portal OIDC callback
+      operationId: portalCallback
+      security: []
+      x-permission: public
+      responses: { "302": { description: Redirect to the portal } }
+  /portal:
+    get:
+      summary: Developer portal home page
+      operationId: portalHome
+      security: []
+      x-permission: public
+      responses: { "200": { description: HTML page } }
+  /portal/keys:
+    post:
+      summary: Developer portal key creation form action
+      operationId: portalCreateKeyPage
+      security: []
+      x-permission: public
+      responses: { "200": { description: Key issued } }
+  /portal/keys/{id}/revoke:
+    post:
+      summary: Developer portal key revoke form action
+      operationId: portalRevokeKeyPage
+      security: []
+      x-permission: public
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key revoked } }
+
+  # ── Portal session ────────────────────────────────────────────────────
+  /portal/logout:
+    post:
+      summary: End the portal session
+      operationId: portalLogout
+      x-permission: portal
+      responses: { "200": { description: Session cleared } }
+  /api/me:
+    get:
+      summary: Caller identity and org rights (portal session when enabled, admin session otherwise)
+      operationId: me
+      x-permission: portal
+      responses: { "200": { description: Identity payload } }
+  /api/me/keys:
+    get:
+      summary: List the developer's own API keys
+      operationId: portalListKeys
+      x-permission: portal
+      responses: { "200": { description: Key list } }
+    post:
+      summary: Issue a new API key for the developer
+      operationId: portalCreateKey
+      x-permission: portal
+      responses: { "201": { description: Key created } }
+  /api/me/keys/{id}:
+    delete:
+      summary: Revoke one of the developer's own keys
+      operationId: portalDeleteKey
+      x-permission: portal
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key revoked } }
+
+  # ── Admin session (dashboard) ─────────────────────────────────────────
+  /api/me/password:
+    post:
+      summary: Change the caller's own password (revokes all older sessions)
+      operationId: adminChangeMyPassword
+      x-permission: session
+      responses: { "200": { description: Password changed; a fresh session cookie is issued } }
+  /api/me/onboarding:
+    get:
+      summary: Read the org onboarding progress flag (?org_id=)
+      description: >-
+        W-WELCOME. Org-scoped: reader+ membership on the target org (root
+        bypasses, foreign org 403); the route middleware is RequireOrgRole,
+        inventoried under the session class.
+      operationId: adminMyOnboardingGet
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses: { "200": { description: "{org_id, completed, skipped}; a missing row is the zero state" } }
+    post:
+      summary: Mark org onboarding completed or skipped (?org_id=)
+      description: >-
+        W-WELCOME. Body {completed|skipped} — exactly one true; the flag only
+        advances. The org target rides the query string (the route middleware
+        resolves it before the body is read). Same org gate as the GET;
+        audit-logged.
+      operationId: adminMyOnboardingMark
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses: { "200": { description: Mark persisted (audit-logged) } }
+  /auth/csrf:
+    get:
+      summary: Mint a CSRF token for the console session
+      operationId: adminCSRF
+      x-permission: session
+      responses: { "200": { description: Token issued } }
+  /api/version:
+    get:
+      summary: Build facts handshake (version, commit, api_level)
+      operationId: adminVersion
+      x-permission: session
+      responses: { "200": { description: Build facts } }
+  /api/client-config/{agent}:
+    get:
+      summary: Render a coding agent's gateway config server-side over pkg/clientconfig (R069 D2 — the single source of truth; the config field is byte-identical to the renderer output and the env NAME only, never a key value; unknown agent 404; labels outside the canonical grammar drop with a reason)
+      operationId: getClientConfig
+      x-permission: session
+      parameters:
+        - { name: agent, in: path, required: true, schema: { type: string, enum: [claude-code, codex, opencode] } }
+        - { name: base_url, in: query, required: true, schema: { type: string, maxLength: 2048 }, description: The operator-entered gateway origin (absolute http(s) URL) }
+        - { name: key_env, in: query, schema: { type: string, default: YABANIN_API_KEY }, description: Env var the client reads the gateway key from }
+        - { name: model, in: query, schema: { type: string, maxLength: 256 }, description: Optional default model id }
+        - { name: labels, in: query, schema: { type: string }, description: Scope labels in the canonical k=v,k=v form (invalid entries drop and ride dropped_labels) }
+      responses:
+        "200": { description: "Render payload {agent, format, path, config, key_env, dropped_labels?}" }
+        "400": { description: Invalid base_url / key_env / model bound }
+        "404": { description: Unknown agent (no renderer) }
+  /:
+    get:
+      summary: Dashboard aggregate (stats, models, top orgs)
+      operationId: dashboard
+      x-permission: root
+      responses: { "200": { description: Aggregate payload } }
+  /api/entitlement/diagnostics:
+    get:
+      summary: Served license state (activation plane) for operator observability (E01-P05 W04-C02)
+      description: >-
+        Read-only root-only diagnostics: the 1:1 served license state —
+        configured (a license file is armed), active / expired (grace) /
+        hard_expired verdicts, org_id, features, seats (inert legacy
+        metadata, I22 — never an account limit) and the verbatim expiry
+        instant. Strictly observational: expiry never gates this endpoint —
+        a hard-expired deployment still answers 200 with its dark snapshot.
+        The handler plane never imports licensing;
+        services/run adapts the license server onto the snapshot
+        interface. Reads are audited.
+      operationId: getEntitlementDiagnostics
+      x-permission: root
+      responses:
+        "200":
+          description: "Snapshot payload {configured, active, org_id, seats, features, expired, hard_expired, expires_at}"
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller is not root }
+        "503": { description: Entitlement diagnostics not armed in this contour }
+
+  # ── Internal service API (X-Admin-Key) ───────────────────────────────
+  /internal/api-keys:
+    get:
+      summary: List one org's API keys (org_id mandatory)
+      operationId: internalListAPIKeys
+      x-permission: service
+      responses: { "200": { description: Key list } }
+  /internal/analytics/savings:
+    get:
+      summary: Org savings report for a bounded window
+      operationId: internalSavings
+      x-permission: service
+      responses: { "200": { description: Savings report } }
+  /internal/analytics/cost:
+    get:
+      summary: Org cost report for a bounded window
+      operationId: internalCost
+      x-permission: service
+      responses: { "200": { description: Cost report } }
+
+  # ── Org-scoped analytics (org:analytics.read) ─────────────────────────
+  /api/analytics/stats:
+    get:
+      summary: Request log stats for the scoped org
+      operationId: analyticsStats
+      x-permission: org:analytics.read
+      responses: { "200": { description: Stats } }
+  /api/analytics/top-models:
+    get:
+      summary: Top models by request count
+      operationId: analyticsTopModels
+      x-permission: org:analytics.read
+      responses: { "200": { description: Model counts } }
+  /api/analytics/time-series:
+    get:
+      summary: Request time series
+      operationId: analyticsTimeSeries
+      x-permission: org:analytics.read
+      responses: { "200": { description: Time series points } }
+  /api/analytics/error-breakdown:
+    get:
+      summary: Error breakdown by type
+      operationId: analyticsErrorBreakdown
+      x-permission: org:analytics.read
+      responses: { "200": { description: Error entries } }
+  /api/analytics/tasks:
+    get:
+      summary: CTOR/task cost analytics
+      operationId: analyticsTasks
+      x-permission: org:analytics.read
+      responses: { "200": { description: Task analytics report } }
+  /api/analytics/latency:
+    get:
+      summary: Latency percentiles
+      operationId: analyticsLatency
+      x-permission: org:analytics.read
+      responses: { "200": { description: Percentiles } }
+  /api/analytics/recent-errors:
+    get:
+      summary: Recent error log entries
+      operationId: analyticsRecentErrors
+      x-permission: org:analytics.read
+      responses: { "200": { description: Error entries } }
+  /api/analytics/query:
+    get:
+      summary: Unified analytics query (dimensions and filters)
+      operationId: analyticsQuery
+      x-permission: org:analytics.read
+      responses: { "200": { description: Query result } }
+  /api/analytics/views:
+    get:
+      summary: List saved analytics views
+      operationId: listAnalyticsViews
+      x-permission: org:analytics.read
+      responses: { "200": { description: Views } }
+    post:
+      summary: Save an analytics view
+      operationId: createAnalyticsView
+      x-permission: org:analytics.read
+      responses: { "201": { description: View created } }
+  /api/analytics/views/{id}:
+    put:
+      summary: Update a saved analytics view
+      operationId: updateAnalyticsView
+      x-permission: org:analytics.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: View updated } }
+    delete:
+      summary: Delete a saved analytics view
+      operationId: deleteAnalyticsView
+      x-permission: org:analytics.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: View deleted } }
+  /api/analytics/label-keys:
+    get:
+      summary: Label key statistics for the scoped org
+      operationId: analyticsLabelKeys
+      x-permission: org:analytics.read
+      responses: { "200": { description: Label key stats } }
+  /api/label-policy:
+    get:
+      summary: Read the org label policy
+      operationId: getLabelPolicy
+      x-permission: org:analytics.read
+      responses: { "200": { description: Policy } }
+    put:
+      summary: Replace the org label policy
+      operationId: putLabelPolicy
+      x-permission: org:policies.manage
+      responses: { "200": { description: Policy saved } }
+    delete:
+      summary: Remove the org label policy
+      operationId: deleteLabelPolicy
+      x-permission: org:policies.manage
+      responses: { "200": { description: Policy removed } }
+  /api/label-policy/test:
+    post:
+      summary: Dry-run a label policy against sample labels
+      operationId: testLabelPolicy
+      x-permission: org:analytics.read
+      responses: { "200": { description: Match results } }
+
+  # ── API keys (org:keys.manage) ────────────────────────────────────────
+  /api/api-keys:
+    get:
+      summary: List the org's API keys
+      operationId: listAPIKeys
+      x-permission: org:keys.manage
+      responses: { "200": { description: Key list } }
+    post:
+      summary: Create an API key
+      operationId: createAPIKey
+      x-permission: org:keys.manage
+      responses: { "201": { description: Key created } }
+  /api/api-keys/{id}:
+    get:
+      summary: Get an API key
+      operationId: getAPIKey
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key } }
+    put:
+      summary: Enable or disable an API key
+      operationId: updateAPIKeyActive
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key updated } }
+    delete:
+      summary: Delete an API key
+      operationId: deleteAPIKey
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key deleted } }
+  /api/api-keys/{id}/labels:
+    put:
+      summary: Update API key labels and label flags
+      operationId: updateAPIKeyLabels
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Labels updated } }
+  /api/api-keys/{id}/rotate:
+    post:
+      summary: Rotate an API key secret
+      operationId: rotateAPIKey
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: New secret issued } }
+
+  # ── Agent keys (org:agent_keys.manage) ────────────────────────────────
+  /api/agent-keys:
+    get:
+      summary: List the org's agent (yag_) keys
+      operationId: listAgentKeys
+      x-permission: org:agent_keys.manage
+      responses: { "200": { description: Key list } }
+    post:
+      summary: Create an agent key
+      operationId: createAgentKey
+      x-permission: org:agent_keys.manage
+      responses: { "201": { description: Key created } }
+  /api/agent-keys/delegate:
+    post:
+      summary: Create a delegated child agent key
+      operationId: createDelegatedAgentKey
+      x-permission: org:agent_keys.manage
+      responses: { "201": { description: Delegated key created } }
+  /api/agent-keys/{id}:
+    get:
+      summary: Get an agent key
+      operationId: getAgentKey
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key } }
+  /api/agent-keys/{id}/revoke:
+    post:
+      summary: Revoke an agent key and its children
+      operationId: revokeAgentKey
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Key revoked } }
+  /api/agent-keys/{id}/budget:
+    get:
+      summary: Get an agent's daily budget
+      operationId: getAgentBudget
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget } }
+    put:
+      summary: Set an agent's daily budget
+      operationId: upsertAgentBudget
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget saved } }
+    delete:
+      summary: Remove an agent's daily budget
+      operationId: deleteAgentBudget
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget removed } }
+
+  # ── Principal delegation chain (org:agent_keys.manage) ────────────────
+  # an agent key authenticates but grants nothing. These routes
+  # issue/list/revoke the bounded read-only permission subset a human
+  # principal delegates to an agent/CI subject. Provenance (grantor →
+  # subject + permission subset) is the delegation record itself;
+  # requests.read_originals is never delegatable.
+  /api/agent-keys/{id}/delegations:
+    post:
+      summary: Delegate a bounded permission subset to this agent/CI subject
+      description: >-
+        Issues one delegation (org, delegatable read-only permission subset,
+        mandatory TTL ≤ 30 days) from the authenticated human principal.
+        Every requested permission must be delegatable AND currently held by
+        the grantor on the org. Foreign or missing key ids are the same 404.
+      operationId: issuePrincipalDelegation
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Delegation issued }
+        "400": { description: Invalid scope, TTL, or subject type }
+        "403": { description: Grantor does not hold the requested permissions }
+        "404": { description: Agent key not found in this org }
+        "409": { description: Agent key is revoked }
+    get:
+      summary: List the delegation provenance for this agent/CI subject
+      operationId: listPrincipalDelegations
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses: { "200": { description: Delegation list (metadata only) } }
+  /api/agent-keys/{id}/delegations/{delegationID}/revoke:
+    post:
+      summary: Revoke one delegation; denial cascades at the next evaluation
+      description: >-
+        Stamps revoked_at on a live delegation. Only the original grantor or
+        the platform root may revoke; unknown or already-revoked ids are 404.
+      operationId: revokePrincipalDelegation
+      x-permission: org:agent_keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: delegationID, in: path, required: true, schema: { type: string } }
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Delegation revoked }
+        "403": { description: Caller is neither the grantor nor root }
+        "404": { description: Delegation not found }
+
+  # ── Team budgets (org:budgets.manage) ─────────────────────────────────
+  /api/teams/{id}/budget:
+    get:
+      summary: Get a team's monthly budget
+      operationId: getTeamBudget
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget } }
+    put:
+      summary: Set a team's monthly budget
+      operationId: upsertTeamBudget
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget saved } }
+    delete:
+      summary: Remove a team's monthly budget
+      operationId: deleteTeamBudget
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget removed } }
+  /api/organizations/{id}/team-budgets:
+    get:
+      summary: List a team budget summary for the org
+      operationId: listOrgTeamBudgets
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Budget summaries } }
+
+  /api/organizations/{id}/original-retention:
+    get:
+      summary: Read an organization's original-content retention setting
+      description: >-
+        Reads the nullable organization override and effective policy. An absent
+        override inherits the platform default (off); therefore only processed
+        content is retained unless explicitly enabled. Reading retained originals
+        is a separate capability (`requests.read_originals`) and is not implied
+        by this settings endpoint, root status, or org administration.
+        Retention governs the 90-day hot window; afterwards records transfer
+        to S3/Iceberg (PostgreSQL-only mode retains in the DB and nothing is
+        deleted by age); archive retention is administrator-defined.
+      operationId: getOrgOriginalRetention
+      x-permission: org:org.update
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Explicit override and effective retention setting. `enabled` is null when inherited; `effective_enabled` is always resolved.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [org_id, enabled, effective_enabled, inherited]
+                properties:
+                  org_id: { type: string }
+                  enabled: { type: boolean, nullable: true, description: Null inherits the platform default }
+                  effective_enabled: { type: boolean, description: Whether original content is retained }
+                  inherited: { type: boolean }
+        "400": { description: Invalid organization scope }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller lacks org.update in this organization }
+        "404": { description: Organization not found }
+        "500": { description: Retention setting lookup failed }
+        "503": { description: Retention settings unavailable }
+    patch:
+      summary: Set or inherit an organization's original-content retention setting
+      description: >-
+        Requires `org.update`. Set `enabled` to true to opt in, false to opt out,
+        or null to inherit the platform default (off). Updates are audited. This
+        changes retention only; it never grants permission to read original
+        content. The separate `requests.read_originals` capability is not assigned
+        to built-in roles. Retention governs the 90-day hot window; afterwards
+        records transfer to S3/Iceberg (PostgreSQL-only mode retains in the DB
+        and nothing is deleted by age); archive retention is administrator-defined.
+        90 days is a tier boundary, never an age-based deletion deadline.
+      operationId: updateOrgOriginalRetention
+      x-permission: org:org.update
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [enabled]
+              properties:
+                enabled: { type: boolean, nullable: true, description: Null inherits the platform default }
+      responses:
+        "200":
+          description: Retention setting updated and audit event recorded
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [status]
+                properties:
+                  status: { type: string, const: ok }
+              example: { status: ok }
+        "400": { description: Invalid JSON, missing enabled, or enabled is not boolean/null }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller lacks org.update in this organization }
+        "404": { description: Organization not found }
+        "500": { description: Retention setting update failed }
+        "503": { description: Retention settings unavailable }
+
+  # ── Security inbox (org:security.read) ──────────────────────────────────
+  /api/organizations/{id}/security-inbox:
+    get:
+      summary: List the organization's security incidents, newest first
+      description: >-
+        E06-P01 unified security inbox. Incidents are folded findings: the
+        projection groups security events per organization and keeps the
+        newest summary, severity, confidence, the occurred_at range and the
+        event count. Reads are audited. Operator status changes and
+        assignment arrive via PATCH on the incident resource
+        (org:security.manage).
+      operationId: listOrgSecurityInbox
+      x-permission: org:security.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: Incidents, newest first; an organization without findings has an empty array
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/SecurityIncident" }
+        "400": { description: Organization id is not a valid UUID }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller lacks security.read in this organization }
+        "500": { description: Inbox read failed }
+        "503": { description: Security inbox is unavailable }
+
+  /api/organizations/{id}/security-inbox/{incident_id}:
+    get:
+      summary: Read one security incident of the organization
+      description: >-
+        Detail view of one folded incident. Unknown and foreign-organization
+        incident ids are indistinguishable (404). Reads are audited.
+      operationId: getOrgSecurityIncident
+      x-permission: org:security.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: incident_id, in: path, required: true, schema: { type: string, format: uuid } }
+      responses:
+        "200":
+          description: The incident
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/SecurityIncident" }
+        "400": { description: Organization or incident id is not a valid UUID }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller lacks security.read in this organization }
+        "404": { description: Incident not found in this organization }
+        "500": { description: Inbox read failed }
+        "503": { description: Security inbox is unavailable }
+    patch:
+      summary: Change an incident's operator status and/or assignee
+      description: >-
+        E06-P01 W04-C02 operator write. The status state machine is
+        new → acknowledged → in_progress → resolved | dismissed, with
+        resolved/dismissed → acknowledged as reopen; a same-state patch is
+        a legal no-op (200, nothing duplicated, nothing bumped). Absent
+        fields are untouched; assignee null clears the assignment.
+        Unknown and foreign-organization incident ids are
+        indistinguishable (404). Every request is journaled (audit action
+        security_inbox.patch: patched | noop | conflict | not_found);
+        middleware denials are unjournaled like every org-permission
+        route. Last-write-wins in v1: no If-Match/ETag optimistic
+        concurrency (transition legality is still enforced server-side).
+      operationId: patchOrgSecurityIncident
+      x-permission: org:security.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string, format: uuid } }
+        - { name: incident_id, in: path, required: true, schema: { type: string, format: uuid } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              minProperties: 1
+              properties:
+                status:
+                  type: string
+                  enum: [new, acknowledged, in_progress, resolved, dismissed]
+                assignee:
+                  type: string
+                  format: uuid
+                  nullable: true
+            example: { status: acknowledged }
+      responses:
+        "200":
+          description: The incident after the patch (also for a same-state no-op)
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/SecurityIncident" }
+        "400": { description: Malformed body, empty patch, unknown status word, or a non-uuid assignee }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller lacks security.manage in this organization (org_admin only) }
+        "404": { description: Incident not found in this organization }
+        "409": { description: The requested status transition is not legal }
+        "500": { description: Inbox patch failed }
+        "503": { description: Security inbox is unavailable }
+
+  # ── Fleet registry (root-only, read-only) ─────────────────────────────
+  /api/organizations/{org_id}/fleet/installations:
+    get:
+      summary: List the org's managed installations (E03-P01 W04-C03)
+      description: >-
+        Read-only fleet-registry view. org_id is the LICENSE org
+        coordinate (TEXT, the one enrollments and heartbeats are signed
+        for), carried verbatim — not an adminstore uuid. Deterministic
+        deployment_id order; a revoked installation is explicitly marked
+        (state=revoked AND revoked=true with revoked_at and reason).
+        Mutations do not exist on this plane: enrollment, heartbeats and
+        revocation flow through their own signed seams. Reads are audited.
+      operationId: listOrgFleetInstallations
+      x-permission: root
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string }, description: License org coordinate }
+      responses:
+        "200":
+          description: Installations in deterministic deployment_id order; an org without installations has an empty array
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data:
+                    type: array
+                    items: { $ref: "#/components/schemas/FleetInstallation" }
+        "400": { description: Org coordinate fails the registry's structural law }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller is not root }
+        "500": { description: Registry read failed }
+        "503": { description: Fleet registry is unavailable }
+
+  /api/organizations/{org_id}/fleet/installations/{deployment_id}:
+    get:
+      summary: Read one managed installation of the org
+      description: >-
+        Detail view of one deployment contour. Unknown and
+        foreign-organization deployments are indistinguishable (404).
+        Reads are audited.
+      operationId: getOrgFleetInstallation
+      x-permission: root
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string }, description: License org coordinate }
+        - { name: deployment_id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: The installation
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [data]
+                properties:
+                  data: { $ref: "#/components/schemas/FleetInstallation" }
+        "400": { description: Org or deployment coordinate fails the registry's structural law }
+        "401": { description: Admin session is missing or invalid }
+        "403": { description: Caller is not root }
+        "404": { description: Installation not found in this organization }
+        "500": { description: Registry read failed }
+        "503": { description: Fleet registry is unavailable }
+
+  # ── Members & developers (org:members.manage) ─────────────────────────
+  /api/organizations/{id}/members:
+    get:
+      summary: List org members with roles
+      operationId: listOrgMembers
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Members } }
+    post:
+      summary: Add an org member
+      operationId: createOrgMember
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Member added } }
+  /api/organizations/{id}/members/{userID}:
+    put:
+      summary: Update an org member's role
+      operationId: updateOrgMember
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: userID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Member updated } }
+    delete:
+      summary: Remove an org member
+      operationId: deleteOrgMember
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: userID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Member removed } }
+  # ── Member invitations (W-INV, org:members.manage; public acceptance page below)
+  /api/organizations/{id}/members/invites:
+    get:
+      summary: List pending member invitations
+      operationId: listMemberInvites
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Pending invitations } }
+  /api/organizations/{id}/members/invite:
+    post:
+      summary: Invite a member by email (returns the one-time link)
+      operationId: createMemberInvite
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Invitation created with the one-time invite path }
+        "409": { description: Duplicate active invite or already a member }
+  /api/organizations/{id}/members/invites/{inviteID}/resend:
+    post:
+      summary: Rotate an invitation's token and restart its 72h window
+      operationId: resendMemberInvite
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: inviteID, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Fresh one-time invite path }
+        "410": { description: Invite already accepted }
+  /api/organizations/{id}/members/invites/{inviteID}/revoke:
+    post:
+      summary: Revoke a pending invitation
+      operationId: revokeMemberInvite
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: inviteID, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Invitation revoked }
+        "410": { description: Invite already accepted }
+
+  /api/organizations/{id}/scim/tokens:
+    get:
+      summary: List the org's SCIM bearer tokens (metadata only, never the secret)
+      operationId: listScimTokens
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Token records (metadata only) } }
+    post:
+      summary: Issue a SCIM bearer token (the raw token is returned exactly once)
+      operationId: createScimToken
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Token created; body carries the raw scim_ token once }
+  /api/organizations/{id}/scim/tokens/{tokenID}:
+    delete:
+      summary: Revoke a SCIM bearer token (immediate 401 on /scim/v2)
+      operationId: revokeScimToken
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: tokenID, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Token revoked }
+        "404": { description: Unknown token (or another org's token) }
+
+  /scim/v2/ServiceProviderConfig:
+    get:
+      summary: SCIM service-provider discovery document
+      operationId: scimServiceProviderConfig
+      x-permission: scim
+      responses: { "200": { description: ServiceProviderConfig resource } }
+  /scim/v2/Schemas:
+    get:
+      summary: SCIM schema discovery (supported User/Group subset; userName immutable, password writeOnly+ignored)
+      operationId: scimSchemas
+      x-permission: scim
+      responses: { "200": { description: ListResponse of Schema resources } }
+  /scim/v2/ResourceTypes:
+    get:
+      summary: SCIM resource-type discovery (User and Group, no extensions)
+      operationId: scimResourceTypes
+      x-permission: scim
+      responses: { "200": { description: ListResponse of ResourceType resources } }
+  /scim/v2/Users:
+    get:
+      summary: List SCIM users of the token's org (filter userName eq supported; startIndex/count pagination)
+      operationId: scimListUsers
+      x-permission: scim
+      responses: { "200": { description: ListResponse of User resources } }
+    post:
+      summary: Provision a SCIM user (idempotent — existing userName/externalId returns the existing resource)
+      operationId: scimCreateUser
+      x-permission: scim
+      responses:
+        "201": { description: User created (membership with the default role) }
+        "200": { description: User already exists (no duplicate) }
+  /scim/v2/Users/{id}:
+    get:
+      summary: Fetch one SCIM user
+      operationId: scimGetUser
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: User resource }
+        "404": { description: Unknown id (or another org's user) }
+    put:
+      summary: Sync a SCIM user's profile (userName immutable)
+      operationId: scimPutUser
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: User synced }
+        "400": { description: userName mutation refused }
+    patch:
+      summary: Attribute-level sync (active, name fields; Okta/Entra profiles)
+      operationId: scimPatchUser
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: User synced }
+        "400": { description: Unsupported operation (e.g. userName mutation) }
+    delete:
+      summary: Deactivate a SCIM user (the account is never hard-deleted)
+      operationId: scimDeleteUser
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: User deactivated }
+        "404": { description: Unknown id (or another org's user) }
+  /scim/v2/Groups:
+    get:
+      summary: List role groups of the token's org with their SCIM members (startIndex/count pagination; deactivated members never listed)
+      operationId: scimListGroups
+      x-permission: scim
+      responses: { "200": { description: ListResponse of Group resources } }
+    post:
+      summary: Resolve a group displayName to a role group (idempotent 201)
+      operationId: scimCreateGroup
+      x-permission: scim
+      responses:
+        "201": { description: Role group resource }
+        "400": { description: displayName does not map to an org role }
+  /scim/v2/Groups/{id}:
+    get:
+      summary: Fetch one role group with its members
+      operationId: scimGetGroup
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Group resource }
+        "404": { description: Unknown role group }
+    patch:
+      summary: Add/remove members (memberships in the token org with the group's role)
+      operationId: scimPatchGroup
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Group resource after the change }
+        "404": { description: Member is not a user of this organization }
+    delete:
+      summary: Strip the role from all members in the org (the role group itself persists)
+      operationId: scimDeleteGroup
+      x-permission: scim
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "204": { description: Memberships removed }
+        "404": { description: Unknown role group }
+  /invite/{token}:
+    get:
+      summary: Public member-invitation acceptance page
+      operationId: memberInvitePage
+      security: []
+      x-permission: public
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: HTML acceptance form }
+        "404": { description: Unknown or revoked invitation token }
+        "410": { description: Expired or already accepted invitation }
+    post:
+      summary: Accept a member invitation (form post)
+      operationId: memberInviteAccept
+      security: []
+      x-permission: public
+      parameters:
+        - { name: token, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Invitation accepted }
+        "401": { description: Invalid credentials for an existing account }
+        "404": { description: Unknown or revoked invitation token }
+        "410": { description: Expired or already accepted invitation }
+  /api/organizations/{id}/developers:
+    get:
+      summary: List portal developers of the org
+      operationId: listDevelopers
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Developers } }
+    post:
+      summary: Invite a portal developer
+      operationId: createDeveloper
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Developer created } }
+  /api/organizations/{id}/developers/{userID}:
+    put:
+      summary: Update a portal developer
+      operationId: updateDeveloper
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: userID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Developer updated } }
+    delete:
+      summary: Deactivate a portal developer
+      operationId: deleteDeveloper
+      x-permission: org:members.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: userID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Developer deactivated } }
+
+  # ── Request explorer (org:requests.read) ──────────────────────────────
+  /api/organizations/{id}/requests:
+    get:
+      summary: Unified request explorer list
+      operationId: listOrgRequests
+      x-permission: org:requests.read
+      description: >
+        Paginated envelope {data, pagination:{page, page_size, total,
+        total_pages}}; newest first. This endpoint and the /stats endpoint
+        share one query-filter parser, so they always accept the same filter
+        surface. `rule_id` narrows to requests whose stored routing decision
+        names that routing rule (the `rule` identity triple inside the
+        row's `routing_decision` field — see docs/api/CONTRACT.md §10 for
+        the reserved envelope vocabulary). The dashboard deep-links here via
+        `#requests-explorer?org=…&inspect=request:<id>` (hash params, again
+        §10).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rule_id, in: query, description: Routing-rule identity filter (routing_rules.id); STRICT uuid — a malformed value is a 400 naming the field, never a silently ignored filter, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Request rows }
+        "400": { description: Malformed rule_id (not a uuid) or invalid time filter }
+  /api/organizations/{id}/requests/stats:
+    get:
+      summary: Request list statistics for the org
+      operationId: orgRequestStats
+      x-permission: org:requests.read
+      description: >
+        Aggregates over the SAME filters as the list endpoint (shared parser,
+        including rule_id), so the stats block always describes exactly what
+        the table shows.
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rule_id, in: query, description: Routing-rule identity filter; strict uuid — malformed values are a 400, schema: { type: string, format: uuid } }
+      responses:
+        "200": { description: Stats }
+        "400": { description: Malformed rule_id (not a uuid) or invalid time filter }
+  /api/organizations/{id}/requests/export:
+    get:
+      summary: Stream request history as JSON Lines
+      operationId: exportOrgRequests
+      description: >
+        Exports filtered request history from the hot request_logs store. Payload fields require the same owner/grant/role matrix as request detail; original payload scope additionally requires effective original retention.
+        Grant refusal/replay contract : every denial that happens before the 200 stream starts (400/403/413/500/503) leaves a redeemed one-time payload grant unconsumed and returns no payload bytes — with one rare audited edge (C1) where a 403 answers after the consume already committed; see the 403 response. The atomic consume is the last step before the 200 commit and the grant is never restored. Once the 200 stream has begun, the attempt is final: any stream failure (X-Export-Error trailer) leaves the grant consumed even if only a partial prefix was delivered — partial data is never re-served and no automatic refund exists. The grant is single-use across BOTH redemption surfaces (this export and the request detail endpoint): replaying a consumed grant on either surface returns the same generic 403 as an unknown grant (no consume/no-consume oracle) — the detail endpoint follows this identical refusal/replay contract .
+      x-permission: org:requests.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: query, in: query, description: YQL request filter, schema: { type: string } }
+        - { name: request_id, in: query, description: Required when redeeming a request-bound payload grant, schema: { type: string } }
+        - { name: payload_grant, in: query, description: Single-use bearer grant; alternatively send X-Request-Payload-Grant, schema: { type: string } }
+        - { name: scope, in: query, description: Grant scope; originals require effective retention, schema: { type: string, enum: [payload.read, payload.read_originals] } }
+      responses:
+        "200":
+          description: >
+            JSONL stream. Once this response has been committed the attempt is final for a redeemed grant: a stream that ends abnormally delivers the partial JSONL prefix plus the X-Export-Error trailer and the grant stays consumed (no refund, no re-serve). Every decision, allowed or denied, is journalled.
+          headers:
+            X-Export-Error:
+              description: >
+                Trailer (announced via the Trailer header) present only when the
+                stream ends abnormally after the 200 was committed. One of:
+                row_limit (the store walk exceeded the 1000-row cap mid-stream),
+                byte_limit (emitted bytes exceeded the 10 MiB cap),
+                write_error (the client transport failed; usually undeliverable),
+                store_error (the store walk failed mid-stream).
+              schema: { type: string, enum: [row_limit, byte_limit, write_error, store_error] }
+        "400": { description: Invalid filter, missing request_id for a payload grant, or invalid grant scope; a payload grant is not consumed }
+        "403":
+          description: >
+            Fail-closed denial, one of: request history access denied (content
+            policy), the payload grant cannot be used (non-root caller or
+            deny-own-history policy), original payload retention is disabled
+            (payload.read_originals), or the payload grant is invalid,
+            expired, revoked, wrong-scope, bound to a different request or
+            organization, already consumed, or the grant store is unavailable.
+            Invalid and consumed grants are deliberately indistinguishable
+            (same generic body, no oracle). No denial here consumes the grant
+            and none returns payload bytes, with one rare audited edge (C1):
+            the atomic consume commits first and the mandatory
+            request_payload.grant_used audit insert runs afterwards — if that
+            insert fails, the store reports an error and this same generic
+            403 answers while the grant is already spent. Replay stays safe:
+            the spent token keeps answering this same generic 403 (no oracle,
+            no payload bytes), so redemption can only be retried with a fresh
+            grant. Every denial is journalled.
+        "413":
+          description: >
+            Pre-stream row-cap rejection: the pre-flight count exceeds 1000
+            rows. No JSONL response has begun and a payload grant is NOT
+            consumed. The mid-stream byte cap is never a 413 — it ends the
+            committed 200 stream with the X-Export-Error: byte_limit trailer.
+        "500":
+          description: >
+            Request store failure before the stream starts (the pre-flight
+            count). Answered as 500 with a JSON error body; no JSONL response
+            has begun, no trailer is involved, and a payload grant is NOT
+            consumed — the redemption may be retried once the store recovers.
+        "503": { description: Request store, export stream, or retention setting unavailable; a payload grant is not consumed }
+  /api/organizations/{id}/requests/archive-search:
+    get:
+      summary: Search request history through the unified payload matrix
+      operationId: searchOrgRequestArchive
+      description: Archive is not materialized yet. This endpoint currently searches hot request_logs; the future archive zone is planned with N10.
+      x-permission: org:requests.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: q, in: query, schema: { type: string } }
+        - { name: query, in: query, description: YQL request filter, schema: { type: string } }
+      responses:
+        "200": { description: Matching rows with source=hot }
+        "400": { description: Invalid filter or YQL expression }
+        "403": { description: Request history access denied (content policy) }
+        "500": { description: Archive search store error }
+        "503": { description: Archive search is unavailable }
+  /api/organizations/{id}/requests/{request_id}:
+    get:
+      summary: Full request detail with stored response snapshot
+      operationId: orgRequestDetail
+      description: >
+        Returns one request row with its stored response snapshot. Payload
+        fields require the same owner/grant/role matrix as the export;
+        original payload scope additionally requires effective original
+        retention. A request without a payload grant token is the everyday
+        metadata-only read and never consumes anything.
+        Grant refusal/replay contract (
+        identical to the export endpoint): every non-disclosing precheck runs
+        before the one-time consume — grant scope validation (400), grant
+        usability (a bearer grant is a root self-grant: a non-root caller,
+        deny-own-history policy, or missing grant capability is a loud 403,
+        never a silent degrade to a metadata read), the original-retention
+        gate for payload.read_originals (403/503), and the row read that
+        decides 404/500 (a discarded pre-consume read). Each of these denials
+        leaves the grant unconsumed and returns no payload bytes. The atomic
+        consume is the last step before the 200 commit and the grant is never
+        restored; every failed consume (invalid, expired, revoked,
+        wrong-scope, bound to a different request or organization, already
+        consumed, or grant store unavailable) answers the same generic 403
+        with zero payload bytes — the pre-consume read is discarded, so
+        invalid and replayed grants are deliberately indistinguishable (no
+        consume/no-consume oracle). Once the 200 has begun the attempt is
+        final: this is a single JSON document with no trailer, so a failure
+        after the consume can only truncate the body — the token stays
+        consumed, nothing is re-served, and no automatic refund exists. The
+        grant is single-use across BOTH redemption surfaces (this detail
+        endpoint and the request export stream): whichever redeems first
+        burns it for both, and a replay gets the same generic 403 as an
+        unknown grant. Every grant-relevant decision, allowed or denied, is
+        journalled (identifiers and content flags only — never the token and
+        never payload content).
+      x-permission: org:requests.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+        - { name: payload_grant, in: query, description: Single-use request-bound bearer grant; alternatively send X-Request-Payload-Grant, schema: { type: string } }
+        - { name: scope, in: query, description: Grant scope; payload.read_originals requires effective original retention, schema: { type: string, enum: [payload.read, payload.read_originals] } }
+      responses:
+        "200":
+          description: >
+            Request detail. For a redeemed grant the 200 commit is final: an
+            encode/write failure after the consume can only truncate the body
+            and the grant stays consumed (no refund, no re-serve).
+        "400": { description: Invalid grant scope; a payload grant is not consumed }
+        "403":
+          description: >
+            Fail-closed denial, one of: the payload grant cannot be used
+            (non-root caller, deny-own-history policy, or no grant
+            capability), original payload retention is disabled
+            (payload.read_originals), or the payload grant is invalid,
+            expired, revoked, wrong-scope, bound to a different request or
+            organization, already consumed, or the grant store is unavailable.
+            Invalid and consumed grants are deliberately indistinguishable
+            (same generic body, no oracle), and a failed consume never falls
+            back to a metadata-only read. No denial here consumes the grant
+            and none returns payload bytes. Every denial is journalled.
+        "404":
+          description: >
+            The row is missing or not visible to the caller (cross-org
+            requests are indistinguishable — no existence oracle). Decided by
+            a pre-consume read: a payload grant is NOT consumed and may be
+            redeemed once a visible target exists.
+        "500":
+          description: >
+            Request store failure on the pre-consume row read. A payload
+            grant is NOT consumed — the redemption may be retried once the
+            store recovers.
+        "503": { description: Original retention setting unavailable (payload.read_originals); a payload grant is not consumed }
+  /api/root/payload-grants:
+    post:
+      summary: Issue an audited, one-use request payload grant
+      operationId: createRootRequestPayloadGrant
+      x-permission: root
+      description: >
+        Issues a single-use bearer grant bound to one (org, request, scope).
+        The grant is redeemable on exactly ONE surface overall — the request
+        export stream or the request detail endpoint; whichever redeems first
+        burns it for both. Redemption is fail-closed: any denial before the
+        response starts (400/403/413/500/503, including store errors and the
+        export row cap) leaves the grant unconsumed and journalled; a grant is
+        consumed only by the atomic consume immediately before a 200 response
+        is committed, and a consumed grant is never restored or refunded.
+        One rare audited edge (C1): the atomic consume commits before the
+        mandatory request_payload.grant_used audit insert, so a redeeming
+        call can answer a generic 403 with the grant already spent; replay
+        stays safe — the spent grant keeps answering the same generic 403 on
+        both surfaces and never discloses payload bytes.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [org_id, request_id, ttl_seconds]
+              properties:
+                org_id: { type: string }
+                request_id: { type: string }
+                ttl_seconds: { type: integer, minimum: 1, maximum: 900 }
+                scope: { type: string, enum: [payload.read, payload.read_originals], default: payload.read }
+      responses:
+        "201": { description: Single-use bearer grant issued after durable audit }
+        "400": { description: Invalid grant request }
+        "403": { description: Root access required }
+        "503": { description: Grant store or durable audit unavailable }
+
+  # ── Lineage (org:lineage.read / org:lineage.verify) ───────────────────
+  /api/lineage/{request_id}:
+    get:
+      summary: Get lineage attestation by request ID
+      operationId: getLineage
+      x-permission: org:lineage.read
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Lineage record } }
+  /api/lineage/{request_id}/verify:
+    post:
+      summary: Verify a lineage attestation signature
+      operationId: verifyLineage
+      x-permission: org:lineage.verify
+      parameters:
+        - { name: request_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Verification result } }
+  /api/organizations/{id}/lineage:
+    get:
+      summary: List lineage records for the org
+      operationId: listOrgLineage
+      x-permission: org:lineage.read
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Lineage records } }
+
+  # ── Global audit & cross-org aggregates ─────────────────────────────
+  /api/audit-logs:
+    get:
+      summary: Cross-org audit log (aggregate view; root or global security auditor)
+      operationId: listAuditLogs
+      x-permission: global:security_auditor
+      responses: { "200": { description: Audit entries } }
+
+  # ── Root-only: classifier feedback review (W-FEED; DB-gated group, locked
+  #    to the fully-wired golden walk; the CSV export stays golden-tracked) ─
+  /api/feedback:
+    get:
+      summary: Page through classifier feedback entries (newest first) with optional org and rating filters
+      operationId: listFeedback
+      x-permission: root
+      parameters:
+        - { name: org_id, in: query, required: false, schema: { type: string } }
+        - { name: rating, in: query, required: false, schema: { type: string, enum: [thumbs_up, thumbs_down, regenerate] }, description: an unknown value is a 400 }
+        - { name: page, in: query, required: false, schema: { type: integer, default: 1, minimum: 1 }, description: values below 1 are a 400 (no silent clamp) }
+        - { name: page_size, in: query, required: false, schema: { type: integer, default: 50, minimum: 1, maximum: 200 }, description: values below 1 are a 400; values above 200 are clamped by the lister }
+      responses:
+        "200":
+          description: One feedback page plus the full filtered total
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/FeedbackPage" }
+        "400": { description: Unparseable page/page_size or an unknown rating value }
+        "403": { description: Not root }
+        "503": { description: Feedback lister not wired }
+  /api/analytics/top-orgs:
+    get:
+      summary: Top orgs by request count (cross-org)
+      operationId: analyticsTopOrgs
+      x-permission: root
+      responses: { "200": { description: Org counts } }
+
+  # ── Root-only: organizations & teams CRUD ─────────────────────────────
+  /api/organizations:
+    get:
+      summary: List organizations
+      operationId: listOrganizations
+      x-permission: root
+      responses: { "200": { description: Organizations } }
+    post:
+      summary: Create an organization
+      operationId: createOrganization
+      x-permission: root
+      responses: { "201": { description: Organization created } }
+  /api/organizations/{id}:
+    get:
+      summary: Get an organization
+      operationId: getOrganization
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Organization } }
+    put:
+      summary: Update an organization
+      operationId: updateOrganization
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Organization updated } }
+    delete:
+      summary: Delete an organization
+      operationId: deleteOrganization
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Organization deleted } }
+  /api/teams:
+    get:
+      summary: List teams
+      operationId: listTeams
+      x-permission: root
+      responses: { "200": { description: Teams } }
+    post:
+      summary: Create a team
+      operationId: createTeam
+      x-permission: root
+      responses: { "201": { description: Team created } }
+  /api/teams/{id}:
+    get:
+      summary: Get a team
+      operationId: getTeam
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Team } }
+    put:
+      summary: Update a team
+      operationId: updateTeam
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Team updated } }
+    delete:
+      summary: Delete a team
+      operationId: deleteTeam
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Team deleted } }
+
+  # ── Root-only: MCP servers & grants ───────────────────────────────────
+  /api/organizations/{id}/mcp/servers:
+    get:
+      summary: List registered external MCP servers
+      operationId: listMCPServers
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Servers }, "503": { description: Registry not configured } }
+    post:
+      summary: Register an external MCP server
+      operationId: createMCPServer
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Server registered }, "503": { description: Registry not configured } }
+  /api/organizations/{id}/mcp/servers/{name}:
+    get:
+      summary: Get a registered MCP server
+      operationId: getMCPServer
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Server } }
+    patch:
+      summary: Update a registered MCP server
+      operationId: updateMCPServer
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Server updated } }
+    delete:
+      summary: Remove a registered MCP server
+      operationId: deleteMCPServer
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Server removed } }
+  /api/organizations/{id}/mcp/servers/{name}/grants:
+    get:
+      summary: List per-agent grants for an MCP server
+      operationId: listMCPGrants
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Grants } }
+    post:
+      summary: Grant an agent access to an MCP server
+      operationId: createMCPGrant
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Grant created } }
+  /api/organizations/{id}/mcp/servers/{name}/grants/{agent_id}:
+    patch:
+      summary: Update an MCP agent grant
+      operationId: updateMCPGrant
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: agent_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Grant updated } }
+    delete:
+      summary: Revoke an MCP agent grant
+      operationId: deleteMCPGrant
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+        - { name: agent_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Grant revoked } }
+  /api/organizations/{id}/mcp/servers/{name}/credential:
+    put:
+      summary: Create or rotate the server-level MCP credential (secret encrypted at rest; response carries the mask only)
+      operationId: putMCPServerCredential
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Masked credential } }
+    get:
+      summary: 'Get the server-level MCP credential (masked last4/has_secret only)'
+      operationId: getMCPServerCredential
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Masked credential } }
+    delete:
+      summary: Delete the server-level MCP credential
+      operationId: deleteMCPServerCredential
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Credential deleted } }
+
+  # ── Root-only: tool policies ──────────────────────────────────────────
+  /api/tool-policies:
+    post:
+      summary: 'Create a tool policy, targeting the org via the body org_id field (root operator path). Same handler as POST /api/organizations/{id}/tool-policies — mounted so the dashboard create capability is reproducible via the documented API; identical guard chain, no permission bypass. Duplicate (org, name) answers 409: retry with a different name is safe, a blind retry is not'
+      operationId: createToolPolicyDirect
+      x-permission: root
+      responses: { "201": { description: Policy created } }
+  /api/organizations/{id}/tool-policies:
+    get:
+      summary: List org tool-call policies
+      operationId: listToolPolicies
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Policies } }
+    post:
+      summary: Create an org tool-call policy
+      operationId: createToolPolicy
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Policy created } }
+  /api/organizations/{id}/tool-policies/presets:
+    get:
+      summary: List tool policy presets
+      operationId: listToolPolicyPresets
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Presets } }
+  /api/organizations/{id}/tool-policies/presets/{preset}:
+    post:
+      summary: Apply a tool policy preset to the org
+      operationId: applyToolPolicyPreset
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: preset, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Preset applied } }
+  /api/organizations/{id}/tool-policies/{name}:
+    get:
+      summary: Get an org tool-call policy
+      operationId: getToolPolicy
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Policy } }
+    patch:
+      summary: Update an org tool-call policy
+      operationId: updateToolPolicy
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Policy updated } }
+    delete:
+      summary: Delete an org tool-call policy
+      operationId: deleteToolPolicy
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Policy deleted } }
+
+  # ── Root-only: A2A agents ─────────────────────────────────────────────
+  /api/organizations/{id}/a2a/agents:
+    get:
+      summary: List registered external A2A agents
+      operationId: listA2AAgents
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Agents } }
+    post:
+      summary: Register an external A2A agent
+      operationId: createA2AAgent
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Agent registered } }
+  /api/organizations/{id}/a2a/agents/{name}:
+    get:
+      summary: Get a registered A2A agent
+      operationId: getA2AAgent
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Agent } }
+    patch:
+      summary: Update a registered A2A agent
+      operationId: updateA2AAgent
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Agent updated } }
+    delete:
+      summary: Remove a registered A2A agent
+      operationId: deleteA2AAgent
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Agent removed } }
+
+  # ── Root-only: agent profiles ─────────────────────────────────────────
+  /api/agent-profiles:
+    get:
+      summary: List agent role profiles
+      operationId: listAgentProfiles
+      x-permission: root
+      responses: { "200": { description: Profiles } }
+    post:
+      summary: Create an agent role profile
+      operationId: createAgentProfile
+      x-permission: root
+      responses: { "201": { description: Profile created } }
+  /api/agent-profiles/{id}:
+    get:
+      summary: Get an agent role profile
+      operationId: getAgentProfile
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Profile } }
+    put:
+      summary: Update an agent role profile
+      operationId: updateAgentProfile
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Profile updated } }
+    delete:
+      summary: Delete an agent role profile
+      operationId: deleteAgentProfile
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Profile deleted } }
+
+  # ── Root-only: models & aliases ───────────────────────────────────────
+  /api/models:
+    get:
+      summary: List registered models
+      operationId: listModels
+      x-permission: root
+      responses: { "200": { description: Models } }
+    post:
+      summary: Register a model
+      operationId: createModel
+      x-permission: root
+      responses: { "201": { description: Model created } }
+  /api/models/{name}:
+    get:
+      summary: Get a registered model
+      operationId: getModel
+      x-permission: root
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Model } }
+    put:
+      summary: Update a registered model
+      operationId: updateModel
+      x-permission: root
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Model updated } }
+    delete:
+      summary: Remove a registered model
+      operationId: deleteModel
+      x-permission: root
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Model removed } }
+  /api/models/{name}/bump-version:
+    post:
+      summary: Bump a model's version stamp (cache bust)
+      operationId: bumpModelVersion
+      x-permission: root
+      parameters:
+        - { name: name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Version bumped } }
+  /api/model-aliases:
+    get:
+      summary: List routing model aliases
+      operationId: listModelAliases
+      x-permission: root
+      responses: { "200": { description: Aliases } }
+    post:
+      summary: Create a routing model alias
+      operationId: createModelAlias
+      x-permission: root
+      responses: { "201": { description: Alias created } }
+  /api/model-aliases/{alias}:
+    delete:
+      summary: Delete a routing model alias
+      operationId: deleteModelAlias
+      x-permission: root
+      parameters:
+        - { name: alias, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Alias deleted } }
+
+  # ── Root-only: routing rules ──────────────────────────────────────────
+  /api/rules/preview:
+    post:
+      summary: Preview a routing rule candidate (read-only dry-run)
+      operationId: previewRoutingRule
+      x-permission: root
+      responses: { "200": { description: Preview } }
+  /api/rules:
+    get:
+      summary: List routing rules
+      operationId: listRoutingRules
+      x-permission: root
+      responses: { "200": { description: Rules } }
+    post:
+      summary: Create a routing rule
+      operationId: createRoutingRule
+      x-permission: root
+      responses: { "201": { description: Rule created } }
+  /api/rules/{id}:
+    get:
+      summary: Get a routing rule
+      operationId: getRoutingRule
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Rule } }
+    put:
+      summary: Update a routing rule
+      operationId: updateRoutingRule
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Rule updated } }
+    delete:
+      summary: Delete a routing rule
+      operationId: deleteRoutingRule
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Rule deleted } }
+  /api/rules/{id}/enable:
+    put:
+      summary: Enable or disable a routing rule
+      operationId: updateRoutingRuleEnabled
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Rule state changed } }
+
+  # ── Root-only: whitelists ─────────────────────────────────────────────
+  /api/whitelist/api-keys/{target_id}:
+    get:
+      summary: List a key's model whitelist
+      operationId: listKeyWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Entries } }
+    post:
+      summary: Add a model whitelist entry for a key
+      operationId: addKeyWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Entry added } }
+  /api/whitelist/api-keys/{target_id}/{model_name}:
+    delete:
+      summary: Remove a model whitelist entry for a key
+      operationId: removeKeyWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+        - { name: model_name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Entry removed } }
+  /api/whitelist/teams/{target_id}:
+    get:
+      summary: List a team's model whitelist
+      operationId: listTeamWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Entries } }
+    post:
+      summary: Add a model whitelist entry for a team
+      operationId: addTeamWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+      responses: { "201": { description: Entry added } }
+  /api/whitelist/teams/{target_id}/{model_name}:
+    delete:
+      summary: Remove a model whitelist entry for a team
+      operationId: removeTeamWhitelist
+      x-permission: root
+      parameters:
+        - { name: target_id, in: path, required: true, schema: { type: string } }
+        - { name: model_name, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Entry removed } }
+
+  # ── Root-only: admin users ────────────────────────────────────────────
+  /api/admin-users:
+    get:
+      summary: List admin console users
+      operationId: listAdminUsers
+      x-permission: root
+      responses: { "200": { description: Users } }
+    post:
+      summary: Create an admin console user
+      operationId: createAdminUser
+      x-permission: root
+      responses: { "201": { description: User created } }
+  /api/admin-users/{id}:
+    get:
+      summary: Get an admin console user
+      operationId: getAdminUser
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: User } }
+    put:
+      summary: Update an admin console user
+      operationId: updateAdminUser
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: User updated } }
+    delete:
+      summary: Delete an admin console user
+      operationId: deleteAdminUser
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: User deleted } }
+
+  # ── Root-only: per-org settings ───────────────────────────────────────
+  /api/organizations/{id}/cache-settings:
+    get:
+      summary: Get the org cache settings
+      operationId: getOrgCacheSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings } }
+    patch:
+      summary: Update the org cache settings
+      operationId: updateOrgCacheSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings updated } }
+  /api/organizations/{id}/routing:
+    get:
+      summary: Get the org routing mode (shadow threshold)
+      operationId: getOrgRoutingSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings } }
+    patch:
+      summary: Update the org routing mode
+      operationId: updateOrgRoutingSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings updated } }
+  /api/organizations/{id}/policy-packs:
+    get:
+      summary: List org residency policy packs
+      operationId: listPolicyPacks
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Packs } }
+  /api/organizations/{id}/policy-packs/{region}:
+    put:
+      summary: Upsert an org residency policy pack
+      operationId: upsertPolicyPack
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: region, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Pack saved } }
+  /api/organizations/{id}/policy-packs/{packID}:
+    delete:
+      summary: Delete an org residency policy pack
+      operationId: deletePolicyPack
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: packID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Pack deleted } }
+  /api/organizations/{id}/residency:
+    get:
+      summary: Get the org residency region
+      operationId: getOrgResidency
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Residency } }
+    put:
+      summary: Set the org residency region
+      operationId: updateOrgResidency
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Residency updated } }
+
+  # ── Org region routing (PB2.7; DB-gated group, locked to the fully-wired
+  #    golden walk; root + org-scope) ─────────────────────────────────────
+  /api/organizations/{id}/region:
+    get:
+      summary: Get the org home-region assignment
+      operationId: getOrgRegion
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Assignment row, or the "sg" default when none exists — a store read failure answers the same default so the UI always renders a region
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/OrgRegionState" }
+        "503": { description: Database not configured }
+    put:
+      summary: 'Upsert the org home-region assignment. Concurrency: one atomic single-statement upsert — concurrent writers serialize on the row lock, last write wins; no optimistic-concurrency token (intentional, single-owner setting)'
+      operationId: updateOrgRegion
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/OrgRegionUpdate" }
+      responses:
+        "200": { description: "Applied: {ok: true}" }
+        "400": { description: Malformed JSON body }
+        "500": { description: Store upsert failure }
+        "503": { description: Database not configured }
+  /api/organizations/{id}/spend-alert:
+    get:
+      summary: Get the org spend alert settings
+      operationId: getOrgSpendAlertSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings } }
+    patch:
+      summary: Update the org spend alert settings
+      operationId: updateOrgSpendAlertSettings
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings updated } }
+  /api/organizations/{id}/tool-calls:
+    get:
+      summary: Tool-call aggregate report for the org
+      operationId: orgToolCalls
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Tool-call report } }
+
+  # ── Org budget settings (NEXT-18f; session surface, per-org gates in the
+  #    handlers: root or the org's budgets.manage admins; reservations-mode
+  #    is root-only) ────────────────────────────────────────────────────────
+  /api/orgs/{id}/credits/grace:
+    get:
+      summary: Get the org budget settings (grace floor, reservations mode, output cap)
+      operationId: getOrgBudgetSettings
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings } }
+    put:
+      summary: Set the org grace floor (null resets to the platform default)
+      operationId: putOrgGraceFloor
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Settings updated } }
+
+  # ── Org credit wallet (PR1/W-CRED; DB-gated group, locked to the
+  #    fully-wired golden walk) ──────────────────────────────────────────
+  /api/orgs/{id}/credits/balance:
+    get:
+      summary: Get the org credit balance (whole cents + display USD)
+      operationId: getOrgCreditBalance
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200":
+          description: Current balance — the org_credits row, or a zero-balance answer for a wallet-less org
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreditBalance" }
+        "400": { description: Org id missing }
+        "403": { description: Not root and not the org's budgets.manage admin (foreign orgs stay invisible) }
+        "503": { description: Credit store not wired }
+  /api/orgs/{id}/credits/transactions:
+    get:
+      summary: Page through the org credit ledger (newest first)
+      operationId: listOrgCreditTransactions
+      x-permission: org:budgets.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 50, minimum: 1, maximum: 200 }, description: handler accepts 1..200; the ledger store clamps values above 100 back to its 50-row default }
+      responses:
+        "200":
+          description: One ledger page
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreditTransactionsPage" }
+        "400": { description: Org id missing }
+        "403": { description: Not root and not the org's budgets.manage admin (foreign orgs stay invisible) }
+        "503": { description: Credit store not wired }
+  /api/orgs/{id}/credits/topup:
+    post:
+      summary: 'Manual credit top-up. Concurrency: the balance increment and the ledger row are written in ONE atomic statement — concurrent top-ups compose, no lost updates; every completed top-up is audited with symmetric before/after balance snapshots (reason body field or X-Audit-Reason header; a missing reason still journals)'
+      operationId: topUpOrgCredits
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: "#/components/schemas/CreditTopUpRequest" }
+      responses:
+        "201":
+          description: Applied
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/CreditTopUpResponse" }
+        "400": { description: Org id missing, malformed JSON body, or amount_cents not positive }
+        "403": { description: Not root — the wallet mutation is platform-operator-only }
+        "500": { description: Store failure — nothing was applied }
+        "503": { description: Credit store not wired }
+  /api/orgs/{id}/reservations-mode:
+    put:
+      summary: Switch the org reservations mode (off|shadow|enforce; root-only)
+      operationId: putOrgReservationsMode
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Mode updated } }
+  /api/orgs/{id}/output-cap:
+    put:
+      summary: Set the org default output-cap override (null clears it)
+      operationId: putOrgDefaultOutputCap
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Cap updated } }
+  /api/orgs/{id}/caps:
+    get:
+      summary: Get the org caps (beta limits — RPM, TPM, hard monthly budget; OP-19 split input/output TPM and per-key TPM (0 = off); overrides + effective)
+      operationId: getOrgCaps
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Caps } }
+    put:
+      summary: Set the org caps overrides (null clears a dimension — back to the beta default for rpm/tpm/budget, back to OFF for input_tokens_per_min/output_tokens_per_min/key_tokens_per_min; mandatory reason)
+      operationId: putOrgCaps
+      x-permission: session
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Caps updated } }
+
+  # ── BYOK provider credentials (W-BYOK-API; keys.manage group, gates in the
+  #    mount: root or the org's keys.manage admins; plaintext keys are never
+  #    returned — responses carry the key_last4 mask only) ─────────────────
+  /api/orgs/{id}/provider-credentials:
+    get:
+      summary: List the org's provider credentials (key_last4 mask, never the plaintext)
+      operationId: listOrgCredentials
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Credential list } }
+    post:
+      summary: Create a provider credential (name, provider, base_url, api_key 20..5000)
+      operationId: createOrgCredential
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Credential created (masked) }
+        "409": { description: A credential with this name already exists in the org }
+  /api/orgs/{id}/provider-credentials/{credId}:
+    put:
+      summary: Update a provider credential (nil fields keep the stored value; api_key rotates)
+      operationId: updateOrgCredential
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: credId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Credential updated (masked) }
+        "409": { description: A credential with this name already exists in the org }
+    delete:
+      summary: Delete a provider credential
+      operationId: deleteOrgCredential
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: credId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Credential deleted } }
+  /api/orgs/{id}/provider-credentials/{credId}/test:
+    post:
+      summary: Test a credential with a one-shot GET {base_url}/models (5s budget, SSRF-guarded, 1/min per org)
+      operationId: testOrgCredential
+      x-permission: org:keys.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: credId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "Test result: {ok, status, error?}" } }
+  /api/orgs/{id}/provider-credentials/{credId}/models:
+    post:
+      summary: Discover the provider's model catalog with the stored key (one-shot GET {base_url}/models, parsed; 5s budget, SSRF-guarded, shares the 1/min-per-org test throttle)
+      operationId: listOrgCredentialModels
+      x-permission: org:keys.manage
+      description: |
+        Discovery-only snapshot of the upstream OpenAI-compatible {base_url}/models list,
+        fetched server-side with the stored key (Bearer header; discovery supports
+        openai-compat semantics only — anthropic x-api-key discovery is a documented
+        limitation, manual entry stays the fallback). A 200 catalog is a snapshot at
+        request time, NOT a verified-usability mark: nothing is written to any registry
+        (verified is always false) and chat readiness is only proven by real gateway
+        traffic. Refusal reasons are machine-readable and derived only from the upstream
+        status/parse outcome (the upstream body is never echoed, the key never returned):
+        models_list_unavailable (404, other non-2xx, or a 2xx body that does not parse),
+        key_forbidden (upstream 403 — listing refused; chat traffic may still work),
+        key_unauthorized (upstream 401 — rotate the key via the credential update),
+        key_unavailable (no enabled stored key resolved for this credential),
+        transport_error (unreachable/refused/timeout within the 5s budget).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: credId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Catalog snapshot {provider, base_url, count, data: [model-id], discovered: true, verified: false} or refusal {provider, count: 0, reason, status?, error?}" }
+        "403": { description: Caller lacks keys.manage on the org }
+        "404": { description: Unknown org or credential (a foreign org/credential is indistinguishable from a missing one) }
+        "429": { description: Throttled (1/min per org, shared with the test endpoint) }
+        "503": { description: Credential store not wired }
+
+  # ── Policy pipelines (OP-0b; policies.manage group, gates in the mount:
+  #    root or the org's policies.manage admins — policies are security
+  #    objects: they deny/mask/rewrite traffic. YAML is validated
+  #    syntactically here; full compilation happens gateway-side when a
+  #    version is loaded) ──────────────────────────────────────────────────
+  # ── Policy decision log (OP-9; policies.manage group, gate in the mount:
+  #    read-only view of what the pipeline did — one row per evaluation the
+  #    gateway attached to an event, content-free findings, 90d retention) ─
+  /api/organizations/{id}/policy-decisions:
+    get:
+      summary: List the org's policy decision log (newest first; entity-scoped filters verdict/mode/policy/request/time; standard pagination envelope)
+      operationId: listPolicyDecisions
+      x-permission: org:policies.manage
+      description: >
+        Read-only view of what the policy pipeline did — one row per policy
+        evaluation the gateway attached to an event (90-day retention;
+        content-free: findings carry detector categories only, never payload
+        content). The `entity` view selects the row family: the default
+        `decisions` view lists individual evaluations newest-first
+        (created_at DESC, id DESC); the `requests` view rolls the filtered
+        evaluations up per distinct request and orders by most-recent
+        activity first (last_seen_at DESC, request_id DESC), excluding
+        evaluations that carried no request id. A `mode: shadow` row never
+        reads as an applied action — a shadow verdict records what WOULD
+        have happened; only enforce verdicts were applied. The dashboard
+        deep-links into this surface through hash params, not query params
+        (see docs/api/CONTRACT.md §10).
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: entity, in: query, description: Row family; totals and pagination count evaluations (decisions) or distinct requests (requests), schema: { type: string, enum: [decisions, requests], default: decisions } }
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: page_size, in: query, schema: { type: integer, default: 50, maximum: 100 } }
+        - { name: verdict, in: query, description: Filter to one evaluation outcome (deny > mask > flag > allow resolution), schema: { type: string, enum: [allow, flag, mask, deny] } }
+        - { name: mode, in: query, description: Filter shadow (would-have, never applied) or enforce (applied) evaluations, schema: { type: string, enum: [shadow, enforce] } }
+        - { name: policy_id, in: query, description: Exact policy pipeline id the evaluation ran under (no FK — the log survives policy deletion), schema: { type: string } }
+        - { name: policy_version, in: query, description: Exact evaluated policy version; 0 is a real value meaning the writer recorded no version, schema: { type: integer, minimum: 0, maximum: 2147483647 } }
+        - { name: request_id, in: query, description: Exact request id (the join key with the request explorer); legacy evaluations with an empty request id never match, schema: { type: string } }
+        - { name: step, in: query, description: Pipeline step name — matches decisions whose findings carry at least one finding with this step, schema: { type: string } }
+        - { name: created_from, in: query, description: Inclusive lower bound on evaluation time (RFC3339), schema: { type: string, format: date-time } }
+        - { name: created_to, in: query, description: Inclusive upper bound on evaluation time (RFC3339), schema: { type: string, format: date-time } }
+      responses:
+        "200":
+          description: >
+            Paginated envelope {data, pagination:{page, page_size, total,
+            total_pages}}. `entity=decisions` rows: {id, org_id, request_id
+            (empty string when the event carried none — legacy rows),
+            policy_id, policy_version (0 = unknown), mode, verdict, findings,
+            findings_valid, duration_ms, created_at}. `findings` is ALWAYS a
+            JSON array of content-free finding objects {step, category,
+            severity, span?, action}; `findings_valid` is false exactly when
+            the stored record could not be decoded into that array (findings
+            is then []) — a degraded legacy record must never read as a clean
+            "nothing found" verdict. `entity=requests` rows: {request_id,
+            evaluations, first_seen_at, last_seen_at}.
+        "400": { description: Invalid filter — unknown entity/verdict/mode value, non-integer/negative/out-of-range policy_version, non-RFC3339 created_from/created_to, or created_from after created_to; the message names the field }
+  /api/organizations/{id}/policies:
+    get:
+      summary: List the org's policy pipelines (rows only; use the detail endpoint for versions and attachments)
+      operationId: listPolicyPipelines
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Policy pipeline list } }
+    post:
+      summary: Create a policy pipeline with its first version (draft; name unique per org)
+      operationId: createPolicyPipeline
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: Pipeline created (version 1, draft) }
+        "400": { description: Invalid body or YAML failing the syntactic gate }
+        "409": { description: A policy with this name already exists in the org }
+  /api/organizations/{id}/policies/drift:
+    get:
+      summary: Report the DB-side drift status of every policy (managed / drift — edited past git after a reconcile / unmanaged — never reconciled; the content-level DB-vs-git diff and convergence live in `yb policies reconcile`, OP-10)
+      operationId: getPolicyPipelinesDrift
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Drift report (per-policy status, latest version authorship, drift_count) } }
+  /api/organizations/{id}/policies/validate:
+    post:
+      summary: Strict-validate a draft policy document with the SAME parser the store path runs (pkg/pipeline.ParsePolicy + Validate); never touches the store. Invalid documents answer 400 with the exact error text a create/update would produce, so the UI can validate at save time and rely on validate-200 ⟺ stores
+      operationId: validatePolicyPipeline
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Valid (parsed name and mode echoed back) }
+        "400": { description: Invalid — same error text as the save path }
+  /api/organizations/{id}/policies/{policyId}:
+    get:
+      summary: Get one policy pipeline with its versions (newest first) and attachments (priority first)
+      operationId: getPolicyPipeline
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: policyId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Pipeline detail } }
+    put:
+      summary: Update a pipeline (yaml appends a new draft version; enabled flips the mode flag; active_version activates; attachments replace-all). Optional "version" is the optimistic-concurrency token — the current_version the caller loaded; a stale token rejects the WHOLE body atomically with 409 + the live row (R070 D2, owner 2026-10-18)
+      operationId: updatePolicyPipeline
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: policyId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Applied (the refreshed pipeline row; use GET for the full detail) }
+        "400": { description: Nothing to update, or a payload field failed validation }
+        "404": { description: Pipeline not found in this org (foreign orgs stay invisible) }
+        "409": { description: "Stale version token: {error, current:{policy}} — the live pipeline row rides the body; nothing was applied" }
+    delete:
+      summary: Delete a policy pipeline (versions and attachments cascade)
+      operationId: deletePolicyPipeline
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: policyId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Pipeline deleted } }
+
+  #    root or the org's routing.manage admins — a rollout IS model choice for
+  #    live traffic, the same sensitivity class the routing settings carry.
+  #    Versioned rows (the policy-pipeline pattern): content changes APPEND
+  #    immutable versions; active_version moves atomically in one transaction;
+  #    enabled=false is the manual rollback and never touches an in-flight
+  #    response — the model is pinned at routing time; percent is a whole
+  #    number 1..99; the split is hash(session_id)%100, sticky per session) ──
+  /api/organizations/{id}/canary-rollouts:
+    get:
+      summary: List the org's canary rollouts (rows only; use the detail endpoint for versions)
+      operationId: listCanaryRollouts
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "Canary rollout list: {data: [rollout rows], count}" } }
+    post:
+      summary: Create a canary rollout with version 1 (draft, detached — activating is the explicit PUT active_version step; name unique per org)
+      operationId: createCanaryRollout
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: "Rollout created: {rollout, versions: [version 1]}" }
+        "400": { description: "Invalid body (name 1..256 chars; base and canary models must be non-empty and differ; percent a whole number 1..99)" }
+        "409": { description: A rollout with this name already exists in the org }
+  /api/organizations/{id}/canary-rollouts/{rolloutId}:
+    get:
+      summary: Get one canary rollout with its versions (newest first; a foreign rollout id is the same 404 as a missing one)
+      operationId: getCanaryRollout
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rolloutId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "Rollout detail: {rollout, versions}" } }
+    put:
+      summary: Update a canary rollout (base_model+canary_model+percent together append a new draft version; active_version activates atomically; enabled flips the attach flag — false is the manual rollback)
+      operationId: updateCanaryRollout
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rolloutId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Applied (the refreshed rollout row; use GET for the versions) }
+        "400": { description: Nothing to update, a partial content triple, or a field failed validation }
+        "404": { description: Rollout not found in this org (foreign orgs stay invisible) }
+    delete:
+      summary: Delete a canary rollout (versions cascade)
+      operationId: deleteCanaryRollout
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rolloutId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Rollout deleted } }
+  /api/organizations/{id}/canary-rollouts/{rolloutId}/recommendation:
+    get:
+      summary: Measured rollout health for a human rollback decision (D3 evidence only — the system never rolls back by itself; arm shares and per-arm failure counts from request_logs over the window)
+      operationId: getCanaryRolloutRecommendation
+      x-permission: org:routing.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: rolloutId, in: path, required: true, schema: { type: string } }
+        - { name: window_hours, in: query, schema: { type: integer, default: 24, minimum: 1, maximum: 720 } }
+      responses:
+        "200": { description: "Evidence: {evidence: {rollout_id, window_hours, canary_total, canary_errors, base_total, base_errors, recommendation: hold|rollback-recommended}, action: manual}" }
+        "404": { description: Rollout not found in this org }
+
+  # ── Root-only: guard detector-pack lifecycle ─────────────
+  #    Deployment-global activation record for guard detector packs
+  #    (migration 0013 guard_pack_state, written only through the durable
+  #    compare-and-swap in pkg/policystore). Activation stages + verifies the
+  #    on-disk pack first; only a winning CAS publishes it, so exactly one
+  #    concurrent activation wins and every loser gets 409 with the LIVE
+  #    durable state. A store failure answers 5xx with the pack state
+  #    unchanged (fail-closed). Unsigned local packs load freely;
+  #    a DECLARED signature fails closed without a configured verifier.
+  #    The env-based startup activation (YABANIN_GUARD_PACK_DIR /
+  #    YABANIN_GUARD_ACTIVE_PACKS) is unchanged; this API is layered on top.
+  /api/guard-packs/activate:
+    post:
+      summary: Verify, stage and activate one on-disk guard detector pack by id + version (durable CAS; no restart needed for consumers of the lifecycle)
+      operationId: activateGuardPack
+      x-permission: root
+      responses:
+        "200": { description: "Activated: {status: activated, active_version, previous_version} — the version identity is pack@version (multi-pack candidates join them)" }
+        "400": { description: Invalid body (pack_id must be a single path component; version 1..128 characters) }
+        "404": { description: Unknown pack (no manifest under the configured pack root) or unknown version (manifest declares a different pack_version) }
+        "409": { description: "Conflict: the durable active version moved (another activation won — body carries {error, current: {active_version, previous_version}}), or the pack failed manifest/detector verification (fail-closed, nothing changed)" }
+        "500": { description: Guard policy store failed; the pack state is unchanged }
+        "503": { description: Guard pack lifecycle or pack directory not configured }
+  /api/guard-packs/rollback:
+    post:
+      summary: Restore the previous active guard pack version through the same durable CAS (the lifecycle's staged-but-unactivated candidate is dropped)
+      operationId: rollbackGuardPack
+      x-permission: root
+      responses:
+        "200": { description: "Rolled back: {status: rolled_back, active_version, previous_version}" }
+        "409": { description: "Conflict: the durable active version moved, no active pack, or no prior version to restore" }
+        "500": { description: Guard policy store failed; the pack state is unchanged }
+        "503": { description: Guard pack lifecycle not configured }
+
+  #    the read + dry-run half of the pack surface. The
+  #    status endpoint never restates per-replica runtime telemetry it cannot
+  #    know (applied versions and gateway_guard_pack_watch_failures_total live
+  #    in the gateway process's /metrics and adoption logs); it reports the
+  #    durable requested state plus the same pack load check the runtime
+  #    materialization performs, so the failure-relevant condition (an active
+  #    version that no longer loads from disk) is visible to the operator.
+  /api/guard-packs:
+    get:
+      summary: "List the on-disk guard pack inventory (one row per pack directory: declared identity or the reason it is not loadable) with the durable active/previous versions"
+      operationId: listGuardPacks
+      x-permission: root
+      responses:
+        "200": { description: "Inventory: {packs: [{dir, pack_id, pack_version, files, signature_declared, error?}], active_version, previous_version} — a broken pack directory is listed WITH its error, never hidden; active/previous are the durable requested versions (empty = built-in chain)" }
+        "500": { description: Guard policy store failed, or the configured pack root is unreadable }
+        "503": { description: Guard pack lifecycle or pack directory not configured }
+  /api/guard-packs/status:
+    get:
+      summary: Durable guard pack state (requested active/previous versions, staged candidate of this process) plus the runtime load check over the active version
+      operationId: getGuardPackStatus
+      x-permission: root
+      responses:
+        "200": { description: "Status: {active_version, previous_version, updated_by, updated_at, staged_version, runtime: {active_pack_loadable, load_error?, check}} — the load check is the same manifest decode + SHA-256 verification + detector compile every replica's adoption performs; a load failure keeps replicas on the last known-good hook and counts in gateway_guard_pack_watch_failures_total (which this endpoint deliberately does not restate)" }
+        "500": { description: Guard policy store failed }
+        "503": { description: Guard pack lifecycle or pack directory not configured }
+  /api/guard-packs/validate:
+    post:
+      summary: Dry-run the pack loader for one on-disk pack by id + version (manifest decode + SHA-256 file verification + detector compile) without staging or activating anything
+      operationId: validateGuardPack
+      x-permission: root
+      responses:
+        "200": { description: "Valid: {status: valid, pack_id, pack_version, digest, detectors} — identical verification semantics to the activate path's stage step, so a valid preview cannot pass where activation would fail" }
+        "400": { description: Invalid body (pack_id must be a single path component; version 1..128 characters) }
+        "404": { description: Unknown pack or version (same fail-closed identity checks as activate) }
+        "409": { description: The pack failed verification (broken manifest/detectors, declared signature without a verifier, oversized file) }
+        "503": { description: Guard pack lifecycle or pack directory not configured }
+  /api/guard-packs/simulate:
+    post:
+      summary: Detect-only dry run — load one on-disk pack (full verification, no staging) and evaluate the posted sample text through the combined built-in + pack evaluator (audit-only semantics; findings carry offsets and detector identity, never actions or state changes)
+      operationId: simulateGuardPack
+      x-permission: root
+      responses:
+        "200": { description: "Simulated: {status: simulated, pack_id, pack_version, digest, total_findings, truncated, findings: [{detector, category, start, end, confidence}]} — the sample is scanned by the same chain a staged candidate runs with (built-ins first, pack detectors after); the findings array is capped at 100 with total_findings + truncated carrying the full count" }
+        "400": { description: Invalid body (pack_id single path component; version 1..128 characters; body cap 128 KiB) }
+        "404": { description: Unknown pack or version }
+        "409": { description: The pack failed verification or the simulation could not run }
+        "503": { description: Guard pack lifecycle or pack directory not configured }
+
+  #    or the org's policies.manage admins — prompts are pipeline INPUTS (a
+  #    judge prompt decides verdicts; partials are substituted into policy
+  #    pipelines), the same sensitivity class as policies. Templates carry
+  #    {{var}} / {{partials.name}} placeholders; edits APPEND immutable
+  #    versions and the draft label follows the latest saved version; labels
+  #    (draft|active|canary|custom) are movable pointers moved via the labels
+  #    endpoint; names are ref-safe [A-Za-z0-9_.-]+ (the prompt_ref /
+  #    partials token key)) ─────────────────────────────────────────────────
+  /api/organizations/{id}/prompts:
+    get:
+      summary: List the org's prompts (rows only; use the detail endpoint for versions and labels)
+      operationId: listPrompts
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "Prompt list: {data: [prompt rows], count}" } }
+    post:
+      summary: Create a prompt with version 1 and the draft binding (name unique per org, ref-safe [A-Za-z0-9_.-]+)
+      operationId: createPrompt
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: "Prompt created: {prompt, versions: [version 1]}" }
+        "400": { description: Invalid body (name grammar 1..256 chars, empty template, params not a JSON object) }
+        "409": { description: A prompt with this name already exists in the org }
+  /api/organizations/{id}/prompts/{promptId}:
+    get:
+      summary: Get one prompt with its versions (newest first) and label bindings
+      operationId: getPrompt
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: promptId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Prompt detail: {prompt, versions, labels}" }
+        "404": { description: Prompt not found in this org (foreign orgs stay invisible) }
+    put:
+      summary: Append a NEW immutable version (template + params) and move the draft label to it — never an in-place edit
+      operationId: updatePrompt
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: promptId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Version appended: {prompt, versions: [the new version]}; use GET for the full detail" }
+        "400": { description: Invalid body }
+        "404": { description: Prompt not found in this org }
+    delete:
+      summary: Delete a prompt (versions and labels cascade)
+      operationId: deletePrompt
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: promptId, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Prompt deleted } }
+  /api/organizations/{id}/prompts/{promptId}/labels:
+    post:
+      summary: Bind a label (draft|active|canary|custom) to a version (upsert — the previous binding of the same label moves)
+      operationId: promotePromptLabel
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: promptId, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Binding: {label: {prompt_id, org_id, label, version, updated_at}}" }
+        "400": { description: Unknown label or version < 1 }
+        "404": { description: Prompt or version not found in this org }
+  /api/organizations/{id}/partials:
+    get:
+      summary: List the org's partials (name-ordered; bodies included — partials are prompt building blocks, not secrets)
+      operationId: listPartials
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: "Partial list: {data: [partial rows], count}" } }
+    post:
+      summary: Create a named partial (name unique per org, ref-safe [A-Za-z0-9_.-]+; body ≤ 64KB — the substitution step's limit)
+      operationId: createPartial
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+      responses:
+        "201": { description: "Partial created: {partial}" }
+        "400": { description: Invalid body }
+        "409": { description: A partial with this name already exists in the org }
+  /api/organizations/{id}/partials/{partialName}:
+    put:
+      summary: Replace a partial's body (version bumps; consumers observe changes)
+      operationId: updatePartial
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: partialName, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: "Partial updated: {partial}" }
+        "400": { description: Invalid body }
+        "404": { description: Partial not found in this org (foreign orgs stay invisible) }
+    delete:
+      summary: Delete a partial
+      operationId: deletePartial
+      x-permission: org:policies.manage
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: string } }
+        - { name: partialName, in: path, required: true, schema: { type: string } }
+      responses:
+        "200": { description: Partial deleted }
+        "404": { description: Partial not found in this org }
+
+  # ── Root-only: cache management ───────────────────────────────────────
+  /api/cache/flush:
+    post:
+      summary: Flush the shared cache
+      operationId: flushCache
+      x-permission: root
+      responses: { "200": { description: Flushed } }
+  /api/cache/analytics:
+    get:
+      summary: Cache analytics (hit rate, savings)
+      operationId: cacheAnalytics
+      x-permission: root
+      responses: { "200": { description: Analytics } }
+  /api/cache/warm:
+    post:
+      summary: Warm the cache for configured models (deprecated)
+      operationId: warmCache
+      x-permission: root
+      deprecated: true
+      x-deprecated-since: "2026-10-31"
+      x-sunset: "2027-04-29"
+      x-migration: none — cache warming was removed; the semantic cache learns from live traffic (see docs/api/cache-admin-api.md)
+      responses:
+        "410": { description: Gone - cache warming removed; the semantic cache learns from live traffic }
+  /api/analytics/{org_id}/cache:
+    get:
+      summary: Per-org cache analytics (hit rate, savings)
+      operationId: orgCacheAnalytics
+      x-permission: root
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Analytics } }
+  /api/cache/experiments:
+    get:
+      summary: List A/B cache experiments
+      operationId: listCacheExperiments
+      x-permission: root
+      responses: { "200": { description: Experiments } }
+    post:
+      summary: Create an A/B cache experiment
+      operationId: createCacheExperiment
+      x-permission: root
+      responses: { "201": { description: Experiment created } }
+  /api/cache/experiments/{exp_id}/results:
+    get:
+      summary: Results of an A/B cache experiment
+      operationId: cacheExperimentResults
+      x-permission: root
+      parameters:
+        - { name: exp_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Results } }
+
+  # ── Root-only: cost analytics ─────────────────────────────────────────
+  /api/analytics/{org_id}/cost:
+    get:
+      summary: Per-org cost report for a window
+      operationId: orgCostAnalytics
+      x-permission: root
+      parameters:
+        - { name: org_id, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Cost report } }
+  /api/analytics/cost/global:
+    get:
+      summary: Global cost statistics (cross-org)
+      operationId: globalCostAnalytics
+      x-permission: root
+      responses: { "200": { description: Cost stats } }
+  /api/analytics/savings:
+    get:
+      summary: Savings report (routing savings vs strongest baseline)
+      operationId: savingsReport
+      x-permission: root
+      responses: { "200": { description: Savings report } }
+  /api/analytics/shadow:
+    get:
+      summary: Primary vs shadow routing cost comparison
+      operationId: shadowComparison
+      x-permission: root
+      responses: { "200": { description: Comparison } }
+  /api/analytics/quality:
+    get:
+      summary: Quality scores and routing recommendation
+      operationId: qualityScores
+      x-permission: root
+      responses: { "200": { description: Quality report } }
+
+  # ── Root-only: pricing ────────────────────────────────────────────────
+  /api/pricing:
+    get:
+      summary: List pricing entries
+      operationId: listPricing
+      x-permission: root
+      responses: { "200": { description: Pricing entries } }
+    post:
+      summary: Create a pricing entry
+      operationId: createPricing
+      x-permission: root
+      responses: { "201": { description: Entry created } }
+  /api/pricing/import:
+    post:
+      summary: Import catalog pricing with mappings
+      operationId: importPricing
+      x-permission: root
+      responses: { "200": { description: Import result } }
+  /api/pricing/{id}:
+    put:
+      summary: Update a pricing entry
+      operationId: updatePricing
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: Entry updated } }
+    delete:
+      summary: Delete a pricing entry
+      operationId: deletePricing
+      x-permission: root
+      parameters:
+        - { name: id, in: path, required: true, schema: { type: integer } }
+      responses: { "200": { description: Entry deleted } }
+  /api/pricing/export.csv:
+    get:
+      summary: Export pricing as CSV
+      operationId: exportPricingCSV
+      x-permission: root
+      responses: { "200": { description: CSV body } }
+
+  # ── Root-only: low-balance radar (PR1; DB-gated group, locked to the
+  #    fully-wired golden walk) ──────────────────────────────────────────
+  /api/credits/low-balance:
+    get:
+      summary: Orgs whose credit balance is below a threshold (balance ascending)
+      operationId: listLowBalanceOrgs
+      x-permission: root
+      parameters:
+        - { name: threshold_cents, in: query, required: false, schema: { type: integer, format: int64, default: -500 }, description: any int64 value — negative thresholds mean "already dipped below zero" }
+        - { name: limit, in: query, required: false, schema: { type: integer, default: 100, minimum: 1, maximum: 1000 } }
+      responses:
+        "200":
+          description: Matching orgs
+          content:
+            application/json:
+              schema: { $ref: "#/components/schemas/LowBalanceReport" }
+        "403": { description: Not root }
+        "503": { description: Credit store not wired }
+
+  # ── Root-only: vertical packs ─────────────────────────────────────────
+  /api/organizations/{orgID}/verticals:
+    get:
+      summary: List enabled vertical compliance packs
+      operationId: listVerticals
+      x-permission: root
+      parameters:
+        - { name: orgID, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Verticals } }
+  /api/organizations/{orgID}/verticals/{vertical}:
+    post:
+      summary: Enable a vertical compliance pack
+      operationId: enableVertical
+      x-permission: root
+      parameters:
+        - { name: orgID, in: path, required: true, schema: { type: string } }
+        - { name: vertical, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Vertical enabled } }
+    delete:
+      summary: Disable a vertical compliance pack
+      operationId: disableVertical
+      x-permission: root
+      parameters:
+        - { name: orgID, in: path, required: true, schema: { type: string } }
+        - { name: vertical, in: path, required: true, schema: { type: string } }
+      responses: { "200": { description: Vertical disabled } }
+  /api/routing/map:
+    get:
+      summary: Org routing map (models, failover chains, tier pools, aliases, rules, warnings)
+      operationId: getRoutingMap
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses: { "200": { description: Routing map } }
+  /api/routing/actual:
+    get:
+      summary: Requested-to-used model paths recorded over the lookback window, with window coverage
+      operationId: getRoutingActual
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+        - { name: period, in: query, schema: { type: string, default: 24h } }
+      responses: { "200": { description: Requested-to-used edges plus coverage } }
+  /api/routing/snapshot:
+    get:
+      summary: Point-in-time routing snapshot (routing map plus active rule overrides in evaluation order)
+      operationId: getRoutingSnapshot
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+      responses: { "200": { description: Routing snapshot with active overrides } }
+  /api/providers/health:
+    get:
+      summary: Org provider health rollup over the lookback window
+      operationId: getProviderHealth
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+        - { name: period, in: query, schema: { type: string, default: 24h } }
+      responses: { "200": { description: Provider health rows } }
+  /api/units/spend:
+    get:
+      summary: Per-unit spend rollup (credits plus USD) for an org over the RFC3339 window; analytics.read member or root
+      operationId: getUnitsSpend
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+        - { name: from, in: query, schema: { type: string, format: date-time } }
+        - { name: to, in: query, schema: { type: string, format: date-time } }
+      responses: { "200": { description: Unit spend rows with the credits scale annotation } }
+  /api/budgets:
+    get:
+      summary: Budget caps status (grace floor, output cap, reservations mode) with optional carbon grams override; budgets.manage member or root
+      operationId: getBudgetCapsStatus
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+        - { name: carbon_budget_grams, in: query, schema: { type: number, format: double } }
+      responses: { "200": { description: Budget caps status } }
+  /api/credits/ledger:
+    get:
+      summary: Credits ledger view (server-clamped limit) for an org; budgets.manage member or root
+      operationId: getCreditsLedgerView
+      x-permission: session
+      parameters:
+        - { name: org_id, in: query, required: true, schema: { type: string } }
+        - { name: limit, in: query, schema: { type: integer } }
+      responses: { "200": { description: Credits ledger entries with the credits scale annotation } }
+  /api/rates/catalog:
+    get:
+      summary: Committed reference rates catalog citation (version, generated time, digest) with the inline catalog
+      operationId: getRatesCatalog
+      x-permission: session
+      responses: { "200": { description: Reference rates catalog citation and body } }
+  /api/rates/diff:
+    post:
+      summary: Diff a candidate sealed rates pack against the committed catalog (dry run; no mutation, no journal)
+      operationId: postRatesDiff
+      x-permission: session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack]
+              properties:
+                pack: { type: string, description: full sealed reference pack JSON }
+                reason: { type: string }
+      responses:
+        "200": { description: Diff report with review flags and counts }
+        "400": { description: Malformed body or invalid pack }
+        "422": { description: Diff refused by review gates; report attached }
+  /api/rates/promote:
+    post:
+      summary: Promote a candidate sealed rates pack (root session only, reason mandatory, chain-verified, journal-audited)
+      operationId: postRatesPromote
+      x-permission: session
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [pack, reason]
+              properties:
+                pack: { type: string, description: full sealed reference pack JSON }
+                reason: { type: string, description: free-text justification recorded in the audit journal }
+      responses:
+        "200": { description: Promotion applied (before, after, rendered diff) }
+        "400": { description: Missing reason, malformed body, invalid pack or broken chain }
+        "403": { description: Root session required }
+        "422": { description: Promotion refused by review gates; refusal is journal-audited }

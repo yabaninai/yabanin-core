@@ -1,0 +1,41 @@
+# R049-04 golden audio refusal envelopes (contract §4/§6 pins).
+# One section per refusal scenario: the exact wire body the gateway writes.
+# Regenerate ONLY with: AUDIO_ENVELOPES_GOLDEN_UPDATE=1 go test ./pkg/gateway/ -run TestAudioRefusalEnvelopesGolden
+### speech/stream-field [400]
+{"error":{"message":"audio streaming is not supported","type":"invalid_request_error","code":"unsupported_feature"}}
+### speech/accept-sse [400]
+{"error":{"message":"audio streaming is not supported","type":"invalid_request_error","code":"unsupported_feature"}}
+### speech/missing-model [400]
+{"error":{"message":"model is required","type":"invalid_request_error"}}
+### speech/missing-input [400]
+{"error":{"message":"input is required","type":"invalid_request_error"}}
+### speech/missing-voice [400]
+{"error":{"message":"voice is required","type":"invalid_request_error"}}
+### speech/malformed-json [400]
+{"error":{"message":"malformed JSON: unexpected end of JSON input","type":"invalid_request_error"}}
+### speech/body-unreadable [400]
+{"error":{"message":"request body too large or malformed","type":"invalid_request_error"}}
+### speech/oversized-body [413]
+{"error":{"message":"request body too large","type":"invalid_request_error"}}
+### speech/provider-not-compat [400]
+{"error":{"message":"speech is not supported for this provider","type":"invalid_request_error","code":"speech_not_supported_for_provider"}}
+### speech/upstream-400-mapped [400]
+{"error":{"message":"upstream request failed","type":"invalid_request_error"}}
+### speech/upstream-401-masked [502]
+{"error":{"message":"upstream request failed","type":"api_error"}}
+### speech/upstream-500-mapped [502]
+{"error":{"message":"upstream request failed","type":"api_error"}}
+### transcriptions/non-multipart [400]
+{"error":{"message":"expected a multipart/form-data request","type":"invalid_request_error"}}
+### transcriptions/missing-model [400]
+{"error":{"message":"model is required","type":"invalid_request_error"}}
+### transcriptions/missing-file [400]
+{"error":{"message":"file is required","type":"invalid_request_error"}}
+### transcriptions/file-without-filename [400]
+{"error":{"message":"file is required","type":"invalid_request_error"}}
+### transcriptions/provider-not-compat [400]
+{"error":{"message":"transcriptions are not supported for this provider","type":"invalid_request_error","code":"transcriptions_not_supported_for_provider"}}
+### transcriptions/truncated-multipart [400]
+{"error":{"message":"request body too large or malformed","type":"invalid_request_error"}}
+### transcriptions/oversized-body [413]
+{"error":{"message":"request body too large","type":"invalid_request_error"}}

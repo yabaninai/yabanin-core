@@ -1,0 +1,108 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Yabanin Spend Audit</title>
+<style>body{font-family:system-ui,-apple-system,"Segoe UI",sans-serif;background:#f2efe6;color:#292d24;margin:0;padding:0;overflow-wrap:anywhere}
+main{max-width:900px;margin:2rem auto;padding:0 1rem}
+h1{font-size:1.5rem;margin:0 0 .5rem}h2{font-size:1.2rem;border-bottom:1px solid #d2d3c4;padding-bottom:.3rem;margin-top:2rem}
+p{line-height:1.5}
+code{background:#e8e5d9;padding:.1rem .3rem;overflow-wrap:anywhere}
+.banner{background:#f3ecd8;border:1px solid #d2d3c4;padding:.6rem .8rem;margin:1rem 0}
+.scroll{overflow-x:auto;margin:1rem 0;border:1px solid #d2d3c4;border-radius:4px}
+.scroll:focus-visible{outline:2px solid #4c6236;outline-offset:1px}
+table{border-collapse:collapse;width:100%;min-width:420px;margin:0}
+th,td{border-bottom:1px solid #d2d3c4;padding:.45rem .6rem;text-align:left;font-size:.9rem}
+th{background:#e8e5d9;border-bottom:2px solid #808570}
+tr:last-child td{border-bottom:0}
+.unknown{color:#626657;font-style:italic}</style>
+</head>
+<body>
+<main>
+<div class="banner"><strong>Synthetic sample — not customer results.</strong> Generated from the bundled 600-request fixture. Estimates depend on historical bundled prices and do not establish answer quality.</div>
+<h1>Yabanin Spend Audit</h1>
+<p><em>_generated: 2026-09-13 01:50:38 UTC_</em></p>
+<p>Source: <code>datasets/audit/sample_traffic.jsonl</code> (offline sample capture; local path normalized)</p>
+<p>Illustrative pricing: historical values from pkg/pricing/pricing.go. This sample does not use the current default catalog.</p><p>Version: <code style="overflow-wrap:anywhere">sha256:af4e6cba31df31ac0f6342f3bf17c84482236565d33fa0ce408f8780d929dc5c</code></p><p>As of: unknown</p><p>Usage-based estimate, not invoice reconciliation. Cached-token discounts, negotiated rates and provider service tiers are not included in audit totals.</p><h2>1. Summary</h2>
+<ul>
+<li>Requests: 600</li>
+<li>Total cost: $ 4.60 (input $ 2.28, output $ 2.32)</li>
+<li>Unpriced requests (no known price, excluded from $ totals): 14</li>
+<li>Window: 397h36m0s</li>
+</ul>
+<div class="scroll" role="region" aria-label="Top models — horizontally scrollable" tabindex="0">
+<table>
+<tr><th>Model</th><th>Requests</th><th>Cost</th><th>Share</th><th>Unpriced</th></tr>
+<tr><td>gpt-4o</td><td>449</td><td>$ 4.21</td><td>91.4%</td><td></td></tr>
+<tr><td>claude-3-5-sonnet-latest</td><td>37</td><td>$ 0.38</td><td>8.3%</td><td></td></tr>
+<tr><td>gpt-4o-mini</td><td>100</td><td>$ 0.01</td><td>0.3%</td><td></td></tr>
+<tr><td>internal-finetuned-7b</td><td>14</td><td><span class="unknown">Unknown</span></td><td>0.0%</td><td>yes</td></tr>
+</table>
+</div>
+<div class="scroll" role="region" aria-label="Top providers — horizontally scrollable" tabindex="0">
+<table>
+<tr><th>Provider</th><th>Requests</th><th>Share</th></tr>
+<tr><td>openai</td><td>549</td><td>91.7%</td></tr>
+<tr><td>anthropic</td><td>37</td><td>8.3%</td></tr>
+<tr><td>(unknown)</td><td>14</td><td>0.0%</td></tr>
+</table>
+</div>
+<h2>2. What we found</h2>
+<ul>
+<li><strong>Spend concentration</strong> — p50=$0.0075 p90=$0.0161 p99=$0.0222; top 1% of requests hold 2.5% of spend, top 10% hold 24.2%.</li>
+<li><strong>Repeated-prefix bloat</strong> — 13 prompt prefixes (&gt;= 20 repeats) carry 852418 prompt tokens; $2.03 of spend is repeated context.</li>
+<li><strong>Top prompt clusters</strong> — top 17 repeated prompts hold $4.60 of spend (largest $0.73 across 96 requests).</li>
+<li><strong>Error waste</strong> — 32 error responses billed for $0.24 of output tokens.</li>
+<li><strong>Tail latency</strong> — gpt-4o p95=4906ms; gpt-4o-mini p95=3056ms; claude-3-5-sonnet-latest p95=4109ms; internal-finetuned-7b p95=2728ms</li>
+<li><strong>Model-mix drift</strong> — model share shifted across 65 day-model points within the window.</li>
+</ul>
+<h2>3. Cache simulation (exact)</h2>
+<ul>
+<li>Hit rate: 59.8%</li>
+<li>Tokens avoided: 660678</li>
+<li>Dollars avoided: $ 2.59</li>
+</ul>
+<div class="scroll" role="region" aria-label="Cache hit rate by model — horizontally scrollable" tabindex="0">
+<table>
+<tr><th>Model</th><th>Requests</th><th>Hit rate</th></tr>
+<tr><td>gpt-4o</td><td>449</td><td>66.1%</td></tr>
+<tr><td>gpt-4o-mini</td><td>100</td><td>57.0%</td></tr>
+<tr><td>claude-3-5-sonnet-latest</td><td>37</td><td>13.5%</td></tr>
+<tr><td>internal-finetuned-7b</td><td>14</td><td>0.0%</td></tr>
+</table>
+</div>
+<h2>4. Routing simulation (rule_tier)</h2>
+<div class="scroll" role="region" aria-label="Routing class distribution — horizontally scrollable" tabindex="0">
+<table>
+<tr><th>Class</th><th>Requests</th></tr>
+<tr><td>easy</td><td>426</td></tr>
+<tr><td>hard</td><td>79</td></tr>
+<tr><td>medium</td><td>95</td></tr>
+</table>
+</div>
+<ul>
+<li>Routing-only savings (all requests): $ 2.65</li>
+<li>Routing-on-misses savings (production order): $ 0.70</li>
+<li>Unpriced targets dropped: 50</li>
+<li>**Combined savings (cache + routing on misses): $ 3.29** (overlap $ 1.95 not double-counted)</li>
+</ul>
+<h2>5. Data quality</h2>
+<ul>
+<li>Parsed: 600, skipped: 0</li>
+<li>Ingestion denominator: 600 lines (parsed + skipped)</li>
+<li>Ingestion cap: 5000000 records</li>
+<li>Rows with real token counts: 100.0%</li>
+<li>Rows with timestamps: 100.0%</li>
+<li>Unpriced requests: 14</li>
+<li>Unpriced models: internal-finetuned-7b</li>
+</ul>
+<h2>6. Recommendations</h2>
+<ol>
+<li><strong>Investigate the top spenders</strong> — The top 1% of requests hold 2.5% of spend; confirm each is intended before scaling it.</li>
+<li><strong>Cache the system prefix</strong> — 13 repeated prefixes cost $2.03 of prompt tokens; provider prompt caching may discount eligible repeated input; confirm model-specific rates.</li>
+<li><strong>Stop paying for errors</strong> — 32 error responses billed $0.24 of output tokens.</li>
+<li><strong>Enable cache + tier routing</strong> — Simulated combined savings of $3.29 (cache $2.59 + routing on misses $2.65; overlap $1.95 not double-counted).</li>
+</ol>
+</main>
+</body>
+</html>

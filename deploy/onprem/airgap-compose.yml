@@ -1,0 +1,90 @@
+name: yabanin-airgap
+
+# Minimal air-gap compose: ONLY pre-loaded images (docker load), no build:,
+# no registry references, nothing to pull. See docs/onprem/offline-bundle.md.
+# Replace `yabanin:hardened-<version>` on install.
+#
+# Secrets are NOT in this file and NOT in the bundle. They come from a .env
+# file next to this compose file (created on the install host before up; both
+# variables are REQUIRED — compose refuses to render without them):
+#
+#   POSTGRES_PASSWORD=$(openssl rand -hex 16)
+#   YABANIN_CACHE_HMAC_SECRET=$(openssl rand -hex 32)
+#
+# YABANIN_CACHE_HMAC_SECRET is mandatory whenever YABANIN_REDIS_ADDR is set:
+# pkg/config hard-errors "cache_hmac_secret is required when redis is
+# configured" at gateway start (fail here, at compose render, instead).
+# The gateway pool also SET ROLEs into yabanin_app (IMP-88), so the
+# db-app-role one-shot below bootstraps that role from
+# bootstrap-app-role.sql — the same SQL the e2e drill applies (drill phase D)
+# and the quickstart uses. Keep this file and bootstrap-app-role.sql
+# together: the compose mounts the SQL from its own directory (they ship
+# side by side in the bundle under install/compose/).
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: yabanin
+      POSTGRES_PASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this file (generate with openssl rand -hex 16)}"
+      POSTGRES_DB: yabanin
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yabanin -d yabanin"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    image: yabanin:hardened-<version>
+    command: ["migrate"]
+    restart: "no"
+    environment:
+      YABANIN_PG_URI: postgres://yabanin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this file (generate with openssl rand -hex 16)}@postgres:5432/yabanin?sslmode=disable
+      YABANIN_REGION: onprem
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # One-shot IMP-88 app-role bootstrap (between migrate and gateway, like the
+  # quickstart db-app-role service and drill phase D4): the gateway pool
+  # SET ROLEs into yabanin_app — without this step the resolver degrades to
+  # fallback-only. Uses the pgvector image already in the bundle (no pull).
+  db-app-role:
+    image: pgvector/pgvector:pg16
+    volumes:
+      - ./bootstrap-app-role.sql:/bootstrap-app-role.sql:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "yabanin", "-d", "yabanin",
+                 "-v", "ON_ERROR_STOP=1", "-f", "/bootstrap-app-role.sql"]
+    environment:
+      PGPASSWORD: "${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this file (generate with openssl rand -hex 16)}"
+    restart: "no"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  gateway:
+    image: yabanin:hardened-<version>
+    command: ["gateway"]
+    environment:
+      YABANIN_PG_URI: postgres://yabanin:${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env next to this file (generate with openssl rand -hex 16)}@postgres:5432/yabanin?sslmode=disable
+      YABANIN_REGION: onprem
+      YABANIN_REDIS_ADDR: redis:6379
+      YABANIN_CACHE_HMAC_SECRET: "${YABANIN_CACHE_HMAC_SECRET:?set YABANIN_CACHE_HMAC_SECRET in .env next to this file (generate with openssl rand -hex 32)}"
+      YABANIN_GATEWAY_LISTEN: ":8082"
+    ports:
+      - "127.0.0.1:8082:8082"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db-app-role:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy

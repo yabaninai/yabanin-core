@@ -1,0 +1,24 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent-eval tool event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["event_id", "episode_id", "call_ref", "tool", "phase", "args_digest", "side_effect", "actor"],
+  "properties": {
+    "event_id": {"type": "string", "minLength": 1},
+    "episode_id": {"type": "string", "minLength": 1},
+    "call_ref": {"type": "string", "minLength": 1},
+    "tool": {"type": "string", "minLength": 1},
+    "phase": {"enum": ["proposed", "allowed", "denied", "executed", "failed"]},
+    "args_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "receipt": {
+      "type": ["object", "null"], "additionalProperties": false,
+      "required": ["id", "idempotency_key"],
+      "properties": {"id": {"type": "string"}, "idempotency_key": {"type": ["string", "null"]}}
+    },
+    "side_effect": {"enum": ["none", "state_mutation", "file_write"]},
+    "fault_injected": {"type": ["boolean", "null"]},
+    "actor": {"enum": ["agent", "controller"]},
+    "deny_reason": {"type": ["string", "null"], "enum": [null, "not_in_allowlist", "requires_approval", "sandbox_escape_attempt"]}
+  }
+}

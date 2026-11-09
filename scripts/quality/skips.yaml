@@ -1,0 +1,123 @@
+# Skip registry (NEXT-07): every test skip must be explained here.
+# A skip not listed in this file causes the quality run to fail.
+# Schema: v1 (2026-09-14).
+#
+# Fields:
+#   test:    Go test name as "package_path.TestName"
+#   condition: when the skip fires (always, or a runtime predicate)
+#   reason:  why the unit test does not cover this behavior
+#   class:   residue class of the skip (e.g. ENVIRONMENT = env/stand-gated by
+#            design; informational, mirrors the registry classification)
+#   refs:    registry/manifest evidence of where the skip was flagged; proves
+#            the entry is a registered owner decision, never a bare silence
+#   owner:   who decided this skip is acceptable
+#   proof:   alternative evidence that the behavior IS verified
+#   expires: empty = permanent; YYYY-MM-DD = temporary exception
+
+schema: 1
+updated: 2026-11-03
+
+skips:
+  - test: pkg/costsim.TestRegenerateSampleHTML
+    condition: always (unless -sample.out flag is passed)
+    reason: manual regeneration tool, not a behavioral test
+    owner: yabanin
+    proof: sample artifacts are committed; docs gate verifies freshness
+    expires: ""
+
+  - test: pkg/cache.TestPurgeExpired
+    condition: always
+    reason: real TTL purge requires a live Postgres+Redis store
+    owner: yabanin
+    proof: int-modules gate runs testcontainers-based integration suite
+    expires: ""
+
+  - test: pkg/cache.TestStoreGetExactMiss
+    condition: always
+    reason: exact-match semantics require a real Postgres store
+    owner: yabanin
+    proof: int-modules gate runs testcontainers-based integration suite
+    expires: ""
+
+  - test: pkg/cache.TestSemanticLookup_RecallAndLatency
+    condition: AF15_RECALL_BENCH env var unset
+    reason: AF-15 recall/latency measurement boots a pgvector container and inserts a 90k-vector dataset (~140s); gated so routine -short/-race/shuffle gates stay fast
+    owner: yabanin
+    proof: run explicitly with AF15_RECALL_BENCH=1 during AF-15 acceptance; measurements recorded in the AF-15 work record (plans archive removed in the beta cleanup, restored post-beta); correctness of the ef_search application itself is covered by TestSemanticLookup_EFSearchOnQueryConnection (runs in every non-short pass)
+    expires: ""
+
+  - test: pkg/cache.TestAF16Longrun_OrgModelChurnAndRedisKeyScaling
+    condition: AF16_LONGRUN env var unset
+    reason: AF-16 long-run evidence boots a Redis container and fills up to 1,000,000 keys (~45s plus container startup); gated so routine -short/-race/shuffle gates stay fast
+    owner: yabanin
+    proof: run explicitly with AF16_LONGRUN=1 during AF-16 acceptance; measurements recorded in the AF-16 work record (plans archive removed in the beta cleanup, restored post-beta) and artifacts/agent-lanes/af16/longrun.log; the boundedness itself is asserted by TestAF16_Analytics_OrgChurnBoundedLRU, TestAF16_Analytics_TierChurnBoundedIncludingMisses, TestAF16_PolicyCache_OrgChurnBounded and TestAF16_Stats_* (run in every pass), and the 20k-key slowlog evidence by TestAF16_Stats_NoKeysCommandInSlowlog
+    expires: ""
+
+  - test: services/admin/handlers.TestRoutesInventoryGenerate
+    condition: ROUTES_INVENTORY_GENERATE env var unset
+    reason: IMP-50 route-inventory generator rewrites docs/api/admin.openapi.yaml stubs; gated so routine gates never mutate tracked docs
+    owner: yabanin
+    proof: run explicitly with ROUTES_INVENTORY_GENERATE=1 (go test -run TestRoutesInventoryGenerate ./services/admin/handlers/); the drift check itself (TestRoutesInventory) runs in every pass and fails on any undocumented or changed route
+    expires: ""
+
+  - test: services/admin/handlers.TestUIActionsInventoryGenerate
+    condition: UI_ACTIONS_INVENTORY_GENERATE env var unset
+    reason: UI action inventory generator rewrites the tracked UI-inventory doc; gated so routine gates never mutate tracked docs (same class as TestRoutesInventoryGenerate)
+    owner: yabanin
+    proof: run explicitly with UI_ACTIONS_INVENTORY_GENERATE=1 (go test -run TestUIActionsInventoryGenerate ./services/admin/handlers/); the drift check itself (TestUIActionsInventory) runs in every pass and fails on any undocumented or changed UI action
+    expires: ""
+
+  - test: pkg/provider.TestAzureOpenAI_LiveSmoke_EnvGated_CostLimited
+    condition: AZURE_OPENAI_LIVE_SMOKE env var != 1
+    reason: live Azure OpenAI smoke needs network egress and owner-approved Azure tenant/quota/spend (cost-limited by design, default cap 0.05 USD); routine quality gates run on stands without egress or spend authorization, so the smoke is armed only on demand
+    owner: yabanin
+    proof: the deterministic contract suite carries the wire contract on every pass (TestAzureOpenAI_Contract_SharedAdapter_MultiOrgCredentials plus the pkg/provider stub suites); arming instructions and the acceptance record are documented in the test's own skip message and artifacts/internal-delivery-program/N08-P01/N08-P01-T03-record-2026-10-30.md
+    expires: ""
+
+  - test: pkg/trcli/credstore.TestKeychainPutKeepsKeyOffArgv
+    condition: runtime.GOOS != darwin (t.Skip guard added by 838bf05, 2026-10-29)
+    reason: the keychain store wraps the macOS security helper and the keychain type is defined only in keychain_darwin.go, so commit 838bf05 (fx1 follow-up) added a runtime GOOS guard to make store_test.go type-check under go vet on linux/windows; on a linux runner the darwin-only keychain code path cannot execute, so this skip is by design, not a lost coverage regression (the identical darwin-only symbol was simply uncompilable on linux before the guard)
+    owner: yabanin
+    proof: BASE-FIX-1 record artifacts/internal-delivery-program/resume-20261028/BASE-FIX-1-record-2026-10-29.md (commit f16ff87) - GOOS=darwin go vet exit 0 at base (darwin path always compiled) and CGO_ENABLED=0 GOOS=darwin go test -c links the full darwin test binary; on darwin Open(t.TempDir(), run) returns exactly keychain{run: run}, so the guarded test body exercises the identical production object with identical assertions; the non-darwin credstore stores are covered on every linux run (TestSecretToolPutKeepsKeyOffArgv, TestFileFallbackPermissions, TestLinuxStoreFallsBackWithoutSecretTool all PASS)
+    expires: ""
+
+  - test: pkg/provider.TestAzureOpenAI_LiveSmoke_EnvGated_CostLimited
+    condition: AZURE_OPENAI_LIVE_SMOKE != "1" (also skips with the exact missing names when any of AZURE_OPENAI_LIVE_{ENDPOINT,DEPLOYMENT,TENANT_ID,CLIENT_ID,CLIENT_SECRET} is unset)
+    reason: live Azure OpenAI smoke needs network egress plus an owner-approved Azure tenant/quota/spend authorization, absent on routine checkout gates by design (the test name states EnvGated_CostLimited); the test's skip message is loud and documents how to arm it on a networked stand
+    class: ENVIRONMENT (live-credential env-gate absent by design, not lost coverage)
+    refs: flagged as unexplained by >=4 lanes before registration - manifests 20261102T191309Z-0a528475 and 20261102T202058Z-f6aeaf45, promotion gates 20261102T182854Z-0ee2f338 and 20261102T210823Z-70c8c66c (policy_findings registry-gap class, jobs.md 309-U ledger (b)); owner-approved registration 2026-11-02 (card imp-qhyg1)
+    owner: yabanin
+    proof: the deterministic wire-contract suite runs in every pass and carries the behavior - TestAzureOpenAI_Contract_SharedAdapter_MultiOrgCredentials plus the pkg/provider stub suites (test comment names them as the carry); arming/cost-limit semantics are specified in artifacts/internal-delivery-program/N08-P01/N08-P01-T03-record-2026-10-30.md; the spend-limit breach and secret-in-error failure paths FAIL (never skip) when armed
+    expires: ""
+
+  - test: services/admin/handlers.TestUIActionsInventoryGenerate
+    condition: UI_ACTIONS_INVENTORY_GENERATE env var unset
+    reason: the UI-action inventory generator rewrites tracked inventory fixtures; env-gated so routine gates never mutate tracked docs (same pattern as services/admin/handlers.TestRoutesInventoryGenerate, IMP-50 route-inventory generator)
+    class: ENVIRONMENT (inventory-generation fixtures not produced in checkout runs, by design)
+    refs: flagged as unexplained by >=4 lanes before registration - manifests 20261102T191309Z-0a528475 and 20261102T202058Z-f6aeaf45, promotion gates 20261102T182854Z-0ee2f338 and 20261102T210823Z-70c8c66c (policy_findings registry-gap class, jobs.md 309-U ledger (b)); owner-approved registration 2026-11-02 (card imp-qhyg1)
+    owner: yabanin
+    proof: run explicitly with UI_ACTIONS_INVENTORY_GENERATE=1 (go test ./services/admin/handlers/ -run TestUIActionsInventoryGenerate, per the test's own header comment); the generated inventory is reviewed content, and the always-on handler action checks keep the underlying behavior covered in every pass
+    expires: ""
+
+  - test: pkg/handlers.TestUIActionsInventoryGenerate
+    condition: UI_ACTIONS_INVENTORY_GENERATE env var unset (ALIAS entry, see below)
+    reason: NOT a distinct test - the physical test lives only in services/admin/handlers (see the entry above); this is the quality runner's short-form package rendering of the same skip (the manifest reporter renders non-pkg/... import paths as pkg/<last-element>, so services/admin/handlers surfaces as "pkg/handlers" in policy findings); there is no pkg/handlers package in the tree; registered so both reported name forms of the one physical skip are explained
+    class: ENVIRONMENT (same registration as services/admin/handlers.TestUIActionsInventoryGenerate)
+    refs: same flags as the physical entry - manifests 20261102T191309Z-0a528475 and 20261102T202058Z-f6aeaf45, promotion gates 20261102T182854Z-0ee2f338 and 20261102T210823Z-70c8c66c; owner-approved registration 2026-11-02 (card imp-qhyg1, "x2 (services/admin/handlers + pkg/handlers)")
+    owner: yabanin
+    proof: identical to services/admin/handlers.TestUIActionsInventoryGenerate (same physical test, same explicit-run evidence)
+  - test: pkg/provider.TestAzureOpenAI_LiveDiagnostics_EnvGated_ZeroSpend
+    condition: AZURE_OPENAI_LIVE_SMOKE != 1 (loud-skip guard added by N08-P01-T04, 2026-11-03)
+    reason: real-cloud diagnostics acceptance needs a live Azure OpenAI resource plus an Entra app registration (owner-approved tenant); routine stands have no network egress and no such tenant, so the live entry is env-gated exactly like the T03 live smoke (pkg/provider.TestAzureOpenAI_LiveSmoke_EnvGated_CostLimited, same env contract) and skips loudly with arming instructions instead of dialing
+    owner: yabanin
+    proof: deterministic diagnostics suite (pkg/provider/azure_openai_diagnostics_test.go) carries the acceptance contract on stubs - endpoint/credential refusal paths, stage attribution, 429 cooldown, discovery wire pin (api-version 2024-10-21), multi-org token non-crossing, deployment-present verdict, 1 MiB cap, 3 proven-RED mutation teeth; the armed live path reuses the same RunDiagnostics code the stubs pin and issues no chat completion (zero spend by construction); unarmed and armed-incomplete skips verified verbatim in the T04 record artifacts/internal-delivery-program/imp-n08p01t04-2026-11-03.md
+    expires: ""
+
+  - test: pkg/metrics.TestN13P04T06_LiveTelegramSink_Drill
+    condition: T06_LIVE != 1 (also skips when armed but the drill env file is absent — arming without credentials FAILS loud instead, per the test's own guard)
+    reason: the REAL leg of N13-P04-T06 sends live Telegram messages to the owner chat through the production bot (up to 4 real TEST-prefixed messages per armed run: 3 alertmanager-driven + 1 direct golden send in full mode, 2 in T06_LIVE_MINIMAL=1 mode for budget-constrained re-runs); it needs network egress to api.telegram.org, the pinned prom/alertmanager image, docker, and owner-provisioned bot credentials in a 0600 env file (T06_LIVE_ENV) — none of which exist on routine checkout gates by design; the armed run is executed with real-message budget <=5 and its evidence is recorded in artifacts/internal-delivery-program/imp-t06live-2026-11-05.md (Azure live-smoke precedent, pkg/provider.TestAzureOpenAI_LiveSmoke_EnvGated_CostLimited)
+    class: ENVIRONMENT (live-credential env-gate absent by design, not lost coverage)
+    refs: card N13-P04-T06 lane imp-n05p05t06 (lease row artifacts/imp/leases.md, commit d97bdfb1); armed-run evidence and transcript bound in artifacts/internal-delivery-program/imp-t06live-2026-11-05.md; one-time execution policy per card acceptance (real-message budget <=5, TEST-labeled)
+    owner: yabanin
+    proof: the deterministic carry runs in every pass and pins the same code paths - TestN13P04T06_MockSink_* (wire contract: request shape, retry_after handling, exactly-one HTTP attempt, token-redacting error paths, wrong-chat rejection, malformed-chat pre-flight) and TestN13P04T06_GoldenBuilder_FormatPins (byte-exact alertmanager v0.27.0 telegram.default.message golden, html/template escaping per notify.TmplHTML, sorted-pairs order, no re-execution of posted annotation values); the armed drill reuses the same telegramSinkClient and the same golden builder the deterministic suites pin
+    expires: ""

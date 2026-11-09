@@ -1,0 +1,45 @@
+# IMP-60 golden gateway route inventory (healthHandler + gw.routes, DB deployment shape).
+# Format: <METHOD> <pattern> <chain>; chain classes: public|auth|labels|credit|failover|anthropic-envelope.
+# Regenerate ONLY with: ROUTES_GOLDEN_UPDATE=1 go test ./pkg/cli/ -run TestGatewayRoutesGolden
+# 41 walked routes
+POST /api/a2a/send auth
+HEAD /api/hello public
+POST /api/mcp/auth/{server}/begin auth
+GET /api/mcp/auth/{server}/callback public
+POST /api/mcp/credentials/{server} auth
+POST /api/mcp/invoke auth
+GET /api/mcp/yabanin/tools auth
+GET /healthz public
+DELETE /mcp auth
+GET /mcp auth
+POST /mcp auth
+POST /v1/audio/speech auth+labels+credit
+POST /v1/audio/transcriptions auth+labels+credit
+GET /v1/batches auth+labels+credit
+POST /v1/batches auth+labels+credit
+GET /v1/batches/{id} auth+labels+credit
+POST /v1/batches/{id}/cancel auth+labels+credit
+GET /v1/batches/{id}/results auth+labels+credit
+POST /v1/chat/completions auth+labels+credit
+POST /v1/completions auth+labels+credit
+POST /v1/embeddings auth+labels+credit
+GET /v1/files auth+labels+credit
+POST /v1/files auth+labels+credit
+DELETE /v1/files/{id} auth+labels+credit
+GET /v1/files/{id} auth+labels+credit
+GET /v1/files/{id}/content auth+labels+credit
+POST /v1/images/generations auth+labels+credit
+POST /v1/messages anthropic-envelope+auth+labels+credit
+POST /v1/messages/count_tokens anthropic-envelope+auth+labels+credit
+GET /v1/models auth+labels+credit
+GET /v1/models/{id} auth+labels+credit
+POST /v1/moderations auth+labels+credit
+POST /v1/realtime auth+labels+credit
+POST /v1/rerank auth+labels+credit
+POST /v1/responses auth+labels+credit
+GET /v1/yabanin/label-policy auth
+POST /v1/yabanin/session-keys auth
+DELETE /v1/yabanin/session-keys/{id} auth
+POST /v1/yabanin/session-keys/{id}/finish auth
+GET /v1/yabanin/session-keys/{id}/usage auth
+GET /v1/yabanin/usage auth

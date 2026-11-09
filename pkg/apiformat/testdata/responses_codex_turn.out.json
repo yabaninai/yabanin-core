@@ -1,0 +1,44 @@
+{
+  "model": "gpt-5-codex",
+  "messages": [
+    {"role": "system", "content": "You are Codex.\n\nUse tools."},
+    {"role": "user", "content": "Hi\n\nthere"},
+    {
+      "role": "assistant",
+      "content": "Ok",
+      "tool_calls": [
+        {"id": "call_1", "type": "function", "function": {"name": "read", "arguments": "{\"path\":\"a\"}"}}
+      ]
+    },
+    {"role": "tool", "content": "file", "tool_call_id": "call_1"}
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read",
+        "parameters": {"type": "object", "properties": {}},
+        "strict": true
+      }
+    },
+    {
+      "type": "function",
+      "function": {
+        "name": "apply_patch",
+        "description": "Patch",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string",
+              "description": "Raw input for this tool.\n\nThe input MUST match this lark grammar:\nstart: WORD"
+            }
+          },
+          "required": ["input"],
+          "additionalProperties": false
+        }
+      }
+    }
+  ]
+}

@@ -1,0 +1,362 @@
+/* Astra design canon (design/astra-tokens.css) + legacy --yb-* mapping.
+   New styles use --astra-*; the mapped names keep pre-migration CSS working
+   until the ASTR-12x screen migrations retire them. Hardcoded color literals
+   are forbidden here (make lint-design). */
+@import '../../../design/astra-tokens.css';
+
+:root {
+  --yb-paper: var(--astra-paper);
+  --yb-surface: var(--astra-surface);
+  --yb-surface-muted: var(--astra-surface-muted);
+  --yb-ink: var(--astra-ink);
+  --yb-text-muted: var(--astra-text-muted);
+  --yb-rule: var(--astra-rule);
+  --yb-rule-strong: var(--astra-rule-strong);
+  --yb-action: var(--astra-action);
+  --yb-action-hover: var(--astra-action-hover);
+  --yb-on-action: var(--astra-on-action);
+  --yb-accent: var(--astra-accent);
+  --yb-accent-surface: var(--astra-accent-surface);
+  --yb-info: var(--astra-info);
+  --yb-info-surface: var(--astra-info-surface);
+  --yb-success: var(--astra-success);
+  --yb-success-surface: var(--astra-success-surface);
+  --yb-warning: var(--astra-warning);
+  --yb-warning-surface: var(--astra-warning-surface);
+  --yb-danger: var(--astra-danger);
+  --yb-danger-surface: var(--astra-danger-surface);
+  --yb-focus: var(--astra-focus);
+  --yb-font-ui: var(--astra-font-ui);
+  --yb-font-editorial: var(--astra-font-editorial);
+  --yb-font-code: var(--astra-font-code);
+  --yb-space-1: var(--astra-space-1);
+  --yb-space-2: var(--astra-space-2);
+  --yb-space-3: var(--astra-space-3);
+  --yb-space-4: var(--astra-space-4);
+  --yb-space-5: var(--astra-space-5);
+  --yb-space-6: var(--astra-space-6);
+  --yb-space-7: var(--astra-space-7);
+  --yb-space-8: var(--astra-space-8);
+  --yb-radius-control: var(--astra-radius-control);
+  --yb-radius-panel: var(--astra-radius-panel);
+  --yb-height-control: var(--astra-height-control);
+  --yb-font-body: var(--astra-font-body);
+  --yb-font-label: var(--astra-font-label);
+  --yb-font-small: var(--astra-font-small);
+  --yb-duration: var(--astra-duration);
+}
+
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* AVR-06 (F06): base surfaces on the Astra tokens. */
+body {
+  @apply antialiased;
+  background: var(--astra-paper);
+  color: var(--astra-ink);
+}
+
+.card {
+  position: relative;
+  background: var(--astra-surface);
+  border: 1px solid var(--astra-rule);
+  border-radius: var(--astra-radius-panel);
+  padding: 1.5rem;
+  min-width: 0;
+}
+
+/* AUX-22: disclosure popover surface (the «Виды ▾» / table-settings menus).
+   Anchored card styling that is position:absolute by definition — plain
+   `.card.absolute` would resolve to .card's position:relative (the class
+   below is defined after the utilities layer, same specificity), so the
+   popover would re-enter layout and shove the page down while open. */
+.astra-menu-pop {
+  position: absolute;
+  top: 100%;
+  inset-inline-end: 0;
+  z-index: 20;
+  margin-top: 0.25rem;
+  background: var(--astra-surface);
+  border: 1px solid var(--astra-rule);
+  border-radius: var(--astra-radius-panel);
+  padding: 1.5rem;
+  min-width: 0;
+}
+
+.stat-card {
+  @apply card flex flex-col gap-1;
+}
+
+.stat-label {
+  @apply text-sm font-medium uppercase tracking-wide;
+  color: var(--astra-text-muted);
+}
+
+.stat-value {
+  @apply text-3xl font-bold;
+  color: var(--astra-ink);
+}
+
+.stat-sub {
+  @apply text-sm;
+  color: var(--astra-text-muted);
+}
+
+/* Operator readability and keyboard access. */
+a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visible, select:focus-visible {
+  outline: 3px solid var(--astra-focus);
+  outline-offset: 3px;
+}
+.stat-sub { color: var(--astra-text-muted); }
+.stat-value { overflow-wrap: anywhere; }
+
+/* IMP-07 (D-06/D-07): long tokens — pricing provenance URLs, sha256, model
+   ids — must wrap instead of widening the document. Tailwind v3 has no
+   overflow-wrap utility, so the class the components already use is defined
+   here once; without it the class name silently does nothing. */
+.overflow-wrap-anywhere { overflow-wrap: anywhere; }
+
+/* Porcelain shared controls (direction #02). One definition per control
+   shape, used by the Astra primitives and every page — per-page styles only
+   add layout (widths, wrapping), never colors or shape. Declared in the
+   components layer so Tailwind utilities can still override single
+   properties (width, font-mono, …). */
+@layer components {
+  /* Raised working surface: white card, thin rule, small radius.
+     position:relative makes the card the containing block for absolutely
+     positioned descendants (sr-only labels, chart tooltips): their overflow
+     contributes to this card's scrollable area instead of the document, so a
+     wide table can never widen the page through a hidden label. */
+  .astra-panel {
+    position: relative;
+    background: var(--astra-surface);
+    border: 1px solid var(--astra-rule);
+    border-radius: var(--astra-radius-panel);
+  }
+
+  /* Primary action — the single filled blue. */
+  .btn-primary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--astra-height-control);
+    padding: 0 var(--astra-space-4);
+    border: 1px solid var(--astra-action);
+    border-radius: var(--astra-radius-control);
+    background: var(--astra-action);
+    color: var(--astra-on-action);
+    font-size: var(--astra-font-small);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .btn-primary:hover:not(:disabled) { background: var(--astra-action-hover); }
+  .btn-primary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Secondary action — bordered surface, ink label. */
+  .btn-secondary {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-height: var(--astra-height-control);
+    padding: 0 var(--astra-space-4);
+    border: 1px solid var(--astra-rule-strong);
+    border-radius: var(--astra-radius-control);
+    background: var(--astra-surface);
+    color: var(--astra-ink);
+    font-size: var(--astra-font-small);
+    font-weight: 500;
+    white-space: nowrap;
+  }
+  .btn-secondary:hover:not(:disabled) { background: var(--astra-surface-muted); }
+  .btn-secondary:disabled { opacity: 0.5; cursor: not-allowed; }
+
+  /* Text inputs and selects. Width set per-usage with utilities. */
+  .control {
+    width: 100%;
+    min-height: var(--astra-height-control);
+    padding: var(--astra-space-2) var(--astra-space-3);
+    border: 1px solid var(--astra-rule-strong);
+    border-radius: var(--astra-radius-control);
+    background: var(--astra-surface);
+    color: var(--astra-ink);
+  }
+  .control::placeholder { color: var(--astra-text-muted); }
+  .control:disabled { opacity: 0.5; cursor: not-allowed; }
+  /* Native <select> ignores CSS min-height in mobile mode (isMobile), so the
+     44px AVR-07 floor silently collapses to the content height. Opt the select
+     out of the native chrome and draw the Astra chevron so the token border,
+     radius and 44px floor apply uniformly across desktop and mobile. */
+  select.control {
+    -webkit-appearance: none;
+    appearance: none;
+    background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 12 12'%3E%3Cpath fill='%23808570' d='M2 4h8L6 8z'/%3E%3C/svg%3E");
+    background-repeat: no-repeat;
+    background-position: right var(--astra-space-3) center;
+    padding-right: 2rem;
+  }
+
+  /* AUX-12 action dialogs: dimmed backdrop, floating toast — token-driven. */
+  .astra-overlay {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: var(--astra-space-4);
+    background: color-mix(in srgb, var(--astra-ink) 40%, transparent);
+  }
+  .astra-dialog {
+    width: 100%;
+    max-width: 40rem;
+    max-height: calc(100vh - 2 * var(--astra-space-4));
+    overflow-y: auto;
+  }
+  .astra-toast {
+    position: fixed;
+    right: var(--astra-space-4);
+    bottom: var(--astra-space-4);
+    z-index: 40;
+    display: flex;
+    align-items: center;
+    gap: var(--astra-space-3);
+    padding: var(--astra-space-2) var(--astra-space-3);
+    background: var(--astra-surface);
+    border: 1px solid var(--astra-rule-strong);
+    border-radius: var(--astra-radius-control);
+    font-size: var(--astra-font-small);
+    box-shadow: 0 4px 16px color-mix(in srgb, var(--astra-ink) 20%, transparent);
+  }
+
+  /* AUX-17 entity drawer: a right-side inspector panel over the dimmed
+     porcelain backdrop. The layer is a fixed inset-0 flex container (never
+     contributes to document scroll width); the panel caps at min(28rem,100%)
+     so a 360px viewport gets the full-screen variant without horizontal
+     overflow (the AUX-17 acceptance gate). */
+  .astra-drawer-layer {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    justify-content: flex-end;
+  }
+  .astra-drawer-backdrop {
+    position: absolute;
+    inset: 0;
+    background: color-mix(in srgb, var(--astra-ink) 40%, transparent);
+  }
+  .astra-drawer {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    gap: var(--astra-space-4);
+    width: min(28rem, 100%);
+    height: 100%;
+    overflow-y: auto;
+    padding: var(--astra-space-4);
+    background: var(--astra-surface);
+    border-inline-start: 1px solid var(--astra-rule-strong);
+  }
+
+  /* AUX-21 command palette: a top-centered launcher over the dimmed
+     porcelain backdrop. Fixed inset-0 layer (never contributes to document
+     scroll width); the panel caps at min(36rem, 100%) so a 360px viewport
+     gets the full-width variant without horizontal overflow (the AUX-21
+     acceptance gate). The list scrolls inside the panel. */
+  .astra-palette-layer {
+    position: fixed;
+    inset: 0;
+    z-index: 50;
+    display: flex;
+    align-items: flex-start;
+    justify-content: center;
+    padding: var(--astra-space-4);
+  }
+  .astra-palette-backdrop {
+    position: absolute;
+    inset: 0;
+    background: color-mix(in srgb, var(--astra-ink) 40%, transparent);
+  }
+  .astra-palette {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    width: min(36rem, 100%);
+    max-height: calc(100vh - 2 * var(--astra-space-4));
+    overflow-y: auto;
+    background: var(--astra-surface);
+    border: 1px solid var(--astra-rule-strong);
+    border-radius: var(--astra-radius-dialog);
+    box-shadow: 0 4px 16px color-mix(in srgb, var(--astra-ink) 20%, transparent);
+  }
+  .astra-palette-input {
+    flex: 1;
+    min-width: 0;
+    min-height: var(--astra-height-control);
+    border: none;
+    background: transparent;
+    color: var(--astra-ink);
+    font-size: var(--astra-font-body);
+    font-family: var(--astra-font-ui);
+  }
+  .astra-palette-input::placeholder { color: var(--astra-text-muted); }
+  .astra-palette-input:focus { outline: none; }
+  .astra-palette-list {
+    overflow-y: auto;
+    padding-bottom: var(--astra-space-2);
+  }
+  .astra-palette-section {
+    padding: var(--astra-space-2) var(--astra-space-3) var(--astra-space-1);
+    color: var(--astra-text-muted);
+    font-size: var(--astra-font-label);
+    letter-spacing: 0.04em;
+    text-transform: uppercase;
+  }
+  .astra-palette-option {
+    display: flex;
+    align-items: center;
+    min-height: 40px;
+    padding: var(--astra-space-2) var(--astra-space-3);
+    color: var(--astra-ink);
+    font-size: var(--astra-font-small);
+    cursor: pointer;
+  }
+  .astra-palette-option:hover,
+  .astra-palette-option.is-active { background: var(--astra-surface-muted); }
+  .astra-palette-option[aria-selected="true"] {
+    background: var(--astra-selection);
+    color: var(--astra-on-selection);
+    font-weight: 600;
+  }
+
+  /* Data table chrome for screens that render plain (non-DataTable) tables:
+     paper header band on surface-muted, thin row rules, tabular numbers
+     stay the caller's concern (mono utilities per cell). */
+  .table-astra { width: 100%; border-collapse: collapse; }
+  .table-astra th {
+    padding: var(--astra-space-2) var(--astra-space-3);
+    background: var(--astra-surface-muted);
+    border-bottom: 1px solid var(--astra-rule-strong);
+    color: var(--astra-text-muted);
+    font-size: var(--astra-font-label);
+    font-weight: 500;
+    text-align: left;
+    white-space: nowrap;
+  }
+  .table-astra td {
+    padding: var(--astra-space-3);
+    border-bottom: 1px solid var(--astra-rule);
+    color: var(--astra-ink);
+    vertical-align: top;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .motion-safe\:animate-pulse { animation: none; }
+}
+
+/* Tighter card padding on phones (space stays token-driven). */
+@media (max-width: 640px) {
+  .card { padding: var(--astra-space-4); }
+}

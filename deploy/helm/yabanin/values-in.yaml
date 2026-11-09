@@ -1,0 +1,22 @@
+replicaCount: 1
+
+image:
+  repository: yabanin-gateway
+  tag: latest
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8082
+
+env:
+  YABANIN_REGION: in
+  YABANIN_HOME_REGION: IN
+  YABANIN_KMS_PROVIDER: local
+resources:
+  limits:
+    cpu: 2
+    memory: 4Gi
+  requests:
+    cpu: 500m
+    memory: 1Gi

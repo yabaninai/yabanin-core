@@ -1,0 +1,17 @@
+# Codecov configuration for yabanin (Yabanin).
+# Enforces minimum coverage thresholds to prevent regressions.
+
+coverage:
+  status:
+    project:
+      default:
+        target: 40%
+        threshold: 5%
+    patch:
+      default:
+        target: 60%
+        threshold: 10%
+
+comment:
+  layout: "reach,diff,flags,files"
+  require_changes: true

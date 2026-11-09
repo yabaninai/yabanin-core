@@ -1,0 +1,15 @@
+{
+  "model": "claude",
+  "messages": [
+    {"role": "user", "content": "List files"},
+    {"role": "assistant", "content": "Calling", "tool_calls": [
+      {"id": "toolu_1", "type": "function", "function": {"name": "bash", "arguments": "{\"cmd\":\"ls\"}"}}
+    ]},
+    {"role": "tool", "content": "a.go", "tool_call_id": "toolu_1"},
+    {"role": "user", "content": "Thanks"}
+  ],
+  "tools": [
+    {"type": "function", "function": {"name": "bash", "description": "Run", "parameters": {"type": "object", "properties": {"cmd": {"type": "string"}}}}}
+  ],
+  "max_tokens": 100
+}

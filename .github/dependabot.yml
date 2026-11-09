@@ -1,0 +1,63 @@
+version: 2
+
+updates:
+  # Go modules
+  - package-ecosystem: "gomod"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+    labels:
+      - "dependencies"
+      - "security"
+    groups:
+      golang-org:
+        patterns:
+          - "golang.org/*"
+      otel-packages:
+        patterns:
+          - "go.opentelemetry.io/*"
+      test-packages:
+        patterns:
+          - "github.com/stretchr/*"
+
+  # GitHub Actions
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 10
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "ci(deps)"
+    labels:
+      - "ci-cd"
+      - "dependencies"
+
+  # Docker base images
+  - package-ecosystem: "docker"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "ci(docker)"
+    labels:
+      - "docker"
+      - "dependencies"

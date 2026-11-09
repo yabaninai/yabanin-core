@@ -1,0 +1,426 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    # Nightly at 03:15 UTC — drives the blocking integration-nightly job.
+    - cron: "15 3 * * *"
+  workflow_dispatch:
+
+env:
+  GO_VERSION: "1.27.x"
+  CGO_ENABLED: 1
+
+jobs:
+  ci:
+    name: CI
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run go vet
+        run: go vet ./...
+
+      - name: Build all packages
+        run: go build ./...
+
+      - name: Check formatting
+        run: test -z "$(gofmt -l .)"
+
+      - name: Run tests with race detector
+        run: go test -race -count=1 -short -coverprofile=coverage.out ./...
+
+      - name: Print total coverage
+        run: go tool cover -func=coverage.out | tail -1
+
+      - name: Upload coverage to Codecov
+        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        uses: codecov/codecov-action@v4
+        with:
+          files: ./coverage.out
+          token: ${{ secrets.CODECOV_TOKEN }}
+
+  # G1 (N16-P01-T02, owner decision 2026-11-04 (c)): the policy declarations
+  # tree is a build artifact — a broken declaration must fail CI before it can
+  # reach a policystore. Dry-run strict parse (the same pkg/pipeline schema the
+  # gateway compiles at load time), no database, default runner.
+  policies:
+    name: Policy declarations (G1)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Validate deploy/policies (strict, dry-run)
+        run: go run ./cmd/yb policies validate --dir deploy/policies --include-pack
+
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Cache golangci-lint
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/golangci-lint
+            ~/go/bin/golangci-lint
+          key: ${{ runner.os }}-golangci-lint-${{ hashFiles('.golangci.yml') }}
+
+      - name: Install golangci-lint
+        run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2
+
+      # Full-repo new-lines pass: catches issues introduced by this change with
+      # full context.
+      - name: Run golangci-lint (new lines, full repo)
+        run: golangci-lint run --new-from-merge-base=origin/master --timeout=5m
+
+      # Critical-path ratchet: skipped in the public export (the baseline
+      # file is internal); the step below is a no-op echo.
+      - name: Run golangci-lint (critical-path ratchet)
+        run: echo "critical-path ratchet skipped in public export"
+
+      - name: Security scan (govulncheck)
+        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0 && govulncheck ./...
+
+  helm:
+    name: Helm validation
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
+      # I5: validate BOTH charts. The onprem chart is the air-gap/single-tenant
+      # deploy path — it broke silently before because CI never rendered it.
+      - name: Lint yabanin chart
+        run: helm lint deploy/helm/yabanin/
+
+      - name: Template yabanin chart
+        run: helm template test-release deploy/helm/yabanin/ > /dev/null
+
+      - name: Lint yabanin-onprem chart
+        run: helm lint deploy/helm/yabanin-onprem/
+
+      - name: Template yabanin-onprem chart
+        run: helm template test-release deploy/helm/yabanin-onprem/ > /dev/null
+
+  docs-site:
+    name: Docs site build (I5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/site
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/site/package-lock.json
+
+      # Build with onBrokenLinks: 'throw' — any dead link fails the build.
+      - name: Build Docusaurus site
+        run: npm ci && npm run build
+
+  docs-lang:
+    name: Docs language gate
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: No Cyrillic in the public docs
+        run: python3 scripts/docs_lang_check.py
+
+  dashboard:
+    name: Dashboard build (I5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: web/dashboard
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: web/dashboard/package-lock.json
+
+      - name: Build dashboard (tsc + vite)
+        run: npm ci && npm run build
+
+  python-sdk:
+    name: Python SDK tests (I5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/python
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install SDK with test extras
+        run: python -m pip install --disable-pip-version-check -e ".[test]"
+
+      - name: Run pytest
+        run: python -m pytest -q
+
+  node-sdk:
+    name: Node SDK tests (I5)
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: sdks/node
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: sdks/node/package-lock.json
+
+      - name: Install dependencies
+        run: npm ci --no-fund --no-audit
+
+      - name: Run vitest
+        run: npm test
+
+  # TP-13: the existing quality runner as the shared CI result. On PRs the
+  # merge-base with origin/master selects the gates (fetch-depth: 0 keeps the
+  # ref available); a clean checkout WITHOUT a base would diff HEAD against
+  # itself and degrade to self-only, so QUALITY_BASE is mandatory here.
+  # Master pushes are covered by the explicit full run in quality.yml.
+  # A failed gate makes the check red (the runner's exit code propagates),
+  # and the evidence uploads on success AND failure.
+  # No secrets are referenced, so fork PRs run the same profile.
+  quality-changed:
+    name: Quality (changed gates)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+          cache: true
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: package-lock.json
+
+      # setup-python's interpreter is pip-installable (the image python is
+      # externally managed) and lands first on PATH, so every gate that
+      # shells out to python3 — self (unittest+yaml), secrets, deps,
+      # licenses, policy, alerts, python-sdk — uses it.
+      # (claims shells no python since the registry check became a no-op;
+      # restore post-beta when the claims registry returns.)
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      # Prerequisites per the runner's own contract: yb bootstrap installs
+      # module deps, the four npm trees, chromium and the pinned analysis
+      # tools; the rest closes the gaps bootstrap does not own (root
+      # playwright node_modules, contract-test deps, the SDK under test).
+      - name: Bootstrap quality prerequisites
+        run: |
+          make yb
+          ./yb bootstrap --yes
+          npm ci --no-audit --no-fund
+          npx playwright install --with-deps chromium
+          python3 -m pip install --disable-pip-version-check pyyaml
+          python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
+
+      # NEXT-14: QUALITY_JOBS=2 overlaps one light gate with the serialized
+      # heavy Go lane on the 2-vCPU hosted runner; heavy and Docker gates stay
+      # exclusive by scheduler design, so 2 cannot oversubscribe the toolchain
+      # or the Docker daemon VM.
+      - name: Run changed-gates quality profile
+        run: make quality-changed QUALITY_BASE=origin/master QUALITY_EXECUTE=1 QUALITY_JOBS=2
+
+      - name: Upload quality evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: quality-changed-evidence
+          path: artifacts/quality/
+
+  # The PR integration gate is BLOCKING — a failed run fails the
+  # check and blocks the merge. The github-hosted runner ships a Docker
+  # daemon; the preflight makes that contract explicit and fails fast.
+  # _quality-int-modules runs the integration-tagged module suites
+  # (testcontainers Postgres), one leaf per ownership boundary.
+  integration:
+    name: Integration tests (blocking)
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    # Strict env parsing — a malformed numeric env value fails the
+    # blocking gate instead of falling back to a default.
+    env:
+      YABANIN_CONFIG_STRICT: "1"
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Docker preflight
+        run: docker info > /dev/null
+
+      - name: Run module integration suites
+        run: make _quality-int-modules
+
+  # The nightly integration job is blocking —
+  # a failure turns the scheduled run red. It covers the gateway integration
+  # suite and the needs-postgres credits tests on top of the PR gate above.
+  integration-nightly:
+    name: Integration tests (nightly)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: yabanin
+          POSTGRES_PASSWORD: yabanin
+          # DB name matches the DSN hard-coded in pkg/credits/store_test.go.
+          POSTGRES_DB: yabanin
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U yabanin" --health-interval 5s
+          --health-timeout 5s --health-retries 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ env.GO_VERSION }}
+
+      - name: Cache Go modules
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/go-build
+            ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: |
+            ${{ runner.os }}-go-
+
+      - name: Run integration tests
+        run: go test -race -count=1 -tags=integration ./services/gateway/integration/...
+
+      # TP-12: the producer's exit code decides the step result; the egrep is
+      # a display filter only and the full report is uploaded as an artifact
+      # so a failed nightly run keeps its evidence.
+      - name: Run credits billing tests (needs postgres)
+        run: scripts/ci/run-with-report.sh credits-tests.log '\[needs-postgres\]|^(ok|FAIL|--- FAIL)' go test -race -count=1 -v ./pkg/credits/...
+
+      - name: Upload credits test log
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: credits-tests-log
+          path: credits-tests.log

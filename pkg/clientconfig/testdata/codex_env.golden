@@ -1,0 +1,9 @@
+model_provider = "yabanin"
+model = "gpt"
+
+[model_providers.yabanin]
+name = "Yabanin"
+base_url = "https://gw.example/v1"
+wire_api = "responses"
+env_http_headers = { "X-Yabanin-Labels" = "YABANIN_LABELS" }
+env_key = "YABANIN_API_KEY"

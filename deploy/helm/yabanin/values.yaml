@@ -1,0 +1,179 @@
+# Base overlay values for yabanin gateway.
+# Per-region overrides (values-sg.yaml, values-in.yaml, values-eu.yaml) set:
+#   gateway.region, gateway.home_region, gateway.kms_provider
+#   gateway.regions.{region}.pg_uri, gateway.regions.{region}.redis_addr
+
+gateway:
+  listen_address: ":8082"
+  admin_listen: ":9090"
+  log_level: "info"
+  log_format: "json"
+  auth_mode: "header"
+  cache_hmac_secret: ""
+  fallback_api_key: "" # Set via Helm --set or Kubernetes Secret for production
+  fallback_model: "smart"
+  circuit_enabled: true
+  metrics_enabled: true
+  # registered MCP server URLs (rendered into the gateway config.yaml).
+  # mcp_allowed_upstreams is a list of exact domains / *.suffix wildcards
+  # (docs/mcp-gateway.md); empty/absent = fail-closed (every host rejected).
+  # Set both via --set, e.g.:
+  #   --set gateway.mcp_gateway_enabled=true \
+  #   --set gateway.mcp_allowed_upstreams={github.com,\*.example.com}
+  mcp_gateway_enabled: false
+
+loggerd:
+  listen_address: ":8085"
+  log_level: "info"
+  log_format: "json"
+
+admin:
+  listen_address: ":9086"
+  log_level: "info"
+  log_format: "json"
+
+replicaCount: 2
+
+# HA topology (deploy/helm/yabanin/HA-TOPOLOGY.md; N11-P02-T02):
+# failure domain = one cluster node (I42). ha.enabled=true adds a HARD
+# topology spread across ha.topology_key on top of the (soft) preferred
+# podAntiAffinity and requires replicaCount >= 2 (render-time fail otherwise
+# — a 1-replica "HA" install would be fake HA). The authoritative DB
+# (secrets.pg_uri) and
+# cache/queue (gateway.regions.<r>.redis_addr) tiers are operator-managed
+# endpoints; their quorum/fencing requirements are defined in HA-TOPOLOGY.md
+# and are NOT provisioned by this chart.
+ha:
+  enabled: false
+  topology_key: "kubernetes.io/hostname"
+  when_unsatisfiable: "DoNotSchedule" # ScheduleAnyway = documented degraded fallback
+
+# unpinned RollingUpdate 25/25 default could take all gateway pods down at
+# once during a helm upgrade). maxUnavailable: 0 + maxSurge: 1 = zero-downtime
+# for these stateless services; the values are exposed so regional overlays
+# can decide differently (ratified D1: overlays decide).
+strategy:
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1
+
+# N11-P02-T03: readiness must hold this long before a rollout proceeds to the
+# next pod; with maxUnavailable: 0 this keeps an upgrade zero-downtime instead
+# of racing an unready pod into the Service endpoints.
+minReadySeconds: 5
+
+# maxUnavailable instead of minAvailable so 1-replica profiles (values-sg/eu/in)
+# stay drainable; at the HA base profile (replicaCount: 2) it still caps
+# voluntary disruption at one pod.
+pdb:
+  gateway:
+    enabled: true
+    maxUnavailable: 1
+  admin:
+    enabled: true
+    maxUnavailable: 1
+
+image:
+  repository: localhost:5000/yabanin/gateway
+  tag: "latest"
+  pullPolicy: IfNotPresent
+
+service:
+  type: ClusterIP
+  port: 8082
+
+resources:
+  limits:
+    cpu: "1"
+    memory: "2Gi"
+  requests:
+    cpu: "250m"
+    memory: "512Mi"
+
+# Secrets must be provided in production. These are dev placeholders.
+secrets:
+  # create cluster roles (the pg_dump baseline cannot carry them); provision
+  # the role from the deploy layer first, e.g. via
+  # deploy/quickstart/bootstrap-app-role.sql, then enable LOGIN and set a
+  # password on it. The app pools additionally SET ROLE yabanin_app on every
+  # connection; migrations need an owner-privileged URI (SET ROLE NONE pins
+  # the login role).
+  pg_uri: ""
+  cache_hmac_secret: ""
+  encryption_key: ""
+  session_key: ""
+
+hpa:
+  maxReplicas: 10
+  cpuTarget: 70
+
+# Health check probes
+probes:
+  gateway:
+    readiness:
+      enabled: true
+      path: /healthz
+      port: 8082
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      path: /healthz
+      port: 8082
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      path: /healthz
+      port: 8082
+      initialDelaySeconds: 30
+      periodSeconds: 5
+      failureThreshold: 12
+  admin:
+    readiness:
+      enabled: true
+      path: /health
+      port: 9086
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      path: /health
+      port: 9086
+      initialDelaySeconds: 10
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      path: /health
+      port: 9086
+      initialDelaySeconds: 20
+      periodSeconds: 5
+      failureThreshold: 12
+  # auxiliary tier (N11-P02-T03): single replica by design, documented
+  # limitation in HA-TOPOLOGY.md — probes only keep it honest, not HA
+  mcp:
+    readiness:
+      enabled: true
+      path: /healthz
+      port: 8787
+      initialDelaySeconds: 5
+      periodSeconds: 10
+      failureThreshold: 3
+    liveness:
+      enabled: true
+      path: /healthz
+      port: 8787
+      initialDelaySeconds: 15
+      periodSeconds: 10
+      failureThreshold: 3
+    startup:
+      enabled: true
+      path: /healthz
+      port: 8787
+      initialDelaySeconds: 30
+      periodSeconds: 5
+      failureThreshold: 12

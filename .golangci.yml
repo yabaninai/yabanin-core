@@ -1,0 +1,132 @@
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  default: none
+  enable:
+    - bodyclose
+    - contextcheck
+    - copyloopvar
+    - durationcheck
+    - errcheck
+    - gosec
+    - staticcheck
+    - ineffassign
+    - misspell
+    - nilerr
+    - nilnesserr
+    - nilnil
+    - noctx
+    - nolintlint
+    - revive
+    - govet
+    - rowserrcheck
+    - sloglint
+    - sqlclosecheck
+    - testifylint
+    - thelper
+    - unused
+
+  settings:
+    errcheck:
+      exclude-functions:
+        # HTTP handler signatures — caller handles errors
+        - (net/http.ResponseWriter).Write
+        - (net/http.ResponseWriter).WriteHeader
+        # io.Closer.Close — callers typically ignore close errors on
+        # non-critical paths (resp.Body.Close, file Close in defers).
+        - (io.Closer).Close
+        - (io.ReadCloser).Close
+        - (*os.File).Close
+    revive:
+      rules:
+        - name: exported
+          disabled: false
+        - name: package-comments
+          disabled: true
+    staticcheck:
+      checks: ["all", "-ST1000"]
+
+  exclusions:
+    generated: strict
+    paths:
+      # Third-party npm packages can vendor Go sources (e.g. flatted ships a
+      # Go port). The official gate scope already excludes node_modules
+      # (scripts/quality/go_scope.py); this aligns direct golangci-lint runs.
+      - node_modules
+    rules:
+      # In tests, unused helper parameters are acceptable.
+      - path: _test\.go$
+        linters:
+          - revive
+        text: "unused-parameter"
+      # This large legacy test file intentionally uses lenient error handling.
+      - path: handler_test\.go$
+        linters:
+          - errcheck
+      # Sovereign adapters follow the same minimal pattern as OpenAI/Anthropic;
+      # revive exported rule fires on every method — suppress for these files.
+      - path: pkg/provider/(sakana|sarvam|krutrim|naver|falcon|jais|mistral|yandex|sber)\.go$
+        linters:
+          - revive
+        text: "exported:"
+      # Stuttering names are part of the current public Go API; renaming
+      # (audit.AuditReport, cache.CacheService) is deferred to a dedicated
+      # API-stability review.
+      - path: pkg/costsim/report\.go$
+        linters:
+          - revive
+        text: "audit.AuditReport"
+      - path: pkg/cache/service\.go$
+        linters:
+          - revive
+        text: "cache.CacheService"
+      # Locale catalogs are maps of UI template strings, not credentials; gosec
+      # G101 false-positives on the "docTitle" key.
+      - path: pkg/costsim/locales/
+        linters:
+          - gosec
+        text: "G101"
+      # Migration test pins: the boundary corpus stores synthetic operator
+      # DSN literals (fictional host/user, no credentials) because byte-pinning
+      # the built URL is the whole point, and the joint-scenario SQL probe
+      # strings trip the "KEY" keyword detector via "PRIMARY KEY".
+      - path: pkg/migrate/.*_test\.go$
+        linters:
+          - gosec
+        text: "G101"
+      # The SSE tool-gate writer and the streaming-policy writer are streaming
+      # relays: upstream provider frames are forwarded (optionally
+      # policy-mutated or filtered) to the local CLI consumer as
+      # text/event-stream (never an HTML sink). gosec G705 taint analysis has
+      # no relay concept — forwarding upstream bytes is the feature, so every
+      # w.Write(frame) here is flagged.
+      - path: pkg/gateway/(toolgate|stream_policy)\.go$
+        linters:
+          - gosec
+        text: "G705"
+      # Sovereign core types — minimal doc pattern consistent with existing code.
+      - path: pkg/sovereign/(policy|cn_guard)\.go$
+        linters:
+          - revive
+        text: "exported:"
+      # Admin sovereign handlers — follow same handler factory pattern as pre-existing code.
+      - path: services/admin/handlers/sovereign_handlers\.go$
+        linters:
+          - revive
+        text: "exported:"
+
+issues:
+  # Show all findings instead of truncating the report.
+  max-issues-per-linter: 0
+  max-same-issues: 0
+
+formatters:
+  enable:
+    - gofmt
+    - goimports
+  settings:
+    gofmt:
+      simplify: true

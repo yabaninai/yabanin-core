@@ -1,0 +1,9 @@
+{
+  "v": "1",
+  "c": "corpus-customer-legacy",
+  "d": "corpus-deployment",
+  "m": ["internal-loop"],
+  "i": "2026-05-01T00:00:00Z",
+  "expiry": "2027-05-01T00:00:00Z",
+  "n": "corpus-v1-nonce"
+}

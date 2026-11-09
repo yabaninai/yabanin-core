@@ -1,0 +1,56 @@
+{
+  "schema_version": 1,
+  "category_uid": 2,
+  "class_uid": 2004,
+  "activity_id": 1,
+  "type_uid": 200401,
+  "severity_id": 3,
+  "time": 1794052800000,
+  "finding_info": {
+    "uid": "core-0000000000000000000000000000000000000000000000000000000000000000",
+    "title": "policy guard v1 observe: step1 category=schema severity=high action=deny"
+  },
+  "metadata": {
+    "version": "1.9.0",
+    "product": {
+      "vendor_name": "yabanin",
+      "name": "secevents-ocsf-export",
+      "version": "v1"
+    },
+    "secevents_schema_version": 1
+  },
+  "org_id": "org-1",
+  "identity": {
+    "agent": {
+      "value": "agent-1",
+      "state": "known"
+    },
+    "session": {
+      "value": "sess-1",
+      "state": "known"
+    },
+    "task": {
+      "state": "absent"
+    },
+    "tool": {
+      "state": "absent"
+    }
+  },
+  "evidence": [
+    {
+      "kind": "payload_digest",
+      "digest": "4bf5122f344554c53bde2ebb8cd2b7e3d1600ad631c385a5d7cce23c7785459a",
+      "location": "request_logs:payload:req-1"
+    },
+    {
+      "kind": "policy_decision",
+      "digest": "dbc1b4c900ffe48d575b5da5c638040125f65db0fe3e24494b76ea986457d986"
+    }
+  ],
+  "cost": {
+    "state": "known",
+    "micro_usd": 1500
+  },
+  "source_event_type": "policy.mask",
+  "mapped": true
+}

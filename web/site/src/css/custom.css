@@ -1,0 +1,393 @@
+/* Astra design canon (design/astra-tokens.css): one Paper & Olive system
+   for the site shell, the docs and the landing. No external font imports —
+   composition must not depend on external fonts (standards/design.md §3);
+   --astra-font-* are local system stacks.
+   Hardcoded color literals are forbidden here (make lint-design [site]). */
+@import '../../../../design/astra-tokens.css';
+
+/* Map compatibility tokens to the shared light theme. */
+:root {
+  --yb-bg: var(--astra-paper);
+  --yb-bg-2: var(--astra-surface-muted);
+  --yb-panel: var(--astra-surface);
+  --yb-line: var(--astra-rule);
+  --yb-line-strong: var(--astra-rule-strong);
+  --yb-text: var(--astra-ink);
+  --yb-dim: var(--astra-text-muted);
+  --yb-mute: var(--astra-text-muted);
+  --yb-teal: var(--astra-action);
+  --yb-teal-2: var(--astra-action-hover);
+  --yb-gold: var(--astra-accent);
+  --yb-rose: var(--astra-danger);
+  --yb-blue: var(--astra-info);
+
+  --yabanin-primary: var(--astra-action);
+  --ifm-color-primary: var(--astra-action);
+  --ifm-color-primary-dark: var(--astra-action-hover);
+  --ifm-color-primary-darker: var(--astra-action-hover);
+  --ifm-color-primary-darkest: var(--astra-ink);
+  --ifm-color-primary-light: var(--astra-rule-strong);
+  --ifm-color-primary-lighter: var(--astra-rule);
+  --ifm-color-primary-lightest: var(--astra-surface-muted);
+
+  --ifm-font-family-base: var(--astra-font-ui);
+  --ifm-heading-font-family: var(--astra-font-editorial);
+  --ifm-font-family-monospace: var(--astra-font-code);
+  --ifm-code-font-size: 90%;
+  --ifm-background-color: var(--astra-paper);
+  --ifm-background-surface-color: var(--astra-surface);
+  --ifm-navbar-background-color: var(--astra-paper);
+  --ifm-footer-background-color: var(--astra-paper);
+  --ifm-navbar-shadow: none;
+  --ifm-navbar-height: 64px;
+  --ifm-global-radius: var(--astra-radius-control);
+  --ifm-hover-overlay: var(--astra-surface-muted);
+  --ifm-toc-border-color: var(--astra-rule);
+  --ifm-hr-background-color: var(--astra-rule);
+  --ifm-color-content: var(--astra-ink);
+  --ifm-color-content-secondary: var(--astra-text-muted);
+  --ifm-heading-color: var(--astra-ink);
+  --ifm-link-color: var(--astra-action);
+  --ifm-menu-color: var(--astra-text-muted);
+  --ifm-menu-color-active: var(--astra-ink);
+  --ifm-navbar-link-color: var(--astra-text-muted);
+  --ifm-navbar-link-hover-color: var(--astra-ink);
+  --docusaurus-highlighted-code-line-bg: var(--astra-accent-surface);
+}
+
+html,
+body {
+  background: var(--astra-paper);
+  color: var(--astra-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+.navbar {
+  border-bottom: 1px solid var(--astra-rule);
+  /* Keep the navbar opaque for readable text. */
+}
+
+.navbar__brand {
+  gap: 0.65rem;
+}
+
+.navbar__logo {
+  height: 34px;
+}
+
+.navbar__logo img {
+  height: 34px !important;
+  width: auto !important;
+  border-radius: var(--astra-radius-control);
+  background: var(--astra-surface);
+}
+
+.navbar__title {
+  font-family: var(--ifm-font-family-monospace);
+  font-weight: 600;
+  font-size: 0.78rem;
+  letter-spacing: 0.2em;
+  text-transform: uppercase;
+  color: var(--astra-ink);
+}
+
+.navbar__link {
+  font-size: 0.92rem;
+  font-weight: 500;
+}
+
+.navbar-cta {
+  display: inline-flex !important;
+  align-items: center;
+  margin-left: 0.4rem;
+  padding: 0.42rem 0.9rem !important;
+  /* Match the shared control radius. */
+  border-radius: var(--astra-radius-control);
+  background: var(--astra-action);
+  color: var(--astra-on-action) !important;
+  font-weight: 600;
+  font-size: 0.86rem !important;
+}
+
+.navbar-cta:hover {
+  background: var(--astra-action-hover);
+  color: var(--astra-on-action) !important;
+}
+
+@media (max-width: 996px) {
+  .navbar-cta {
+    display: none !important;
+  }
+}
+
+.footer {
+  border-top: 1px solid var(--astra-rule);
+}
+
+.footer__title {
+  font-family: var(--ifm-font-family-monospace);
+  font-size: 0.72rem;
+  letter-spacing: 0.16em;
+  text-transform: uppercase;
+  color: var(--astra-text-muted);
+}
+
+.footer__copyright {
+  color: var(--astra-text-muted);
+  font-size: 0.82rem;
+}
+
+/* Allow footer links to wrap when text is enlarged. */
+.footer__link-item,
+.footer__link {
+  overflow-wrap: anywhere;
+  word-break: break-word;
+  white-space: normal;
+  min-width: 0;
+  max-width: 100%;
+}
+.footer__links .col {
+  min-width: 0;
+}
+
+.theme-doc-sidebar-container {
+  border-right: 1px solid var(--astra-rule) !important;
+}
+
+.menu__link--active {
+  background: var(--astra-accent-surface);
+}
+
+.pagination-nav__link {
+  border-color: var(--astra-rule);
+  background: var(--astra-surface);
+}
+
+.card,
+.theme-admonition {
+  background: var(--astra-surface);
+  border-color: var(--astra-rule);
+}
+
+/* Homepage: kill the default main padding so the landing can go edge-to-edge. */
+.landing-wrap .main-wrapper {
+  background: var(--astra-paper);
+}
+
+.landing-wrap main {
+  padding: 0 !important;
+}
+
+.landing-wrap footer {
+  margin-top: 0;
+}
+
+/* Keep keyboard navigation visible across the shared site chrome. */
+a:focus-visible, button:focus-visible {
+  outline: 3px solid var(--astra-focus);
+  outline-offset: 4px;
+}
+
+/* --- DESIGN-PAPER-OLIVE-03: docs reading layer ---------------------------- */
+
+/* Article headings: serif stays on the introductory H1 only; the scanning
+   structure (H2–H6) uses the UI sans (standards/design.md §3). */
+.theme-doc-markdown h2,
+.theme-doc-markdown h3,
+.theme-doc-markdown h4,
+.theme-doc-markdown h5,
+.theme-doc-markdown h6 {
+  font-family: var(--astra-font-ui);
+}
+
+/* Sidebar: active item = soft selection, readable ink, short marker. */
+.menu__link--active {
+  background: var(--astra-selection);
+  color: var(--astra-on-selection);
+  box-shadow: inset 2px 0 0 var(--astra-accent);
+}
+
+/* TOC: the current heading is ink and weight, not just color. */
+.table-of-contents__link--active {
+  color: var(--astra-ink);
+  font-weight: 600;
+}
+
+/* Code blocks sit on muted paper with the shared code roles. Docusaurus
+   paints the block from the --prism-* variables on .codeBlockContainer, so
+   the light theme is set at the variable level (the element rules below are
+   only a fallback). Copy button, line highlighting and local scroll behavior
+   stay unchanged. */
+:root {
+  --prism-background-color: var(--astra-code-surface);
+  --prism-color: var(--astra-code-ink);
+  --prism-comment-color: var(--astra-code-comment);
+  --prism-comment-font-style: italic;
+  --prism-punctuation-color: var(--astra-code-ink);
+  --prism-operator-color: var(--astra-code-ink);
+  --prism-keyword-color: var(--astra-code-keyword);
+  --prism-tag-color: var(--astra-code-keyword);
+  --prism-selector-color: var(--astra-code-keyword);
+  --prism-at-rule-color: var(--astra-code-keyword);
+  --prism-important-color: var(--astra-code-keyword);
+  --prism-deleted-color: var(--astra-danger);
+  --prism-string-color: var(--astra-code-string);
+  --prism-char-color: var(--astra-code-string);
+  --prism-attr-value-color: var(--astra-code-string);
+  --prism-inserted-color: var(--astra-success);
+  --prism-number-color: var(--astra-code-number);
+  --prism-boolean-color: var(--astra-code-number);
+  --prism-constant-color: var(--astra-code-number);
+  --prism-symbol-color: var(--astra-code-number);
+  --prism-property-color: var(--astra-code-property);
+  --prism-attr-name-color: var(--astra-code-property);
+  --prism-function-color: var(--astra-code-property);
+  --prism-class-name-color: var(--astra-code-property);
+  --prism-builtin-color: var(--astra-code-property);
+  --prism-variable-color: var(--astra-code-ink);
+  --prism-regex-color: var(--astra-code-number);
+  --prism-url-color: var(--astra-code-string);
+  --prism-entity-color: var(--astra-code-keyword);
+}.theme-code-block {
+  --prism-background-color: var(--astra-code-surface) !important;
+  --prism-color: var(--astra-code-ink) !important;
+  --prism-comment-color: var(--astra-code-comment) !important;
+  --prism-comment-font-style: italic !important;
+  --prism-punctuation-color: var(--astra-code-ink) !important;
+  --prism-operator-color: var(--astra-code-ink) !important;
+  --prism-keyword-color: var(--astra-code-keyword) !important;
+  --prism-tag-color: var(--astra-code-keyword) !important;
+  --prism-selector-color: var(--astra-code-keyword) !important;
+  --prism-at-rule-color: var(--astra-code-keyword) !important;
+  --prism-important-color: var(--astra-code-keyword) !important;
+  --prism-deleted-color: var(--astra-danger) !important;
+  --prism-string-color: var(--astra-code-string) !important;
+  --prism-char-color: var(--astra-code-string) !important;
+  --prism-attr-value-color: var(--astra-code-string) !important;
+  --prism-inserted-color: var(--astra-success) !important;
+  --prism-number-color: var(--astra-code-number) !important;
+  --prism-boolean-color: var(--astra-code-number) !important;
+  --prism-constant-color: var(--astra-code-number) !important;
+  --prism-symbol-color: var(--astra-code-number) !important;
+  --prism-property-color: var(--astra-code-property) !important;
+  --prism-attr-name-color: var(--astra-code-property) !important;
+  --prism-function-color: var(--astra-code-property) !important;
+  --prism-class-name-color: var(--astra-code-property) !important;
+  --prism-builtin-color: var(--astra-code-property) !important;
+  --prism-variable-color: var(--astra-code-ink) !important;
+  --prism-regex-color: var(--astra-code-number) !important;
+  --prism-url-color: var(--astra-code-string) !important;
+  --prism-entity-color: var(--astra-code-keyword) !important;
+}
+
+.theme-code-block,
+.theme-code-block pre {
+  /* The CodeBlock renders the resolved theme as an inline style on <pre>;
+     author !important is the only cascade layer that beats it. */
+  background: var(--astra-code-surface) !important;
+  color: var(--astra-code-ink) !important;
+}
+.theme-code-block {
+  border: 1px solid var(--astra-rule);
+  border-radius: var(--astra-radius-panel);
+}
+.theme-code-block .copyButton {
+  color: var(--astra-code-ink);
+}
+.theme-code-block .copyButton:hover {
+  background: var(--astra-surface);
+}
+
+/* Prism token roles (standards/design.md §2 code aliases). Comments stay
+   readable; a highlighted line never destroys text contrast. */
+.token.comment,
+.token.prolog,
+.token.cdata,
+.token.doctype {
+  color: var(--astra-code-comment);
+  font-style: italic;
+}
+.token.keyword,
+.token.tag,
+.token.selector,
+.token.atrule,
+.token.important,
+.token.deleted {
+  color: var(--astra-code-keyword);
+}
+.token.string,
+.token.char,
+.token.attr-value,
+.token.inserted {
+  color: var(--astra-code-string);
+}
+.token.number,
+.token.boolean,
+.token.constant,
+.token.symbol {
+  color: var(--astra-code-number);
+}
+.token.property,
+.token.attr-name,
+.token.function,
+.token.class-name {
+  color: var(--astra-code-property);
+}
+.docusaurus-highlighted-code-line {
+  background: var(--astra-code-highlight);
+}
+
+/* Inline code wraps by meaning instead of overflowing the article column. */
+code {
+  background: var(--astra-code-surface);
+  border: 1px solid var(--astra-rule);
+  overflow-wrap: anywhere;
+}
+
+/* Admonitions: semantic state surfaces; the label still carries the meaning. */
+.admonition {
+  border-radius: var(--astra-radius-panel);
+  border: 1px solid var(--astra-rule);
+  border-left-width: 3px;
+}
+.admonition-note {
+  background: var(--astra-surface);
+  border-left-color: var(--astra-info);
+}
+.admonition-info {
+  background: var(--astra-info-surface);
+  border-left-color: var(--astra-info);
+}
+.admonition-tip,
+.admonition-success {
+  background: var(--astra-success-surface);
+  border-left-color: var(--astra-success);
+}
+.admonition-caution,
+.admonition-warning {
+  background: var(--astra-warning-surface);
+  border-left-color: var(--astra-warning);
+}
+.admonition-danger {
+  background: var(--astra-danger-surface);
+  border-left-color: var(--astra-danger);
+}
+.admonition .admonition-title {
+  color: var(--astra-ink);
+}
+
+/* Technical tables: muted header band, thin rules. Layout (block display +
+   local horizontal scroll on narrow screens) stays Docusaurus's own — do not
+   set display/width/overflow here, that regresses mobile reflow. */
+.markdown table th {
+  background: var(--astra-surface-muted);
+  color: var(--astra-text-muted);
+  border-bottom: 1px solid var(--astra-rule-strong);
+}
+.markdown table th,
+.markdown table td {
+  border-color: var(--astra-rule);
+}
+.markdown table tr:nth-child(2n) {
+  background: var(--astra-surface);
+}

@@ -1,0 +1,45 @@
+# yabanin config (all services in one file, each service uses its section)
+#
+# Secrets must be set via environment variables or _FILE references:
+#   PG_URI / PG_URI_FILE        — PostgreSQL connection string
+#   FALLBACK_API_KEY             — API key for unauthenticated requests
+#   ENCRYPTION_KEY               — Lineage Ed25519 key encryptor
+#   KMS_KEY_ID (per-region)     — AWS KMS data encryption key ID
+# See .env.example for all supported variables.
+
+gateway:
+  listen_address: ":8082"
+  admin_listen: ":9090"
+  # provider must be set via YABANIN_PROVIDER_ADDR env var (e.g. https://api.openai.com/v1)
+  redis_addr: "redis:6379"
+  log_level: "info"
+  log_format: "json"
+  # auth_mode must be set via YABANIN_AUTH_MODE env var (default: header)
+  # api_key and fallback_api_key must be set via environment variables (YABANIN_API_KEY / YABANIN_FALLBACK_KEY)
+  fallback_model: "smart"
+  event_stream: "events:queue"
+  cache_enabled: true
+  # WARNING: /metrics on admin_listen is unauthenticated by default — restrict at
+  # network level, or set metrics_bearer_key (YABANIN_METRICS_BEARER_KEY) to require
+  # "Authorization: Bearer <key>" for Prometheus scrapes.
+  metrics_enabled: true
+  # metrics_bearer_key: "${METRICS_BEARER_KEY}"
+
+  # PB2: multi-region config (single-region deployments can leave these blank)
+  region: sg
+  home_region: SG
+  kms_provider: local
+  regions:
+    sg: { name: sg, country: SG, pg_uri: "", redis_addr: "redis:6379", gateway_url: "http://localhost:8082", priority: 1, kms_key_id: "" }
+    in: { name: in, country: IN, pg_uri: "", redis_addr: "redis-in:6379", gateway_url: "http://localhost:8083", priority: 2, kms_key_id: "" }
+    eu: { name: eu, country: DE, pg_uri: "", redis_addr: "redis-eu:6379", gateway_url: "http://localhost:8084", priority: 3, kms_key_id: "" }
+
+loggerd:
+  listen_address: ":8085"
+  stream_name: "events:queue"
+  redis_addr: "redis:6379"
+  log_level: "info"
+  log_format: "json"
+
+# embedder configuration is read from environment variables (YABANIN_EMBEDDER_*).
+# It is intentionally NOT in this config file — see pkg/config/cache.go.

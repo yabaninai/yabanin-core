@@ -1,0 +1,63 @@
+name: "Developer Preview feedback — coding agents"
+description: "Voluntary feedback from coding-agent users (OpenCode, Claude Code, Codex, Cline, Continue): bug, config gap, or feature signal"
+labels: ["preview-feedback", "audience-coding-agents"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for trying the Yabanin Developer Preview. Feedback is
+        **voluntary** — report only what you want to report, and redact all
+        API keys, provider keys, raw prompts and completions before submitting.
+        Documentation for this audience: `docs/preview/getting-started-coding-agents.md`
+        and the compatibility matrix in `docs/compatibility.md`.
+        Security vulnerabilities do NOT belong here — use the private
+        security-advisory flow (see SECURITY.md).
+  - type: dropdown
+    id: kind
+    attributes:
+      label: Feedback kind
+      description: "Bug = something broke; Config gap = documented config did not work as written; Feature signal = something you need is missing."
+      options:
+        - Bug
+        - Configuration gap
+        - Feature signal
+    validations:
+      required: true
+  - type: dropdown
+    id: client
+    attributes:
+      label: Client tool
+      options:
+        - OpenCode
+        - Claude Code
+        - Codex
+        - Cline
+        - Continue
+        - Other (describe below)
+    validations:
+      required: true
+  - type: input
+    id: versions
+    attributes:
+      label: Client version and gateway build
+      description: "Client tool version, and the gateway build/commit if known (`yb support-bundle preview` shows build version and commit). Do not paste keys."
+      placeholder: "codex-cli 0.16x.x, gateway commit abc1234 (or 'unknown')"
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: "What you tried (which page you followed), what you expected, what happened instead. Redact prompts/keys — a description is enough."
+    validations:
+      required: true
+  - type: textarea
+    id: time-to-first-success
+    attributes:
+      label: Time to first successful request (optional)
+      description: "Roughly how long from install start to the first successful request through the gateway, and what blocked you longest."
+  - type: checkboxes
+    id: sanitize
+    attributes:
+      label: Sanitization check
+      options:
+        - label: "This report contains no API keys, provider keys, raw prompts or completions."
+          required: true

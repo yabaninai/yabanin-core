@@ -1,0 +1,1 @@
+{"schema_version":"guardpacks.v1","pack_id":"golden","pack_version":"1","runtime_api":"guardrails.v1","files":[{"path":"detector.json","sha256":"7099fb9f3bbc3f36b5b7b5ea8ef30856586b3ad92e3357b64f54463935ee03b0"}]}

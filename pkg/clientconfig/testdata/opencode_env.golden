@@ -1,0 +1,16 @@
+{
+  "npm": "@ai-sdk/openai-compatible",
+  "name": "Yabanin",
+  "options": {
+    "baseURL": "https://gw.example/v1",
+    "apiKey": "{env:YABANIN_API_KEY}",
+    "headers": {
+      "X-Yabanin-Labels": "team=payments"
+    }
+  },
+  "models": {
+    "gpt": {
+      "name": "gpt"
+    }
+  }
+}

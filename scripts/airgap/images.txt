@@ -1,0 +1,5 @@
+yabanin-gateway
+yabanin-loggerd
+yabanin-admin
+pgvector/pgvector:pg16
+redis:7-alpine

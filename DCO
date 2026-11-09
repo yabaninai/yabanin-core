@@ -1,0 +1,71 @@
+Developer Certificate of Origin
+Version 1.1
+
+Copyright (C) 2004, 2006 OASIS(R), 2005, 2014 The Linux Foundation and its contributors.
+Leandro Caniglia, Paolo Ciccone and other Yabanin contributors.
+All rights reserved worldwide. Please see the LICENSE file (Apache-2.0) for
+the licensing of the Yabanin project itself; this certificate only governs
+contribution sign-offs and is distributed under the standard DCO terms
+(anyone may copy and use it, per the DCO 1.1 redistribution grant).
+
+Developer Certificate of Origin
+Version 1.1
+
+The purpose of this document is to state that the content labeled below,
+which was authored or otherwise acquired by the person or entity exercising
+the rights granted by this certificate (the "Developer"), is licensed to the
+project under the project's license (Apache License 2.0 for the Yabanin
+core, unless a contribution explicitly states otherwise and the maintainer
+accepts that stated license in writing), and that the Developer has the
+authority to make that license grant. By making a contribution and adding a
+
+    Signed-off-by: <Real Name> <email>
+
+trailer to a commit, the Developer accepts and agrees to the following
+terms and conditions for that contribution:
+
+1. The contribution was created in whole or in part by the Developer and
+   the Developer has the necessary rights to submit it under the project
+   license; or the contribution is based upon previous work that, to the
+   best of the Developer's knowledge, is covered under an appropriate open
+   source license and the Developer has the right under that license to
+   submit that work with modifications, whether created in whole or in part
+   by the Developer, under the project license; or the contribution was
+   provided directly to the project by some other person who certified (a),
+   (b) or (c) and the Developer has not modified it.
+
+2. The contribution is the Developer's original work, or the Developer has
+   sufficient rights to submit it, and to the best of the Developer's
+   knowledge the contribution does not infringe the rights (including
+   copyright, patent, and trademark rights) of any third party. If the
+   contribution incorporates third-party material, the Developer has
+   documented the source, license, and any applicable notices, and the
+   material is compatible with the project license.
+
+3. If the Developer's employer(s) has rights to intellectual property that
+   the Developer creates that include the contribution, the Developer has
+   received permission to make the contribution on behalf of that employer,
+   or the employer has waived such rights to the contribution.
+
+4. The Developer understands and agrees that the project and the
+   contribution are public and that a record of the contribution (including
+   all personal information submitted with it, including the sign-off) is
+   maintained indefinitely and may be redistributed consistent with the
+   project license and this project's policies.
+
+5. The Developer is providing the contribution on an "AS IS" BASIS, and
+   makes no warranties of any kind concerning the contribution, whether
+   express or implied, including, without limitation, warranties that the
+   contribution is free of defects, merchantable, fit for a particular
+   purpose or non-infringing.
+
+How to sign off
+---------------
+
+Every commit in a pull request must carry the trailer:
+
+    git commit -s   # or add the trailer manually
+
+The trailer must identify a real name and a reachable email address. See
+CONTRIBUTING.md for the full acceptance process, third-party code rules,
+and employer-grant requirements.

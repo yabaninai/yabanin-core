@@ -1,0 +1,18 @@
+{
+  "id": "msg_fixed",
+  "type": "message",
+  "role": "assistant",
+  "model": "claude-test",
+  "content": [
+    {"type": "text", "text": "Done"},
+    {"type": "tool_use", "id": "call_1", "name": "bash", "input": {"cmd": "ls"}}
+  ],
+  "stop_reason": "tool_use",
+  "stop_sequence": null,
+  "usage": {
+    "input_tokens": 5,
+    "output_tokens": 2,
+    "cache_creation_input_tokens": 0,
+    "cache_read_input_tokens": 0
+  }
+}

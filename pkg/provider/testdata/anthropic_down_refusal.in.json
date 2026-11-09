@@ -1,0 +1,9 @@
+{
+  "id": "msg_refusal",
+  "model": "claude",
+  "stop_reason": "refusal",
+  "content": [
+    {"type": "text", "text": "I can't help with that request."}
+  ],
+  "usage": {"input_tokens": 5, "output_tokens": 9}
+}

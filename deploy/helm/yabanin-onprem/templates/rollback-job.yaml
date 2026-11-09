@@ -1,0 +1,41 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "yabanin.fullname" . }}-rollback
+  annotations:
+    "helm.sh/hook": post-rollback
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "5"
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          command: ["sh", "-c", "until pg_isready -h {{ .Release.Name }}-postgres -U yabanin -d yabanin; do sleep 2; done"]
+      containers:
+        - name: restore
+          image: {{ .Values.postgres.image }}
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              latest=$(ls -1t /backup/yabanin-pre-*.sql.gz | head -1)
+              echo "Restoring from $latest"
+              gunzip -c "$latest" | psql -h {{ .Release.Name }}-postgres -U yabanin yabanin
+          env:
+            - { name: PGPASSWORD, valueFrom: { secretKeyRef: { name: {{ include "yabanin.onprem.appSecretName" . }}, key: pg_password } } }
+          volumeMounts:
+            - { name: backup, mountPath: /backup }
+      volumes:
+        - name: backup
+          persistentVolumeClaim: { claimName: {{ template "yabanin.fullname" . }}-backup }

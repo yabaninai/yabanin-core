@@ -1,0 +1,85 @@
+# MCP Server Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ .Release.Name }}-mcp
+  labels:
+    app: yabinin-mcp
+spec:
+  type: ClusterIP
+  ports:
+    - port: 8787
+      targetPort: 8787
+      name: sse
+  selector:
+    app: yabinin-mcp
+---
+# MCP Server Deployment
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ .Release.Name }}-mcp
+  labels:
+    app: yabinin-mcp
+spec:
+  replicas: 1
+  minReadySeconds: {{ .Values.minReadySeconds }}
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: {{ .Values.strategy.rollingUpdate.maxUnavailable }}
+      maxSurge: {{ .Values.strategy.rollingUpdate.maxSurge }}
+  selector:
+    matchLabels:
+      app: yabinin-mcp
+  template:
+    metadata:
+      labels:
+        app: yabinin-mcp
+    spec:
+      serviceAccountName: {{ .Release.Name }}-yabinin
+      containers:
+        - name: mcp
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          args: ["mcp"]
+          ports:
+            - containerPort: 8787
+              name: sse
+          env:
+            - name: YABANIN_MCP_HTTP
+              value: "1"
+            - name: YABANIN_GATEWAY_URL
+              value: "http://{{ .Release.Name }}-gateway:8082"
+            {{- if .Values.admin.enabled }}
+            - name: YABANIN_ADMIN_URL
+              value: "http://{{ .Release.Name }}-admin:9086"
+            {{- end }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop:
+                - ALL
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+        {{- if .Values.probes.mcp.readiness.enabled }}
+          readinessProbe:
+            httpGet: { path: {{ .Values.probes.mcp.readiness.path }}, port: {{ .Values.probes.mcp.readiness.port }} }
+            initialDelaySeconds: {{ .Values.probes.mcp.readiness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.mcp.readiness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.mcp.readiness.failureThreshold }}
+        {{- end }}
+        {{- if .Values.probes.mcp.liveness.enabled }}
+          livenessProbe:
+            httpGet: { path: {{ .Values.probes.mcp.liveness.path }}, port: {{ .Values.probes.mcp.liveness.port }} }
+            initialDelaySeconds: {{ .Values.probes.mcp.liveness.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.mcp.liveness.periodSeconds }}
+            failureThreshold: {{ .Values.probes.mcp.liveness.failureThreshold }}
+        {{- end }}
+        {{- if .Values.probes.mcp.startup.enabled }}
+          startupProbe:
+            httpGet: { path: {{ .Values.probes.mcp.startup.path }}, port: {{ .Values.probes.mcp.startup.port }} }
+            initialDelaySeconds: {{ .Values.probes.mcp.startup.initialDelaySeconds }}
+            periodSeconds: {{ .Values.probes.mcp.startup.periodSeconds }}
+            failureThreshold: {{ .Values.probes.mcp.startup.failureThreshold }}
+        {{- end }}

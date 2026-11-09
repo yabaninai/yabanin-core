@@ -1,0 +1,32 @@
+# PB4.7: vLLM subchart for self-hosted Llama-3 70B. Buyer deploys into their
+# own cluster; gateway's models_registry.upstream_url points at the service.
+replicas: 1
+image:
+  repository: vllm/vllm-openai
+  tag: latest
+  pullPolicy: IfNotPresent
+command:
+  - "--model"
+  - "meta-llama/Meta-Llama-3-70B"
+  - "--served-model-name"
+  - "local-llama3-70b"
+  - "--port"
+  - "8000"
+service:
+  port: 8000
+resources:
+  limits:
+    nvidia.com/gpu: 4
+    memory: 120Gi
+  requests:
+    nvidia.com/gpu: 4
+    memory: 96Gi
+persistence:
+  enabled: true
+  size: 200Gi
+  mountPath: /root/.cache/huggingface
+# Buyer pre-fills the PVC with weights from their air-gapped artifact store.
+# Do NOT enable HuggingFace download in air-gap mode.
+extraEnv:
+  - name: HF_HUB_OFFLINE
+    value: "1"

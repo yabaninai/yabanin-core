@@ -1,0 +1,23 @@
+{
+  "plugin": [
+    "other"
+  ],
+  "provider": {
+    "yabanin": {
+      "models": {
+        "gpt": {
+          "name": "gpt"
+        }
+      },
+      "name": "Yabanin",
+      "npm": "@ai-sdk/openai-compatible",
+      "options": {
+        "apiKey": "{env:YABANIN_API_KEY}",
+        "baseURL": "https://gw.example/v1",
+        "headers": {
+          "X-Yabanin-Labels": "team=payments"
+        }
+      }
+    }
+  }
+}

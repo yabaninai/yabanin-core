@@ -1,0 +1,189 @@
+{
+  "realm": "__KC_REALM__",
+  "attributes": {
+    "n04.note": "N04 live-IdP realm template for the local Keycloak stand (owner decision 2026-10: local Keycloak in Docker is the approved 'Real IdP flow' evidence for N04-P01 T02/T06 and N04-P02 T06). The test stand (pkg/adminauth/keycloak_live_stand_test.go, integration build tag) rewrites __KC_REALM__ to a unique per-run realm name, imports this file through Keycloak's --import-realm, and re-points the SAML client (entity ID + ACS) at the random console port through the admin API. Clients/users/groups here exist only inside the disposable container; the committed secrets are throwaway test-realm credentials, not deployment secrets."
+  },
+  "enabled": true,
+  "sslRequired": "none",
+  "registrationAllowed": false,
+  "loginWithEmailAllowed": true,
+  "rememberMe": false,
+  "verifyEmail": false,
+  "accessTokenLifespan": 600,
+  "ssoSessionIdleTimeout": 3600,
+  "ssoSessionMaxLifespan": 43200,
+  "clientScopes": [
+    {
+      "name": "email",
+      "description": "standard email scope, declared inline because the realm import is self-contained",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "email",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "email",
+            "claim.name": "email",
+            "jsonType.label": "String",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "lightweight.claim": "false"
+          }
+        },
+        {
+          "name": "email verified",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-usermodel-property-mapper",
+          "config": {
+            "user.attribute": "emailVerified",
+            "claim.name": "email_verified",
+            "jsonType.label": "boolean",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "lightweight.claim": "false"
+          }
+        }
+      ]
+    },
+    {
+      "name": "n04-groups",
+      "description": "group membership -> groups claim (ID token), full path off; the exact claim shape the admin console resolves with ResolveSSORole",
+      "protocol": "openid-connect",
+      "attributes": {
+        "include.in.token.scope": "true",
+        "display.on.consent.screen": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "n04 group membership",
+          "protocol": "openid-connect",
+          "protocolMapper": "oidc-group-membership-mapper",
+          "config": {
+            "full.path": "false",
+            "claim.name": "groups",
+            "id.token.claim": "true",
+            "access.token.claim": "true",
+            "userinfo.token.claim": "true",
+            "introspection.token.claim": "true",
+            "lightweight.claim": "false",
+            "multivalued": "true"
+          }
+        }
+      ]
+    }
+  ],
+  "defaultDefaultClientScopes": ["email", "n04-groups"],
+  "clients": [
+    {
+      "clientId": "yabanin-admin",
+      "name": "yabanin admin console (N04 live test)",
+      "description": "confidential OIDC client bound to the console authorization-code flow (PKCE S256)",
+      "enabled": true,
+      "protocol": "openid-connect",
+      "publicClient": false,
+      "secret": "n04-live-admin-secret",
+      "standardFlowEnabled": true,
+      "directAccessGrantsEnabled": false,
+      "serviceAccountsEnabled": false,
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": ["http://localhost/*", "http://127.0.0.1/*"],
+      "webOrigins": ["*"],
+      "attributes": {
+        "post.logout.redirect.uris": "+",
+        "use.jwks.url": "false"
+      },
+      "defaultClientScopes": ["email", "n04-groups"],
+      "optionalClientScopes": []
+    },
+    {
+      "clientId": "__KC_SAML_ENTITY__",
+      "name": "yabanin admin console SAML SP (N04 live test)",
+      "enabled": true,
+      "protocol": "saml",
+      "publicClient": false,
+      "secret": "n04-live-saml-secret",
+      "consentRequired": false,
+      "fullScopeAllowed": false,
+      "redirectUris": ["http://localhost:9/auth/saml/acs"],
+      "attributes": {
+        "saml.assertion.signature": "true",
+        "saml.server.signature": "true",
+        "saml.signature.algorithm": "RSA_SHA256",
+        "saml.client.signature": "false",
+        "saml.encrypt": "false",
+        "saml.force.post.binding": "false",
+        "saml.authnstatement": "true",
+        "saml_assertion_consumer_url_post": "http://localhost:9/auth/saml/acs",
+        "saml_assertion_consumer_url_redirect": "http://localhost:9/auth/saml/acs",
+        "saml_force_name_id_format": "true",
+        "saml_name_id_format": "email",
+        "saml_allow_idp_initiated": "false",
+        "saml.artifact.binding": "false"
+      },
+      "protocolMappers": [
+        {
+          "name": "n04 saml groups",
+          "protocol": "saml",
+          "protocolMapper": "saml-group-membership-mapper",
+          "config": {
+            "group.attribute": "groups",
+            "full.group.path": "false",
+            "single": "false",
+            "attribute.nameformat": "Basic",
+            "attribute.name": "groups"
+          }
+        }
+      ],
+      "defaultClientScopes": [],
+      "optionalClientScopes": []
+    }
+  ],
+  "groups": [
+    {"name": "platform-team", "path": "/platform-team"},
+    {"name": "contractors", "path": "/contractors"},
+    {"name": "team-a", "path": "/team-a"},
+    {"name": "team-b", "path": "/team-b"}
+  ],
+  "users": [
+    {
+      "username": "sso-root",
+      "enabled": true,
+      "email": "sso-root@test.io",
+      "emailVerified": true,
+      "firstName": "SSO",
+      "lastName": "Root",
+      "credentials": [{"type": "password", "value": "n04-pass-root", "temporary": false}],
+      "groups": ["/platform-team"]
+    },
+    {
+      "username": "sso-deny",
+      "enabled": true,
+      "email": "sso-deny@test.io",
+      "emailVerified": true,
+      "firstName": "SSO",
+      "lastName": "Deny",
+      "credentials": [{"type": "password", "value": "n04-pass-deny", "temporary": false}],
+      "groups": ["/platform-team"]
+    },
+    {
+      "username": "sso-conflict",
+      "enabled": true,
+      "email": "sso-conflict@test.io",
+      "emailVerified": true,
+      "firstName": "SSO",
+      "lastName": "Conflict",
+      "credentials": [{"type": "password", "value": "n04-pass-conflict", "temporary": false}],
+      "groups": ["/team-a", "/team-b"]
+    }
+  ]
+}

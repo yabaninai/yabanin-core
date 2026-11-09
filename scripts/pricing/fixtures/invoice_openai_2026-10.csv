@@ -1,0 +1,13 @@
+date,usage_type,cost_usd
+2026-10-01,completion,4.312500
+2026-10-02,completion,3.870000
+2026-10-03,"completion, priority tier",7.500000
+2026-10-04,embedding,0.125000
+2026-10-05,completion,5.000000
+2026-10-06,completion + audio,9.250000
+2026-10-07,completion,2.000000
+2026-10-08,completion,1.750000
+2026-10-09,embedding,0.050000
+2026-10-10,completion,6.400000
+2026-10-28,completion,3.500000
+2026-11-15,completion,99.000000

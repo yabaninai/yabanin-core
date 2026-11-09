@@ -1,0 +1,421 @@
+groups:
+  - name: yabanin-gateway
+    rules:
+      # Gateway latency P99 > 100ms. Threshold derivation (N13-P04-T03):
+      # contract load profile (research/LOAD-PROFILE.md) — gateway
+      # own-processing p95 <= 100ms steady / <= 250ms peak @ 20 RPS steady,
+      # 100 RPS 60s bursts — so the 100ms P99 is the tail early-warning
+      # inside the steady-state p95 bound, and for: 2m outlasts the
+      # sanctioned 60s bursts (a 2-minute sustained P99 breach is not a
+      # burst artifact). The profile is contract-derived, not yet
+      # fleet-measured; live-traffic percentile baseline is deferred to
+      # T06 (measure runs G1/G2/G4).
+      - alert: HighGatewayLatencyP99
+        expr: histogram_quantile(0.99, rate(gateway_http_request_duration_seconds_bucket[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#HighGatewayLatencyP99"
+          summary: "High gateway P99 latency"
+          description: "P99 latency is {{ $value | humanize }}s (threshold: 100ms)"
+
+      # Gateway error rate > 5%
+      - alert: HighGatewayErrorRate
+        expr: sum(rate(gateway_http_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_http_requests_total[5m])) > 0.05
+        for: 2m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#HighGatewayErrorRate"
+          summary: "High gateway error rate"
+          description: "Error rate is {{ $value | humanizePercentage }} (threshold: 5%)"
+
+      # Upstream health unhealthy (3 = unhealthy)
+      - alert: UpstreamDown
+        expr: gateway_upstream_health_state == 3
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#UpstreamDown"
+          summary: "Upstream model {{ $labels.url }} is down"
+          description: "Model has been unhealthy for >1 minute"
+
+      # Circuit breaker open (1 = open)
+      - alert: CircuitBreakerOpen
+        expr: gateway_circuit_breaker_state == 1
+        for: 30s
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#CircuitBreakerOpen"
+          summary: "Circuit breaker open for {{ $labels.upstream }}"
+          description: "Circuit breaker has tripped — upstream may be failing"
+
+      # High fallback rate
+      - alert: HighFallbackRate
+        expr: sum(rate(gateway_fallback_total[5m])) / sum(rate(gateway_http_requests_total[5m])) > 0.2
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#HighFallbackRate"
+          summary: "High fallback rate"
+          description: "{{ $value | humanizePercentage }} of requests are falling back"
+
+  - name: yabanin-classifier
+    rules:
+      # Classifier accuracy degradation — alerts when hard-class routing share exceeds threshold
+      - alert: LowClassifierAccuracy
+        expr: sum(rate(gateway_classifier_class_total{class="hard"}[5m])) / sum(rate(gateway_classifier_class_total[5m])) > 0.3
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#LowClassifierAccuracy"
+          summary: "Classifier accuracy dropped below 10% premium routing"
+          description: "Premium classifier share is {{ $value | humanizePercentage }}, expected >10%"
+
+  - name: infrastructure
+    rules:
+      # Disk full — below 10% available
+      - alert: DiskSpaceLow
+        expr: node_filesystem_avail_bytes / node_filesystem_size_bytes < 0.1
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#DiskSpaceLow"
+          summary: "Disk space below 10%"
+
+      # Credit deduction skip rate high (wallet issues, insufficient credits)
+      - alert: HighDeductionFailureRate
+        expr: sum(rate(gateway_credit_deduction_skipped_total{reason="insufficient"}[5m])) > 0.5
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#HighDeductionFailureRate"
+          summary: "Credit deduction failure rate high"
+
+      # Gateway error rate above 10% (improved threshold)
+      - alert: HighGatewayErrorRateV2
+        expr: sum(rate(gateway_http_requests_total{status=~"5.."}[5m])) / sum(rate(gateway_http_requests_total[5m])) > 0.1
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#HighGatewayErrorRateV2"
+          summary: "Gateway error rate above 10%"
+
+      # Generic service down
+      - alert: ServiceDown
+        expr: up == 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#ServiceDown"
+          summary: "{{ $labels.instance }} is down"
+
+  - name: yabanin-shadow
+    rules:
+      # Shadow error rate > 50% while there is shadow traffic (sustained
+      # errors mean the target is misconfigured or unreachable).
+      # The `and` guard avoids a 0/0 division when no shadow traffic flows.
+      - alert: ShadowHighErrorRate
+        expr: |
+          (sum(rate(yabanin_shadow_requests_total{result="error"}[15m]))
+           /
+           sum(rate(yabanin_shadow_requests_total[15m]))) > 0.5
+          and
+          sum(rate(yabanin_shadow_requests_total[15m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#ShadowHighErrorRate"
+          summary: "Shadow-mode error rate high"
+          description: "{{ $value | humanizePercentage }} of shadow calls are failing (threshold: 50% over 15m) — check YABANIN_SHADOW_MODEL / upstream URL"
+
+      # Daily budget exhausted — shadow is still enabled but the budget cap
+      # is blocking new shadow calls. Inform the operator to tune
+      # YABANIN_SHADOW_DAILY_BUDGET_USD or lower the sample rate.
+      - alert: ShadowBudgetBurn
+        expr: sum(increase(yabanin_shadow_budget_exhausted_total[1h])) > 0
+        for: 5m
+        labels:
+          severity: info
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#ShadowBudgetBurn"
+          summary: "Shadow-mode daily budget exhausted"
+          description: "Shadow calls were skipped because the daily budget cap was hit — tune YABANIN_SHADOW_DAILY_BUDGET_USD or lower YABANIN_SHADOW_SAMPLE_RATE"
+
+  # N13-P04-T02: drop / silent-failure / error alerts (inventory gap G-1 —
+  # previously NO alert watched any of these counters). All annotations
+  # carry counters and bounded labels only, never request content or
+  # secrets (owner decision I63). Threshold derivations are measurement/
+  # SLO-tied per N13-P04-T03 — see the per-alert comments and the
+  # measurement-basis sections in docs/runbooks/alerts.md; fleet-data
+  # refinements remaining are marked deferred-to-T06 there.
+  - name: yabanin-drops
+    rules:
+      # Credit-audit entries dropped because the bounded audit queue
+      # (128 slots, services/admin/handlers/credit_handlers.go) was full —
+      # audit records are being lost (contract §8 visibility surface).
+      # Window derivation (N13-P04-T03, measured): one serial worker, each
+      # entry a durable write under a 5s timeout; measured drain floor
+      # 15.6µs/entry (credit_audit_queue_measure_test.go — 64k entries/s
+      # sustained), so drops at healthy-audit rates are a DB-slowness
+      # symptom, not volume. A degraded audit DB at the 5s ceiling drains
+      # 0.2 entries/s and holds ~10.7 min of backlog per full buffer: the
+      # 10m window covers the drop burst while it persists; any drop is a
+      # signal (audit loss is unrecoverable).
+      - alert: CreditAuditDropped
+        expr: increase(credit_audit_dropped_total[10m]) > 0
+        for: 1m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#CreditAuditDropped"
+          summary: "Credit-audit entries dropped (audit loss)"
+          description: "{{ $value | humanize }} credit-audit entries were dropped in the last 10m — the bounded audit queue overflowed."
+
+      # Best-effort cache write jobs dropped from a full write queue
+      # (pkg/cache). Correctness is unaffected (fallback = recompute);
+      # hit rate degrades and backend load rises. Window derivation
+      # (N13-P04-T03, measured): 4 workers over a 256-slot queue; measured
+      # orchestration floor 9.5µs/job (~26k jobs/s per worker, cache
+      # writer drain harness) — the CPU path alone cannot saturate the
+      # queue, so production drops mean embedder/PG latency inside the
+      # 30s write deadline; the 10m window catches sustained (not burst)
+      # overload, for: 5m clears on short spikes.
+      - alert: CacheWriteDrops
+        expr: increase(cache_write_queue_drops_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#CacheWriteDrops"
+          summary: "Cache write queue dropping jobs"
+          description: "{{ $value | humanize }} cache write jobs were dropped in the last 10m — the write path is slower than input."
+
+      # Unified silent-failure counter (IMP-98 closed map): any registered
+      # (place, reason) pair incremented. Labels name the exact site; the
+      # registry is bounded, so a firing series is a real occurrence.
+      - alert: SilentFailureObserved
+        expr: increase(gateway_silent_failures_total[10m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#SilentFailureObserved"
+          summary: "Silent failure at {{ $labels.place }} ({{ $labels.reason }})"
+          description: "{{ $value | humanize }} swallowed error(s) at place={{ $labels.place }} reason={{ $labels.reason }} in the last 10m."
+
+      # Leader-election workload crashed (IMP-92 — the error used to be
+      # discarded). Repeated failures stall reconcile/settlement passes;
+      # the money-side consequence is watched by BudgetSettlementLagHigh.
+      - alert: LeaderFnFailed
+        expr: increase(leader_fn_failed_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#LeaderFnFailed"
+          summary: "Loggerd leader workload failed"
+          description: "{{ $value | humanize }} leader workload invocation(s) exited with an error in the last 15m."
+
+      # Region-cache mutation failed (pkg/regionrouter): op="del" leaves a
+      # stale region mapping cached until TTL; op="set" forces DB lookups.
+      - alert: RegionCacheInvalidateFailed
+        expr: increase(region_cache_invalidate_failed_total[15m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#RegionCacheInvalidateFailed"
+          summary: "Region-cache mutation failed (op={{ $labels.op }})"
+          description: "{{ $value | humanize }} failed region-cache mutation(s), op={{ $labels.op }}, in the last 15m — stale entries persist until TTL."
+
+      # OTel request-log records dropped at the export boundary (R064 D2
+      # carried alert — receipt names signal rate(dropped[5m])>0 and anchor
+      # otel-export.md). Bounded queue (4096); consumer loop never blocked.
+      - alert: OTelLogsDropped
+        expr: rate(yabanin_otel_logs_dropped_total[5m]) > 0
+        for: 2m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/observability/otel-export.md#OTelLogsDropped"
+          summary: "OTel log export dropping records"
+          description: "OTLP request-log records are being dropped (export queue full or shutdown race) at {{ $value | humanize }}/s."
+
+  # N13-P04-T02 installed a loggerd stall alert; N13-P04-T03 tightened its
+  # `for` from 15m to 5m. AUDIT-P2-08 (analytical counterexample) showed both
+  # forms share a broken CONDITION: `gateway_loggerd_events_in_flight > 0`
+  # measures OCCUPANCY, not progress. The consumer loop increments the gauge
+  # per message and decrements after delivery (stream.go handleMessage), so a
+  # HEALTHY continuously-busy consumer — 20 RPS at <49 ms per event is ~98%
+  # busy — keeps the gauge above zero at every 15 s scrape: the occupancy
+  # form satisfies any `for` and pages healthy load (at 15m it only delayed
+  # the same false page; rule tests scripts/quality/test_alert_rules.py pin
+  # this counterexample against both the old and the new expression).
+  # The corrected signal is NO PROGRESS: successful deliveries have stopped
+  # (sum(rate(gateway_loggerd_events_consumed_total[5m])) == 0) while
+  # in-flight activity persists (max_over_time(gateway_loggerd_events_in_flight[5m]) > 0).
+  # - rate == 0 excludes every healthy mode: busy, burst, and idle drain all
+  #   show completions inside the trailing window whenever any event ran.
+  # - max_over_time > 0 excludes pure no-traffic idle (no work, no page) and
+  #   is robust to scrape-time sampling: a wedged handler pins the gauge
+  #   continuously; a DB outage re-raises it on every failed delivery attempt
+  #   (2 s outage pause between attempts, ≤5 m PEL reclaim pass —
+  #   stream.go defaultOutagePause / pelReclaimTimeout).
+  # The AND is false by construction whenever a completion falls inside the
+  # trailing window (a successful delivery both advances the counter and
+  # raises the gauge at the same moment), so the only way to stay true for
+  # 5 continuous minutes is ≥10 m with zero successful deliveries while
+  # delivery attempts keep occurring — a genuinely stalled consumer.
+  # Detection is ≈10 m from the last completion (5 m rate window until the
+  # rate decays to zero + 5 m `for`): tighter than the original 15 m
+  # occupancy alert, with the healthy-load false-positive class removed.
+  - name: yabanin-loggerd
+    rules:
+      - alert: LoggerdConsumerStalled
+        expr: sum(rate(gateway_loggerd_events_consumed_total[5m])) == 0 and on() max_over_time(gateway_loggerd_events_in_flight[5m]) > 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/alerts.md#LoggerdConsumerStalled"
+          summary: "Loggerd consumer delivery stalled (no successful consumption)"
+          description: "gateway_loggerd_events_consumed_total has not advanced for 5m while gateway_loggerd_events_in_flight shows in-flight activity — deliveries are blocked (DB outage or wedged handler) beyond the 5-min contract recovery bound."
+
+  # N13-P04-T02: budget-reservation family (inventory gap G-2 — the rules
+  # documented in docs/runbooks/budget-reservations-alerts.md §2 are now
+  # installed; ADR-0001 §7). BudgetSettlementLagHighCritical is the
+  # documented escalation clone (§5.4: warning at 30 min lag, critical
+  # after it persists 30 min more). N13-P04-T03: for: durations are
+  # multiples of the 5-min reconcile cycle (pkg/budget/reconcile.go
+  # default interval) — 5m detects within the same cycle, 15m tolerates 3
+  # cycles, 30m/1h for slow-moving aggregates; SLO/gate anchors (D17 5ms
+  # admission p95, 0.001 bound-violation rate, §5.4 1800s settlement lag)
+  # are fixed and unchanged. Fleet-data thresholds (stranded-capacity
+  # 10M µUSD, expired-release 10/h) remain conservative defaults; their
+  # refinement is explicitly deferred to T06 (needs fleet distribution
+  # data, no measurement tonight — see the runbook).
+  - name: yabanin-budget
+    rules:
+      - alert: BudgetSettlementLagHigh
+        expr: settlement_lag_seconds > 1800
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetSettlementLagHigh"
+          summary: "Settlement lag above 30 minutes"
+          description: "Oldest unsettled settlement job is {{ $value | humanizeDuration }} old."
+
+      - alert: BudgetSettlementLagHighCritical
+        expr: settlement_lag_seconds > 1800
+        for: 30m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetSettlementLagHighCritical"
+          summary: "Settlement lag above 30 minutes for 30+ minutes (critical)"
+          description: "Oldest unsettled settlement job is {{ $value | humanizeDuration }} old and the warning has fired for 30m — the settlement worker is stalled; a double outage can temporarily overstate available capacity."
+
+      - alert: BudgetScopeReserveDivergence
+        expr: max by (scope_kind) (budget_reserved_divergence_micro_usd) > 0
+        for: 10m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetScopeReserveDivergence"
+          summary: "Reserved-money invariant divergence ({{ $labels.scope_kind }})"
+          description: "reserved_µ(S) ≠ Σ remainders of non-released allowances; {{ $value }} µUSD unexplained."
+
+      # N13-P04-T03: for: 15m = 3 reconcile cycles. The §7.1.4 reading
+      # "sustained beyond any normal settle latency" is PG-bound (settle
+      # batch runs inside the worker pass) — not measurable tonight
+      # without live PG; measurement deferred to T06. The value keeps the
+      # T02 conservative default.
+      - alert: BudgetWalletInvariantBreach
+        expr: budget_wallet_invariant_violations > 0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetWalletInvariantBreach"
+          summary: "Wallet invariant breached on {{ $value }} org(s)"
+          description: "balance − floor − reserved < 0 sustained beyond the bound-overshoot window (§7.1.4)."
+
+      - alert: BudgetWalletHeadroomNegative
+        expr: budget_wallet_headroom_micro_usd < 0
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetWalletHeadroomNegative"
+          summary: "Worst-case wallet headroom is negative"
+          description: "Worst-case §7.1.4 headroom is {{ $value }} µUSD — early signal of the wallet invariant breach."
+
+      - alert: BudgetStrandedCapacityHigh
+        expr: budget_stranded_micro_usd > 10000000
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetStrandedCapacityHigh"
+          summary: "Stranded reservation capacity {{ $value | humanize }}µUSD"
+          description: "Dead/lost replicas keep freezing capacity (released after TTL 10m + safety 2h)."
+
+      - alert: BudgetExpiredReleaseSpike
+        expr: increase(budget_allowance_released_total{reason="expired_safety_window"}[1h]) > 10
+        for: 5m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BudgetExpiredReleaseSpike"
+          summary: "Multiple allowances released past the safety window"
+          description: "{{ $value | humanize }} releases past the 2h safety window in 1h — replicas are dying (or losing renewal) without graceful drain."
+
+      - alert: BoundViolationRateHigh
+        expr: >
+          sum(increase(budget_bound_violation_total[7d]))
+            / clamp_min(sum(increase(budget_local_admit_total{result=~"local|grant"}[7d])), 1) > 0.001
+        for: 1h
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#BoundViolationRateHigh"
+          summary: "Bound-violation rate above 0.1% of reserved requests (D17 gate)"
+          description: "Actual spend exceeded the reserved bound in more than 0.1% of reserved requests over 7d — blocks the D17 shadow-exit report while firing."
+
+      # N13-P04-T03: measured floor vs gate. Enforce-path Plan overhead
+      # p95 = 3.75µs (n=20000, bundled.json pricing, warm caches —
+      # admission_overhead_measure_test.go); the 5ms D17 gate
+      # (ADR-0001 §7.3, contract-fixed) holds ~1300x headroom on the
+      # CPU leg; the gate value is unchanged and stays the shadow-exit
+      # authority.
+      - alert: AdmissionOverheadP95High
+        expr: histogram_quantile(0.95, sum by (le) (rate(budget_admission_overhead_seconds_bucket[1h]))) > 0.005
+        for: 30m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#AdmissionOverheadP95High"
+          summary: "Reservation admission p95 overhead above 5ms (D17 gate)"
+          description: "Admission (Plan + Reserve) p95 overhead is above the 5ms D17 gate bound."
+
+      - alert: ReservationGrantErrors
+        expr: sum(rate(budget_grants_total{result="error"}[10m])) > 0
+        for: 10m
+        labels:
+          severity: warning
+        annotations:
+          runbook_url: "docs/runbooks/budget-reservations-alerts.md#ReservationGrantErrors"
+          summary: "Reservation store errors during grant"
+          description: "PG unreachable for grants — enforce orgs get 503 budget_store_unavailable once local escrow drains (D9/D14)."

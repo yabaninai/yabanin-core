@@ -1,0 +1,1 @@
+{"detectors":[{"rule_id":"golden-secret","rule_version":"1","category":"secret","pattern":"GOLDEN_BLOCK_[A-Z]+"}]}

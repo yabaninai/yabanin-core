@@ -1,0 +1,9 @@
+# Continue cannot call a key helper; export YABANIN_API_KEY instead of pasting the key
+models:
+  - name: gpt
+    provider: openai
+    apiBase: "https://gw.example/v1"
+    apiKey: "${YABANIN_API_KEY}"
+    requestOptions:
+      headers:
+        X-Yabanin-Labels: team=payments

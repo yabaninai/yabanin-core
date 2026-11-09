@@ -1,0 +1,27 @@
+name: Setup yb
+description: Download the yb binary, verify its sha256, and add it to PATH.
+inputs:
+  url:
+    description: URL of the yb binary
+    required: true
+  sha256:
+    description: Expected sha256 hex digest of that binary
+    required: true
+  gateway-url:
+    description: Yabanin gateway base URL
+    required: true
+runs:
+  using: composite
+  steps:
+    - name: Install yb
+      shell: bash
+      env:
+        YABANIN_YB_URL: ${{ inputs.url }}
+        YABANIN_YB_SHA256: ${{ inputs.sha256 }}
+        YABANIN_GATEWAY_URL: ${{ inputs.gateway-url }}
+      run: |
+        curl -fsSL "$YABANIN_YB_URL" -o "$RUNNER_TEMP/yb"
+        printf '%s  %s\n' "$YABANIN_YB_SHA256" "$RUNNER_TEMP/yb" | sha256sum -c
+        chmod +x "$RUNNER_TEMP/yb"
+        echo "$RUNNER_TEMP" >> "$GITHUB_PATH"
+        echo "YABANIN_GATEWAY_URL=$YABANIN_GATEWAY_URL" >> "$GITHUB_ENV"

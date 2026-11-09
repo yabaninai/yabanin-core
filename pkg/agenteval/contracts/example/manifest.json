@@ -1,0 +1,43 @@
+{
+  "schema_version": 1,
+  "run_id": "9b6f1c2e-3a44-4f55-8a21-7c9d0e1b2a33",
+  "created_at": "2026-09-12T00:00:00Z",
+  "profile": "AGENT_SMOKE_20",
+  "git_commit": "e3dd2edd66b05dbb855fd98543a7092e19ba583d",
+  "dirty_files": [],
+  "dataset": {
+    "catalog_id": "demo-tasks",
+    "selection_file": "smoke-selection.json",
+    "sha256": ["0000000000000000000000000000000000000000000000000000000000000000"],
+    "split": "smoke"
+  },
+  "arms": [
+    {
+      "id": "g1",
+      "model_slug": "gpt-4o",
+      "endpoint_url": "https://api.openai.example/v1",
+      "provider_pinning": "openai",
+      "headers_allowed": ["authorization", "content-type"]
+    }
+  ],
+  "caps": {
+    "max_llm_attempts": 6,
+    "max_tool_calls": 12,
+    "max_wall_seconds": 300,
+    "episode_cap_usd": 0.25,
+    "max_child_agents": 0,
+    "max_concurrent_llm": 2
+  },
+  "price_snapshot": {
+    "source": "provider-console",
+    "as_of": "2026-09-08",
+    "currency": "USD",
+    "entries": [
+      {"model": "gpt-4o", "in_per_1m": 2.5, "out_per_1m": 10.0, "cache_write": 1.25, "cache_read": 0.625}
+    ]
+  },
+  "spend": {"authorized": false, "limit_usd": 0, "approved_by": "", "approved_at": null},
+  "integrity": {
+    "catalog.json": "1111111111111111111111111111111111111111111111111111111111111111"
+  }
+}

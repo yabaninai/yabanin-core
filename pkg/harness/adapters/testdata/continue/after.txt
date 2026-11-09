@@ -1,0 +1,11 @@
+name: foreign
+# >>> yabanin:continue:models (managed by `yb harness`; undo: `yb harness disconnect continue`) >>>
+models:
+  - name: gpt
+    provider: openai
+    apiBase: "https://gw.example/v1"
+    apiKey: "${YABANIN_API_KEY}"
+    requestOptions:
+      headers:
+        X-Yabanin-Labels: team=payments
+# <<< yabanin:continue:models <<<

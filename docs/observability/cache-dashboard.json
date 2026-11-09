@@ -1,0 +1,102 @@
+{
+  "annotations": { "list": [] },
+  "description": "Yabanin Cache Performance Dashboard",
+  "editable": true,
+  "fiscalYearStartMonth": 0,
+  "graphTooltip": 1,
+  "id": null,
+  "links": [],
+  "panels": [
+    {
+      "title": "Cache Hit Rate",
+      "type": "stat",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(cache_hits_total[5m])) by (type) / (sum(rate(cache_hits_total[5m])) + sum(rate(cache_janitor_runs_total[5m])))",
+        "legendFormat": "{{type}}"
+      }],
+      "fieldConfig": { "defaults": { "unit": "percent" } }
+    },
+    {
+      "title": "Hits by Source (exact / semantic)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 6, "y": 0 },
+      "targets": [{
+        "expr": "sum(rate(cache_hits_total{type=~'exact|semantic'}[5m])) by (type)",
+        "legendFormat": "{{type}}"
+      }]
+    },
+    {
+      "title": "Lookup Latency p99",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 0 },
+      "targets": [{
+        "expr": "histogram_quantile(0.99, rate(cache_lookup_duration_seconds_bucket[5m]))",
+        "legendFormat": "{{type}}"
+      }]
+    },
+    {
+      "title": "Write Queue Depth & Drops",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 6, "x": 0, "y": 8 },
+      "targets": [
+        { "expr": "cache_write_queue_size", "legendFormat": "queue" },
+        { "expr": "rate(cache_write_queue_drops_total[5m])", "legendFormat": "drops/s" },
+        { "expr": "rate(cache_writes_total{status='queued'}[5m])", "legendFormat": "queued/s" },
+        { "expr": "rate(cache_writes_total{status='written'}[5m])", "legendFormat": "written/s" }
+      ]
+    },
+    {
+      "title": "Semantic Similarity Distribution",
+      "type": "histogram",
+      "gridPos": { "h": 8, "w": 6, "x": 6, "y": 8 },
+      "targets": [{ "expr": "rate(cache_similarity_score[5m])" }]
+    },
+    {
+      "title": "Savings USD (Counterfactual)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 6, "x": 12, "y": 8 },
+      "targets": [{
+        "expr": "sum(rate(request_logs_counterfactual_cost_usd[5m]))",
+        "legendFormat": "savings_usd/s"
+      }]
+    },
+    {
+      "title": "Janitor Stats (runs / deleted / errors)",
+      "type": "graph",
+      "gridPos": { "h": 8, "w": 6, "x": 18, "y": 8 },
+      "targets": [
+        { "expr": "rate(cache_janitor_runs_total[5m])", "legendFormat": "runs" },
+        { "expr": "rate(cache_janitor_deleted_total[5m])", "legendFormat": "deleted" },
+        { "expr": "rate(cache_janitor_errors_total[5m])", "legendFormat": "errors" }
+      ]
+    },
+    {
+      "title": "Error Rate (embedding / cache write)",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 16 },
+      "targets": [
+        { "expr": "rate(cache_embedding_errors_total[5m])", "legendFormat": "embedding errors" },
+        { "expr": "rate(cache_writes_total{status='dropped'}[5m])", "legendFormat": "write drops" }
+      ]
+    },
+    {
+      "title": "Per-Org Cache Size",
+      "type": "timeseries",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 16 },
+      "targets": [{
+        "expr": "sum(cache_size) by (org_id)",
+        "legendFormat": "{{org_id}}"
+      }]
+    }
+  ],
+  "refresh": "30s",
+  "schemaVersion": 40,
+  "tags": ["yabanin", "cache"],
+  "templating": { "list": [] },
+  "time": { "from": "now-6h", "to": "now" },
+  "timezone": "browser",
+  "title": "Yabanin Cache Performance",
+  "uid": "yabanin-cache-perf",
+  "version": 1
+}

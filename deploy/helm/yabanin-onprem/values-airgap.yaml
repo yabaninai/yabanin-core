@@ -1,0 +1,15 @@
+airgap:
+  enabled: true
+  telemetryEnabled: false
+  egressBlockAll: true
+
+image:
+  repository: "localhost:5000/yabanin"
+  pullPolicy: IfNotPresent
+
+kms:
+  provider: file
+
+config:
+  region: onprem
+  homeRegion: ONPREM

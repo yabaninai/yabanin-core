@@ -1,0 +1,95 @@
+{
+  "sample_spec": {"title": "not a model"},
+  "openai/priced": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": 3e-6,
+    "output_cost_per_token": 1.5e-5,
+    "cache_creation_input_token_cost": 3.75e-6,
+    "cache_read_input_token_cost": 3e-7,
+    "input_cost_per_token_above_200k_tokens": 6e-6
+  },
+  "embed-small": {
+    "litellm_provider": "openai",
+    "mode": "embedding",
+    "input_cost_per_token": 1e-7
+  },
+  "dall-e": {
+    "litellm_provider": "openai",
+    "mode": "image_generation",
+    "input_cost_per_token": 0.04
+  },
+  "anthropic/claude-x": {
+    "litellm_provider": "anthropic",
+    "mode": "chat",
+    "input_cost_per_token": 3e-6,
+    "output_cost_per_token": 1.5e-5
+  },
+  "a/gpt-dup": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": 1e-6,
+    "output_cost_per_token": 2e-6
+  },
+  "b/gpt-dup": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": 9e-6,
+    "output_cost_per_token": 9e-6
+  },
+  "text-completion-openai/legacy": {
+    "litellm_provider": "text-completion-openai",
+    "mode": "completion",
+    "input_cost_per_token": 1e-6,
+    "output_cost_per_token": 1e-6
+  },
+  "together_ai/llama": {
+    "litellm_provider": "together_ai",
+    "mode": "chat",
+    "input_cost_per_token": 2e-6,
+    "output_cost_per_token": 2e-6
+  },
+  "fireworks_ai/mixtral": {
+    "litellm_provider": "fireworks_ai",
+    "mode": "chat",
+    "input_cost_per_token": 2e-6,
+    "output_cost_per_token": 2e-6
+  },
+  "vertex_ai_europe/gemini": {
+    "litellm_provider": "vertex_ai_europe",
+    "mode": "chat",
+    "input_cost_per_token": 2e-6,
+    "output_cost_per_token": 2e-6
+  },
+  "free-chat": {
+    "litellm_provider": "openai",
+    "mode": "chat"
+  },
+  "bad-negative": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": -1,
+    "output_cost_per_token": 1e-6
+  },
+  "nan-model": {
+    "litellm_provider": "openai",
+    "mode": "responses",
+    "input_cost_per_token": "NaN",
+    "output_cost_per_token": 1e-6
+  },
+  "whisper": {
+    "litellm_provider": "openai",
+    "mode": "audio_transcription",
+    "input_cost_per_token": 1e-6
+  },
+  "rerank-model": {
+    "litellm_provider": "cohere",
+    "mode": "rerank",
+    "input_cost_per_token": 1e-6
+  },
+  "moderation-model": {
+    "litellm_provider": "openai",
+    "mode": "moderation",
+    "input_cost_per_token": 1e-6
+  }
+}

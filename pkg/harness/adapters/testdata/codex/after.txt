@@ -1,0 +1,19 @@
+# >>> yabanin:codex:top (managed by `yb harness`; undo: `yb harness disconnect codex`) >>>
+model_provider = "yabanin"
+model = "gpt"
+# <<< yabanin:codex:top <<<
+owner = "me"
+# yabanin-disabled: model_provider = "openai"
+# >>> yabanin:codex:provider (managed by `yb harness`; undo: `yb harness disconnect codex`) >>>
+[model_providers.yabanin]
+name = "Yabanin"
+base_url = "https://gw.example/v1"
+wire_api = "responses"
+env_http_headers = { "X-Yabanin-Labels" = "YABANIN_LABELS" }
+
+[model_providers.yabanin.auth]
+command = "yb"
+args = ["harness", "key", "--tool", "codex"]
+refresh_interval_ms = 300000
+timeout_ms = 5000
+# <<< yabanin:codex:provider <<<

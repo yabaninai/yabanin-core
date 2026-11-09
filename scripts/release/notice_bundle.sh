@@ -1,0 +1,194 @@
+#!/usr/bin/env bash
+# licenses-report inventory). Consumes artifacts/licenses/audit.json produced by
+# `make licenses-report` plus the static project NOTICE files and writes a
+# delivery NOTICE draft. Per standards/license-compliance.md the license
+# IDENTIFIERS listed here do NOT replace the full license texts: the draft
+# carries an explicit disclaimer and the release reviewer must attach the full
+# texts (and scoped review evidence) before distribution.
+#
+# Determinism: the draft stamps SOURCE_DATE_EPOCH (integer unix seconds), never
+# wall-clock time, so identical inputs give identical bytes. release-artifacts.sh
+# exports SOURCE_DATE_EPOCH derived from the last commit time; a direct run
+# without the variable falls back to the pinned unix epoch (0). An explicit
+# non-integer value is a build-input error (exit 1).
+#
+# Usage:
+#   scripts/release/notice_bundle.sh [--audit FILE] [--out FILE]
+#
+# Environment: RELEASE_STRICT=1 makes a missing/unreadable audit a hard failure
+# (same message as release-artifacts.sh strict preflight). Exit codes:
+# 0 draft written; 1 incomplete input (strict semantics) or invalid
+# SOURCE_DATE_EPOCH; 2 usage error.
+set -euo pipefail
+
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+cd "$ROOT"
+
+AUDIT="artifacts/licenses/audit.json"
+OUT="dist/release/THIRD-PARTY-NOTICES.md"
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+    --audit) AUDIT="$2"; shift 2 ;;
+    --out) OUT="$2"; shift 2 ;;
+    -h | --help) sed -n '2,21p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    *) echo "usage error: unknown argument: $1" >&2; exit 2 ;;
+    esac
+done
+
+strict() { [ "${RELEASE_STRICT:-0}" = "1" ] || [ "${RELEASE_STRICT:-}" = "true" ]; }
+
+if [ ! -f "$AUDIT" ]; then
+    if strict; then
+        echo "FAIL: incomplete release artifacts: license audit not found at $AUDIT (run 'make licenses-report'); RELEASE_STRICT=1 requires the NOTICE input" >&2
+        exit 1
+    fi
+    echo "notice: SKIPPED — $AUDIT not found (run 'make licenses-report' first)" >&2
+    exit 1
+fi
+
+mkdir -p "$(dirname "$OUT")"
+# Generation lives in python3 (stdlib only): audit.json is JSON and the repo
+# standard tooling already depends on python3; no jq requirement is imposed on
+# release hosts.
+AUDIT="$AUDIT" OUT="$OUT" ROOT="$ROOT" python3 - <<'PY'
+import json
+import os
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+
+root = Path(os.environ["ROOT"])
+audit_path = Path(os.environ["AUDIT"])
+out_path = Path(os.environ["OUT"])
+
+# The audit location is embedded in the draft as provenance, so it must not
+# leak the machine-specific build root (C-3: different build paths must
+# preserve hashes). Audits under the build root are displayed root-relative —
+# the canonical release run passes exactly this relative path, so standard-run
+# bytes do not change — while inputs outside the build root keep their
+# absolute path as honest provenance of an external input.
+abs_audit = audit_path if audit_path.is_absolute() else root / audit_path
+try:
+    audit_display = str(abs_audit.relative_to(root))
+except ValueError:
+    audit_display = str(abs_audit)
+
+# The generation timestamp must not depend on wall-clock time: identical
+# inputs must give identical bytes. SOURCE_DATE_EPOCH (integer unix seconds)
+# is the only time source; when unset, the pinned unix epoch (0) keeps the
+# output deterministic instead of silently changing with the clock. An
+# explicit non-integer value is a build-input error.
+raw_epoch = os.environ.get("SOURCE_DATE_EPOCH", "").strip()
+if raw_epoch == "":
+    generated_at = datetime.fromtimestamp(0, tz=timezone.utc)
+else:
+    try:
+        generated_at = datetime.fromtimestamp(int(raw_epoch), tz=timezone.utc)
+    except (ValueError, OSError, OverflowError) as exc:
+        print(f"FAIL: SOURCE_DATE_EPOCH must be an integer unix timestamp:"
+              f" {raw_epoch!r} ({exc})", file=sys.stderr)
+        sys.exit(1)
+
+try:
+    audit = json.loads(audit_path.read_text(encoding="utf-8"))
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"FAIL: cannot read license audit {audit_path}: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+inventory = audit.get("inventory") or []
+if not inventory:
+    print(f"FAIL: license audit {audit_path} has an empty inventory — refusing to"
+          " emit a NOTICE draft that would understate third-party components",
+          file=sys.stderr)
+    sys.exit(1)
+
+def read_optional(rel):
+    path = root / rel
+    try:
+        return rel, path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return rel, None
+
+project_notice = read_optional("NOTICE")
+litellm_notice = read_optional("pkg/pricing/NOTICE-litellm.txt")
+
+scopes = {}
+for row in inventory:
+    scopes.setdefault(row.get("scope", "(unknown)"), []).append(row)
+
+lines = []
+lines.append("# THIRD-PARTY NOTICES (DRAFT)")
+lines.append("")
+lines.append("> **DRAFT — generated, not legal clearance.** Generated by")
+lines.append("> `scripts/release/notice_bundle.sh` from the license inventory")
+lines.append(f"> `{audit_display}` at "
+             f"{generated_at.strftime('%Y-%m-%dT%H:%M:%SZ')} (SOURCE_DATE_EPOCH;")
+lines.append("> wall-clock generation time is intentionally not embedded).")
+lines.append("")
+lines.append("## 1. Project notice")
+lines.append("")
+if project_notice[1]:
+    lines.append(f"Contents of the repository root `{project_notice[0]}`:")
+    lines.append("")
+    lines.append("```text")
+    lines.append(project_notice[1])
+    lines.append("```")
+else:
+    lines.append("_Repository root `NOTICE` was not found — attach it before distribution._")
+lines.append("")
+lines.append("## 2. Bundled third-party attribution files")
+lines.append("")
+if litellm_notice[1]:
+    lines.append(f"Contents of `{litellm_notice[0]}` (retained historical attribution;")
+    lines.append("the public release does not bundle the LiteLLM price corpus):")
+    lines.append("")
+    lines.append("```text")
+    lines.append(litellm_notice[1])
+    lines.append("```")
+else:
+    lines.append(f"_`{litellm_notice[0]}` not found — required when pricing data ships._")
+lines.append("")
+lines.append("## 3. Third-party dependency inventory (license identifiers)")
+lines.append("")
+for scope in sorted(scopes):
+    rows = sorted(scopes[scope], key=lambda r: r.get("dependency", ""))
+    lines.append(f"### Scope: `{scope}` ({len(rows)} dependencies)")
+    lines.append("")
+    lines.append("| Dependency | License (identifier) | Status |")
+    lines.append("|---|---|---|")
+    for row in rows:
+        dep = str(row.get("dependency", "?")).replace("|", "\\|")
+        lic = str(row.get("license", "?")).replace("|", "\\|")
+        status = str(row.get("status", "?")).replace("|", "\\|")
+        lines.append(f"| `{dep}` | {lic} | {status} |")
+    lines.append("")
+
+findings = audit.get("findings") or []
+errors = audit.get("errors") or []
+gaps = audit.get("release_gaps") or []
+
+lines.append("## 4. Disclaimer — full license texts are NOT embedded")
+lines.append("")
+lines.append("This draft lists license **identifiers** only. Per")
+lines.append("`standards/license-compliance.md`, license names do not replace")
+lines.append("their full texts: before distributing this release, the reviewer")
+lines.append("must (a) attach the complete LICENSE/copyright/NOTICE texts for")
+lines.append("every shipped component listed above, (b) hold scoped human review")
+lines.append("evidence (`review.json`, all seven areas) matching the audit's")
+lines.append("`source_sha256`, and (c) fulfil any component-specific obligations")
+lines.append("(e.g. source-code offers for permitted copyleft parts).")
+lines.append("")
+lines.append(f"Audit state at generation: exit_code={audit.get('exit_code', '?')},"
+             f" source_sha256={audit.get('source_sha256', '?')},"
+             f" active findings={len(findings)}, scanner errors={len(errors)},"
+             f" release gaps={len(gaps)}.")
+if errors or gaps:
+    lines.append("")
+    lines.append("**This draft was generated from an audit with errors and/or open")
+    lines.append("release gaps — do not ship from it without re-review.**")
+lines.append("")
+out_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+print(f"THIRD-PARTY-NOTICES draft written: {out_path} "
+      f"({len(inventory)} inventory rows, {len(scopes)} scopes)")
+PY

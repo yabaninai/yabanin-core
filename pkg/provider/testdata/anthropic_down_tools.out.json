@@ -1,0 +1,21 @@
+{
+  "id": "msg_1",
+  "object": "chat.completion",
+  "created": 1700000000,
+  "model": "claude",
+  "choices": [
+    {
+      "index": 0,
+      "finish_reason": "tool_calls",
+      "message": {
+        "role": "assistant",
+        "content": "ok",
+        "tool_calls": [
+          {"id": "toolu_1", "type": "function", "function": {"name": "get_weather", "arguments": "{\"city\":\"Paris\"}"}},
+          {"id": "toolu_2", "type": "function", "function": {"name": "get_time", "arguments": "{\"tz\":\"UTC\"}"}}
+        ]
+      }
+    }
+  ],
+  "usage": {"prompt_tokens": 3, "completion_tokens": 4, "total_tokens": 7}
+}

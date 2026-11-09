@@ -1,0 +1,21 @@
+{
+  "name": "@yabanin/tr-node",
+  "version": "0.1.0",
+  "description": "Yabanin AI gateway SDK — cost-aware model routing",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "tsc",
+    "test": "vitest run"
+  },
+  "peerDependencies": {
+    "openai": "^4.50.0"
+  },
+  "devDependencies": {
+    "typescript": "^5.4.0",
+    "vitest": "^1.6.0",
+    "msw": "^2.3.0"
+  },
+  "license": "Apache-2.0"
+}

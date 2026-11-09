@@ -1,0 +1,119 @@
+# Binaries (anchored to repo root: unanchored names also match same-named
+# directories like cmd/yabanin-migrate/, silently ignoring new files there)
+/tokenrouter
+/yabanin
+/yb
+/yabanin-gateway
+/yabanin-sessiond
+/yabanin-ruled
+/yabanin-loggerd
+/yabanin-admin
+/yabanin-mcp
+/yabanin-migrate
+/grpcauth.test
+/tr
+*.exe
+*/build/
+
+# Dependencies
+vendor/
+
+# Python test/build caches
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+
+# Go test cache
+testbinary
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*.sublime-*
+
+# OS
+.DS_Store
+
+# Config (local overrides)
+config.local.yaml
+deploy/.env
+deploy/quickstart/.env
+*.env
+!.env.example
+
+# Coverage
+*.out
+coverage.out
+
+# Compiled test binaries
+integration.test
+
+# Docker
+docker-compose.override.yml
+
+# Deploy secrets
+deploy/secrets/
+
+# Release binaries (audit-dist) — artifacts, not source
+dist/
+
+# Web dashboard build artifacts
+web/dashboard/node_modules/
+web/dashboard/dist/
+sdks/node/node_modules/
+artifacts/
+
+# Profiling output
+profiles/
+*.prof
+*.pprof
+
+# DR backup data
+/data/backups/
+deploy/backups/
+
+# Local-only private documentation (never commit)
+/private/
+
+# OpenCode local config (secrets live in env, not in git)
+/opencode.json
+/examples/opencode.generated.json
+
+# Subscription bridge
+services/subscription-bridge/node_modules/
+
+# Local git-bundle backups (B1: make backup) — never commit
+/.backups/
+
+# Local build artifacts
+/bin/
+
+# Playwright
+node_modules/
+/test-results/
+/playwright-report/
+/blob-report/
+/playwright/.cache/
+/playwright/.auth/
+
+# Nested-module build outputs (NEXT-24 hygiene: never commit binaries)
+/deploy/mock-provider/mock-provider
+/deploy/mock-embedder/mock-embedder
+/scripts/loadtest/http/http
+# Same hygiene rule as the nested-module build outputs below, extended to
+# the loadtest tools: compiled binaries are build outputs, never source.
+# The tracked copies (24,371,750 bytes total) are untracked; rebuild from
+# source instead:
+#   go build ./scripts/loadtest          (cache_loadtest tool)
+#   cd scripts/loadtest/matched && go build ./...
+#   cd scripts/loadtest/gatewayoverhead && go build ./...
+#   cd scripts/loadtest/http && go build ./...
+#   cd tests/load/slowmock && go build ./...   (or: docker build tests/load/slowmock)
+/scripts/loadtest/loadtest
+/tests/load/slowmock/slowmock
+
+# Agent worktree lanes (inside workspace; see artifacts/imp/leases.md)
+/lanes/

@@ -1,0 +1,43 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Agent-eval episode record",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["episode_id", "root_id", "case_id", "arm", "repetition", "execution_status", "safety_outcome", "protocol_outcome", "usage", "cost"],
+  "properties": {
+    "episode_id": {"type": "string", "minLength": 1},
+    "root_id": {"type": "string", "minLength": 1},
+    "case_id": {"type": "string", "minLength": 1},
+    "arm": {"type": "string", "minLength": 1},
+    "repetition": {"type": "integer", "minimum": 0},
+    "execution_status": {"enum": ["not_run", "running", "completed", "failed", "blocked", "canceled", "budget_exhausted", "partial", "invalid", "needs_approval"]},
+    "stop_reason": {"type": ["string", "null"], "enum": [null, "natural", "limit_llm", "limit_tools", "limit_wall", "budget_usd", "cancel", "error", "needs_approval"]},
+    "task_outcome": {"type": ["string", "null"], "enum": [null, "success", "failure", "clarification", "refusal", "safe_stop", "uncertain"]},
+    "safety_outcome": {"enum": ["clean", "violation_proposed", "violation_blocked", "violation_executed"]},
+    "protocol_outcome": {"enum": ["ok", "failure"]},
+    "usage": {
+      "type": "object", "additionalProperties": false,
+      "required": ["llm_calls", "tool_calls", "tokens_in", "tokens_out", "reasoning_tokens", "cache_read"],
+      "properties": {
+        "llm_calls": {"type": "integer", "minimum": 0},
+        "tool_calls": {"type": "integer", "minimum": 0},
+        "tokens_in": {"type": ["integer", "null"], "minimum": 0},
+        "tokens_out": {"type": ["integer", "null"], "minimum": 0},
+        "reasoning_tokens": {"type": ["integer", "null"], "minimum": 0},
+        "cache_read": {"type": ["integer", "null"], "minimum": 0}
+      }
+    },
+    "cost": {
+      "type": "object", "additionalProperties": false,
+      "required": ["estimated_usd", "observed_usd", "uncertain_usd", "coverage"],
+      "properties": {
+        "estimated_usd": {"type": ["number", "null"], "minimum": 0},
+        "observed_usd": {"type": ["number", "null"], "minimum": 0},
+        "uncertain_usd": {"type": ["number", "null"], "minimum": 0},
+        "coverage": {"type": "number", "minimum": 0, "maximum": 1}
+      }
+    },
+    "verdict_ref": {"type": ["string", "null"]},
+    "artifacts": {"type": "array", "items": {"type": "string"}}
+  }
+}

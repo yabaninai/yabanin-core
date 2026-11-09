@@ -1,0 +1,21 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: {{ template "yabanin.fullname" . }}-config
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+data:
+  YABANIN_REGION: {{ .Values.config.region | quote }}
+  YABANIN_HOME_REGION: {{ .Values.config.homeRegion | quote }}
+  YABANIN_KMS_PROVIDER: {{ .Values.kms.provider | quote }}
+  YABANIN_ORG_ID: {{ .Values.orgId | quote }}
+  # Gateway config
+  YABANIN_GATEWAY_LISTEN: ":8082"
+  YABANIN_ADMIN_LISTEN: ":9086"
+  YABANIN_LOGGERD_LISTEN: ":8085"
+  YABANIN_REDIS_ADDR: "{{ template "yabanin.fullname" . }}-redis:6379"
+  # registered MCP server URLs. Both gateway (invoke) and admin (registry
+  # CRUD) consume these via envFrom — the list MUST be one and the same.
+  # Empty/unset list = fail-closed (every host rejected).
+  YABANIN_MCP_GATEWAY: {{ .Values.config.mcpGatewayEnabled | default false | quote }}
+  YABANIN_MCP_ALLOWED_UPSTREAMS: {{ .Values.config.mcpAllowedUpstreams | default "" | quote }}

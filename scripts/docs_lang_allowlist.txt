@@ -1,0 +1,15 @@
+# Allowlist for scripts/docs_lang_check.py — Cyrillic lines intentionally
+# kept in the public docs surface (docs/**, README.md, SECURITY.md,
+# CONTRIBUTING.md; docs/plans/** is internal and never scanned).
+#
+# Format: <repo-relative-path>:<sha256-of-line-content, first 16 hex chars>
+# The checker prints the ready-to-paste entry for every finding.
+# D1-D3 (docs plan DOCS-UPDATE-PLAN-2026-10-05) left this file empty. The
+# single exception below is quoted detector corpus data, not doc language:
+# the FIRST-PACK-DESIGN free-detector table quotes a verbatim RU phrase
+# matched by pkg/guardhooks/guardhooks.go injectionRe (one of the 10 RU
+# instruction-override phrases); translating or dropping it would falsify
+# the detector documentation. Translatable citations and any other Cyrillic
+# in the public surface are doc defects: fix the doc, never allowlist it.
+
+docs/packs/FIRST-PACK-DESIGN-2026-11-01.md:d480b8b329ca915f

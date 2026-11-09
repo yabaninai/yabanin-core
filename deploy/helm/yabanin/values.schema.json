@@ -1,0 +1,130 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "type": "object",
+  "properties": {
+    "replicaCount": {
+      "description": "Gateway/admin replica count; R056-03: malformed (non-integer), fractional or <1 values must fail at render time, not render an un-appliable Deployment",
+      "type": "integer",
+      "minimum": 1
+    },
+    "service": {
+      "type": "object",
+      "properties": {
+        "port": {
+          "description": "Service port must be a valid TCP port (1-65535); R056-03 negative: -1 previously rendered silently",
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 65535
+        },
+        "type": { "type": "string" }
+      }
+    },
+    "strategy": {
+      "type": "object",
+      "properties": {
+        "rollingUpdate": {
+          "type": "object",
+          "properties": {
+            "maxUnavailable": {
+              "description": "Non-negative integer or percentage string (e.g. 25%)",
+              "anyOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string", "pattern": "^[0-9]+%$" }
+              ]
+            },
+            "maxSurge": {
+              "description": "Non-negative integer or percentage string (e.g. 25%)",
+              "anyOf": [
+                { "type": "integer", "minimum": 0 },
+                { "type": "string", "pattern": "^[0-9]+%$" }
+              ]
+            }
+          }
+        }
+      }
+    },
+    "pdb": {
+      "type": "object",
+      "properties": {
+        "gateway": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxUnavailable": {
+              "description": "Must allow at least one voluntary eviction (ha_selector_test A2 invariant)",
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        },
+        "admin": {
+          "type": "object",
+          "properties": {
+            "enabled": { "type": "boolean" },
+            "maxUnavailable": {
+              "type": "integer",
+              "minimum": 1
+            }
+          }
+        }
+      }
+    },
+    "hpa": {
+      "type": "object",
+      "properties": {
+        "maxReplicas": { "type": "integer", "minimum": 1 },
+        "cpuTarget": { "type": "integer", "minimum": 1, "maximum": 100 }
+      }
+    },
+    "ha": {
+      "type": "object",
+      "description": "HA topology placement (deploy/helm/yabanin/HA-TOPOLOGY.md); failure domain = one node (I42)",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "topology_key": {
+          "description": "Failure-domain topology key; kubernetes.io/hostname = node loss domain (I42)",
+          "type": "string",
+          "minLength": 1
+        },
+        "when_unsatisfiable": {
+          "description": "DoNotSchedule = hard spread (documented HA); ScheduleAnyway = explicit degraded fallback",
+          "enum": ["DoNotSchedule", "ScheduleAnyway"]
+        }
+      }
+    },
+    "minReadySeconds": {
+      "description": "N11-P02-T03: readiness must hold this long before a RollingUpdate proceeds to the next pod (>=0)",
+      "type": "integer",
+      "minimum": 0
+    },
+    "probes": {
+      "type": "object",
+      "properties": {
+        "gateway": { "$ref": "#/definitions/probePair" },
+        "admin": { "$ref": "#/definitions/probePair" },
+        "mcp": { "$ref": "#/definitions/probePair" }
+      }
+    }
+  },
+  "definitions": {
+    "probePair": {
+      "type": "object",
+      "properties": {
+        "readiness": { "$ref": "#/definitions/probe" },
+        "liveness": { "$ref": "#/definitions/probe" },
+        "startup": { "$ref": "#/definitions/probe" }
+      }
+    },
+    "probe": {
+      "type": "object",
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "path": { "type": "string", "minLength": 1 },
+        "port": { "type": "integer", "minimum": 1, "maximum": 65535 },
+        "initialDelaySeconds": { "type": "integer", "minimum": 0 },
+        "periodSeconds": { "type": "integer", "minimum": 1 },
+        "failureThreshold": { "type": "integer", "minimum": 1 }
+      }
+    }
+  }
+}

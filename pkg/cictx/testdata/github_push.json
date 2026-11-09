@@ -1,0 +1,13 @@
+{
+  "GITHUB_ACTIONS": "true",
+  "GITHUB_RUN_ID": "55",
+  "GITHUB_RUN_ATTEMPT": "2",
+  "GITHUB_JOB": "build",
+  "GITHUB_WORKFLOW": "CI",
+  "GITHUB_EVENT_NAME": "push",
+  "GITHUB_REPOSITORY": "org/app",
+  "GITHUB_REF_NAME": "main",
+  "GITHUB_SHA": "0123456789abcdef",
+  "GITHUB_SERVER_URL": "https://github.com",
+  "GITHUB_ACTOR": "ada"
+}

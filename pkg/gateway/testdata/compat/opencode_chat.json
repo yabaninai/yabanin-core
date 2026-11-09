@@ -1,0 +1,23 @@
+{
+  "model": "m",
+  "stream": true,
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Read"},
+        {"type": "text", "text": "main.go"}
+      ]
+    }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "read",
+        "description": "Read a file",
+        "parameters": {"type": "object", "properties": {"path": {"type": "string"}}}
+      }
+    }
+  ]
+}

@@ -1,0 +1,68 @@
+{
+  "sample_spec": {
+    "title": "Authored synthetic importer fixture; invented IDs and amounts, not upstream pricing data"
+  },
+  "openai/fixture-manual": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": 1.3199999999999999e-05,
+    "output_cost_per_token": 1.33e-05,
+    "cache_creation_input_token_cost": 1.4299999999999999e-05,
+    "cache_read_input_token_cost": 1.3899999999999999e-05
+  },
+  "openai/fixture-small": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": 1.4299999999999999e-05,
+    "output_cost_per_token": 1.44e-05
+  },
+  "anthropic/fixture-cache": {
+    "litellm_provider": "anthropic",
+    "mode": "chat",
+    "input_cost_per_token": 1.5399999999999998e-05,
+    "output_cost_per_token": 1.55e-05,
+    "cache_creation_input_token_cost": 1.6499999999999998e-05,
+    "cache_read_input_token_cost": 1.61e-05
+  },
+  "gemini/fixture-tiered": {
+    "litellm_provider": "gemini",
+    "mode": "chat",
+    "input_cost_per_token": 1.6499999999999998e-05,
+    "output_cost_per_token": 1.66e-05,
+    "input_cost_per_token_above_128k_tokens": 1.8299999999999998e-05
+  },
+  "deepseek/fixture-chat": {
+    "litellm_provider": "deepseek",
+    "mode": "chat",
+    "input_cost_per_token": 1.76e-05,
+    "output_cost_per_token": 1.77e-05
+  },
+  "fireworks_ai/fixture-normalized": {
+    "litellm_provider": "fireworks_ai",
+    "mode": "chat",
+    "input_cost_per_token": 1.87e-05,
+    "output_cost_per_token": 1.88e-05
+  },
+  "openai/fixture-embedding": {
+    "litellm_provider": "openai",
+    "mode": "embedding",
+    "input_cost_per_token": 1.98e-05
+  },
+  "xai/fixture-extra": {
+    "litellm_provider": "xai",
+    "mode": "chat",
+    "input_cost_per_token": 2.09e-05,
+    "output_cost_per_token": 2.1e-05
+  },
+  "openai/fixture-unsupported-audio": {
+    "litellm_provider": "openai",
+    "mode": "audio_transcription",
+    "input_cost_per_token": 2.2e-05
+  },
+  "broken/bad-price-type": {
+    "litellm_provider": "openai",
+    "mode": "chat",
+    "input_cost_per_token": "free",
+    "output_cost_per_token": 2.3199999999999998e-05
+  }
+}

@@ -1,0 +1,39 @@
+# Hidden job. Extend it from a real job:
+#
+#   agent:
+#     extends: .yabanin
+#     script:
+#       - yb ci exec -- codex exec "summarize the diff"
+#     artifacts:
+#       paths:
+#         - yabanin-ci.json
+
+.yabanin:
+  before_script:
+    - |
+      if ! command -v yb >/dev/null 2>&1; then
+        curl -fsSL "$YABANIN_YB_URL" -o yb
+        printf '%s  yb\n' "$YABANIN_YB_SHA256" | sha256sum -c
+        chmod +x yb
+        mkdir -p "$HOME/.local/bin"
+        mv yb "$HOME/.local/bin/yb"
+      fi
+      export PATH="$HOME/.local/bin:$PATH"
+  artifacts:
+    paths:
+      - yabanin-ci.json
+    when: always
+
+# Final stage. GitLab Premium/Ultimate shows metrics.txt in the MR widget.
+# On Free it is only a job artifact.
+yabanin-pipeline:
+  stage: .post
+  when: always
+  script:
+    - yb ci report --pipeline --gitlab-metrics metrics.txt
+  artifacts:
+    reports:
+      metrics: metrics.txt
+    paths:
+      - yabanin-pipeline.json
+    when: always

@@ -1,0 +1,97 @@
+/* Astra — the Yabanin design language. Canonical semantic tokens.
+   v2 "Paper & Olive" (standards/design.md): faded paper, lighter paper
+   working surfaces, dark ink, restrained olive for actions, active
+   navigation and small accents. One language for console, landing, docs
+   and first-party reports; density differs per surface.
+   Namespaced --astra-*; the legacy --yb-* names are aliased in tokens.css.
+   The former scoped .astra-porcelain override is retired (DESIGN-PAPER-OLIVE-03):
+   the :root defaults below ARE the product theme now. */
+
+:root {
+  /* Surfaces and ink — faded paper, lighter paper work areas */
+  --astra-paper: #f2efe6;
+  --astra-surface: #faf8f1;
+  --astra-surface-muted: #e8e5d9;
+  --astra-ink: #292d24;
+  --astra-text-muted: #626657;
+  --astra-rule: #d2d3c4;
+  --astra-rule-strong: #808570;
+
+  /* Action and editorial accent — olive carries actions, active nav and
+     small graphic accents; it is never a fill for sidebars, heroes or cards */
+  --astra-action: #59633f;
+  --astra-action-hover: #465033;
+  --astra-on-action: #faf8f1;
+  --astra-accent: #5f693f;
+  --astra-accent-surface: #e6e9da;
+
+  /* Selection — chosen item/row/text (same ground as accent-surface,
+     different role) */
+  --astra-selection: #e6e9da;
+  --astra-on-selection: #465033;
+
+  /* States — each has a distinct meaning; color is never the only carrier */
+  --astra-info: #3d5e6b;
+  --astra-info-surface: #e7eef0;
+  --astra-success: #3f6148;
+  --astra-success-surface: #e8efe5;
+  --astra-warning: #755820;
+  --astra-warning-surface: #f3ecd8;
+  --astra-danger: #9a4437;
+  --astra-danger-surface: #f5e7e0;
+  --astra-focus: #4c6236;
+
+  /* Code roles — aliases into the palette above (arrows are var() refs,
+     not new hex). Verify contrast on code-surface AND highlighted lines. */
+  --astra-code-surface: var(--astra-surface-muted);
+  --astra-code-ink: var(--astra-ink);
+  --astra-code-comment: var(--astra-text-muted);
+  --astra-code-keyword: var(--astra-action-hover);
+  --astra-code-string: var(--astra-success);
+  --astra-code-number: var(--astra-warning);
+  --astra-code-property: var(--astra-info);
+  --astra-code-highlight: var(--astra-selection);
+
+  /* Onboarding wizard roles (N15; design/wizard/ is the owned reference) —
+     aliases into the palette above (arrows are var() refs, not new hex).
+     Step and plan-item states never rely on color alone: the glyph
+     (✓ / step number / ○ / ✕) plus a state word carry the meaning;
+     "unknown" is never styled as done or failed. */
+  --astra-wizard-step-done: var(--astra-success);
+  --astra-wizard-step-todo-ink: var(--astra-text-muted);
+  --astra-wizard-step-todo-border: var(--astra-rule-strong);
+  --astra-wizard-item-ok: var(--astra-success);
+  --astra-wizard-item-pending: var(--astra-text-muted);
+  --astra-wizard-item-failed: var(--astra-danger);
+  --astra-wizard-item-failed-surface: var(--astra-danger-surface);
+  --astra-wizard-choice-border: var(--astra-accent);
+  --astra-wizard-choice-surface: var(--astra-selection);
+  --astra-wizard-choice-ink: var(--astra-on-selection);
+  --astra-wizard-complete-surface: var(--astra-success-surface);
+
+  /* Typography — one sans for UI, one serif for editorial headlines, one
+     mono for code/IDs/values. Licensed local files may prepend, never
+     replace, these stacks. */
+  --astra-font-ui: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  --astra-font-editorial: Georgia, "Times New Roman", serif;
+  --astra-font-code: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  --astra-font-body: 15px;
+  --astra-font-label: 12px;
+  --astra-font-small: 13px;
+
+  /* Space, shape, motion — 4px base scale through section rhythm */
+  --astra-space-1: 4px;
+  --astra-space-2: 8px;
+  --astra-space-3: 12px;
+  --astra-space-4: 16px;
+  --astra-space-5: 24px;
+  --astra-space-6: 32px;
+  --astra-space-7: 48px;
+  --astra-space-8: 64px;
+  --astra-space-9: 96px;
+  --astra-radius-control: 4px;
+  --astra-radius-panel: 6px;
+  --astra-radius-dialog: 8px;
+  --astra-height-control: 44px;
+  --astra-duration: 140ms;
+}

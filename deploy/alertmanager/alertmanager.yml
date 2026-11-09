@@ -1,0 +1,62 @@
+# Alertmanager config — rendered by docker-compose.prod.yml at container
+# start: __ALERT_WEBHOOK_URL__, __ALERT_TG_BOT_TOKEN__ and __ALERT_TG_CHAT_ID__
+# are replaced with $ALERT_WEBHOOK_URL, $ALERT_TG_BOT_TOKEN and
+# $ALERT_TG_CHAT_ID (set them in deploy/.env or the environment; compose
+# defaults them to the dev black-hole values below). Alertmanager itself does
+# not expand env vars in config files, hence the placeholder + sed rendering
+# step in the compose entrypoint.
+#
+# Owner channels (W-EXPOSE): a generic webhook (ALERT_WEBHOOK_URL — Slack,
+# PagerDuty, ops receiver) and/or a Telegram bot (ALERT_TG_BOT_TOKEN +
+# ALERT_TG_CHAT_ID). Critical alerts fan out to BOTH receivers; everything
+# else goes to the webhook receiver. Test-fire procedure:
+# docs/runbooks/alerts.md.
+global:
+  resolve_timeout: 5m
+  # TODO: Configure real SMTP for production.
+  # smtp_smarthost: 'smtp.yourdomain.com:587'
+  # smtp_from: 'alerts@yourdomain.com'
+  # smtp_auth_username: '...'
+  # smtp_auth_password: '...'
+
+route:
+  receiver: "webhook"
+  group_by: ["alertname", "severity"]
+  group_wait: 10s
+  group_interval: 10s
+  repeat_interval: 1h
+  routes:
+    - match:
+        severity: critical
+      receiver: "critical"
+
+receivers:
+  - name: "webhook"
+    webhook_configs:
+      # Owner receiver via ALERT_WEBHOOK_URL (Slack/PagerDuty/ops webhook).
+      # Default: intentionally unreachable 127.0.0.1:1 — alerts are dropped
+      # but still visible in the alertmanager logs (dev posture).
+      - url: "__ALERT_WEBHOOK_URL__"
+        send_resolved: true
+  - name: "critical"
+    webhook_configs:
+      - url: "__ALERT_WEBHOOK_URL__"
+        send_resolved: true
+    telegram_configs:
+      # Owner Telegram bot via ALERT_TG_BOT_TOKEN/ALERT_TG_CHAT_ID.
+      # Default dud token/chat: config loads, sends fail with 401/400 logged
+      # in the alertmanager container (dev posture — same idea as the
+      # unreachable webhook above). chat_id is unquoted on purpose: it must
+      # render to a YAML integer (the sed default is 0).
+      - bot_token: "__ALERT_TG_BOT_TOKEN__"
+        chat_id: __ALERT_TG_CHAT_ID__
+        send_resolved: true
+
+inhibit_rules:
+  # alertmanager 0.27 requires matcher LISTS here (source_matchers as a map
+  # fails config load with "cannot unmarshal !!map into []string").
+  - source_matchers:
+      - 'severity="critical"'
+    target_matchers:
+      - 'severity="warning"'
+    equal: ['alertname', 'job']

@@ -1,0 +1,47 @@
+global:
+  scrape_interval: 15s
+  evaluation_interval: 15s
+
+rule_files:
+  - "alert-rules.yml"
+
+alerting:
+  alertmanagers:
+    - static_configs:
+        - targets: ["alertmanager:9093"]
+
+scrape_configs:
+  - job_name: "gateway"
+    static_configs:
+      - targets: ["gateway:9090"]
+    metrics_path: /metrics
+    scrape_timeout: 10s
+    # The gateway's /metrics (on the admin listener) requires the configured
+    # bearer key (YABANIN_METRICS_BEARER_KEY) when one is set. Without this,
+    # Prometheus gets 401 and the gateway target stays down.
+    #
+    # credentials_file (not inline credentials) is used because Prometheus
+    # v2.5x does NOT expand ${VAR} env references inside authorization
+    # credentials — it would send the literal string. A mounted file avoids
+    # that. The demo script writes the key to this path; production stacks
+    # that don't set the key leave the file absent (Prometheus then sends no
+    # Authorization header, and the gateway only enforces auth when a key is
+    # configured, so both stay consistent).
+    authorization:
+      credentials_file: /etc/prometheus/metrics-bearer.key
+
+  - job_name: "admin"
+    static_configs:
+      - targets: ["admin:8086"]
+    metrics_path: /metrics
+    scrape_timeout: 10s
+
+  - job_name: "loggerd"
+    static_configs:
+      - targets: ["loggerd:8085"]
+    metrics_path: /metrics
+    scrape_timeout: 10s
+
+  - job_name: "node"
+    static_configs:
+      - targets: ['node-exporter:9100']

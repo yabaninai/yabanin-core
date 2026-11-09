@@ -1,0 +1,62 @@
+# Yabanin Core
+
+Yabanin Core is a self-hosted AI gateway with OpenAI-compatible endpoints,
+provider routing, organization and agent credentials, request logs and an admin
+console. Run the local Docker Compose quickstart with a mock provider, then
+configure your own model endpoints and credentials.
+
+Optional controls include caching, budgets, policy pipelines and signed lineage
+records. Availability depends on configuration and the requested API. Recorded
+region claims do not independently establish where a provider ran inference.
+Cost estimates depend on recorded usage and available prices; missing prices
+remain unknown. Core is licensed under Apache-2.0.
+
+## Start here
+
+- [Quickstart](https://yabanin.ai/docs/quickstart): Start the local stack, create credentials and send your first request.
+- [Introduction](https://yabanin.ai/docs/intro): Core capabilities and operating model.
+- [Architecture](https://yabanin.ai/docs/architecture): Services, request processing and deployment boundaries.
+- [Compatibility](https://yabanin.ai/docs/compatibility): Supported APIs and client-specific limits.
+- [Deployment options](https://yabanin.ai/docs/deployment-options): Choose a deployment for your workload.
+- [CLI](https://yabanin.ai/docs/cli): Chat, offline spend analysis and operations commands.
+- [Offline spend audit](https://yabanin.ai/docs/audit): Analyze local traffic files and distinguish estimates from invoices.
+
+## Providers and clients
+
+- [Provider configuration](https://yabanin.ai/docs/providers): Configure local and external model endpoints.
+- [Provider keys](https://yabanin.ai/docs/byok): Manage organization-scoped upstream credentials.
+- [OpenCode](https://yabanin.ai/docs/clients/opencode): Configure the gateway as an OpenAI-compatible provider.
+- [Codex](https://yabanin.ai/docs/clients/codex): Client setup and compatibility limits.
+- [Claude Code](https://yabanin.ai/docs/clients/claude-code): Client setup and compatibility limits.
+- [SDK versions](https://yabanin.ai/docs/clients/sdk-versions): Supported client library versions.
+
+## Routing and controls
+
+- [Cache](https://yabanin.ai/docs/cache): Exact and semantic cache configuration and behavior.
+- [Cache architecture](https://yabanin.ai/docs/cache-architecture): Cache isolation, storage and lookup flow.
+- [Cache precision](https://yabanin.ai/docs/cache-precision): Semantic matching measurements and limitations.
+- [Gateway performance](https://yabanin.ai/docs/gateway-performance): Performance characteristics and tuning.
+- [Task classifier](https://yabanin.ai/docs/classifier): Classification used in model routing.
+- [Policy pipeline](https://yabanin.ai/docs/pipeline): Request policies, detectors, mutators and staged enforcement.
+- [Agent access](https://yabanin.ai/docs/agent-governance): Agent credentials, budgets and request controls.
+- [MCP gateway](https://yabanin.ai/docs/mcp-gateway): Register external MCP servers and control access to their tools.
+- [A2A gateway](https://yabanin.ai/docs/a2a-gateway): Configure agent-to-agent requests.
+- [Tool policies](https://yabanin.ai/docs/tool-policies): Apply rules to supported tool calls.
+- [Lineage](https://yabanin.ai/docs/lineage): Signed request records, verification and location-claim limitations.
+- [Evaluation](https://yabanin.ai/docs/evaluation): Run routing and guard regression suites.
+- [Shadow mode](https://yabanin.ai/docs/shadow-mode): Compare proposed behavior before enforcing changes.
+
+## Security and operation
+
+- [Security](https://yabanin.ai/docs/security): Authentication, secrets, controls and known limitations.
+- [OWASP control mapping](https://yabanin.ai/docs/security-owasp-llm): Available controls and remaining application risks.
+- [OIDC sign-in](https://yabanin.ai/docs/sso-oidc): Configure administrator single sign-on.
+- [On-premises installation](https://yabanin.ai/docs/onprem/install-guide): Install and configure a deployment you operate.
+- [Offline installation](https://yabanin.ai/docs/onprem/offline-bundle): Prepare the files needed for an offline environment.
+- [Air-gap checklist](https://yabanin.ai/docs/onprem/airgap-checklist): Review dependencies and network boundaries.
+- [Multi-region deployment](https://yabanin.ai/docs/multi-region): Configure services across regions.
+- [Operations](https://yabanin.ai/docs/ops): Maintain a running deployment.
+- [Secrets rotation](https://yabanin.ai/docs/ops/secrets-rotation): Rotate credentials and keys.
+- [Backup and restore](https://yabanin.ai/docs/runbooks/backup-restore-rehearsal): Test recovery from backups.
+- [Incident response](https://yabanin.ai/docs/runbooks/incident-response): Investigate and contain incidents.
+- [Development](https://yabanin.ai/docs/DEVELOPMENT): Build and work on Core locally.

@@ -1,0 +1,9 @@
+{
+  "id": "msg_2",
+  "model": "claude",
+  "stop_reason": "tool_use",
+  "content": [
+    {"type": "tool_use", "id": "toolu_9", "name": "lookup", "input": null}
+  ],
+  "usage": {"input_tokens": 1, "output_tokens": 1}
+}

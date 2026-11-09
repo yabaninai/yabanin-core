@@ -1,0 +1,18 @@
+[build-system]
+requires = ["flit_core==4.1.0"]
+build-backend = "flit_core.buildapi"
+
+[project]
+name = "tokenrouter"
+version = "0.1.0"
+description = "Yabanin AI gateway SDK — cost-aware model routing with lineage verification"
+requires-python = ">=3.9"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+dependencies = [
+    "openai>=1.40",
+    "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+test = ["pytest", "respx"]

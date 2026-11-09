@@ -1,0 +1,42 @@
+# Binaries
+yabanin-gateway
+yabanin-sessiond
+yabanin-ruled
+yabanin-loggerd
+
+# Git
+.git
+.gitignore
+.gitmodules
+
+# Build artifacts
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+dist/
+bin/
+
+# Test data and coverage
+coverage.out
+profile.out
+*.pkl
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Config (optional, adjust as needed)
+# config.local.yaml
+
+# Generated runtime secrets must never enter the Docker build context.
+# Exact .env names only; public .env.example templates remain available.
+.env
+**/.env

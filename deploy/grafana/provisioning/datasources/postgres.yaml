@@ -1,0 +1,39 @@
+apiVersion: 1
+
+# W-FEED: Postgres datasource for the beta dashboard (deploy/grafana/dashboards/beta.json),
+# which reads the beta_* metrics SQL views (pkg/feedback/views.go) directly.
+#
+# Values below are the compose-stack defaults (deploy/docker-compose.yml);
+# replace them per environment (host/credentials) or point user/password at
+# the dedicated read-only metrics role described at the bottom.
+#
+# Least privilege: provision a dedicated read-only metrics role instead of
+# the owner login when possible:
+#
+#   CREATE ROLE beta_metrics_reader LOGIN PASSWORD '...';
+#   GRANT USAGE ON SCHEMA public TO beta_metrics_reader;
+#   GRANT SELECT ON beta_dau_daily, beta_requests_daily, beta_onboarding_ttfq,
+#                    beta_provider_distribution, beta_provider_errors,
+#                    beta_latency_daily, beta_cache_hit_rate_daily
+#     TO beta_metrics_reader;
+#
+# The views are plain (definer) views over request_logs, so a reader bound by
+# region RLS should also pin its region once per session:
+#   ALTER ROLE beta_metrics_reader IN DATABASE yabanin SET app.region = 'sg';
+# Without a region GUC the underlying region_isolation policy hides every row
+# for NOBYPASSRLS readers (the compose default login is exempt).
+datasources:
+  - name: Yabanin Postgres (beta)
+    uid: beta-postgres
+    type: postgres
+    access: proxy
+    url: postgres:5432
+    user: yabanin
+    secureJsonData:
+      password: yabanin
+    jsonData:
+      database: yabanin
+      sslmode: disable
+      postgresVersion: 1600
+      maxOpenConns: 2
+    editable: false

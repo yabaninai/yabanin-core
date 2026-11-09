@@ -1,0 +1,19 @@
+{
+  "name": "yabanin-subscription-bridge",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Loopback sidecar that runs official Codex and Cursor agents for Yabanin delegation.",
+  "engines": {
+    "node": ">=22.13.0"
+  },
+  "scripts": {
+    "start": "node --experimental-strip-types src/index.ts",
+    "start:fake": "YABANIN_BRIDGE_FAKE=1 node --experimental-strip-types src/index.ts",
+    "test": "node --test --experimental-strip-types src/contract.test.ts src/listen.test.ts src/runners.test.ts"
+  },
+  "optionalDependencies": {
+    "@openai/codex-sdk": "0.153.0"
+  },
+  "license": "Apache-2.0"
+}

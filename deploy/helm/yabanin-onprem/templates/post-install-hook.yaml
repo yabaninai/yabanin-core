@@ -1,0 +1,78 @@
+{{- define "yabanin.onprem.waitPostgres" -}}
+# concern (migrations cannot create cluster roles), but the air-gap buyer
+# has no repo checkout on the jump host — bootstrap-app-role.sql could never
+# be applied on the k8s path. The idempotent role bootstrap now runs as a
+# hook init container (mirrors deploy/quickstart/bootstrap-app-role.sql;
+# NOLOGIN least-privilege — services SET ROLE from the owner pools, direct
+# app-role logins stay an operator decision).
+- name: wait-for-postgres
+  image: {{ .Values.postgres.image }}
+  command: ["sh", "-c", "until pg_isready -h {{ .Release.Name }}-postgres -U yabanin -d yabanin; do sleep 2; done"]
+- name: bootstrap-app-role
+  image: {{ .Values.postgres.image }}
+  resources: {{ toYaml $.Values.migration.resources | nindent 12 }}
+  env:
+    - name: PG_PASSWORD
+      valueFrom:
+        secretKeyRef:
+          name: {{ include "yabanin.onprem.appSecretName" $ }}
+          key: pg_password
+    - name: YABANIN_REGION
+      value: {{ .Values.config.region | default "onprem" }}
+  command: ["sh", "-c"]
+  args:
+    - |
+      set -e
+      psql "postgres://yabanin:$PG_PASSWORD@{{ .Release.Name }}-postgres:5432/yabanin?sslmode=disable" -v ON_ERROR_STOP=1 <<'SQL'
+      -- kubelet expands $$ -> $ and $(VAR) in command/args, so the SQL
+      -- dollar-quote must be written $$$$ in this template to reach psql as $$.
+      DO $$$$ BEGIN
+        IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yabanin_app') THEN
+          CREATE ROLE yabanin_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
+        END IF;
+      END $$$$;
+      GRANT USAGE ON SCHEMA public TO yabanin_app;
+      GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO yabanin_app;
+      GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO yabanin_app;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yabanin_app;
+      ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO yabanin_app;
+      SQL
+      echo "yabanin_app role bootstrapped (idempotent)"
+{{- end -}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "yabanin.fullname" . }}-post-install-migrate
+  annotations:
+    "helm.sh/hook": post-install
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "5"
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 3
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        {{- include "yabanin.onprem.waitPostgres" . | nindent 8 }}
+        {{- include "yabanin.onprem.waitMigrationLock" . | nindent 8 }}
+      containers:
+        - name: migrate
+          image: "{{ .Values.image.repository | default "yabanin" }}:{{ .Values.image.tag }}"
+          args: ["migrate"]
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          env:
+            - name: PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: {{ include "yabanin.onprem.appSecretName" . }}
+                  key: pg_password
+            - name: YABANIN_PG_URI
+              value: "postgres://yabanin:$(PG_PASSWORD)@{{ .Release.Name }}-postgres:5432/yabanin?sslmode=disable"
+            # Region is an env var, not a flag (install-guide
+            # troubleshooting: RLS errors when migrations run without region).
+            - name: YABANIN_REGION
+              value: {{ .Values.config.region | default "onprem" }}

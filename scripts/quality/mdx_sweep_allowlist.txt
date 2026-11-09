@@ -1,0 +1,16 @@
+# MDX parse sweep allowlist (MDX005 warnings only).
+#
+# Conventions follow scripts/docs_lang_allowlist.txt: one entry per line,
+# content-keyed as <repo-relative-path>:<sha256-of-the-source-line-16hex>.
+# The docs-mdx gate prints the ready-to-paste key for every un-allowlisted
+# MDX005 warning. FATAL findings (MDX000-004: unreadable file, raw '<'
+# cannot start a tag, unclosed JSX tag, unclosed '{' expression, unclosed
+# HTML comment) are NOT allowlistable — fix the file.
+#
+# MDX005 marks brace expression containers: parse-valid, but MDX evaluates
+# them as JavaScript at build/render (SSR hazard class). Allowlist only
+# intentional JSX expressions that belong in the
+# public site; prefer code-spanning literal text instead.
+#
+# Entries at HEAD: none (docs/strategy/** template braces print as labeled
+# site-excluded warnings by design and need no entries).

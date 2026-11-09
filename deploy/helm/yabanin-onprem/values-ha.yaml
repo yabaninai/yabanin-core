@@ -1,0 +1,38 @@
+# Documented HA profile for the on-prem chart (N11-P02-T03).
+#
+# Render guard: ha.enabled=true requires >=2 gateway AND admin replicas
+# (gateway-deployment.yaml) and adds a HARD topology spread across
+# ha.topology_key — one node loss keeps at least one serving replica
+# (deploy/helm/yabanin/HA-TOPOLOGY.md; failure domain = one cluster node).
+#
+# This overlay covers the STATELESS tiers only. The authoritative database
+# is an operator-managed HA endpoint per deploy/helm/yabanin/HA-TOPOLOGY.md
+# (quorum Postgres, Patroni pattern, fenced single-writer). LIMITATION
+# (packet remainder, T04+): this chart release wires only the bundled
+# single-replica postgres-statefulset — no template consumes
+# bundled.postgres, so an external-DB endpoint cannot be selected through
+# values yet; the migration/backup/rollback hooks pin
+# <release>-postgres. Do not read this overlay as an external-DB switch.
+# The bundled single-replica postgres-statefulset is NOT an HA
+# database — local fsync is not replication and must never be presented as
+# replicated RPO=0 storage (I44; HA-TOPOLOGY.md "Tier 2"). Explicit negatives
+# that stay true with this overlay: no availability-zone/region survival, no
+# promise that in-flight streams survive node loss.
+ha:
+  enabled: true
+  topology_key: "kubernetes.io/hostname"
+  when_unsatisfiable: "DoNotSchedule"
+
+gateway:
+  replicas: 2
+admin:
+  replicas: 2
+loggerd:
+  replicas: 1
+
+# zero-downtime rollouts: maxUnavailable 0 + maxSurge 1 + minReadySeconds
+minReadySeconds: 5
+strategy:
+  rollingUpdate:
+    maxUnavailable: 0
+    maxSurge: 1

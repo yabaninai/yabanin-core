@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:yabanin:secevents:ocsf-export:v1",
+  "title": "Yabanin secevents OCSF export envelope (v1)",
+  "description": "Versioned wire schema of the normalized OCSF-aligned export (packet E07-P01). Root is the envelope; records are its $defs.record. Unknown fields are allowed EVERYWHERE and must be ignored by readers (forward compatibility is a packet acceptance criterion; see the W02 versioning artifact). The schema is a declarative subset contract, not a full OCSF class schema: extensions (org_id, identity, evidence, cost, source_event_type, mapped) are documented extensions, and full OCSF conformance is not claimed.",
+  "type": "object",
+  "required": ["schema_version", "envelope_id", "issued_at", "records"],
+  "properties": {
+    "schema_version": {
+      "type": "integer",
+      "description": "Export schema version. MUST equal 1 for this schema. The equality gate (missing vs unsupported) is enforced by the code validator (validate.go) with explicit errors; the schema only types the field."
+    },
+    "envelope_id": {
+      "type": "string",
+      "minLength": 1,
+      "maxLength": 256,
+      "description": "Envelope identifier assigned by the exporting connector; unique within the connector's export stream."
+    },
+    "issued_at": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Envelope issue time, epoch milliseconds (OCSF timestamp_t)."
+    },
+    "records": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/record" },
+      "description": "Normalized records; empty only for an explicitly empty export."
+    },
+    "attempt": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Envelope-level delivery-retry counter (E07-P01-W04 semantics; populated since batch B by the writer-side redelivery path — Envelope.Attempt grows once per delivery retry, never per record; see replay.go and the DLQ precedent cited there). The slot stays schema-stable. Third-party v1 producers MUST NOT set it ad hoc: it is writer-side delivery state, not record content; readers treat it as informational."
+    }
+  },
+  "$defs": {
+    "record": {
+      "type": "object",
+      "description": "One secevents event in the OCSF-aligned export form (Detection Finding 2004). Canonical key order is the record struct declaration order (pkg/ocsf/record.go); JSON objects are unordered, but the canonical encoding is byte-deterministic.",
+      "required": ["schema_version", "category_uid", "class_uid", "activity_id", "type_uid", "severity_id", "time", "finding_info", "metadata", "org_id", "identity", "source_event_type", "mapped"],
+      "properties": {
+        "schema_version": { "type": "integer", "description": "Export schema version of the record; equals the envelope's schema_version." },
+        "category_uid": { "type": "integer", "minimum": 0, "description": "OCSF category. Current mapping: 2 (Findings)." },
+        "class_uid": { "type": "integer", "minimum": 0, "description": "OCSF class. Current mapping: 2004 (Detection Finding)." },
+        "activity_id": { "type": "integer", "minimum": 0, "description": "OCSF activity. 1 = Create for mapped types; 0 = Unknown for unmapped types." },
+        "type_uid": { "type": "integer", "minimum": 0, "description": "class_uid*100+activity_id: 200401 mapped, 200400 unmapped." },
+        "severity_id": { "type": "integer", "enum": [0, 1, 2, 3, 4, 5, 6], "description": "OCSF severity. deny=4 High, mask=3 Medium, flag=2 Low, allow=1 Informational, unmapped=0 Unknown." },
+        "time": { "type": "integer", "minimum": 0, "description": "Event occurrence time, epoch milliseconds (UTC)." },
+        "finding_info": { "$ref": "#/$defs/finding_info" },
+        "metadata": { "$ref": "#/$defs/metadata" },
+        "org_id": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Tenant scope of the event, carried verbatim from secevents." },
+        "identity": { "$ref": "#/$defs/identity" },
+        "evidence": { "type": "array", "items": { "$ref": "#/$defs/evidence_ref" }, "description": "Redacted evidence references: digests only, content cannot be carried by type." },
+        "cost": { "$ref": "#/$defs/cost" },
+        "source_event_type": { "type": "string", "pattern": "^[a-z0-9._-]{1,64}$", "description": "Original secevents event_type, always preserved — including for unmapped records." },
+        "mapped": { "type": "boolean", "description": "false = the source type was not in the known mapping table (unmapped discipline); the record is still complete and must not be dropped." },
+        "replay_id": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Replay correlation id (E07-P01-W04; populated since batch B by the writer-side pipeline: ReplayID(org_id, finding_info.uid) — a deterministic derivation filled by AssignReplayIDs before envelope construction, and re-derived and enforced by VerifyEnvelope, ErrReplayIDMismatch on divergence). The slot stays schema-stable. Third-party v1 producers MUST NOT set it ad hoc: the value is derived, and a mismatched value fails verification." }
+      }
+    },
+    "finding_info": {
+      "type": "object",
+      "description": "Subset of the OCSF finding_info object.",
+      "required": ["uid"],
+      "properties": {
+        "uid": { "type": "string", "minLength": 1, "maxLength": 256, "description": "Dedup anchor: the secevents event_id (deterministically derived)." },
+        "title": { "type": "string", "maxLength": 1024, "description": "Bounded single-line summary (secevents TrimSummary)." }
+      }
+    },
+    "metadata": {
+      "type": "object",
+      "required": ["version", "product", "secevents_schema_version"],
+      "properties": {
+        "version": { "type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+$", "description": "Target OCSF release, pinned (e.g. 1.9.0); see the W01 mapping artifact." },
+        "product": { "$ref": "#/$defs/product" },
+        "secevents_schema_version": { "type": "integer", "minimum": 1, "description": "Source secevents schema version (dual version pinning)." }
+      }
+    },
+    "product": {
+      "type": "object",
+      "required": ["vendor_name", "name", "version"],
+      "properties": {
+        "vendor_name": { "type": "string", "minLength": 1 },
+        "name": { "type": "string", "minLength": 1 },
+        "version": { "type": "string", "minLength": 1 }
+      }
+    },
+    "identity": {
+      "type": "object",
+      "description": "secevents tri-state identifier block, carried verbatim: unknown must never collapse into absent or a known value.",
+      "properties": {
+        "agent": { "$ref": "#/$defs/idref" },
+        "session": { "$ref": "#/$defs/idref" },
+        "task": { "$ref": "#/$defs/idref" },
+        "tool": { "$ref": "#/$defs/idref" }
+      }
+    },
+    "idref": {
+      "type": "object",
+      "description": "Typed identifier reference. Default resolution when state is absent: a non-empty value means known, an empty/missing value means absent. An explicit unknown state must not carry a value.",
+      "properties": {
+        "value": { "type": "string", "minLength": 1, "maxLength": 256 },
+        "state": { "enum": ["known", "unknown", "absent"] }
+      }
+    },
+    "evidence_ref": {
+      "type": "object",
+      "required": ["kind", "digest"],
+      "description": "Digest reference to a redacted evidence artifact; there is deliberately no content-bearing field.",
+      "properties": {
+        "kind": { "type": "string", "pattern": "^[a-z0-9._-]{1,64}$", "description": "Open lowercase-slug namespace (payload_digest, policy_decision, …)." },
+        "digest": { "type": "string", "pattern": "^[0-9a-f]{64}$", "description": "Lower-case hex SHA-256 of the redacted artifact." },
+        "location": { "type": "string", "maxLength": 256, "description": "Optional storage pointer; never a capture (data URLs are rejected upstream)." }
+      }
+    },
+    "cost": {
+      "type": "object",
+      "description": "Cost extension. State known ⇒ micro_usd is expected to be present (an explicit 0 means known-free). State unknown ⇒ micro_usd MUST NOT be present (unknown must not collapse into zero). A missing cost object means the event has no cost dimension at all. The state-conditional rule is enforced by the mapper and pinned by tests; expressing it here would need draft 2020-12 conditionals the embedded validator intentionally does not implement.",
+      "required": ["state"],
+      "properties": {
+        "state": { "enum": ["known", "unknown"] },
+        "micro_usd": { "type": "integer", "minimum": 0, "description": "Present iff state is known (pointer-typed in the producer)." }
+      }
+    }
+  }
+}

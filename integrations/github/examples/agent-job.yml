@@ -1,0 +1,46 @@
+name: agent
+on:
+  pull_request:
+jobs:
+  codex:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./integrations/github/setup-yb
+        with:
+          url: ${{ vars.YABANIN_YB_URL }}
+          sha256: ${{ vars.YABANIN_YB_SHA256 }}
+          gateway-url: ${{ vars.YABANIN_GATEWAY_URL }}
+      - name: Run Codex through the gateway
+        run: yb ci exec -- codex exec "summarize the diff"
+        env:
+          YABANIN_CI_KEY: ${{ secrets.YABANIN_CI_KEY }}
+  claude:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./integrations/github/setup-yb
+        with:
+          url: ${{ vars.YABANIN_YB_URL }}
+          sha256: ${{ vars.YABANIN_YB_SHA256 }}
+          gateway-url: ${{ vars.YABANIN_GATEWAY_URL }}
+      - name: Export gateway headers
+        run: yb ci env --format github >> "$GITHUB_ENV"
+  report:
+    if: always()
+    needs: [codex, claude]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: ./integrations/github/setup-yb
+        with:
+          url: ${{ vars.YABANIN_YB_URL }}
+          sha256: ${{ vars.YABANIN_YB_SHA256 }}
+          gateway-url: ${{ vars.YABANIN_GATEWAY_URL }}
+      - name: Pipeline usage
+        run: yb ci report --pipeline
+        env:
+          YABANIN_CI_KEY: ${{ secrets.YABANIN_CI_KEY }}
+      - uses: anthropics/claude-code-action@v1
+        with:
+          anthropic_api_key: ${{ secrets.YABANIN_CI_KEY }}

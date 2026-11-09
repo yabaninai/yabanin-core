@@ -1,0 +1,187 @@
+name: yabanin-quickstart
+
+# Localhost-only stack. Published ports bind 127.0.0.1.
+# Secrets come from deploy/quickstart/.env (generated, mode 600, not in git).
+# The Postgres password below is a fixed dev credential for this compose file.
+#
+# The default network pins an explicit subnet so mock-openai holds a static
+# IP. The gateway's SSRF egress guard (D-4 posture) refuses allow-listed DNS
+# names whose answers fall in reserved ranges (rebinding protection), so a
+# compose hostname cannot be the operator pin for a private-range upstream —
+# an IP LITERAL can. The quickstart therefore pins the mock provider at a
+# fixed address inside a dedicated (non-Docker-pool) subnet and points the
+# provider origin + seeded model URL at that literal.
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: yabanin
+      POSTGRES_PASSWORD: yabanin
+      POSTGRES_DB: yabanin
+    volumes:
+      # Named volume: `compose down` (no -v) keeps the database across
+      # restarts. An anonymous volume would be discarded by every `down`,
+      # silently wiping seeded keys.
+      - pg_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U yabanin -d yabanin"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  redis:
+    image: redis:7-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541  # pinned 2026-10-25 (was: redis:7-alpine)
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+
+  migrate:
+    image: yabanin-quickstart:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["migrate"]
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      # Migrations keep the owner login: the controlled-elevation path.
+      YABANIN_PG_URI: postgres://yabanin:yabanin@postgres:5432/yabanin?sslmode=disable
+      YABANIN_REGION: sg
+      YABANIN_REDIS_ADDR: redis:6379
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  # The application must not run as the table owner. The consolidated
+  # baseline migration is a pg_dump and cannot carry cluster roles (the old
+  # role-creating migration was dropped), so this one-shot bootstraps the
+  # yabanin_app role idempotently from bootstrap-app-role.sql (mirrors
+  # pkg/testdb.applyMigrations: NOLOGIN least-privilege + grants) and then
+  # enables LOGIN with the quickstart's fixed dev credential so the app DSN
+  # below can log in as it. In production set a strong password instead
+  # (ALTER ROLE ... PASSWORD).
+  db-app-role:
+    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    volumes:
+      - ./bootstrap-app-role.sql:/bootstrap-app-role.sql:ro
+    entrypoint: ["psql", "-h", "postgres", "-U", "yabanin", "-d", "yabanin",
+                 "-v", "ON_ERROR_STOP=1", "-f", "/bootstrap-app-role.sql"]
+    environment:
+      PGPASSWORD: yabanin
+    restart: "no"
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # One-shot seed: the canonical `yabanin seed` bootstrap (org + default team
+  # + budget + seed API key + model + starting credits + root admin). Gated
+  # behind the `seed` profile so `up --wait` never runs it (a completed
+  # one-shot fails --wait on compose v2.18); scripts/quickstart/seed.sh
+  # activates the profile and invokes it with --admin-email and
+  # --admin-password-stdin, so the key and password print once on the
+  # operator's terminal. Idempotent: a rerun reuses the seed key and does not
+  # reprint the plaintext. The subcommand is baked into the entrypoint so
+  # `compose run seed --flag …` appends seed flags (compose run would
+  # otherwise replace the command: array wholesale).
+  seed:
+    profiles: ["seed"]
+    image: yabanin-quickstart:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    entrypoint: ["/app/yabanin", "seed"]
+    restart: "no"
+    env_file:
+      - .env
+    environment:
+      YABANIN_REGION: sg
+      # Seeding keeps the owner login, like migrate: it writes the bootstrap
+      # rows (the app itself stays on the non-owner yabanin_app role).
+      YABANIN_PG_URI: postgres://yabanin:yabanin@postgres:5432/yabanin?sslmode=disable
+      SEED_PROFILE: mock
+      SEED_MODEL: ${QS_MODEL:-}
+      # Default matches the pinned mock-openai address below; keep it a
+      # literal IP — see the network note at the top of this file.
+      SEED_UPSTREAM_URL: ${QS_UPSTREAM_URL:-http://10.207.0.9:8081}
+    depends_on:
+      db-app-role:
+        condition: service_completed_successfully
+
+  yabanin:
+    image: yabanin-quickstart:local
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+    command: ["dev"]
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # App runs as the non-owner yabanin_app role; the pool also
+      # downgrades every connection via SET ROLE (defense in depth).
+      YABANIN_PG_URI: postgres://yabanin_app:yabanin_app@postgres:5432/yabanin?sslmode=disable
+      YABANIN_REGION: sg
+      YABANIN_REDIS_ADDR: redis:6379
+      YABANIN_GATEWAY_LISTEN: ":8082"
+      YABANIN_GATEWAY_ADMIN: ":9090"
+      YABANIN_ADMIN_LISTEN: ":8086"
+      YABANIN_LOGGERD_LISTEN: ":8085"
+      YABANIN_AUTH_MODE: header
+      # Literal-IP default: the SSRF egress guard waives the reserved-range
+      # refusal only for exact IP pins (D-4) — see the note at the top.
+      YABANIN_PROVIDER_ADDR: ${QS_UPSTREAM_URL:-http://10.207.0.9:8081}
+    ports:
+      # Host ports are overridable (QS_GATEWAY_PORT / QS_ADMIN_PORT, e.g. for
+      # scripts/quickstart/regression.sh isolated runs); defaults keep the
+      # documented localhost-only 127.0.0.1:8082/8086.
+      - "127.0.0.1:${QS_GATEWAY_PORT:-8082}:8082"
+      - "127.0.0.1:${QS_ADMIN_PORT:-8086}:8086"
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:8082/healthz >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      start_period: 15s
+      retries: 24
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      db-app-role:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+
+  mock-openai:
+    profiles: ["mock"]
+    restart: unless-stopped
+    build:
+      context: ../../deploy/mock-provider
+      dockerfile: Dockerfile
+    networks:
+      default:
+        # Static address inside the pinned subnet (see the file header): the
+        # gateway's egress allow-list pins this literal, so the seeded model
+        # URL and provider origin stay valid across project restarts.
+        ipv4_address: 10.207.0.9
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8081/healthz >/dev/null || exit 1"]
+      interval: 2s
+      timeout: 3s
+      retries: 20
+
+networks:
+  default:
+    ipam:
+      config:
+        # 10.207.0.0/24 is outside Docker's default auto-allocation pools
+        # (172.16.0.0/12, 192.168.0.0/16), so parallel compose projects and
+        # auto-allocated networks never collide with this pin.
+        - subnet: 10.207.0.0/24
+
+volumes:
+  pg_data:

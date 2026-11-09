@@ -1,0 +1,58 @@
+{{- /* N11-P02-T03 migration jobs (pre-upgrade hook, locking):
+     1. wait for the bundled postgres to accept connections (the hook used to
+        pg_dump straight into a possibly-not-ready DB);
+     2. wait out any OTHER migration holding the migration advisory lock
+        (concurrent helm run) instead of racing it — bounded by
+        migration.waitTimeoutSeconds, hard Stop by
+        migration.activeDeadlineSeconds;
+     3. explicit resources so the backup cannot evict/steamroll workload pods.
+     The upgrade itself stays blocked while this hook runs (helm semantics):
+     a failed backup fails the upgrade BEFORE any workload is replaced. */}}
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: {{ template "yabanin.fullname" . }}-pre-upgrade
+  annotations:
+    "helm.sh/hook": pre-upgrade
+    "helm.sh/hook-delete-policy": before-hook-creation
+    "helm.sh/hook-weight": "-10"
+  labels:
+    {{- include "yabanin.labels" . | nindent 4 }}
+spec:
+  backoffLimit: 1
+  activeDeadlineSeconds: {{ .Values.migration.activeDeadlineSeconds }}
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      initContainers:
+        - name: wait-for-postgres
+          image: {{ .Values.postgres.image }}
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          command: ["sh", "-c", "until pg_isready -h {{ .Release.Name }}-postgres -U yabanin -d yabanin; do sleep 2; done"]
+        {{- include "yabanin.onprem.waitMigrationLock" . | nindent 8 }}
+      containers:
+        - name: backup
+          image: {{ .Values.postgres.image }}
+          resources: {{ toYaml .Values.migration.resources | nindent 12 }}
+          env:
+            - { name: PGPASSWORD_FILE, value: /etc/yabanin/secrets/pg_password }
+          command:
+            - sh
+            - -c
+            - |
+              set -e
+              ts=$(date +%s)
+              echo "Backing up to /backup/yabanin-pre-${ts}.sql.gz"
+              PGPASSWORD=$(cat /etc/yabanin/secrets/pg_password) \
+                pg_dump -h {{ .Release.Name }}-postgres -U yabanin yabanin \
+                | gzip > /backup/yabanin-pre-${ts}.sql.gz
+              ls -la /backup/yabanin-pre-${ts}.sql.gz
+          volumeMounts:
+            - { name: backup, mountPath: /backup }
+            - { name: secrets, mountPath: /etc/yabanin/secrets, readOnly: true }
+      volumes:
+        - name: backup
+          persistentVolumeClaim: { claimName: {{ template "yabanin.fullname" . }}-backup }
+        - name: secrets
+          secret: { secretName: {{ include "yabanin.onprem.appSecretName" . }} }

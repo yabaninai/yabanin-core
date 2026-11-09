@@ -1,0 +1,23 @@
+{
+  "corpus_sha256": "69b24ed1e823338ccb3cd78ac785578f290ec739c3fab98ee3d930731c5a6b8e",
+  "default_max_false_positives": 0,
+  "max_false_positives": {
+    "pii.ae": 0,
+    "pii.br": 0,
+    "pii.eg": 0,
+    "pii.email": 0,
+    "pii.in": 0,
+    "pii.innsnils": 0,
+    "pii.ke": 0,
+    "pii.my": 0,
+    "pii.ng": 0,
+    "pii.ogrn": 0,
+    "pii.pan": 0,
+    "pii.phone": 0,
+    "pii.ru_passport": 0,
+    "pii.za": 0,
+    "secrets.credential_keys": 0,
+    "secrets.material": 0,
+    "injection.prompts": 0
+  }
+}

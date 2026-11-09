@@ -1,0 +1,71 @@
+# syntax=docker/dockerfile:1
+# Hardened build: distroless static, non-root, read-only FS friendly.
+# Single unified binary, same as Dockerfile: the service is selected at
+# runtime via subcommand (gateway / admin / loggerd / mcp / migrate / dev /
+# license), so there is no SERVICE build arg.
+
+# Pin the official golang:1.27.3-alpine multi-arch manifest used by Dockerfile.
+FROM golang:1.27.3-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS builder
+
+# Exact-version package pins: the apk repository index is a mutable input, so
+# bare package names would let OS package bytes float between builds. Versions
+# below were resolved inside this pinned builder image (alpine 3.24.3, base
+# already ships ca-certificates at the same version). If the mirror drops a
+# pinned version the build fails loudly instead of drifting.
+RUN apk add --no-cache \
+        ca-certificates=20261020-r0 \
+        git=2.54.0-r0
+
+WORKDIR /src
+
+COPY go.mod go.sum ./
+RUN go mod download
+
+COPY . .
+
+# Same recipe as the Dockerfile builder stage and
+# scripts/release/release-artifacts.sh: one public source and one recipe give
+# a byte-identical subject across the release set and both image variants.
+RUN CGO_ENABLED=0 GOOS=linux GOFLAGS= GOWORK=off go build \
+        -trimpath -buildvcs=false \
+        -ldflags "-s -w" \
+        -o /out/yabanin \
+        ./cmd/yabanin
+
+# Wall-clock normalization rationale (BUILD-20261102 A/B divergence fix,
+# artifacts/internal-delivery-program/BUILD-20261102/repro-ab-20261102.md §2.2): go build
+# stamps /out/yabanin with the builder-stage wall-clock mtime, and the final
+# stage's `COPY --from=builder` records that mtime verbatim in the layer tar
+# header. SOURCE_DATE_EPOCH as a build-arg only clamps the exported image
+# config `created` field — it does NOT touch file mtimes produced inside RUN —
+# so two builds of the same commit seconds apart shipped divergent final-layer
+# digests (observed: member yabanin mtime 1793617272 vs 1793617314, layer
+# sha256 81519131… vs 85aa2707…, payload bytes identical). Normalizing every
+# build-produced artifact's mtime to SOURCE_DATE_EPOCH before the final COPY
+# makes the final layer bytes a pure function of (source tree, epoch). The
+# final distroless stage has no shell, so the normalization must happen here.
+# busybox touch -d @N parses the seconds-since-epoch form exactly.
+ARG SOURCE_DATE_EPOCH
+RUN case "${SOURCE_DATE_EPOCH:-}" in \
+        ''|*[!0-9]*) \
+            echo "FAIL: SOURCE_DATE_EPOCH must be an integer unix timestamp (got: '${SOURCE_DATE_EPOCH:-}')" >&2; \
+            exit 1 ;; \
+        esac
+RUN touch -d "@${SOURCE_DATE_EPOCH}" /out/*
+# Keep the fail-loud convention of scripts/release/release-artifacts.sh: a
+# missing or non-integer epoch must fail the build instead of silently leaving
+# wall-clock bytes in the OCI layer. Full digest determinism additionally
+# requires the exporter to see the same value, so always build with
+# `--build-arg SOURCE_DATE_EPOCH=<integer>` (commit time per
+# plans/internal-delivery-program-2026-10-31/REPRODUCIBLE-BUILDS.md §2).
+
+# Runtime — distroless static (no shell, no package manager), pinned to the
+# multi-arch index digest of static-debian12:nonroot.
+FROM gcr.io/distroless/static-debian12:nonroot@sha256:afa5c872c891853ca7fcf1f12c3edb23f7eeef36189728842dd51042ff57f7ab
+
+LABEL org.opencontainers.image.title="yabanin" \
+      org.opencontainers.image.description="Yabanin (hardened, non-root)"
+COPY --from=builder /out/yabanin /yabanin
+USER 65532:65532
+ENTRYPOINT ["/yabanin"]
+CMD ["gateway"]

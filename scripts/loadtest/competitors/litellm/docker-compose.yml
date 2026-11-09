@@ -1,0 +1,23 @@
+# N18-P01-T02 — LiteLLM pinned benchmark launch (validated against this exact digest).
+#
+# Digest pin: ghcr.io/berriai/litellm 1.108.0 manifest-list digest recorded in
+# ../VERSIONS.md (single source of truth; validate-configs.sh fails on drift).
+#
+# Fail-closed auth: upstream refuses to start without LITELLM_MASTER_KEY —
+# compose requires it explicitly instead of weakening it. The bench client
+# passes the same value via -api-key (credentials attach to loopback targets
+# only, per scripts/loadtest/gatewayoverhead).
+#
+# Loopback discipline: --host 127.0.0.1 keeps the proxy off every external
+# interface. Never expose this on a reachable interface.
+services:
+  litellm:
+    image: ghcr.io/berriai/litellm@sha256:c560d317136880ea92d62334d4367ab10955b1af189dd3ea24f6551290b1d6c1
+    network_mode: host
+    environment:
+      LITELLM_MASTER_KEY: ${LITELLM_MASTER_KEY:?export LITELLM_MASTER_KEY before starting (dummy sk-bench-local-dummy is fine for the loopback mock)}
+      # Referenced by config.yaml as os.environ/LITELLM_BENCH_UPSTREAM_KEY.
+      LITELLM_BENCH_UPSTREAM_KEY: ${LITELLM_BENCH_UPSTREAM_KEY:?export LITELLM_BENCH_UPSTREAM_KEY before starting (dummy value is fine for the loopback mock)}
+    volumes:
+      - ./config.yaml:/app/config.yaml:ro
+    command: ["--config", "/app/config.yaml", "--host", "127.0.0.1", "--port", "14661", "--num_workers", "1"]
