@@ -1,9 +1,9 @@
 # Local demonstration
 
 Use the **[quickstart](quickstart.md)** for a reproducible local demonstration.
-It builds Yabanin from your checkout, starts PostgreSQL, Redis and a mock
-provider, creates credentials, and verifies a chat request and persisted
-request logs. The dashboard is an optional separate step.
+It builds Yabanin from your checkout, starts PostgreSQL, Redis, a mock
+provider, and (with the `ui` profile) the containerized dashboard, creates
+credentials, and verifies a chat request and persisted request logs.
 
 ## A useful demonstration sequence
 
