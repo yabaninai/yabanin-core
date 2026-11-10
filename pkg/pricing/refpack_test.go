@@ -688,7 +688,7 @@ func assertPricingRefreshRefusal(t *testing.T, recipe string, notice []byte) {
 	if !errors.As(err, &exit) || exit.ExitCode() != 2 {
 		t.Fatalf("pricing-refresh must explicitly refuse with exit 2: %v\n%s", err, output)
 	}
-	for _, marker := range []string{"Bundled LiteLLM price refresh was removed", "--in", "--source", "docs/compat/litellm-migration.md"} {
+	for _, marker := range []string{"Pricing imports require an operator-supplied file", "--in", "--source", "docs/compat/litellm-migration.md"} {
 		if !bytes.Contains(output, []byte(marker)) {
 			t.Errorf("refresh refusal lacks operator guidance %q: %s", marker, output)
 		}

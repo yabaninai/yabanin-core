@@ -12,7 +12,7 @@ operator can validate a snapshot by reading either.
 Yabanin needs its own reference snapshot of model prices and metering units:
 independently assembled from primary provider sources and verified
 contractual rates, never invented, and never a rename of a third-party
-aggregator's catalog. No LiteLLM token or unit price corpus is distributed.
+aggregator's catalog.
 The committed reference pack contains independently verified Nebius records;
 operators may import their own snapshots with their original attribution.
 

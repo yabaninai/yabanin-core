@@ -10,10 +10,9 @@ first request. The default upstream is a **mock**: no provider account,
 model download, or paid inference is needed. Its replies demonstrate the
 request path, not model quality.
 
-The release does not bundle LiteLLM pricing data. Demo requests do not incur
-provider charges, and demo cost figures are not live provider quotes. For a
-real provider, configure and verify your own applicable prices; a missing
-price means unknown cost, not free inference. See
+Demo requests do not incur provider charges, and demo cost figures are not
+live provider quotes. For a real provider, configure and verify your own
+applicable prices; a missing price means unknown cost, not free inference. See
 [pricing data and optional imports](compat/litellm-migration.md#pricing-data).
 
 This guide is for the **Developer Preview**. It starts PostgreSQL, Redis,

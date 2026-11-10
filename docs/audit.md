@@ -166,9 +166,9 @@ but the report flags that they are not statistically reliable.
 
 ## Pricing and privacy limits
 
-The release excludes LiteLLM pricing data. The default reference catalog contains
-independently verified Nebius entries subject to their validity and review dates;
-a small historical Anthropic fallback remains. This is limited coverage, not a
+The default reference catalog contains independently verified Nebius entries
+subject to their validity and review dates; a small historical Anthropic fallback
+remains. This is limited coverage, not a
 current market-wide price list. The example above uses that historical fallback
 only to demonstrate reporting; its rates are not current provider quotes.
 

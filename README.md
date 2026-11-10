@@ -42,9 +42,8 @@ with production traffic.
   integrity, not the physical location of inference. [Lineage](docs/lineage.md)
 
 Costs depend on configured prices and recorded usage. The bundled reference
-prices have limited coverage and may be outdated; LiteLLM pricing data is not
-included. Configure current prices before relying on cost reports. The mock
-quickstart makes no paid provider calls.
+prices have limited coverage and may be outdated. Configure current prices
+before relying on cost reports. The mock quickstart makes no paid provider calls.
 
 ## Quickstart with Docker Compose
 

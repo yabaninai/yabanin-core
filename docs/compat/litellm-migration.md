@@ -10,10 +10,8 @@ secret. Review reports and outputs for sensitive content before sharing them.
 
 ## Pricing data
 
-The public release does not bundle LiteLLM's price corpus or prices derived
-from it. Routing configuration migration remains available and does not
-install a price catalog. Missing prices mean **unknown cost**, not free
-inference.
+Routing configuration migration does not install a price catalog. Missing
+prices mean **unknown cost**, not free inference.
 
 To convert a price file you have obtained and reviewed yourself, use the
 local import commands. They read the specified file; they do not download
@@ -32,8 +30,8 @@ Replace the paths, source and date with those of your actual reviewed input.
 Keep generated files outside the source checkout and preserve applicable
 upstream notices. Review the conversion report before using the output;
 unsupported modes and tiers are not silently treated as supported prices.
-The former `make pricing-refresh` target now refuses to repopulate the
-release's bundled data.
+`make pricing-refresh` displays guidance for importing an operator-supplied
+price file; it does not download or modify pricing data.
 
 ## Commands
 

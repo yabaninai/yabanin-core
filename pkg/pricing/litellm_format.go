@@ -99,10 +99,10 @@ func LiteLLMFormatPin() LiteLLMFormat {
 		PriceScale:      1e6,
 		SupportedModes:  modes,
 		ProviderAliases: aliases,
-		PinnedUpstream:  "github.com/BerriAI/litellm model_prices_and_context_window.json @ 61a73c59b049a8cd6c559168d7f3a2557a1a8cf7 (historical format reference only; no pricing dataset is distributed)",
-		Notice:          "historical upstream/import-format attribution preserved in pkg/pricing/NOTICE-litellm.txt",
+		PinnedUpstream:  "github.com/BerriAI/litellm model_prices_and_context_window.json @ 61a73c59b049a8cd6c559168d7f3a2557a1a8cf7 (import-format reference)",
+		Notice:          "upstream/import-format attribution in pkg/pricing/NOTICE-litellm.txt",
 		Limitations: []string{
-			"compatibility covers the documented flat model_prices layout; no bundled prices or compatibility guarantee for every upstream version",
+			"compatibility covers the documented flat model_prices layout; compatibility is not guaranteed for every upstream version",
 			"catalogs are untrusted input: malformed JSON entries and entries with an empty provider or model id are counted in SkippedInvalid, never emitted",
 			"tiered per-token fields (*_above_*_tokens) are counted in LiteLLMImportStats.TieredIgnored, never converted",
 			"no user accounts, request logs, or financial history are carried by design (PRODUCT-CONTRACT.md §14 negative)",
