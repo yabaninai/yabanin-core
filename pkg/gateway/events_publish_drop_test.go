@@ -30,9 +30,17 @@ func silentFailureValue(t *testing.T, place, reason string) float64 {
 
 // deadRedisPublisher is a publisher wired to a refused port: construction
 // never dials, every Publish fails immediately — the unit shape of a queue
-// outage, no Redis server needed.
+// outage, no Redis server needed. DialerRetries/MaxRetries pin that shape on
+// go-redis >= 9.8, where the pool otherwise retries the dial (default 5
+// attempts at 100ms backoff) and the command (default 3 retries with up to
+// 1s backoff), stretching each Publish to the caller's context budget and
+// blowing the bounded retry ladder's timing assumptions below.
 func deadRedisPublisher() *eventpub.RedisPublisher {
-	return eventpub.NewRedisPublisher(redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"}), "events")
+	return eventpub.NewRedisPublisher(redis.NewClient(&redis.Options{
+		Addr:          "127.0.0.1:1",
+		DialerRetries: 1,
+		MaxRetries:    -1,
+	}), "events")
 }
 
 // requirePublishQuiescence pins the observation window for the shared
