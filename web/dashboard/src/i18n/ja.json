@@ -989,6 +989,7 @@
     "organization": "組織",
     "keyName": "キー名",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "デフォルトチーム（自動的に割り当て）",
     "working": "処理中…",
     "createKey": "キーを作成",
     "createOrgFirst": "まず組織を作成してください。",

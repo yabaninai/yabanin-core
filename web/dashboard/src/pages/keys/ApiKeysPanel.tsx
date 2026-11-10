@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listAPIKeys, createAPIKey, rotateAPIKey, setAPIKeyActive, deleteAPIKey, type APIKey } from '../../api/keys'
-import { addKeyWhitelist } from '../../api/members'
+import { addKeyWhitelist, listTeams, type Team } from '../../api/members'
 import { Pagination } from '../../components/Pagination'
 import { StateNotice } from '../../components/astra/StateNotice'
 import { DataTable, type DataTableColumn } from '../../components/astra/DataTable'
@@ -72,9 +72,24 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
   const orgRef = useRef(org)
   orgRef.current = org
   useEffect(() => {
-    setOneTimeKey(''); setError(''); setSelectedIds([]); setOverrides({})
+    setOneTimeKey(''); setError(''); setSelectedIds([]); setOverrides({}); setTeamId('')
   }, [org])
   const refresh = useCallback(() => { keysQuery.load() }, [keysQuery])
+
+  // Team picker for the create form: the org's teams load only while the
+  // drawer is open, and the list endpoint is root-only. `teams === null`
+  // (non-root, failed load, drawer closed) falls back to the raw-ID input —
+  // the fallback keeps the old capability instead of a dead select.
+  const [teams, setTeams] = useState<Team[] | null>(null)
+  useEffect(() => {
+    if (!createOpen || !perms.isRoot || !org) { setTeams(null); return }
+    const ctrl = new AbortController()
+    setTeams(null)
+    listTeams(org, 1, 100, { signal: ctrl.signal }) // server caps page_size at 100
+      .then(r => { if (!ctrl.signal.aborted) setTeams(r.data ?? []) })
+      .catch(() => { if (!ctrl.signal.aborted) setTeams(null) })
+    return () => ctrl.abort()
+  }, [createOpen, org, perms.isRoot])
 
   // --- create: the drawer closes at once; the create keeps running under
   // its org scope (a switch never surfaces a stale one-time secret) ---
@@ -288,7 +303,16 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
         </label>
         <label className="flex flex-col gap-1 text-sm">
           <span className="text-[color:var(--astra-text-muted)]">{t('drawer.team')}</span>
-          <input value={teamId} onChange={e => setTeamId(e.target.value)} className="control" style={{ fontFamily: 'var(--astra-font-code)' }} />
+          {teams !== null ? (
+            <select value={teamId} onChange={e => setTeamId(e.target.value)} className="control">
+              <option value="">{t('keys.teamDefaultOption')}</option>
+              {teams.map(team => (
+                <option key={team.id} value={team.id}>{teamLabel(team)}</option>
+              ))}
+            </select>
+          ) : (
+            <input value={teamId} onChange={e => setTeamId(e.target.value)} className="control" style={{ fontFamily: 'var(--astra-font-code)' }} />
+          )}
         </label>
         <label className="flex flex-col gap-1 text-sm">
           <span className="text-[color:var(--astra-text-muted)]">{t('keys.labelsTitle')}</span>
@@ -381,6 +405,11 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
       )}
     </div>
   )
+}
+
+// Option label: readable slug/name first, short id for disambiguation.
+function teamLabel(team: Team): string {
+  return `${team.slug || team.name} · ${team.id.slice(0, 8)}`
 }
 
 function parsePairs(text: string): Record<string, string> {

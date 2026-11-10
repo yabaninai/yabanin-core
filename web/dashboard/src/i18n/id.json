@@ -989,6 +989,7 @@
     "organization": "Organisasi",
     "keyName": "Nama kunci",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "Tim bawaan (ditetapkan otomatis)",
     "working": "Memproses…",
     "createKey": "Buat kunci",
     "createOrgFirst": "Buat organisasi terlebih dahulu.",

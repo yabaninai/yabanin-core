@@ -1001,6 +1001,7 @@
     "organization": "Organización",
     "keyName": "Nombre de la clave",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "Equipo predeterminado (asignado automáticamente)",
     "working": "Trabajando…",
     "createKey": "Crear clave",
     "createOrgFirst": "Crea primero una organización.",

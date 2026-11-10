@@ -13,6 +13,9 @@
 //     when the directory lists exactly one org).
 //   * The last committed org is remembered by lib/orgScope and adopted by the
 //     store when the URL carries none.
+//   * A root remembered org that resolves nowhere anymore (demo DB re-created)
+//     is re-anchored once the directory is loaded: the single listed org, else
+//     the "All organizations" view — instead of 404-ing every scoped request.
 //
 // The /api/organizations directory is fetched only when the caller may
 // actually list it (root, or /api/me unavailable = fail-open). A member's
@@ -57,7 +60,18 @@ export function resolveScopeOrg(input: {
     const ids = new Set(input.memberships.map(o => o.id))
     return ids.has(input.currentOrg) ? input.currentOrg : input.memberships[0]!.id
   }
-  if (input.currentOrg) return input.currentOrg
+  if (input.currentOrg) {
+    // The remembered org survives only while it still resolves somewhere.
+    // A LOADED directory (plus memberships) that lacks it — e.g. the demo
+    // DB was re-created — must not leave root 404-storming: re-anchor to
+    // the single listed org, else "All organizations". An unloaded
+    // directory never guesses (no flicker while /api/organizations runs).
+    const known = new Set([...input.memberships, ...(input.listedOrgs ?? [])].map(o => o.id))
+    if (!known.has(input.currentOrg) && input.listedOrgs !== null && input.listedOrgs.length > 0) {
+      return input.listedOrgs.length === 1 ? input.listedOrgs[0]!.id : ''
+    }
+    return input.currentOrg
+  }
   if (input.listedOrgs && input.listedOrgs.length === 1) return input.listedOrgs[0]!.id
   return input.currentOrg
 }
