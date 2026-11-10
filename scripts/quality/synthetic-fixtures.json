@@ -1,0 +1,9 @@
+{
+  "schema": 1,
+  "purpose": "Exact reviewed synthetic secret-detection inputs; changed bytes require review.",
+  "sha256": {
+    "datasets/eval/attack_text_cases.v1.json": "4ebed9c7cb902708d1f1f1a26c60a3d0efb59226aab933dd4838340b90a4363d",
+    "datasets/eval/generate/main.go": "cc3e73b8a6d2a1b039a0c3f9146eef99867555c90f4f181c9cf59a7ebca5e134",
+    "datasets/eval/guards_labeled.jsonl": "95aeb94a453f793af5830bb4dab51296051510533fc1d1311d28c7eb8f60a4f9"
+  }
+}

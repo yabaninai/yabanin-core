@@ -126,7 +126,7 @@ analyze-fast: install-analysis-tools ## Quick loop: format + vet + golangci-lint
 
 analyze-security: install-analysis-tools ## go mod verify + govulncheck
 	go mod verify
-	python3 scripts/security/local_security.py db-status
+	python3 scripts/security/local_security.py db-status --go-only
 	$(GO_SCOPE) $(GOVULNCHECK_BIN) -db "file://$(YABANIN_SECURITY_CACHE)/govuln"
 
 TRIVY_VERSION := 0.75.0
@@ -176,11 +176,13 @@ analyze-tests: ## Full test suite: race + shuffle + coverage profile
 	GOTOOLCHAIN=$(MODULE_GO_VERSION) $(GO_SCOPE) go test -json -race -shuffle=on -count=1 -coverprofile="$(COVERAGE_FILE)"
 	go tool cover -func="$(COVERAGE_FILE)" | awk '/^total:/ { print }'
 
-evaluate-routing: ## EV1: routing regression vs golden baseline (eval datasets not in public export)
-	@echo "evaluate-routing: eval datasets are not part of the public export"; exit 77
+evaluate-routing: yb ## Routing regression against the public synthetic baseline
+	./yb evaluate routing --golden datasets/eval/golden_routing.jsonl \
+		--against datasets/eval/routing_baseline.json --max-mismatch 0
 
-evaluate-guards: ## EV2: guard detectors precision/recall gate (eval datasets not in public export)
-	@echo "evaluate-guards: eval datasets are not part of the public export"; exit 77
+evaluate-guards: yb ## Guard precision and recall against the public synthetic corpus
+	./yb evaluate guards --corpus datasets/eval/guards_labeled.jsonl \
+		--min-precision 0.98 --min-recall 0.90
 
 YABANIN_POLICIES_PG_URI ?= $(or $(YABANIN_PG_URI),postgres://yabanin:yabanin@localhost/yabanin?sslmode=disable)
 
@@ -224,10 +226,10 @@ quality-prune: ## Prune old artifacts/quality runs (helper not in public export)
 quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-eval quality-integration quality-self quality-licenses quality-plan: ## Quality gate profile via scripts/quality (see make quality-help)
 	@python3 scripts/quality/quality.py run $(patsubst quality-%,%,$@) --jobs "$(QUALITY_JOBS)"
 
-.PHONY: _quality-self _quality-fast _quality-static _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-claims _quality-package
+.PHONY: _quality-self _quality-fast _quality-static _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-package
 _quality-self:
 	bash -n scripts/quality/run.sh scripts/quality/changed.sh scripts/ci/run-with-report.sh scripts/security/govulncheck-classify.sh
-	@echo "public export: private harness checks are not part of the public tree (export-gate syntax check, commentlint, TP-11 verifier, quality self-tests)"
+	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
 
 _quality-fast:
 	$(GO_SCOPE) go build
@@ -274,9 +276,6 @@ _quality-package:
 
 _quality-alerts:
 	python3 scripts/quality/alert_check.py
-
-_quality-claims:
-	@echo "quality-claims: the claims registry is internal and not part of the public export"; exit 77
 
 _quality-dr:
 	bash scripts/quality/dr_drill.sh
