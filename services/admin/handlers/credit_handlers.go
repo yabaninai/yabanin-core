@@ -295,6 +295,10 @@ func (h *CreditHandlers) HandleLowBalance(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
 		return
 	}
+	// A nil slice encodes as null; the client contract is [].
+	if orgIDs == nil {
+		orgIDs = []string{}
+	}
 
 	_ = json.NewEncoder(w).Encode(map[string]interface{}{
 		"threshold_cents": threshold,
