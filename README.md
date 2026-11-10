@@ -7,6 +7,45 @@ providers, manage access and budgets, and inspect request logs and usage.
 This is a **Developer Preview**. Read the release notes before deploying it
 with production traffic.
 
+## Feature highlights
+
+- **One API for multiple providers.** OpenAI-compatible and Anthropic-compatible
+  endpoints, streaming, and tool calling; bring your own provider keys with
+  [BYOK](docs/byok.md). See [client compatibility](docs/compatibility.md) for
+  endpoint coverage.
+- **Automatic model routing.** Match prompt complexity to cheap, mid, or premium
+  model pools, balance requests across pool members, and override routing per
+  organization. [Task classifier](docs/classifier.md)
+- **Retries and fallback.** Retry eligible failures, switch to configured fallback
+  models, and use circuit breakers for failing upstreams.
+  [Request path](docs/architecture.md)
+- **Exact and semantic caching.** Reuse cached responses with streaming replay;
+  optional semantic matching uses an embedder and pgvector.
+  [Caching](docs/cache.md)
+- **Access and spend controls.** Organization roles, API keys, rate limits,
+  credits, and budget caps keep shared model access manageable.
+  [Organization setup](docs/organization-setup.md)
+- **Programmable guardrails.** Compose YAML policies for PII, secrets, and prompt
+  injection checks, masking, external scanners, and LLM judges. Preview decisions
+  in shadow mode before enforcement; the pipeline is opt-in.
+  [Policy pipeline](docs/pipeline.md)
+- **Agent governance.** Give agents separate identities, daily budgets, task token
+  limits, and delegated keys; control supported tool and MCP calls with
+  [tool policies](docs/tool-policies.md).
+  [Agent governance](docs/agent-governance.md)
+- **Usage visibility and offline audits.** Inspect request history and usage in
+  the React dashboard, manage the gateway through the admin API and `yb` CLI,
+  and simulate cache reuse and cheaper routing from local logs with
+  [offline spend audit](docs/audit.md).
+- **Signed request records.** Optional Ed25519-signed lineage preserves model
+  and region-related claims in a tamper-evident ledger. Signatures verify record
+  integrity, not the physical location of inference. [Lineage](docs/lineage.md)
+
+Costs depend on configured prices and recorded usage. The bundled reference
+prices have limited coverage and may be outdated; LiteLLM pricing data is not
+included. Configure current prices before relying on cost reports. The mock
+quickstart makes no paid provider calls.
+
 ## Quickstart with Docker Compose
 
 Start the whole local stand — gateway, PostgreSQL, Redis, a mock model
@@ -124,20 +163,6 @@ dominated by three things:
 
 Restarting later reuses the layer cache and the named database volume, so
 `up` returns in seconds.
-
-## What is included
-
-- Gateway APIs for connecting model clients and applications.
-- Provider routing, request policies, rate limits, and caching.
-- Organizations, API keys, budgets, and usage reporting.
-- An admin API, React dashboard, and the `yb` operator CLI.
-- PostgreSQL request storage and a Redis-backed log consumer.
-
-Protocol support varies by endpoint and client. See the
-[compatibility guide](docs/compatibility.md) for supported operations.
-Costs depend on configured prices and recorded usage. The bundled reference
-prices have limited coverage and may be outdated; LiteLLM pricing data is not
-included. Configure current prices before relying on cost reports. The mock quickstart makes no paid provider calls.
 
 ## Documentation
 
