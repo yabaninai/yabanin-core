@@ -155,6 +155,14 @@ services:
         condition: service_completed_successfully
       redis:
         condition: service_healthy
+    networks:
+      default:
+        aliases:
+          # The containerized dashboard (profile `ui`) proxies same-origin
+          # /api/ and /auth/ to `admin:8086` (web/dashboard/nginx.conf).
+          # The unified quickstart process hosts the admin API, so it
+          # answers to that name via an alias — no second container.
+          - admin
 
   mock-openai:
     profiles: ["mock"]
@@ -173,6 +181,29 @@ services:
       interval: 2s
       timeout: 3s
       retries: 20
+
+  # Built dashboard for the full stand: `--profile ui` (see README).
+  # Serves the production SPA build on :8080 and proxies same-origin /api/
+  # and /auth/ to the admin API through the `admin` alias above, so the
+  # browser talks to one origin and no local Node.js is required. The image
+  # is the same one the broader dev stack ships (web/dashboard/Dockerfile).
+  dashboard:
+    profiles: ["ui"]
+    restart: unless-stopped
+    build:
+      context: ../..
+      dockerfile: web/dashboard/Dockerfile
+    ports:
+      # Overridable like the other host ports (QS_DASHBOARD_PORT).
+      - "127.0.0.1:${QS_DASHBOARD_PORT:-3000}:8080"
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8080/ >/dev/null || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+    depends_on:
+      yabanin:
+        condition: service_healthy
 
 networks:
   default:

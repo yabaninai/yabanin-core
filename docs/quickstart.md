@@ -17,9 +17,9 @@ price means unknown cost, not free inference. See
 [pricing data and optional imports](compat/litellm-migration.md#pricing-data).
 
 This guide is for the **Developer Preview**. It starts PostgreSQL, Redis,
-a mock provider, and one Yabanin process containing the gateway, admin API,
-and log consumer. Published ports bind to `127.0.0.1`. The React dashboard
-is an optional, separate step.
+a mock provider, one Yabanin process containing the gateway, admin API, and
+log consumer, and (with the `ui` profile) the containerized React dashboard.
+Published ports bind to `127.0.0.1`.
 
 ## Before you start
 
@@ -34,8 +34,8 @@ root. You need:
 - Enough Docker memory and disk space to compile the gateway and run
   PostgreSQL and Redis. Start with at least 4 GB of Docker memory; this is
   a development sizing guideline, not a measured production requirement.
-- Free localhost ports **8082** (gateway) and **8086** (admin API), and an
-  available Docker subnet **10.207.0.0/24**.
+- Free localhost ports **3000** (dashboard), **8082** (gateway), and
+  **8086** (admin API), and an available Docker subnet **10.207.0.0/24**.
 
 Check the tools and daemon before downloading dependencies:
 
@@ -101,19 +101,23 @@ The Dockerfile requires a source timestamp for reproducible builds. Pass the
 checked-out commit time explicitly:
 
 ```bash
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock build \
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui build \
   --build-arg SOURCE_DATE_EPOCH="$(git log -1 --format=%ct)"
 
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock \
-  up -d --no-build --wait
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui up -d --no-build --wait
 
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock ps -a
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui ps -a
 ```
 
-The first build can take several minutes. `postgres`, `redis`, `mock-openai`,
-and `yabanin` should become healthy. The one-shot `migrate` and `db-app-role`
-services should finish with exit code **0**; an exited migration container
-is expected. The seed service has not run yet.
+The `ui` profile adds the `dashboard` service; omit it for a leaner stack
+without the web interface. The first build can take several minutes — see
+the timing notes in the repository README. `postgres`, `redis`,
+`mock-openai`, `yabanin`, and `dashboard` should become healthy. The one-shot
+`migrate` and `db-app-role` services should finish with exit code **0**; an
+exited migration container is expected. The seed service has not run yet.
 
 Do not replace these two steps with `make quickstart-up` in this preview:
 that target performs a build without forwarding the required timestamp.
@@ -188,25 +192,28 @@ log rows: on later runs, old rows can satisfy the logging check, so inspect
 the new request separately when diagnosing delivery. It does not establish live provider or
 coding-client compatibility. See the [compatibility matrix](compatibility.md).
 
-## 6. Open the dashboard (optional)
+## 6. Open the dashboard
 
-Port **8086 is the admin API**, not the React dashboard. A JSON response at
-its root after login is expected. To run the web interface locally, install
-Node.js 22 and npm (the documentation walkthrough uses Node 22), then
-open a second terminal at the repository root:
+Open **http://127.0.0.1:3000** (the `dashboard` service from the `ui`
+profile). Port **8086 is the admin API**, not the dashboard; a JSON response
+at its root after login is expected. On the initial “Session expired” screen,
+click **Sign in**; that message also appears when you have not signed in
+before. Sign in with `admin@localhost` and the admin password from step 4.
+The dashboard container serves the built UI and proxies `/auth` and `/api`
+to the admin API on the same origin, so no local Node.js is needed. Keep the
+same hostname (`127.0.0.1`) throughout the login flow.
+
+To iterate on the dashboard source with hot reload instead, install Node.js
+22 and npm, open a second terminal at the repository root, and run:
 
 ```bash
 npm ci --prefix web/dashboard
 npm --prefix web/dashboard run dev -- --host 127.0.0.1
 ```
 
-Open **http://127.0.0.1:5173**. On the initial “Session expired” screen, click
-**Sign in**; that message also appears when you have not signed in before.
-Sign in with `admin@localhost` and the
-admin password from step 4. The local development server proxies `/auth`
-and `/api` to port 8086. Keep the same hostname (`127.0.0.1`) throughout the
-login flow. If Vite selects another port because 5173 is busy, use the exact
-URL printed in its terminal.
+Open **http://127.0.0.1:5173**. The development server proxies `/auth` and
+`/api` to port 8086. If Vite selects another port because 5173 is busy, use
+the exact URL printed in its terminal.
 
 Select the seeded **Seed** organization. Click **Skip for now** on the welcome
 screen: the mock does not require an organization provider credential.
@@ -220,7 +227,7 @@ explorer at this point does not mean the log consumer failed.
 For this disposable local organization:
 
 1. In another tab in the same browser, open
-   **http://127.0.0.1:5173/api/me**. Copy the top-level `id` value from the JSON
+   **http://127.0.0.1:3000/api/me**. Copy the top-level `id` value from the JSON
    response. It identifies your admin user; it is not an API key.
 2. Return to the dashboard and open **Teams & members** with **Seed** selected.
 3. In **Members**, paste that ID into **User ID**, choose **reader**, and click
@@ -266,18 +273,19 @@ mock test above makes no such calls.
 
 ## Stop, restart, and reset
 
-Stop the dashboard with Ctrl-C in its terminal. Stop the Compose services:
+Stop the Compose services (the dashboard container stops with them):
 
 ```bash
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock down
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui down
 ```
 
 This retains the named PostgreSQL volume and your configuration file. To
 restart the same checkout without rebuilding:
 
 ```bash
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock \
-  up -d --no-build --wait
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui up -d --no-build --wait
 bash scripts/quickstart/smoke.sh "$YABANIN_API_KEY"
 ```
 
@@ -288,7 +296,8 @@ not persisted in this stack; cached responses are disposable.
 Only run this on the disposable local stack created by this guide:
 
 ```bash
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock down -v
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui down -v
 ```
 
 Start again with step 3's `up` command and repeat step 4. The old key will no
@@ -315,23 +324,25 @@ unset YABANIN_API_KEY
 | `502` / `503` from chat | Check mock health, upstream configuration, logs, and egress policy. Keep the generated URL and model unchanged for the first run. |
 | Seed says the key/user already exists | Seeding is idempotent. Use the credentials saved earlier; it is not a password-reset command. For disposable data, use the explicit reset above. |
 | Request explorer is empty after successful smoke | Add the seeded admin as a `reader` of Seed using step 6; then check time filters and logging. |
-| Browser shows JSON at 8086 | Start the separate dashboard and use its URL (5173 by default). |
+| Browser shows JSON at 8086 | Open **http://127.0.0.1:3000** instead; port 8086 is the admin API, not the dashboard. |
 | Smoke reports no request log rows | Inspect the `yabanin` logs and PostgreSQL/Redis health. A health response alone does not verify log persistence. |
 
 ```bash
-docker compose -f deploy/quickstart/docker-compose.yml --profile mock \
-  logs --tail=100 yabanin migrate db-app-role postgres redis mock-openai
+docker compose -f deploy/quickstart/docker-compose.yml \
+  --profile mock --profile ui \
+  logs --tail=100 yabanin migrate db-app-role postgres redis mock-openai dashboard
 ```
 
 Review and redact logs before sharing them. Never attach the generated `.env`,
 API keys, admin passwords, session cookies, or private request content.
 
-For alternative host ports, add `QS_GATEWAY_PORT=18082` and
-`QS_ADMIN_PORT=18086` to `deploy/quickstart/.env` **before starting**. Use the
-matching URLs; run smoke with `QS_BASE=http://127.0.0.1:18082`. For the
-optional dashboard, start npm with `YABANIN_ADMIN_URL=http://127.0.0.1:18086`.
-These settings do not change the reserved subnet or create isolated copies
-of the stack.
+For alternative host ports, add `QS_GATEWAY_PORT=18082`,
+`QS_ADMIN_PORT=18086`, and `QS_DASHBOARD_PORT=13000` to
+`deploy/quickstart/.env` **before starting**. Use the matching URLs; run
+smoke with `QS_BASE=http://127.0.0.1:18082`. For the Vite development
+server, start npm with `YABANIN_ADMIN_URL=http://127.0.0.1:18086`. These
+settings do not change the reserved subnet or create isolated copies of the
+stack.
 
 ## Before deploying to production
 
