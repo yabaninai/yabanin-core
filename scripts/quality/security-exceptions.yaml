@@ -1,40 +1,27 @@
-# Public license metadata exceptions — exported subset of the internal
-# security-exceptions.yaml (which also carries standing security accept-risks
-# and never leaves the monorepo: the export allowlist excludes it by design).
-# scripts/make-public-export.sh materializes THIS file in the public tree as
-# scripts/quality/security-exceptions.yaml so the exported license_check.py
-# resolves its default path and public dependency audits see exactly these
-# three reviewed npm metadata waivers — nothing else. The export gate
-# byte-verifies the copy and its row set.
-#
-# Provenance (verified 2026-11-09): npm registry tarballs for the exact
-# locked versions were downloaded and sha512-verified against the lock
-# integrities; each upstream declares MIT (legacy "licenses" array or a
-# shipped LICENSE file) but predates the modern "license" field that the
-# lockfile schema records, so the scanner reports "missing license field".
-# These waivers suppress metadata gaps only — a known restrictive license is
-# never suppressible (license_check.py applies this rule itself).
-- id: npm-eval-no-license-metadata
-  path: node_modules/eval
-  scope: web/site/package-lock.json
-  version: 0.1.8
-  reason: upstream MIT (shipped LICENSE file; legacy licenses array); build-time dep of web/site, not shipped to visitors
-  owner: yabanin
-  expires: 2027-03-28
-  scanner: license_check
-- id: npm-format-no-license-metadata
-  path: node_modules/format
-  scope: web/site/package-lock.json
-  version: 0.2.2
-  reason: upstream MIT (legacy licenses array; Readme copyright 2010-2014 Sami Samhuri); build-time dep of web/site, not shipped to visitors
-  owner: yabanin
-  expires: 2027-03-28
-  scanner: license_check
-- id: npm-require-like-no-license-metadata
-  path: node_modules/require-like
-  scope: web/site/package-lock.json
-  version: 0.1.2
-  reason: upstream MIT (full License grant, Felix Geisendorfer 2011); build-time dep of web/site, not shipped to visitors
-  owner: yabanin
-  expires: 2027-03-28
-  scanner: license_check
+# Reviewed license metadata exceptions. These do not waive vulnerabilities.
+schema: 1
+exceptions:
+  - id: npm-eval-no-license-metadata
+    path: node_modules/eval
+    scope: web/site/package-lock.json
+    version: 0.1.8
+    reason: upstream MIT (shipped LICENSE file; legacy licenses array); build-time dep of web/site, not shipped to visitors
+    owner: yabanin
+    expires: 2027-03-28
+    scanner: license_check
+  - id: npm-format-no-license-metadata
+    path: node_modules/format
+    scope: web/site/package-lock.json
+    version: 0.2.2
+    reason: upstream MIT (legacy licenses array; Readme copyright 2010-2014 Sami Samhuri); build-time dep of web/site, not shipped to visitors
+    owner: yabanin
+    expires: 2027-03-28
+    scanner: license_check
+  - id: npm-require-like-no-license-metadata
+    path: node_modules/require-like
+    scope: web/site/package-lock.json
+    version: 0.1.2
+    reason: upstream MIT (full License grant, Felix Geisendorfer 2011); build-time dep of web/site, not shipped to visitors
+    owner: yabanin
+    expires: 2027-03-28
+    scanner: license_check

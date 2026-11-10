@@ -10,6 +10,7 @@ import assert from 'node:assert/strict'
 import { readFileSync } from 'node:fs'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
+import { formatUnitAmount, labelSpendLines } from '../../lib/unitSpend.ts'
 
 const here = dirname(fileURLToPath(import.meta.url))
 const src = readFileSync(join(here, 'UnitsSpendSection.tsx'), 'utf8')
@@ -92,4 +93,40 @@ test('the server family/fidelity vocabularies render localized, unknown ids verb
 test('BudgetsPage mounts the section under the same gate as the server (root or analytics.read)', () => {
   assert.ok(budgetsPage.includes('<UnitsSpendSection org={org} />'))
   assert.ok(/isRoot \|\| canAnalytics\) && \(\s*\n\s*<UnitsSpendSection/.test(budgetsPage), 'the mount must be gated root || canAnalytics')
+})
+
+test('recorded and what-if USD stay distinct when both are zero or unknown', () => {
+  for (const amount of [0, null]) {
+    const rows = labelSpendLines([
+      { unit: 'USD', family: 'money', fidelity: amount === null ? 'unknown' : 'exact', amount },
+      { unit: 'USD', family: 'money', fidelity: amount === null ? 'unknown' : 'exact', amount },
+      { unit: 'credits', family: 'money', fidelity: 'exact', amount: 42 },
+      { unit: 'tokens', family: 'resource', fidelity: 'exact', amount: 1234 },
+      { unit: 'gCO2e', family: 'impact', fidelity: 'estimated', amount: null },
+    ])
+    assert.deepEqual(rows.map(row => row.labelKey), [
+      'budgets.unitsSpend.actualCost', 'budgets.unitsSpend.counterfactualCost',
+      'budgets.unitsSpend.creditsSpent', 'budgets.unitsSpend.tokensUsed',
+      'budgets.unitsSpend.carbonEstimate',
+    ])
+    assert.equal(rows[0].line.amount, amount)
+    assert.equal(rows[1].line.amount, amount)
+    assert.equal(rows[4].line.amount, null)
+  }
+})
+
+test('tiny costs and carbon values remain nonzero, while missing values stay unknown', () => {
+  assert.equal(formatUnitAmount(0.00000048, 'en'), '0.00000048')
+  assert.equal(formatUnitAmount(0.00048, 'de'), '0,00048')
+  assert.equal(formatUnitAmount(0, 'en'), '0')
+  assert.equal(formatUnitAmount(null, 'en'), null)
+  assert.equal(formatUnitAmount(Number.NaN, 'en'), null)
+  assert.equal(formatUnitAmount(Number.POSITIVE_INFINITY, 'en'), null)
+})
+
+test('additional units retain their own values without being folded into USD', () => {
+  const row = { unit: 'future-unit', family: 'resource', fidelity: 'unknown', amount: null }
+  const result = labelSpendLines([row])
+  assert.equal(result[0].labelKey, undefined)
+  assert.deepEqual(result[0].line, row)
 })

@@ -2,9 +2,9 @@ name: CI
 
 on:
   push:
-    branches: [master]
+    branches: [main]
   pull_request:
-    branches: [master]
+    branches: [main]
   schedule:
     # Nightly at 03:15 UTC — drives the blocking integration-nightly job.
     - cron: "15 3 * * *"
@@ -18,6 +18,8 @@ jobs:
   ci:
     name: CI
     runs-on: ubuntu-latest
+    env:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
@@ -55,7 +57,7 @@ jobs:
         run: go tool cover -func=coverage.out | tail -1
 
       - name: Upload coverage to Codecov
-        if: ${{ secrets.CODECOV_TOKEN != '' }}
+        if: ${{ env.CODECOV_TOKEN != '' }}
         uses: codecov/codecov-action@v4
         with:
           files: ./coverage.out
@@ -128,15 +130,12 @@ jobs:
       # Full-repo new-lines pass: catches issues introduced by this change with
       # full context.
       - name: Run golangci-lint (new lines, full repo)
-        run: golangci-lint run --new-from-merge-base=origin/master --timeout=5m
-
-      # Critical-path ratchet: skipped in the public export (the baseline
-      # file is internal); the step below is a no-op echo.
-      - name: Run golangci-lint (critical-path ratchet)
-        run: echo "critical-path ratchet skipped in public export"
+        run: golangci-lint run --new-from-merge-base=origin/main --timeout=5m
 
       - name: Security scan (govulncheck)
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0 && govulncheck ./...
+        run: |
+          make install-analysis-tools security-tools-install security-db-update
+          make analyze-security
 
   helm:
     name: Helm validation
@@ -259,14 +258,7 @@ jobs:
       - name: Run vitest
         run: npm test
 
-  # TP-13: the existing quality runner as the shared CI result. On PRs the
-  # merge-base with origin/master selects the gates (fetch-depth: 0 keeps the
-  # ref available); a clean checkout WITHOUT a base would diff HEAD against
-  # itself and degrade to self-only, so QUALITY_BASE is mandatory here.
-  # Master pushes are covered by the explicit full run in quality.yml.
-  # A failed gate makes the check red (the runner's exit code propagates),
-  # and the evidence uploads on success AND failure.
-  # No secrets are referenced, so fork PRs run the same profile.
+  # Use the same source-bound checks locally and on pull requests.
   quality-changed:
     name: Quality (changed gates)
     if: github.event_name == 'pull_request'
@@ -289,38 +281,36 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: |
+            web/dashboard/package-lock.json
+            web/site/package-lock.json
+            sdks/node/package-lock.json
 
-      # setup-python's interpreter is pip-installable (the image python is
-      # externally managed) and lands first on PATH, so every gate that
-      # shells out to python3 — self (unittest+yaml), secrets, deps,
-      # licenses, policy, alerts, python-sdk — uses it.
-      # (claims shells no python since the registry check became a no-op;
-      # restore post-beta when the claims registry returns.)
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Prerequisites per the runner's own contract: yb bootstrap installs
-      # module deps, the four npm trees, chromium and the pinned analysis
-      # tools; the rest closes the gaps bootstrap does not own (root
-      # playwright node_modules, contract-test deps, the SDK under test).
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
       - name: Bootstrap quality prerequisites
         run: |
-          make yb
-          ./yb bootstrap --yes
-          npm ci --no-audit --no-fund
-          npx playwright install --with-deps chromium
+          npm ci --prefix web/dashboard --no-audit --no-fund
+          npm ci --prefix web/site --no-audit --no-fund
+          npm ci --prefix sdks/node --no-audit --no-fund
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
+          make install-analysis-tools security-tools-install security-db-update
 
       # NEXT-14: QUALITY_JOBS=2 overlaps one light gate with the serialized
       # heavy Go lane on the 2-vCPU hosted runner; heavy and Docker gates stay
       # exclusive by scheduler design, so 2 cannot oversubscribe the toolchain
       # or the Docker daemon VM.
       - name: Run changed-gates quality profile
-        run: make quality-changed QUALITY_BASE=origin/master QUALITY_EXECUTE=1 QUALITY_JOBS=2
+        run: make quality-changed QUALITY_BASE=origin/main QUALITY_EXECUTE=1 QUALITY_JOBS=2
 
       - name: Upload quality evidence
         if: always()

@@ -73,7 +73,7 @@ const EXPECTED_GATES: Record<string, NavGate> = {
   // custodians see the setup. The config generation is local and the test
   // call goes browser→gateway (no admin route).
   agents: { anyOrg: ['keys.manage', 'agent_keys.manage'] },
-  budgets: { anyOrg: ['budgets.manage'] },
+  budgets: { anyOrg: ['budgets.manage', 'agent_keys.manage', 'analytics.read'] },
   exports: { anyOrg: ['budgets.read'] },  // documented wart — see DOCUMENTED_WARTS
   'model-access': { rootOnly: true },     // whitelist/aliases/teams — MustBeRoot mounts
   members: { anyOrg: ['members.manage'] },// RequireOrgPermission(MembersManage) — role sweep

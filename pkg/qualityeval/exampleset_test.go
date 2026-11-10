@@ -512,9 +512,7 @@ func TestSetIDLengthBounds(t *testing.T) {
 func TestGoldenRoutingFixtureRoundTrip(t *testing.T) {
 	raw, err := os.ReadFile("../../datasets/eval/routing_example_set.v1.json")
 	if err != nil {
-		// The routing example set is internal-only (datasets/eval); skip
-		// with an explicit reason in the public tree instead of failing.
-		t.Skipf("eval datasets are not part of the public export (routing fixture absent): %v", err)
+		t.Fatalf("public evaluation fixture is required: %v", err)
 	}
 	got, rev, err := ReadSetBundle(bytes.NewReader(raw))
 	if err != nil {

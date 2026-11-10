@@ -9,23 +9,12 @@ import (
 	"testing"
 )
 
-// E04-P01-W01-C02 lock-step watchdog: the capability matrix
-// (artifacts/enterprise-beta/E04-P01/W01-TEXT-TYPES-2026-11-07.md) and the
-// code constants in texttypes.go are two views of one truth. This test
-// makes them inseparable:
-//   - every matrix row must match its code constant (type, order, limit);
-//   - every row must cite the exact C01 boundary subtest;
-//   - the documented cross-cutting batteries (multibyte, check order,
-//     whitespace refusal, closed set) must be cited, not dangle;
-//   - a missing artifact is a FAIL, never a skip (dispatch W01-C02 AC).
-//
-// Changing a limit without the matrix (or the matrix without the code)
-// breaks this test; adding a sixth type in code breaks the row-count
-// equality.
+// The public matrix must agree with the supported type set, byte limits and
+// boundary tests. Missing documentation is a failure, not a skipped check.
 func TestTextTypesMatrix(t *testing.T) {
-	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "artifacts", "enterprise-beta", "E04-P01", "W01-TEXT-TYPES-2026-11-07.md"))
+	raw, err := os.ReadFile(filepath.Join(repoRoot(t), "docs", "contracts", "text-types.md"))
 	if err != nil {
-		t.Fatalf("capability matrix artifact is mandatory (dispatch E04-P01-W01-C02): %v", err)
+		t.Fatalf("public capability matrix is mandatory: %v", err)
 	}
 	doc := string(raw)
 
@@ -40,8 +29,8 @@ func TestTextTypesMatrix(t *testing.T) {
 			if row[0] != string(ty) {
 				t.Fatalf("row %d type cell = %q, want %q — canonical order must match SupportedTextTypes()", i, row[0], ty)
 			}
-			if row[1] != "да" {
-				t.Fatalf("type %q must be marked supported (да) in this window", ty)
+			if row[1] != "yes" {
+				t.Fatalf("type %q must be marked supported (yes)", ty)
 			}
 			limit, err := MaxTextBytes(ty)
 			if err != nil {
@@ -60,12 +49,12 @@ func TestTextTypesMatrix(t *testing.T) {
 			}
 			subtest := fmt.Sprintf("TestTextTypes_LimitsExactBoundary/%s", ty)
 			if !strings.Contains(row[5], subtest) {
-				t.Fatalf("type %q row must cite its exact C01 boundary subtest %q, got %q", ty, subtest, row[5])
+				t.Fatalf("type %q row must cite its exact boundary subtest %q, got %q", ty, subtest, row[5])
 			}
 		})
 	}
 
-	// Cross-cutting rows must reference real C01 battery names (no dangling
+	// Cross-cutting rows must reference real boundary test names (no dangling
 	// documentation), and the form row must disclose that DetectType never
 	// produces the type.
 	for _, tc := range []struct {
@@ -78,16 +67,16 @@ func TestTextTypesMatrix(t *testing.T) {
 		{"TestTextTypes_ParseRefusesUnknown", "closed-set note must cite the unknown-type battery"},
 	} {
 		if !strings.Contains(doc, tc.battery) {
-			t.Errorf("%s: %s (battery missing from the artifact)", tc.battery, tc.note)
+			t.Errorf("%s: %s (test missing from the contract)", tc.battery, tc.note)
 		}
 	}
-	if !strings.Contains(doc, "DetectType его НЕ возвращает") {
+	if !strings.Contains(doc, "DetectType never returns form") {
 		t.Errorf("the form row must disclose that DetectType never returns form (caller-declared only)")
 	}
 }
 
 // matrixRows extracts the pipe-table data rows (cells trimmed) from the
-// artifact's «Матрица» section: the first table in the document.
+// public contract: the first table in the document.
 func matrixRows(t *testing.T, doc string) [][]string {
 	t.Helper()
 	var rows [][]string
@@ -106,7 +95,7 @@ func matrixRows(t *testing.T, doc string) [][]string {
 		if len(cells) < 6 {
 			continue // header or |---| separator
 		}
-		if cells[0] == "Тип" || strings.HasPrefix(cells[0], "-") {
+		if cells[0] == "Type" || strings.HasPrefix(cells[0], "-") {
 			continue
 		}
 		rows = append(rows, cells)

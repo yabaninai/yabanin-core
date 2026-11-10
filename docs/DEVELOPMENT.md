@@ -14,10 +14,11 @@ Commands run from the repository root unless a different directory is shown.
 - Node.js and npm for dashboard or documentation work; use the relevant
   `package.json` and lockfile. Python 3 is needed by documentation checks.
 
-The public core export omits private execution plans, datasets, and some
-internal orchestration/quality helpers. A Make target's presence does not mean
-its dependencies are included. Use the direct public commands below; do not
-copy private credentials or internal configuration into a public checkout.
+Core includes public synthetic evaluation data and standalone product checks.
+Private plans and agent execution records are maintained separately and are not
+prerequisites for building or testing Core. Follow the
+[quality guide](https://github.com/yabaninai/yabanin-core/blob/main/scripts/quality/README.md) to prepare tools and run the full
+local checks; never copy private credentials or configuration into a checkout.
 
 ## Build the executables
 
@@ -113,9 +114,11 @@ review the rendered changed pages; valid Markdown alone does not establish
 readable navigation or a working command sequence. Keep public documentation
 and API descriptions in English.
 
-If your checkout includes `AGENTS.md` and the full quality runner, follow those
-additional instructions. Internal quality-target dependencies are not all part
-of the public export, so do not interpret a missing helper as a successful gate.
+For a complete local check, run `make quality-full` after installing the
+[quality prerequisites](https://github.com/yabaninai/yabanin-core/blob/main/scripts/quality/README.md). The runner writes source-bound
+results under `artifacts/quality/`. Missing tools, inputs and failed checks are
+errors, not successful validation. Quickstart and browser acceptance remain
+separate checks.
 
 ## Docker image
 

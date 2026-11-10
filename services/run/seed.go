@@ -395,9 +395,15 @@ func ApplySeed(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Encrypto
 	res.ModelName = opts.ModelName
 
 	if _, err := pool.Exec(ctx, `
-		INSERT INTO org_credits (org_id, balance_cents)
-		VALUES ($1, $2)
-		ON CONFLICT (org_id) DO NOTHING`, orgID, seedCreditsCents); err != nil {
+		WITH opening AS (
+			INSERT INTO org_credits (org_id, balance_cents)
+			VALUES ($1, $2)
+			ON CONFLICT (org_id) DO NOTHING
+			RETURNING org_id, balance_cents
+		)
+		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, invoice_ref, amount_micro_usd)
+		SELECT org_id, balance_cents, balance_cents, 'topup', 'seed-opening-balance', balance_cents * 10000
+		FROM opening`, orgID, seedCreditsCents); err != nil {
 		return res, fmt.Errorf("seed credits: %w", err)
 	}
 

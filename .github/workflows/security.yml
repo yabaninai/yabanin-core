@@ -35,14 +35,16 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-go-
 
-      - name: Install govulncheck
-        run: go install golang.org/x/vuln/cmd/govulncheck@v1.6.0
+      - name: Prepare security tools and databases
+        run: make install-analysis-tools security-tools-install security-db-update
 
       - name: Run govulncheck
         id: scan
         run: |
           set +e
-          govulncheck ./... > govulncheck-output.log 2>&1
+          python3 scripts/quality/go_scope.py python3 scripts/security/go_vulnerability_disposition.py \
+            --scanner "$(go env GOPATH)/bin/govulncheck" \
+            --db "file://$HOME/.cache/yabanin-security/govuln" > govulncheck-output.log 2>&1
           status=$?
           set -e
           cat govulncheck-output.log
@@ -62,7 +64,9 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: govulncheck-report
-          path: govulncheck-output.log
+          path: |
+            govulncheck-output.log
+            artifacts/security/
 
       - name: Create security issue if vulnerabilities found
         if: always() && steps.scan.outputs.found == 'true'

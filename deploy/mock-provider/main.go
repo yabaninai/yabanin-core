@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ChatCompletionRequest matches OpenAI's /v1/chat/completions.
@@ -165,63 +167,72 @@ func buildResponse(req ChatCompletionRequest) ChatCompletionResponse {
 	}
 }
 
-// ChunkDelta is the streaming delta of one chat.completion.chunk frame.
-// It reuses ResponseMsg: role first, then content and/or tool_calls pieces.
-type chunkChoice struct {
-	Index        int         `json:"index"`
-	Delta        ResponseMsg `json:"delta"`
-	FinishReason *string     `json:"finish_reason"`
+func chatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
+		return
+	}
+	response := buildResponse(req)
+	if req.Stream {
+		if err := writeStream(w, response); err != nil {
+			log.Printf("mock stream write failed: %v", err)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("mock response write failed: %v", err)
+	}
 }
 
-type chatChunk struct {
-	ID      string        `json:"id"`
-	Object  string        `json:"object"`
-	Created int64         `json:"created"`
-	Model   string        `json:"model"`
-	Choices []chunkChoice `json:"choices"`
-	Usage   *Usage        `json:"usage,omitempty"`
-}
-
-// streamFrames renders the full SSE payload for a streaming request: OpenAI
-// chat.completion.chunk frames ending with a terminal data: [DONE] event.
-// The gateway's drain (pkg/provider/stream.go) requires the [DONE]
-// terminator — a plain JSON body is not a stream, and the request used to be
-// recorded as failed with an injected client-facing error frame.
-func streamFrames(req ChatCompletionRequest) []string {
-	resp := buildResponse(req)
-	choice := resp.Choices[0]
-	id := "chatcmpl-stream-" + resp.ID[9:] // strip "chatcmpl-" prefix reuse
-	mk := func(delta ResponseMsg, finish *string, usage *Usage) string {
-		payload, err := json.Marshal(chatChunk{
-			ID: id, Object: "chat.completion.chunk", Created: resp.Created, Model: resp.Model,
-			Choices: []chunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
-			Usage:   usage,
-		})
+func writeStream(w http.ResponseWriter, response ChatCompletionResponse) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	control := http.NewResponseController(w)
+	writeEvent := func(choices []any, usage *Usage) error {
+		chunk := map[string]any{
+			"id": response.ID, "object": "chat.completion.chunk", "created": response.Created,
+			"model": response.Model, "choices": choices,
+		}
+		if usage != nil {
+			chunk["usage"] = usage
+		}
+		data, err := json.Marshal(chunk)
 		if err != nil {
-			return "data: {}\n\n" // unreachable: the structs always marshal
+			return err
 		}
-		return "data: " + string(payload) + "\n\n"
-	}
-
-	frames := []string{mk(ResponseMsg{Role: "assistant"}, nil, nil)}
-	if choice.FinishReason == "tool_calls" {
-		for _, call := range choice.Message.ToolCalls {
-			frames = append(frames, mk(ResponseMsg{ToolCalls: []ToolCall{call}}, nil, nil))
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return err
 		}
-	} else {
-		// Split the canned content into two deltas so consumers see a real
-		// incremental stream, not one bulk frame.
-		content := choice.Message.Content
-		half := len(content) / 2
-		frames = append(frames,
-			mk(ResponseMsg{Content: content[:half]}, nil, nil),
-			mk(ResponseMsg{Content: content[half:]}, nil, nil),
-		)
+		return control.Flush()
 	}
-	finish := choice.FinishReason
-	frames = append(frames, mk(ResponseMsg{}, &finish, &resp.Usage))
-	frames = append(frames, "data: [DONE]\n\n")
-	return frames
+	choice := response.Choices[0]
+	delta := map[string]any{"role": "assistant", "content": choice.Message.Content}
+	if len(choice.Message.ToolCalls) > 0 {
+		calls := make([]map[string]any, 0, len(choice.Message.ToolCalls))
+		for i, call := range choice.Message.ToolCalls {
+			calls = append(calls, map[string]any{"index": i, "id": call.ID, "type": call.Type, "function": call.Function})
+		}
+		delta["tool_calls"] = calls
+	}
+	if err := writeEvent([]any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, nil); err != nil {
+		return err
+	}
+	if err := writeEvent([]any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": choice.FinishReason}}, nil); err != nil {
+		return err
+	}
+	if err := writeEvent([]any{}, &response.Usage); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return control.Flush()
 }
 
 func main() {
@@ -230,44 +241,24 @@ func main() {
 		port = "8081"
 	}
 
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		log.Fatal("MOCK_PROVIDER_PORT must be a port from 1 to 65535")
+	}
+
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
+			log.Printf("health response failed: %v", err)
+		}
 	})
 
-	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	http.HandleFunc("/v1/chat/completions", chatCompletions)
 
-		var req ChatCompletionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		if req.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			for _, frame := range streamFrames(req) {
-				if _, err := fmt.Fprintf(w, "%s", frame); err != nil {
-					return
-				}
-				if f, ok := w.(http.Flusher); ok {
-					f.Flush()
-				}
-			}
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(buildResponse(req))
-	})
-
-	addr := ":" + port
-	log.Printf("mock-provider listening on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	addr := fmt.Sprintf(":%d", portNumber)
+	log.Printf("mock-provider listening on port %d", portNumber)
+	server := &http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }

@@ -40,3 +40,8 @@ Re-check any time with:
 ```bash
 make analyze-security   # go mod verify + govulncheck ./...
 ```
+
+The current source assessment of `GO-2026-6909` is documented in the
+[SAML advisory review](docs/security/saml-advisory.md). It retains the raw
+reachable finding and binds the assessment to the exact reviewed dependency
+and advisory bytes. It does not change the historical preview scan record.

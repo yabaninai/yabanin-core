@@ -12,9 +12,6 @@ permissions:
 jobs:
   quality:
     runs-on: ubuntu-latest
-    # TP-13: the full profile runs 25 gates sequentially (Go static/security/
-    # tests, evals, web builds, SDKs, packaging, DR) — 2h is the honest
-    # ceiling; a timeout must not be able to read as a pass.
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v4
@@ -35,24 +32,29 @@ jobs:
         with:
           node-version: "22"
           cache: npm
-          cache-dependency-path: package-lock.json
+          cache-dependency-path: |
+            web/dashboard/package-lock.json
+            web/site/package-lock.json
+            sdks/node/package-lock.json
 
       - name: Set up Python
         uses: actions/setup-python@v5
         with:
           python-version: "3.12"
 
-      # Same prerequisite contract as the PR job in ci.yml (TP-13): bootstrap
-      # owns modules/npm trees/chromium/pinned tools; the rest closes the
-      # gaps bootstrap does not own.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v3.15.0
+
       - name: Bootstrap quality prerequisites
         run: |
-          make yb
-          ./yb bootstrap --yes
-          npm ci --no-audit --no-fund
-          npx playwright install --with-deps chromium
+          npm ci --prefix web/dashboard --no-audit --no-fund
+          npm ci --prefix web/site --no-audit --no-fund
+          npm ci --prefix sdks/node --no-audit --no-fund
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
+          make install-analysis-tools security-tools-install security-db-update
 
       # Preserved coverage: the Go quality-tagged regression suite keeps
       # running (its verdict is independent of the runner's).

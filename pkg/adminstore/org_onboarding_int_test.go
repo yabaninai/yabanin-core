@@ -1,101 +1,130 @@
 package adminstore
 
-// org_onboarding under the application RLS posture (SET ROLE yabanin_app):
-// the store must pin app.current_org inside its own transaction — a bare
-// app-role session used to 500 on the upsert (RLS WITH CHECK) and silently
-// answer "not onboarded" forever on the read, so the welcome flow could
-// never be dismissed (regression seen live on the quickstart stand).
-
 import (
 	"context"
-	"fmt"
 	"log/slog"
 	"testing"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/stretchr/testify/assert"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/require"
 )
 
-func newOnboardingFixture(t *testing.T) (store *Store, pool *pgxpool.Pool, orgID string) {
-	t.Helper()
-	pool = openAdminTestPool(t)
-	store = New(pool, slog.New(slog.DiscardHandler), nil)
-	ctx := context.Background()
-
-	suffix := time.Now().UnixNano()
-	org, err := store.CreateOrganization(ctx, fmt.Sprintf("onb-%d", suffix), fmt.Sprintf("onb-%d", suffix))
-	require.NoError(t, err)
+func TestOrgOnboarding_AppRoleIsolation(t *testing.T) {
+	pool := openAdminTestPool(t)
+	ctx := t.Context()
+	admin := New(pool, slog.New(slog.DiscardHandler), nil)
+	orgs := make([]string, 0, 2)
+	for range 2 {
+		name := "onboarding-" + uuid.NewString()
+		org, err := admin.CreateOrganization(ctx, name, name)
+		require.NoError(t, err)
+		orgs = append(orgs, org.ID)
+	}
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DELETE FROM organizations WHERE id::text = $1", org.ID)
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = pool.Exec(cleanup, "DELETE FROM organizations WHERE id::text = ANY($1)", orgs)
 	})
-	return store, pool, org.ID
-}
-
-// TestOrgOnboarding_AppRoleRoundTrip_Integration: with NO externally bound
-// app.current_org (the exact posture the admin plane runs in when a route
-// handler calls the store directly), upsert then read back must succeed and
-// report the marked state.
-func TestOrgOnboarding_AppRoleRoundTrip_Integration(t *testing.T) {
-	store, pool, orgID := newOnboardingFixture(t)
-	ctx := context.Background()
+	orgA, orgB := orgs[0], orgs[1]
+	_, err := pool.Exec(ctx, "INSERT INTO org_onboarding (org_id, completed, skipped) VALUES ($1, true, false)", orgA)
+	require.NoError(t, err)
 
 	conn, err := pool.Acquire(ctx)
 	require.NoError(t, err)
-	defer func() {
-		_, _ = conn.Exec(context.Background(), "RESET ROLE")
-		_, _ = conn.Exec(context.Background(), "SELECT set_config('app.current_org', '', false)")
+	t.Cleanup(func() {
+		cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		_, _ = conn.Exec(cleanup, "RESET ROLE")
+		_, _ = conn.Exec(cleanup, "SELECT set_config('app.current_org', '', false)")
 		conn.Release()
-	}()
-	_, err = conn.Exec(ctx, "RESET ROLE")
+	})
+	_, err = conn.Exec(ctx, "SET ROLE yabanin_app")
 	require.NoError(t, err)
 	_, err = conn.Exec(ctx, "SET row_security = on")
 	require.NoError(t, err)
-	_, err = conn.Exec(ctx, "SET ROLE yabanin_app")
-	require.NoError(t, err, "yabanin_app must exist (testdb bootstrap mirrors the deploy layer)")
-
-	rls := newForTest(rlsConnAdapter{conn.Conn()}, slog.New(slog.DiscardHandler), nil)
-
-	require.NoError(t, rls.UpsertOrgOnboarding(ctx, orgID, false, true),
-		"the store pins app.current_org in its own tx; a bare app-role session must not 500")
-	got, err := rls.GetOrgOnboarding(ctx, orgID)
+	_, err = conn.Exec(ctx, "SELECT set_config('app.current_org', '', false)")
 	require.NoError(t, err)
-	assert.True(t, got.Skipped, "the read must see the row the upsert wrote (RLS GUC), not silently report zero state")
-	assert.False(t, got.Completed)
+	var user string
+	var superuser, bypass, enabled, forced bool
+	require.NoError(t, conn.QueryRow(ctx, "SELECT current_user, rolsuper, rolbypassrls FROM pg_roles WHERE rolname = current_user").Scan(&user, &superuser, &bypass))
+	require.Equal(t, "yabanin_app", user)
+	require.False(t, superuser)
+	require.False(t, bypass)
+	require.NoError(t, conn.QueryRow(ctx, "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'org_onboarding'::regclass").Scan(&enabled, &forced))
+	require.True(t, enabled)
+	require.True(t, forced)
+	store := newForTest(rlsConnAdapter{conn.Conn()}, slog.New(slog.DiscardHandler), nil)
 
-	// completed and skipped are mutually exclusive terminal states
-	// (org_onboarding_state_check): marking completed after skipped must be
-	// rejected by the database, not silently merged.
-	err = rls.UpsertOrgOnboarding(ctx, orgID, true, false)
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "org_onboarding_state_check")
-
-	// The completed path on a fresh org works under the same posture.
-	org2, err := store.CreateOrganization(ctx, "onb2-"+orgID[len(orgID)-8:], "onb2-"+orgID[len(orgID)-8:])
-	require.NoError(t, err)
-	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(), "DELETE FROM organizations WHERE id::text = $1", org2.ID)
+	t.Run("unscoped reads and writes remain denied", func(t *testing.T) {
+		var count int
+		require.NoError(t, conn.QueryRow(ctx, "SELECT count(*) FROM org_onboarding").Scan(&count))
+		require.Zero(t, count)
+		_, err := conn.Exec(ctx, "INSERT INTO org_onboarding (org_id, completed, skipped) VALUES ($1, false, true)", orgB)
+		var denied *pgconn.PgError
+		require.ErrorAs(t, err, &denied)
+		require.Equal(t, "42501", denied.Code)
 	})
-	require.NoError(t, rls.UpsertOrgOnboarding(ctx, org2.ID, true, false))
-	got2, err := rls.GetOrgOnboarding(ctx, org2.ID)
-	require.NoError(t, err)
-	assert.True(t, got2.Completed)
-	assert.False(t, got2.Skipped)
 
-	// Unknown org is ErrNotFound, not an RLS error.
-	err = rls.UpsertOrgOnboarding(ctx, "00000000-0000-0000-0000-000000000000", true, false)
-	require.ErrorIs(t, err, ErrNotFound)
-}
-
-// TestOrgOnboarding_ZeroStateForMissingRow_Integration: a fresh org answers
-// the zero state (not an error) — the dashboard treats "never answered" as
-// false/false.
-func TestOrgOnboarding_ZeroStateForMissingRow_Integration(t *testing.T) {
-	store, _, orgID := newOnboardingFixture(t)
-	got, err := store.GetOrgOnboarding(context.Background(), orgID)
+	// The store must scope each transaction, even on a connection previously
+	// used for another organization, and restore that session's original scope.
+	_, err = conn.Exec(ctx, "SELECT set_config('app.current_org', $1, false)", orgB)
 	require.NoError(t, err)
-	require.NotNil(t, got)
-	assert.False(t, got.Completed)
-	assert.False(t, got.Skipped)
+	checkScope := func(t *testing.T) {
+		t.Helper()
+		var scope string
+		require.NoError(t, conn.QueryRow(ctx, "SELECT current_setting('app.current_org', true)").Scan(&scope))
+		require.Equal(t, orgB, scope)
+	}
+	t.Run("read persisted state in the requested organization", func(t *testing.T) {
+		state, err := store.GetOrgOnboarding(ctx, orgA)
+		require.NoError(t, err)
+		require.Equal(t, &OrgOnboarding{OrgID: orgA, Completed: true}, state)
+		checkScope(t)
+	})
+	t.Run("write skip and read it back", func(t *testing.T) {
+		t.Cleanup(func() {
+			_, restoreErr := conn.Exec(ctx, "SELECT set_config('app.current_org', $1, false)", orgB)
+			require.NoError(t, restoreErr)
+		})
+		_, err := conn.Exec(ctx, "SELECT set_config('app.current_org', '', false)")
+		require.NoError(t, err)
+		require.NoError(t, store.UpsertOrgOnboarding(ctx, orgB, false, true))
+		require.NoError(t, store.UpsertOrgOnboarding(ctx, orgB, false, true))
+		state, err := store.GetOrgOnboarding(ctx, orgB)
+		require.NoError(t, err)
+		require.Equal(t, &OrgOnboarding{OrgID: orgB, Skipped: true}, state)
+		var scope string
+		require.NoError(t, conn.QueryRow(ctx, "SELECT current_setting('app.current_org', true)").Scan(&scope))
+		require.Empty(t, scope)
+		_, err = conn.Exec(ctx, "SELECT set_config('app.current_org', $1, false)", orgB)
+		require.NoError(t, err)
+	})
+	t.Run("failed updates preserve state and scope", func(t *testing.T) {
+		require.Error(t, store.UpsertOrgOnboarding(ctx, orgA, false, true))
+		checkScope(t)
+		state, err := store.GetOrgOnboarding(ctx, orgA)
+		require.NoError(t, err)
+		require.Equal(t, &OrgOnboarding{OrgID: orgA, Completed: true}, state)
+		require.Error(t, store.UpsertOrgOnboarding(ctx, orgA, false, false))
+		require.Error(t, store.UpsertOrgOnboarding(ctx, orgA, true, true))
+		checkScope(t)
+	})
+	t.Run("foreign keys and absent progress retain their contracts", func(t *testing.T) {
+		missing := uuid.NewString()
+		state, err := store.GetOrgOnboarding(ctx, missing)
+		require.NoError(t, err)
+		require.Equal(t, &OrgOnboarding{OrgID: missing}, state)
+		require.ErrorIs(t, store.UpsertOrgOnboarding(ctx, missing, true, false), ErrNotFound)
+		checkScope(t)
+	})
+	t.Run("another scope cannot see or alter the completed row", func(t *testing.T) {
+		var count int
+		require.NoError(t, conn.QueryRow(ctx, "SELECT count(*) FROM org_onboarding WHERE org_id=$1", orgA).Scan(&count))
+		require.Zero(t, count)
+		tag, err := conn.Exec(ctx, "UPDATE org_onboarding SET completed=false WHERE org_id=$1", orgA)
+		require.NoError(t, err)
+		require.Zero(t, tag.RowsAffected())
+	})
 }
