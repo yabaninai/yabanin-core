@@ -9,7 +9,7 @@ Core includes a synthetic regression corpus in `datasets/eval/`. Run
 `make evaluate-routing` and `make evaluate-guards` to check the committed
 classifier baseline and guard precision/recall thresholds. These checks require
 no private datasets, gateway, or provider account. See the
-[dataset scope](../datasets/eval/README.md) before interpreting their results.
+[dataset scope](https://github.com/yabaninai/yabanin-core/blob/main/datasets/eval/README.md) before interpreting their results.
 You can also evaluate your own local inputs with the CLI, as below.
 
 ## Build and create a workspace
