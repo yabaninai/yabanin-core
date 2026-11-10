@@ -40,15 +40,15 @@ aliases are platform-global (documented at pkg/adminstore/routing_map.go:75-78).
 
 | JSON field | Kind / units | Producer (file:line) | Scoping actually applied | Data class |
 | --- | --- | --- | --- | --- |
-| `org_id` | string (uuid echo) | handler reads the query param (services/admin/handlers/routing_map.go:62); struct field `RoutingMap.OrgID` (pkg/adminstore/routing_map.go:57) | gated by `requireOrgRead` with `PermRoutingManage` (services/admin/handlers/routing_map.go:57-58) | configuration (scope echo; not a stored row) |
+| `org_id` | string (uuid echo) | handler reads the query param (services/admin/handlers/routing_map.go:54); struct field `RoutingMap.OrgID` (pkg/adminstore/routing_map.go:57) | gated by `requireOrgRead` with `PermRoutingManage` (services/admin/handlers/routing_map.go:55) | configuration (scope echo; not a stored row) |
 | `models[].model_name` | string | SQL `SELECT ... FROM models_registry` (pkg/adminstore/routing_map.go:84-88); struct `RoutingMapModel` (pkg/adminstore/routing_map.go:16-25) | none — `models_registry` is global (table: migrations/0001_init.up.sql:1089) | configuration |
 | `models[].display_name` | string | same query, same scan (pkg/adminstore/routing_map.go:85-100) | global | configuration |
 | `models[].tier` | string | same query | global | configuration |
-| `models[].provider` | string | same query; column default `'openai-compat'` with a provider CHECK list (migrations/0001_init.up.sql:1099-1101) | global | configuration |
+| `models[].provider` | string | same query; column default `'openai-compat'` with a provider CHECK list (migrations/0001_init.up.sql:1099, :1114) | global | configuration |
 | `models[].enabled` | boolean | same query | global | configuration |
-| `models[].fallback_model` | nullable string (`omitempty`) | same query; column `fallback_model text` (migrations/0001_init.up.sql:1104) | global | configuration |
-| `models[].failover_models` | string array | same query; column `failover_models text[]` (migrations/0001_init.up.sql:1105) | global | configuration |
-| `models[].tier_pool` | string array | same query; column `tier_pool text[]` (migrations/0001_init.up.sql:1106) | global | configuration |
+| `models[].fallback_model` | nullable string (`omitempty`) | same query; column `fallback_model text` (migrations/0001_init.up.sql:1100) | global | configuration |
+| `models[].failover_models` | string array | same query; column `failover_models text[]` (migrations/0001_init.up.sql:1101) | global | configuration |
+| `models[].tier_pool` | string array | same query; column `tier_pool text[]` (migrations/0001_init.up.sql:1102) | global | configuration |
 | `aliases[].alias` | string | `Store.ListModelAliases` (pkg/adminstore/model_aliases.go:27-33), mapped at pkg/adminstore/routing_map.go:107-114; struct `RoutingMapAlias` (pkg/adminstore/routing_map.go:28-31) | none — `model_aliases` has no org column (table: migrations/0001_init.up.sql:1036-1041) | configuration |
 | `aliases[].target_model` | string | same producer | global | configuration |
 | `rules[].id` | string (uuid) | SQL `SELECT id::text, ... FROM routing_rules WHERE org_id = $1 ORDER BY priority, created_at, id` (pkg/adminstore/routing_map.go:116-120); struct `RoutingMapRule` (pkg/adminstore/routing_map.go:34-40) | **org-scoped** by `WHERE org_id = $1` (table: migrations/0001_init.up.sql:1812-1821) | configuration |
@@ -116,44 +116,44 @@ visibility is decided inside the store query and post-read checks):
 
 | JSON field | Kind / units | Producer (file:line) | Persistence | Data class |
 | --- | --- | --- | --- | --- |
-| `request_id` | string | gateway request id on the event; column `request_logs.request_id` (migrations/0001_init.up.sql:1711) | request_logs row | recorded |
-| `org_id` | string (uuid) | `ev.orgIDValue` set by loggerd (services/loggerd/consumer/event_mapper.go:561); scanned at pkg/adminstore/request_detail.go:259 | request_logs | recorded |
-| `model_requested` | string | client-requested model from the gateway event (`eventBase.ModelRequested`, e.g. pkg/gateway/chat.go:1070); mapped at services/loggerd/consumer/event_mapper.go:562 | request_logs (migrations/0001_init.up.sql:1701) | recorded |
-| `model_used` | string | model that actually served (or `''` on pre-upstream termination, e.g. the 429 budget projection forces `''`, services/loggerd/consumer/event_mapper.go:652-653) | request_logs (migrations/0001_init.up.sql:1702) | recorded |
-| `upstream_url` | string, `omitempty`; **originals-gated** | winning hop URL from the event; selected only under originals access (pkg/adminstore/request_detail.go:217) | request_logs (migrations/0001_init.up.sql:1703) | recorded (may be redacted to `''`) |
-| `method` | string (default `POST`) | event `Method` (pkg/gateway/chat.go:1074); scan default at pkg/adminstore/request_detail.go:218 | request_logs (migrations/0001_init.up.sql:1704) | recorded |
+| `request_id` | string | gateway request id on the event; column `request_logs.request_id` (migrations/0001_init.up.sql:1713) | request_logs row | recorded |
+| `org_id` | string (uuid) | `ev.orgIDValue` set by loggerd (services/loggerd/consumer/event_mapper.go:560); scanned at pkg/adminstore/request_detail.go:259 | request_logs | recorded |
+| `model_requested` | string | client-requested model from the gateway event (`eventBase.ModelRequested`, e.g. pkg/gateway/chat.go:1070); mapped at services/loggerd/consumer/event_mapper.go:561 | request_logs (migrations/0001_init.up.sql:1702) | recorded |
+| `model_used` | string | model that actually served (or `''` on pre-upstream termination, e.g. the 429 budget projection forces `''`, services/loggerd/consumer/event_mapper.go:662) | request_logs (migrations/0001_init.up.sql:1703) | recorded |
+| `upstream_url` | string, `omitempty`; **originals-gated** | winning hop URL from the event; selected only under originals access (pkg/adminstore/request_detail.go:217) | request_logs (migrations/0001_init.up.sql:1704) | recorded (may be redacted to `''`) |
+| `method` | string (default `POST`) | event `Method` (pkg/gateway/chat.go:1074); scan default at pkg/adminstore/request_detail.go:218 | request_logs (migrations/0001_init.up.sql:1705) | recorded |
 | `status_code` | integer (HTTP) | event `StatusCode` (pkg/gateway/chat.go:1071-1072) | request_logs (migrations/0001_init.up.sql:1706) | recorded |
-| `duration_ms` | integer, milliseconds | total request wall duration on the event (`DurationMs`, pkg/gateway/chat.go:1073) | request_logs (migrations/0001_init.up.sql:1707) | recorded; a real 0 exists only where a producer writes it (budget-blocked rows use literal 0, services/loggerd/consumer/event_mapper.go:657) |
+| `duration_ms` | integer, milliseconds | total request wall duration on the event (`DurationMs`, pkg/gateway/chat.go:1073) | request_logs (migrations/0001_init.up.sql:1707) | recorded; a real 0 exists only where a producer writes it (budget-blocked rows use literal 0, services/loggerd/consumer/event_mapper.go:665) |
 | `tokens_in`, `tokens_out` | integers | upstream usage accounting on the event | request_logs (migrations/0001_init.up.sql:1708-1709) | recorded |
-| `error` | string, `omitempty`; owner/grant/delegation-gated | event `Error` (pkg/gateway/chat.go:1080); column selection CASE (pkg/adminstore/request_detail.go:223) | request_logs (migrations/0001_init.up.sql:1710) | recorded |
-| `created_at` | RFC3339 timestamp (raw JSON via `to_jsonb`) | event business time (`created_at`, services/loggerd/consumer/event_mapper.go:602-603; parser at :472) | request_logs (migrations/0001_init.up.sql:1712) | recorded |
-| `prompt_hash` | string, `omitempty` | one-way prompt hash on the event | request_logs (migrations/0001_init.up.sql:1713) | recorded |
-| `response` | raw JSON (redacted/truncated snapshot), payload-gated | processed response sample; selection CASE (pkg/adminstore/request_detail.go:226) | request_logs (migrations/0001_init.up.sql:1714) | recorded sample, not the full body |
-| `upstream_request`, `upstream_response` | raw JSON, **originals-gated** | upstream captures on the event (`UpstreamRequest`/`UpstreamResponse`, pkg/gateway/events.go:307-308); selected only under originals (pkg/adminstore/request_detail.go:227-228) | request_logs (migrations/0001_init.up.sql:1731-1732) | recorded sample |
-| `cache_hit_type` | string, `omitempty` (`exact` / `semantic` known values) | cache outcome on the event | request_logs (migrations/0001_init.up.sql:1715) | recorded |
-| `counterfactual_cost_usd` | decimal (numeric(12,6) scanned as float64) | cost the un-cached equivalent would have incurred | request_logs (migrations/0001_init.up.sql:1716) | recorded |
-| `cost_in_usd` | decimal (numeric(12,6) scanned as float64) | priced usage cost on the event | request_logs (migrations/0001_init.up.sql:1718) | recorded |
-| `classifier_class` | string, `omitempty` | classifier outcome (`ClassifierClass`, pkg/gateway/chat.go:1078) | request_logs (migrations/0001_init.up.sql:1719) | recorded |
-| `classifier_confidence` | float32, `omitempty` | as above (pkg/gateway/chat.go:1079) | request_logs (migrations/0001_init.up.sql:1720) | recorded |
-| `classifier_source` | string, `omitempty` | as above | request_logs (migrations/0001_init.up.sql:1721) | recorded |
-| `tier_used` | string, `omitempty` | serving tier on the event (pkg/gateway/chat.go:1077) | request_logs (migrations/0001_init.up.sql:1722) | recorded |
-| `ab_group` | string, `omitempty` (`shadow` marks mirror rows) | canary/shadow arm (`ABGroup`, pkg/gateway/events.go:310); shadow rows forced to `shadow` (services/loggerd/consumer/event_mapper.go:616) | request_logs (migrations/0001_init.up.sql:1723) | recorded |
-| `task_id` | string, `omitempty` | G2 fields parsed from the event (services/loggerd/consumer/event_mapper.go:113-133, set at :587) | request_logs (migrations/0001_init.up.sql:1729) | recorded |
-| `agent_id` | string (uuid), `omitempty` | as above (set at :588) | request_logs (migrations/0001_init.up.sql:1730) | recorded |
+| `error` | string, `omitempty`; owner/grant/delegation-gated | event `Error` (pkg/gateway/chat.go:1078); column selection CASE (pkg/adminstore/request_detail.go:223) | request_logs (migrations/0001_init.up.sql:1710) | recorded |
+| `created_at` | RFC3339 timestamp (raw JSON via `to_jsonb`) | event business time (`created_at`, services/loggerd/consumer/event_mapper.go:602-603; parser at :472) | request_logs (migrations/0001_init.up.sql:1711) | recorded |
+| `prompt_hash` | string, `omitempty` | one-way prompt hash on the event | request_logs (migrations/0001_init.up.sql:1714) | recorded |
+| `response` | raw JSON (redacted/truncated snapshot), payload-gated | processed response sample; selection CASE (pkg/adminstore/request_detail.go:226) | request_logs (migrations/0001_init.up.sql:1715) | recorded sample, not the full body |
+| `upstream_request`, `upstream_response` | raw JSON, **originals-gated** | upstream captures on the event (`UpstreamRequest`/`UpstreamResponse`, pkg/gateway/events.go:305-306); selected only under originals (pkg/adminstore/request_detail.go:227-228) | request_logs (migrations/0001_init.up.sql:1731-1732) | recorded sample |
+| `cache_hit_type` | string, `omitempty` (`exact` / `semantic` known values) | cache outcome on the event | request_logs (migrations/0001_init.up.sql:1716) | recorded |
+| `counterfactual_cost_usd` | decimal (numeric(12,6) scanned as float64) | cost the un-cached equivalent would have incurred | request_logs (migrations/0001_init.up.sql:1718) | recorded |
+| `cost_in_usd` | decimal (numeric(12,6) scanned as float64) | priced usage cost on the event | request_logs (migrations/0001_init.up.sql:1719) | recorded |
+| `classifier_class` | string, `omitempty` | classifier outcome (`ClassifierClass`, pkg/gateway/chat.go:1080) | request_logs (migrations/0001_init.up.sql:1720) | recorded |
+| `classifier_confidence` | float32, `omitempty` | as above (pkg/gateway/chat.go:1081) | request_logs (migrations/0001_init.up.sql:1721) | recorded |
+| `classifier_source` | string, `omitempty` | as above | request_logs (migrations/0001_init.up.sql:1722) | recorded |
+| `tier_used` | string, `omitempty` | serving tier on the event (pkg/gateway/chat.go:1079) | request_logs (migrations/0001_init.up.sql:1723) | recorded |
+| `ab_group` | string, `omitempty` (`shadow` marks mirror rows) | canary/shadow arm (`ABGroup`, pkg/gateway/events.go:314); shadow rows forced to `shadow` (services/loggerd/consumer/event_mapper.go:634) | request_logs (migrations/0001_init.up.sql:1724) | recorded |
+| `task_id` | string, `omitempty` | G2 fields parsed from the event (services/loggerd/consumer/event_mapper.go:113-133, set at :586) | request_logs (migrations/0001_init.up.sql:1728) | recorded |
+| `agent_id` | string (uuid), `omitempty` | as above (set at :587) | request_logs (migrations/0001_init.up.sql:1729) | recorded |
 | `session_id` | string (uuid), `omitempty` | session resolution in loggerd (column migrations/0001_init.up.sql:1700) | request_logs | recorded |
-| `routing_decision` | string (JSON document), `omitempty` | `gateway.decisionJSON` marshals the `routingDecision` struct (pkg/gateway/decision.go:38-96; marshal at pkg/gateway/gateway.go:1911-1921); persisted via loggerd (services/loggerd/consumer/event_mapper.go:588). Payload: `source` (`cache_exact`, `cache_semantic`, `tier_router`, `rule_override`, `passthrough`, `quality_eval`), classifier `class`/`confidence`/`threshold`, session `affinity`/`preferred`, `from`/`to` models, `effort`, canary `arm`/`rollout_id`/`rollout_version`/`canary_percent`, `reason`, `quality_version`, `downgrade`, and `rule` (`DecisionRuleRef`: namespace/id/version captured at match time, pkg/gateway/decision.go:88-98) | request_logs (migrations/0001_init.up.sql:1728) | recorded decision snapshot for this one request |
+| `routing_decision` | string (JSON document), `omitempty` | `gateway.decisionJSON` marshals the `routingDecision` struct (pkg/gateway/decision.go:38-96; marshal at pkg/gateway/gateway.go:1911-1921); persisted via loggerd (services/loggerd/consumer/event_mapper.go:588). Payload: `source` (`cache_exact`, `cache_semantic`, `tier_router`, `rule_override`, `passthrough`, `quality_eval`), classifier `class`/`confidence`/`threshold`, session `affinity`/`preferred`, `from`/`to` models, `effort`, canary `arm`/`rollout_id`/`rollout_version`/`canary_percent`, `reason`, `quality_version`, `downgrade`, and `rule` (`DecisionRuleRef`: namespace/id/version captured at match time, pkg/gateway/decision.go:88-98) | request_logs (migrations/0001_init.up.sql:1730) | recorded decision snapshot for this one request |
 | `home_region` | string (always present) | database default `current_setting('app.region', true)` at insert time (migrations/0001_init.up.sql:1727); not set by the loggerd projection | request_logs | recorded (log-storage region of the writer, not inference-region provenance) |
 | `first_token_ms` | nullable integer (`*int64`), milliseconds | measured in the gateway from request start to the first upstream SSE byte; `0` for non-streaming and streams that died tokenless (documented at pkg/eventpublisher/publisher.go:150-153; assigned e.g. pkg/gateway/stream.go:913); persisted as nullable (services/loggerd/consumer/event_mapper.go:589); scanned as pointer (pkg/adminstore/request_detail.go:242) — null means unknown (legacy row or non-streaming), never a fake 0 | request_logs (migrations/0001_init.up.sql:1733) | recorded; **nullable timing: absent stays absent** |
 | `attempt_count` | nullable integer (`*int64`) | `len(attempts)` at completion (pkg/gateway/chat.go:1083, pkg/gateway/stream.go:698, :907); semantics: fallback-chain hops tried, 1 = primary only (pkg/eventpublisher/publisher.go:154-158) | request_logs (migrations/0001_init.up.sql:1734) | recorded summary counter only |
 | `retry_count` | nullable integer (`*int64`) | intra-model retries across all hops (pkg/gateway/chat.go:1084; semantics at pkg/eventpublisher/publisher.go:159-162) | request_logs (migrations/0001_init.up.sql:1735) | recorded summary counter only |
 | `tool_calls` | array of `tool_name` (always a list) | second query `SELECT tool_name FROM tool_calls WHERE org_id = $1 AND request_id = $2` (pkg/adminstore/request_detail.go:299-302); names extracted by loggerd from the pre-truncation sample (table migrations/0001_init.up.sql:2087) | tool_calls table | recorded; empty list = none recorded |
 | `tool_call_invocations` | array of `seq`/`call_id`/`tool_name`/`arguments` (always a list) | third query on `tool_call_invocations` (pkg/adminstore/request_detail.go:320-323; table migrations/0001_init.up.sql:2057); rows exist only for requests logged after the invocation-capture feature landed — earlier requests return an empty list | tool_call_invocations table | recorded |
-| `labels` | object (string → string) | attribution labels on the event (services/loggerd/consumer/event_mapper.go:600) | request_logs (migrations/0001_init.up.sql:1741) | recorded |
+| `labels` | object (string → string) | attribution labels on the event (services/loggerd/consumer/event_mapper.go:597) | request_logs (migrations/0001_init.up.sql:1741) | recorded |
 | `response_view` | object, `omitempty` | `ParseResponseEnvelope(d.Response)` projection of the stored sample (pkg/adminstore/request_detail.go:276, :183); nil for legacy or non-envelope rows | derived at read time from request_logs.response | recorded-derived |
 
 Columns that exist in `request_logs` but are **not selected** by the detail
 query (present in storage, absent from this API): `updated_at`
-(migrations/0001_init.up.sql:1713 area), `cache_similarity` (:1717),
+(migrations/0001_init.up.sql:1712), `cache_similarity` (:1717),
 `endpoint` (:1736), `usage_source` (:1737), `cost_status` (:1738),
 `cache_read_tokens` / `cache_creation_tokens` (:1739-1740), `user_id`,
 `api_key_id`, `session_key_id` (:1742-1744; `user_id` is scanned only as the
@@ -293,7 +293,7 @@ different provider after the fact; a model missing from the registry lands in
   empty `rules` array is a confirmed zero (the org configured no rules), not
   an unknown. A real numeric zero appears only where a producer wrote one
   (e.g. `duration_ms` literal 0 for budget-blocked rows,
-  services/loggerd/consumer/event_mapper.go:657).
+  services/loggerd/consumer/event_mapper.go:665).
 - **Logical requests are rows; attempts are counters.** One `request_logs` row
   is one logical request (including failed and budget-blocked projections).
   Shadow traffic creates additional mirror rows discriminated by
