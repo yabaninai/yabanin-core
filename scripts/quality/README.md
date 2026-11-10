@@ -13,6 +13,9 @@ container images and temporary databases. Install Python's PyYAML in your active
 Python environment; the dependency checker uses it.
 
 ```bash
+python3 -m venv .venv
+. .venv/bin/activate
+python3 -m pip install pyyaml -e 'sdks/python[test]'
 npm ci --prefix web/dashboard
 npm ci --prefix web/site
 npm ci --prefix sdks/node
@@ -28,7 +31,8 @@ hours. `YABANIN_SECURITY_CACHE` selects metadata and Go database storage;
 updates and scans. Go-only analysis does not require the Trivy database.
 
 Builds may download Go modules, npm packages and container base images. The
-Node bridge has no npm dependencies; Python SDK tests use the standard library.
+Node bridge has no npm dependencies. Python SDK tests require its `test` extras,
+including pytest and respx; the install command above supplies them.
 Use an isolated worktree and avoid concurrent heavy checks on the same Docker
 daemon or Go caches.
 

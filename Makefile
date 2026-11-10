@@ -127,7 +127,7 @@ analyze-fast: install-analysis-tools ## Quick loop: format + vet + golangci-lint
 analyze-security: install-analysis-tools ## go mod verify + govulncheck
 	go mod verify
 	python3 scripts/security/local_security.py db-status --go-only
-	$(GO_SCOPE) $(GOVULNCHECK_BIN) -db "file://$(YABANIN_SECURITY_CACHE)/govuln"
+	$(GO_SCOPE) python3 scripts/security/go_vulnerability_disposition.py --scanner "$(GOVULNCHECK_BIN)" --db "file://$(YABANIN_SECURITY_CACHE)/govuln"
 
 TRIVY_VERSION := 0.75.0
 GITLEAKS_VERSION := 8.30.1
