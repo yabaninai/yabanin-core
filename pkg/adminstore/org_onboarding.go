@@ -32,14 +32,17 @@ func (s *Store) GetOrgOnboarding(ctx context.Context, orgID string) (*OrgOnboard
 	if err != nil {
 		return nil, err
 	}
-	var out OrgOnboarding
-	err = s.db.QueryRow(ctx,
-		`SELECT org_id::text, completed, skipped FROM org_onboarding WHERE org_id = $1`,
-		oid,
-	).Scan(&out.OrgID, &out.Completed, &out.Skipped)
-	if IsNotFound(err) {
-		return &OrgOnboarding{OrgID: orgID}, nil
-	}
+	out := OrgOnboarding{OrgID: orgID}
+	err = s.withOrgTx(ctx, oid.String(), func(tx auditTx) error {
+		err := tx.QueryRow(ctx,
+			`SELECT org_id::text, completed, skipped FROM org_onboarding WHERE org_id = $1`,
+			oid,
+		).Scan(&out.OrgID, &out.Completed, &out.Skipped)
+		if IsNotFound(err) {
+			return nil
+		}
+		return err
+	})
 	if err != nil {
 		return nil, fmt.Errorf("get org onboarding: %w", err)
 	}
@@ -61,15 +64,18 @@ func (s *Store) UpsertOrgOnboarding(ctx context.Context, orgID string, completed
 	if err != nil {
 		return err
 	}
-	_, err = s.db.Exec(ctx, `
+	err = s.withOrgTx(ctx, oid.String(), func(tx auditTx) error {
+		_, err := tx.Exec(ctx, `
 		INSERT INTO org_onboarding (org_id, completed, skipped)
 		VALUES ($1, $2, $3)
 		ON CONFLICT (org_id) DO UPDATE
 		    SET completed = org_onboarding.completed OR EXCLUDED.completed,
 		        skipped = org_onboarding.skipped OR EXCLUDED.skipped,
 		        updated_at = now()`,
-		oid, completed, skipped,
-	)
+			oid, completed, skipped,
+		)
+		return err
+	})
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "23503" { // foreign_key_violation
 		return fmt.Errorf("organization not found: %s: %w", orgID, ErrNotFound)
