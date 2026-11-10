@@ -508,11 +508,10 @@ demo: ## One command to a populated dashboard (scripts/demo/run_demo.sh)
 demo-down: ## docker compose down with volumes + orphans
 	docker compose -f deploy/docker-compose.yml down --volumes --remove-orphans
 
-# Public releases do not bundle the LiteLLM price corpus. Keep the former
-# convenience target as an explicit refusal instead of restoring removed data.
-# Operators can convert their own files with the local import commands.
+# Pricing imports require an explicit operator-supplied file and provenance.
+# This guidance-only target does not download or modify pricing data.
 pricing-refresh: ## Explain how to import an operator-supplied price file
-	@echo 'Bundled LiteLLM price refresh was removed. Use yb pricing import-litellm or import-litellm-units with explicit --in, --out, --source and --date; see docs/compat/litellm-migration.md.' >&2
+	@echo 'Pricing imports require an operator-supplied file. Use yb pricing import-litellm or import-litellm-units with explicit --in, --out, --source and --date; see docs/compat/litellm-migration.md.' >&2
 	@exit 2
 
 # CORE-REF-03 offline reference-pack tooling. Both targets are hermetic:

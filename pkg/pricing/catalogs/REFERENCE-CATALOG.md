@@ -3,9 +3,9 @@
 Only independently verified Nebius entries are distributed: three active arms,
 their three aliases, and two retired identities with no rates. The reference
 pack enforces verification dates, effective windows, and the 90-day review SLA.
-The historical LiteLLM token/unit corpus is excluded. Operators can still import
-and validate their own snapshots; imported entries retain source attribution and
-start as drafts. No imported empty file is accepted as a free pricing policy.
+Operators can import and validate their own snapshots; imported entries retain
+source attribution and start as drafts. No imported empty file is accepted as a
+free pricing policy.
 
 The following exact inventory is checked by `TestReleaseRecordPinnedStats`.
 This describes catalog content, not a human release approval.

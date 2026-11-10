@@ -134,13 +134,21 @@ func TestRun_CleanInstallSeedRegression(t *testing.T) {
 	require.Equal(t, 1, up.Applied)
 	require.Equal(t, int64(27), up.Version)
 
-	// Shipped seed scope before any seed run: 29 baseline models_registry
-	// rows (incl. the I18N-14 regional set pinned by
+	// Shipped seed scope before any seed run: 21 disabled model templates
+	// (incl. the I18N-14 regional set pinned by
 	// TestRegionalModelsMigration_PresentAndHonest).
 	var baselineModels int
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT count(*) FROM models_registry`).Scan(&baselineModels))
-	require.Equal(t, 29, baselineModels, "baseline must ship exactly the 29 seeded models")
+	require.Equal(t, 21, baselineModels, "baseline must ship only the disabled model templates")
+	require.Equal(t, int64(0), countTable(t, ctx, ownerPool,
+		`SELECT count(*) FROM models_registry WHERE enabled`),
+		"a fresh install must not advertise unconfigured models as enabled")
+	require.Equal(t, int64(0), countTable(t, ctx, ownerPool,
+		`SELECT count(*) FROM models_registry WHERE model_name IN
+		 ('smart', 'cheap', 'turbo', 'gpt-4o', 'gpt-4o-mini', 'gpt-4-turbo',
+		  'claude-3-5-sonnet', 'claude-3-opus')`),
+		"unconfigured example models must be absent, not merely disabled")
 
 	// Deploy layer: the real role bootstrap file.
 	bootstrapAppRole(t, ctx, connStr)
@@ -187,7 +195,10 @@ func TestRun_CleanInstallSeedRegression(t *testing.T) {
 	require.True(t, hardLimit)
 	require.Equal(t, int64(1), countTable(t, ctx, ownerPool,
 		`SELECT count(*) FROM models_registry WHERE model_name = 'mock-model' AND provider = 'openai-compat'
-		 AND upstream_url = 'http://mock-openai:8081' AND upstream_api_key IS NULL`))
+		 AND upstream_url = 'http://mock-openai:8081' AND upstream_api_key IS NULL AND enabled`))
+	require.Equal(t, int64(1), countTable(t, ctx, ownerPool,
+		`SELECT count(*) FROM models_registry WHERE enabled`),
+		"the mock seed must enable only its explicitly configured model")
 	require.Equal(t, int64(1), countTable(t, ctx, ownerPool,
 		`SELECT count(*) FROM org_credits WHERE org_id = $1 AND balance_cents = 105000`, res.OrgID),
 		"seed credits are the $1,000 grant plus the beta starter grant, applied once")
@@ -307,9 +318,9 @@ func TestRun_PopulatedBaselineNoopPreservesForeignData(t *testing.T) {
 	require.Equal(t, int64(1), countTable(t, ctx, ownerPool,
 		`SELECT count(*) FROM models_registry WHERE model_name = 'client-custom-model'
 		 AND upstream_url = 'https://client.example.com/v1'`))
-	require.Equal(t, int64(30), countTable(t, ctx, ownerPool,
+	require.Equal(t, int64(22), countTable(t, ctx, ownerPool,
 		`SELECT count(*) FROM models_registry`),
-		"29 baseline seeds + the client model: migrate must not re-apply baseline seeds")
+		"21 baseline templates + the client model: migrate must not re-apply baseline seeds")
 
 	// A seed run on the populated stand adds its own org and touches none of
 	// the foreign rows.

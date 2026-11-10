@@ -15,10 +15,9 @@ materials retain their applicable licenses. The project license does not
 replace those terms. See [NOTICE](NOTICE) and the third-party notices included
 with each release.
 
-The release does not include LiteLLM pricing data or derived prices.
-[pkg/pricing/NOTICE-litellm.txt](pkg/pricing/NOTICE-litellm.txt) preserves the
-historical upstream notice. If you import your own price data, retain the
-notices required by its source.
+Attribution for the supported third-party pricing import format is in
+[pkg/pricing/NOTICE-litellm.txt](pkg/pricing/NOTICE-litellm.txt). If you import
+your own price data, retain the notices required by its source.
 
 ## Names and support
 

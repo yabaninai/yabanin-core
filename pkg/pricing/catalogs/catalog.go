@@ -15,11 +15,11 @@ import (
 	"github.com/reireirei/yabanin/pkg/pricing"
 )
 
-// Historical format attribution and independently verified primary provenance.
-// These are labels, not fetch targets; no third-party price dataset ships.
+// Import-format attribution and independently verified primary provenance.
+// These are labels, not fetch targets.
 const (
-	// LiteLLMCorpusRef and LiteLLMCorpusDate retain the historical import-format
-	// reference for API compatibility. The referenced dataset is not distributed.
+	// LiteLLMCorpusRef and LiteLLMCorpusDate pin the import-format reference
+	// for API compatibility.
 	LiteLLMCorpusRef  = "github.com/BerriAI/litellm@61a73c59b049a8cd6c559168d7f3a2557a1a8cf7/model_prices_and_context_window.json"
 	LiteLLMCorpusDate = "2026-09-30"
 	// NebiusEvidencePrefix is the opaque internal-evidence ref prefix for the

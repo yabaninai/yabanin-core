@@ -121,8 +121,7 @@ organization scope. Earlier unmounted designs are not installation requirements.
   (required for root callers, target org). No request body.
 - Change: new endpoint — one model/provider catalog import pass for the
   org. The pass reads the deployment's GLOBAL models_registry plus the
-  reference planes (process model catalog; bundled pricing refpack, which
-  excludes LiteLLM-derived pricing data) and
+  reference planes (process model catalog and bundled pricing refpack) and
   materializes them into the org's asset rows (kind=model
   `model:<provider>/<model>`, kind=provider `provider:<provider>`). A pair
   known to only one side is imported with a `discrepancy` flag
