@@ -30,9 +30,17 @@ func silentFailureValue(t *testing.T, place, reason string) float64 {
 
 // deadRedisPublisher is a publisher wired to a refused port: construction
 // never dials, every Publish fails immediately — the unit shape of a queue
-// outage, no Redis server needed.
+// outage, no Redis server needed. DialerRetries/MaxRetries pin that shape on
+// go-redis >= 9.8, where the pool otherwise retries the dial (default 5
+// attempts at 100ms backoff) and the command (default 3 retries with up to
+// 1s backoff), stretching each Publish to the caller's context budget and
+// blowing the bounded retry ladder's timing assumptions below.
 func deadRedisPublisher() *eventpub.RedisPublisher {
-	return eventpub.NewRedisPublisher(redis.NewClient(&redis.Options{Addr: "127.0.0.1:1"}), "events")
+	return eventpub.NewRedisPublisher(redis.NewClient(&redis.Options{
+		Addr:          "127.0.0.1:1",
+		DialerRetries: 1,
+		MaxRetries:    -1,
+	}), "events")
 }
 
 // requirePublishQuiescence pins the observation window for the shared
@@ -43,12 +51,16 @@ func deadRedisPublisher() *eventpub.RedisPublisher {
 // publish. Package-random shuffle order exposed the race: a previous
 // test's retry backoff landed its publish_failed increment after the next
 // test's `before` snapshot, breaking exact delta assertions.
+// The semaphore waits use a generous 10s deadline: the helper's job is to
+// catch leaked tokens (a hang), not to bound publish latency, and the
+// parallel -race quality gate can starve the retry ladder's ~650ms of
+// backoff sleeps well past the old 1-2s deadlines.
 func requirePublishQuiescence(t *testing.T) {
 	t.Helper()
 	for i := 0; i < cap(eventPublishSem); i++ {
 		select {
 		case eventPublishSem <- struct{}{}:
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatalf("publish semaphore not empty at slot %d — leaked tokens", i)
 		}
 	}
@@ -68,7 +80,7 @@ func TestPublishEventBacklogFullCounted(t *testing.T) {
 	for i := 0; i < cap(eventPublishSem); i++ {
 		select {
 		case eventPublishSem <- struct{}{}:
-		case <-time.After(time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatalf("publish semaphore not empty at slot %d — leaked tokens", i)
 		}
 	}
@@ -76,7 +88,7 @@ func TestPublishEventBacklogFullCounted(t *testing.T) {
 		for i := 0; i < cap(eventPublishSem); i++ {
 			select {
 			case <-eventPublishSem:
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatalf("publish semaphore did not drain at slot %d", i)
 			}
 		}

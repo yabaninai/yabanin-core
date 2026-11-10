@@ -7,7 +7,7 @@
 # export path; the root go.mod declares go 1.27.3, so the builder must be
 # 1.27.3 or newer).
 ARG GO_VERSION=1.27.3
-FROM golang:${GO_VERSION}-alpine@sha256:d530cf60723abf1ffae0cd16bb546b379ec0550d2f3815e5b16ed69dbc00fba4 AS builder
+FROM golang:${GO_VERSION}-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
 
 # Release rebuilds override this with a frozen mirror containing the original
 # signed indices and every resolved APK, retained with a checksum manifest.

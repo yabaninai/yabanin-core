@@ -1,7 +1,7 @@
 version: 2
 
 updates:
-  # Go modules
+  # Go modules - product root
   - package-ecosystem: "gomod"
     directory: "/"
     schedule:
@@ -14,9 +14,6 @@ updates:
       - "maintainer"
     commit-message:
       prefix: "chore(deps)"
-    labels:
-      - "dependencies"
-      - "security"
     groups:
       golang-org:
         patterns:
@@ -27,6 +24,172 @@ updates:
       test-packages:
         patterns:
           - "github.com/stretchr/*"
+
+  # Go modules - nested modules (same dependency universe as the root,
+  # but dependabot only updates what each go.mod actually requires).
+  - package-ecosystem: "gomod"
+    directory: "/sdks/go"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      golang-org:
+        patterns:
+          - "golang.org/*"
+
+  - package-ecosystem: "gomod"
+    directory: "/deploy/mock-embedder"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/deploy/mock-provider"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/tests/load/slowmock"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/scripts/loadtest/gatewayoverhead"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/scripts/loadtest/http"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "gomod"
+    directory: "/scripts/loadtest/matched"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # npm lockfiles
+  - package-ecosystem: "npm"
+    directory: "/sdks/node"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "npm"
+    directory: "/services/subscription-bridge"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "npm"
+    directory: "/web/dashboard"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  - package-ecosystem: "npm"
+    directory: "/web/site"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
+
+  # Python SDK (pyproject.toml). deploy/classifier uses a pip constraints
+  # file (deploy/python-constraints.txt) that dependabot does not manage;
+  # it stays a manual review surface.
+  - package-ecosystem: "pip"
+    directory: "/sdks/python"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "06:00"
+      timezone: "UTC"
+    open-pull-requests-limit: 5
+    reviewers:
+      - "maintainer"
+    commit-message:
+      prefix: "chore(deps)"
 
   # GitHub Actions
   - package-ecosystem: "github-actions"
@@ -41,9 +204,6 @@ updates:
       - "maintainer"
     commit-message:
       prefix: "ci(deps)"
-    labels:
-      - "ci-cd"
-      - "dependencies"
 
   # Docker base images
   - package-ecosystem: "docker"
@@ -58,6 +218,3 @@ updates:
       - "maintainer"
     commit-message:
       prefix: "ci(docker)"
-    labels:
-      - "docker"
-      - "dependencies"
