@@ -149,7 +149,7 @@ func TestHandleLowBalance_EmptyListEncodesJSONArray(t *testing.T) {
 
 	require.Equal(t, http.StatusOK, rw.Code)
 	raw := strings.TrimSpace(rw.Body.String())
-	assert.Equal(t, `{"count":0,"org_ids":[],"threshold_cents":-500}`, raw,
+	assert.JSONEq(t, `{"count":0,"org_ids":[],"threshold_cents":-500}`, raw,
 		"org_ids must encode as [] with count 0, not null")
 }
 
