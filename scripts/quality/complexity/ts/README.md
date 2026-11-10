@@ -116,9 +116,28 @@ rename handling that preserves baseline debt is QG-C02-02 scope.
 ## Fixtures
 
 `scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds a throwaway
-git repository from `ts_fixtures/` (base and head states), asserts exit codes
-and report contents for all six control classes, checks byte-determinism of
-two consecutive runs, and re-runs deliberately mutated analyzer copies to
-prove each control fails on its intended assertion. The fixture templates
-intentionally contain high-complexity bodies; they are test inputs, not
-shipped logic, and are excluded from the analyzer's self-check scope.
+git repository from `ts_fixtures/` (base and head states) and asserts:
+
+- the changed-function control classes C1–C13: changed/added/moved/deleted
+  bodies, nested-closure attribution, untouched debt, and pinned metric
+  paths with exact scores — `switch` case-clause counting, `catch`-clause
+  counting, class getter/setter/method bodies, async function and async
+  arrow bodies;
+- fingerprint stability: a whitespace/comment-only reformatted body is in
+  the diff but produces no changed-function entry, only its untouched-debt
+  measurement;
+- byte-determinism of two consecutive runs;
+- receipt state: with `--receipt`, a review-band entry is marked
+  `receipt-recorded` and the receipt id is echoed verbatim in the report;
+  without it the same entry stays `required` (receipt validation is
+  QG-C02-02 scope);
+- mutation guards: every guarded control has a mutant (M1a–M6 plus
+  M-switch/M-catch/M-class/M-async) that disables exactly one counting or
+  extraction path via a single exact-string replacement (target uniqueness
+  asserted, crashed mutants rejected), and the battery passes only when the
+  target control fails on that mutant — a disabled metric path cannot keep
+  the battery green.
+
+The fixture templates intentionally contain high-complexity bodies; they are
+test inputs, not shipped logic, and are excluded from the analyzer's
+self-check scope.

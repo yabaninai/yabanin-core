@@ -315,14 +315,18 @@ function collectHeadRecords(ts, repo, scopeFiles, sides) {
       headRecords.set(file, side.newRecs);
       continue;
     }
+    let text;
     try {
-      const parsed = parseAndCollect(ts, file, readFileSync(join(repo, file), "utf8"));
-      if (parsed.error) throw new Error(`parser failure: ${parsed.error}`);
-      headRecords.set(file, parsed.functions);
+      text = readFileSync(join(repo, file), "utf8");
     } catch (error) {
-      if (error.message.startsWith("parser failure")) throw error;
-      // absent from the working tree: nothing to measure at head
+      // Only a file absent from the working tree has no head measurement;
+      // any other read failure is a tool error and must surface (exit 2).
+      if (error.code === "ENOENT") continue;
+      throw new Error(`cannot read ${file}: ${error.message}`);
     }
+    const parsed = parseAndCollect(ts, file, text);
+    if (parsed.error) throw new Error(`parser failure: ${parsed.error}`);
+    headRecords.set(file, parsed.functions);
   }
   return headRecords;
 }

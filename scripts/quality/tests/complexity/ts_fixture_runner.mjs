@@ -2,13 +2,15 @@
 //
 // Builds a throwaway git repository from ts_fixtures/ (base and head
 // states), runs scripts/quality/complexity/ts/analyze.mjs against it and
-// asserts exit codes plus report contents for the six required control
-// classes. Each control is then re-checked against a deliberately mutated
-// copy of the analyzer (single exact-string replacement, target uniqueness
-// asserted) so every control is proven to fail on its intended assertion.
-// Also checks byte-determinism of two consecutive runs and minimal
-// --receipt recording. Exit 0 only if all controls pass on the real
-// analyzer and fail on their mutants.
+// asserts exit codes plus report contents for the changed-function control
+// classes C1-C13, including pinned metric paths (switch case clauses, catch
+// clauses, class getter/setter/method bodies, async bodies) and fingerprint
+// stability under reformat-only edits. Each guarded control is re-checked
+// against a deliberately mutated copy of the analyzer (single exact-string
+// replacement, target uniqueness asserted) so every guarded control is
+// proven to fail on its intended assertion. Also checks byte-determinism
+// of two consecutive runs and --receipt state recording. Exit 0 only if
+// all controls pass on the real analyzer and fail on their mutants.
 import { execFileSync, spawnSync } from "node:child_process";
 import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -94,7 +96,9 @@ const CONTROLS = [
     check: (report) => {
       const debt = report.untouched_debt;
       const top = debt.top[0];
-      return Boolean(debt.functions_total === 1 && debt.block === 1 && top
+      // Debt is legacyDeep (block) plus the fingerprint-stable reformat
+      // body from C13, which is measured at head but never "changed".
+      return Boolean(debt.functions_total === 2 && debt.block === 1 && top
         && top.name === "legacyDeep" && top.complexity === 25
         && report.failures.every((line) => line.includes("MegaList")));
     },
@@ -109,6 +113,62 @@ const CONTROLS = [
         && outer.old_complexity === 2 && outer.new_complexity === 0);
     },
   },
+  {
+    id: "C9", label: "switch counts each case clause and nests inside clauses",
+    check: (report) => {
+      // 4 case clauses at switch nesting (4 x 2) + if inside a clause (2).
+      const entry = findEntry(report, "routePlan");
+      return Boolean(entry && entry.status === "added" && entry.kind === "function"
+        && entry.new_complexity === 10 && entry.classification === "ok");
+    },
+  },
+  {
+    id: "C10", label: "catch clause counted and nested body scored deeper",
+    check: (report) => {
+      // if in try (+1) + catch clause (+1) + if at catch nesting (+2).
+      const entry = findEntry(report, "guardedParse");
+      return Boolean(entry && entry.status === "added" && entry.new_complexity === 4
+        && entry.classification === "ok");
+    },
+  },
+  {
+    id: "C11", label: "class getter/setter/method bodies measured separately",
+    check: (report) => {
+      const getter = findEntry(report, "ScoreKeeper::value");
+      const setter = findEntry(report, "ScoreKeeper::value#2");
+      const method = findEntry(report, "ScoreKeeper::bump");
+      return Boolean(getter && getter.kind === "getter" && getter.status === "added"
+        && getter.new_complexity === 1
+        && setter && setter.kind === "setter" && setter.status === "added"
+        && setter.new_complexity === 3
+        && method && method.kind === "method" && method.status === "added"
+        && method.new_complexity === 3);
+    },
+  },
+  {
+    id: "C12", label: "async function and async arrow bodies measured",
+    check: (report) => {
+      const fn = findEntry(report, "fetchScore");
+      const arrow = findEntry(report, "asyncLabel");
+      return Boolean(fn && fn.kind === "function" && fn.status === "added"
+        && fn.new_complexity === 4
+        && arrow && arrow.kind === "arrow" && arrow.status === "added"
+        && arrow.new_complexity === 3);
+    },
+  },
+  {
+    id: "C13", label: "reformat-only body keeps fingerprint, no changed entry",
+    check: (report) => {
+      // reformat.ts must be in the diff (7 changed in-scope files across the
+      // fixture set) yet stableReformat yields no changed_functions entry —
+      // it is only measured as untouched debt, at its base complexity.
+      const changed = findEntry(report, "stableReformat");
+      const debt = report.untouched_debt.top.find((entry) => entry.name === "stableReformat");
+      return Boolean(changed === null && debt && debt.complexity === 2
+        && report.run.files_changed_in_scope === 7
+        && report.failures.every((line) => line.includes("MegaList")));
+    },
+  },
 ];
 
 const MUTATIONS = [
@@ -118,6 +178,30 @@ const MUTATIONS = [
   { id: "M4", file: "analyze.mjs", find: "deleted: deletedCount,", replace: "deleted: 0,", control: "C4" },
   { id: "M5", file: "analyze.mjs", find: "untouchedDebt.push({ file, name: record.name, complexity: record.complexity, kind: record.kind });", replace: ";", control: "C5" },
   { id: "M6", file: "collect.mjs", find: "ts.forEachChild(node, (child) => visit(child, childScope));", replace: "if (!kind) ts.forEachChild(node, (child) => visit(child, childScope));", control: "C6" },
+  {
+    id: "M-switch", file: "metric.mjs",
+    find: "if (ts.isCaseClause(clause)) increment();",
+    replace: ";",
+    control: "C9",
+  },
+  {
+    id: "M-catch", file: "metric.mjs",
+    find: "[ts.isCatchClause, (n) => {\n      increment();\n      inNested(n.variableDeclaration);",
+    replace: "[ts.isCatchClause, (n) => {\n      inNested(n.variableDeclaration);",
+    control: "C10",
+  },
+  {
+    id: "M-class", file: "collect.mjs",
+    find: "if (kind && node.body) {",
+    replace: "if (kind && node.body && !ts.isClassLike(node.parent)) {",
+    control: "C11",
+  },
+  {
+    id: "M-async", file: "collect.mjs",
+    find: "functions.push({",
+    replace: "if (node.modifiers?.some((m) => m.kind === ts.SyntaxKind.AsyncKeyword)) return own;\n    functions.push({",
+    control: "C12",
+  },
 ];
 
 function applyMutation(sourceDir, targetDir, mutation) {
@@ -156,6 +240,22 @@ function evaluateControls(rows, report, first) {
 
 function isDeterministic(first, second) {
   return second.stdout === first.stdout && second.code === first.code;
+}
+
+function parseReport(run, label) {
+  // A tool error (exit 2) leaves no report to assert on; surface the
+  // analyzer's own diagnostic instead of crashing on JSON.parse("").
+  if (run.code !== 0 && run.code !== 1) {
+    throw new Error(`${label}: analyzer exited ${run.code} without a report\n${run.stderr}`.trim());
+  }
+  if (!run.stdout.trim()) {
+    throw new Error(`${label}: analyzer exited ${run.code} with empty stdout\n${run.stderr}`.trim());
+  }
+  try {
+    return JSON.parse(run.stdout);
+  } catch (error) {
+    throw new Error(`${label}: analyzer stdout is not valid JSON (${error.message})`);
+  }
 }
 
 function receiptRecorded(receiptReport, receiptRun, plainReport) {
@@ -199,13 +299,14 @@ function main() {
   const repo = join(work, "repo");
   let failures = 0;
   const rows = [];
+  let fatal = null;
   try {
     const baseSha = buildFixtureRepo(repo);
     const first = runAnalyzer(ANALYZER_DIR, repo, baseSha);
-    const report = JSON.parse(first.stdout);
+    const report = parseReport(first, "analyzer run");
     const second = runAnalyzer(ANALYZER_DIR, repo, baseSha);
     const receiptRun = runAnalyzer(ANALYZER_DIR, repo, baseSha, ["--receipt", "QG-C02-02-placeholder"]);
-    const receiptReport = JSON.parse(receiptRun.stdout);
+    const receiptReport = parseReport(receiptRun, "--receipt run");
 
     failures += evaluateControls(rows, report, first);
     failures += record(rows, "C7", "two consecutive runs are byte-identical", isDeterministic(first, second));
@@ -217,8 +318,14 @@ function main() {
       rows.push([mutation.id, outcome.label, outcome.detected ? "DETECTED" : "MISSED"]);
       if (!outcome.detected) failures += 1;
     }
+  } catch (error) {
+    fatal = error;
   } finally {
     rmSync(work, { recursive: true, force: true });
+  }
+  if (fatal) {
+    process.stderr.write(`ts fixture runner: ${fatal.message}\n`);
+    process.exit(1);
   }
   emit(rows, failures);
   process.exit(failures > 0 ? 1 : 0);
