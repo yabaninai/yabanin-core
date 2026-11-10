@@ -1,0 +1,9 @@
+// Fixture head (reverse control): MovableHelper relocated WITH a modified
+// body. Body-hash matching must refuse the moved label and measure it as
+// added content instead.
+func MovableHelper(a int) int {
+	if a < 0 {
+		return -a
+	}
+	return 2 * a
+}
