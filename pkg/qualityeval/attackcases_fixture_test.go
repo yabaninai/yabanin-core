@@ -18,9 +18,7 @@ func attackFixtureRaw(t *testing.T) []byte {
 	t.Helper()
 	raw, err := os.ReadFile("../../datasets/eval/attack_text_cases.v1.json")
 	if err != nil {
-		// The attack corpus is internal-only (datasets/eval); skip with an
-		// explicit reason in the public tree instead of failing the suite.
-		t.Skipf("eval datasets are not part of the public export (attack fixture absent): %v", err)
+		t.Fatalf("public evaluation fixture is required: %v", err)
 	}
 	return raw
 }

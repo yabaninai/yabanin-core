@@ -271,8 +271,10 @@ func (b *AliasBook) refresh(ctx context.Context) bool {
 // runLoad owns refreshMu for the duration of one load attempt (the lock was
 // acquired by refresh) and always settles its done channel.
 func (b *AliasBook) runLoad(trigger context.Context, done chan struct{}) {
-	defer b.refreshMu.Unlock()
+	// Publish completion only after releasing the refresh slot. A cold
+	// waiter may immediately start the next attempt when backoff has expired.
 	defer close(done)
+	defer b.refreshMu.Unlock()
 
 	// Double-check under the lock: a concurrent refresh may have completed a
 	// fresh load between the stale check and the TryLock.

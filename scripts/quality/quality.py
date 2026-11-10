@@ -25,7 +25,7 @@ PROFILES = {
     "self": ["self"],
     "fast": ["self", "fast"],
     "static": ["self", "static"],
-    "security": ["self", "static", "security", "secrets", "deps", "licenses", "policy", "package", "alerts", "dr", "claims"],
+    "security": ["self", "static", "security", "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
     "security-code": ["self", "static", "security", "secrets", "commit-secrets", "deps", "licenses", "policy"],
     "security-runtime": ["self", "tests", "int-modules", "integration"],
     "security-release": ["self", "static", "security", "secrets", "history-secrets",
@@ -48,7 +48,7 @@ PROFILES = {
     "full": ["self", "static", "security", "tests", "routing", "guards",
              "dashboard", "site", "design", "node-sdk", "python-sdk", "bridge",
              "go-sdk", "docs", "nested-go", "int-modules",
-             "secrets", "deps", "licenses", "policy", "package", "alerts", "dr", "claims"],
+             "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
 }
 LEAVES = {gate for gates in PROFILES.values() for gate in gates}
 RELEASE_PLAN_DIR = "__private_release_plan__/"  # internal plans archive (not part of the public export)

@@ -5,9 +5,12 @@ local labeled data. These flows do not start a gateway or call a model. They
 help detect specific regressions; they do not measure full production routing,
 model quality, or protection against every sensitive-data pattern.
 
-The public export does not include the private `datasets/eval/` corpora or
-their generators. `make evaluate-routing` and `make evaluate-guards` therefore
-exit **77** in that export. Use explicit local inputs with the CLI, as below.
+Core includes a synthetic regression corpus in `datasets/eval/`. Run
+`make evaluate-routing` and `make evaluate-guards` to check the committed
+classifier baseline and guard precision/recall thresholds. These checks require
+no private datasets, gateway, or provider account. See the
+[dataset scope](https://github.com/yabaninai/yabanin-core/blob/main/datasets/eval/README.md) before interpreting their results.
+You can also evaluate your own local inputs with the CLI, as below.
 
 ## Build and create a workspace
 

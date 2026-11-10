@@ -6,7 +6,9 @@ import (
 	"log"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
+	"time"
 )
 
 // ChatCompletionRequest matches OpenAI's /v1/chat/completions.
@@ -165,36 +167,98 @@ func buildResponse(req ChatCompletionRequest) ChatCompletionResponse {
 	}
 }
 
+func chatCompletions(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+		return
+	}
+	var req ChatCompletionRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
+		return
+	}
+	response := buildResponse(req)
+	if req.Stream {
+		if err := writeStream(w, response); err != nil {
+			log.Printf("mock stream write failed: %v", err)
+		}
+		return
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if err := json.NewEncoder(w).Encode(response); err != nil {
+		log.Printf("mock response write failed: %v", err)
+	}
+}
+
+func writeStream(w http.ResponseWriter, response ChatCompletionResponse) error {
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	control := http.NewResponseController(w)
+	writeEvent := func(choices []any, usage *Usage) error {
+		chunk := map[string]any{
+			"id": response.ID, "object": "chat.completion.chunk", "created": response.Created,
+			"model": response.Model, "choices": choices,
+		}
+		if usage != nil {
+			chunk["usage"] = usage
+		}
+		data, err := json.Marshal(chunk)
+		if err != nil {
+			return err
+		}
+		if _, err := fmt.Fprintf(w, "data: %s\n\n", data); err != nil {
+			return err
+		}
+		return control.Flush()
+	}
+	choice := response.Choices[0]
+	delta := map[string]any{"role": "assistant", "content": choice.Message.Content}
+	if len(choice.Message.ToolCalls) > 0 {
+		calls := make([]map[string]any, 0, len(choice.Message.ToolCalls))
+		for i, call := range choice.Message.ToolCalls {
+			calls = append(calls, map[string]any{"index": i, "id": call.ID, "type": call.Type, "function": call.Function})
+		}
+		delta["tool_calls"] = calls
+	}
+	if err := writeEvent([]any{map[string]any{"index": 0, "delta": delta, "finish_reason": nil}}, nil); err != nil {
+		return err
+	}
+	if err := writeEvent([]any{map[string]any{"index": 0, "delta": map[string]any{}, "finish_reason": choice.FinishReason}}, nil); err != nil {
+		return err
+	}
+	if err := writeEvent([]any{}, &response.Usage); err != nil {
+		return err
+	}
+	if _, err := fmt.Fprint(w, "data: [DONE]\n\n"); err != nil {
+		return err
+	}
+	return control.Flush()
+}
+
 func main() {
 	port := os.Getenv("MOCK_PROVIDER_PORT")
 	if port == "" {
 		port = "8081"
 	}
 
+	portNumber, err := strconv.ParseUint(port, 10, 16)
+	if err != nil || portNumber == 0 {
+		log.Fatal("MOCK_PROVIDER_PORT must be a port from 1 to 65535")
+	}
+
 	http.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(map[string]string{"status": "ok"})
+		if err := json.NewEncoder(w).Encode(map[string]string{"status": "ok"}); err != nil {
+			log.Printf("health response failed: %v", err)
+		}
 	})
 
-	http.HandleFunc("/v1/chat/completions", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
-			return
-		}
+	http.HandleFunc("/v1/chat/completions", chatCompletions)
 
-		var req ChatCompletionRequest
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
-			http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
-			return
-		}
-
-		w.Header().Set("Content-Type", "application/json")
-		json.NewEncoder(w).Encode(buildResponse(req))
-	})
-
-	addr := ":" + port
-	log.Printf("mock-provider listening on %s", addr)
-	if err := http.ListenAndServe(addr, nil); err != nil {
+	addr := fmt.Sprintf(":%d", portNumber)
+	log.Printf("mock-provider listening on port %d", portNumber)
+	server := &http.Server{Addr: addr, ReadHeaderTimeout: 5 * time.Second, ReadTimeout: 30 * time.Second, WriteTimeout: 30 * time.Second, IdleTimeout: 60 * time.Second}
+	if err := server.ListenAndServe(); err != nil {
 		log.Fatalf("server failed: %v", err)
 	}
 }

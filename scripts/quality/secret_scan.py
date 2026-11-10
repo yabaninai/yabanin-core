@@ -13,6 +13,8 @@ ADR documents this choice). Scanner error != pass: any internal error exits
 from __future__ import annotations
 
 import argparse
+import hashlib
+import os
 import json
 import math
 import re
@@ -40,9 +42,6 @@ ALLOW_SUFFIXES = ("secret_scan.py",)
 ALLOW_PATH_PARTS = (
     "/.opencode/skills/",
     "/docs/strategy/qa/",
-    # Synthetic guard-classification fixtures: they TEACH the patterns
-    # (labeled examples of leaked secrets, no real credentials).
-    "/datasets/eval/",
 )
 
 BASE64 = re.compile(r"^[A-Za-z0-9+/_-]+$")
@@ -90,6 +89,16 @@ def load_exceptions():
     return live, expired
 
 
+def reviewed_fixture(path: str, content: bytes) -> bool:
+    if not path.startswith("datasets/eval/"):
+        return False
+    policy = json.loads((ROOT / "scripts/quality/synthetic-fixtures.json").read_text())
+    if policy.get("schema") != 1 or not isinstance(policy.get("sha256"), dict):
+        raise ValueError("invalid synthetic fixture policy")
+    expected = policy["sha256"].get(path)
+    return expected is not None and hashlib.sha256(content).hexdigest() == expected
+
+
 def scan_text(path: str, text: str, only_added_lines=False):
     findings = []
     if any(part in "/" + path for part in ALLOW_PATH_PARTS):
@@ -113,13 +122,19 @@ def scan_text(path: str, text: str, only_added_lines=False):
     return findings
 
 
-def diff_mode():
+def diff_mode(base=None):
     """Scan additions in the working tree (staged+unstaged vs HEAD) plus
     untracked files."""
     findings = []
+    revision = "HEAD"
+    if base:
+        revision = subprocess.check_output(
+            ["git", "rev-parse", "--verify", "--end-of-options", base + "^{commit}"],
+            cwd=ROOT, text=True).strip()
+    reviewed = set()
     try:
         diff = subprocess.run(
-            ["git", "diff", "HEAD", "--no-color", "-U0"],
+            ["git", "diff", revision, "--no-color", "-U0"],
             cwd=ROOT, capture_output=True, text=True, check=True).stdout
     except subprocess.CalledProcessError as exc:
         print(f"scanner error: git diff failed: {exc}", file=sys.stderr)
@@ -129,10 +144,16 @@ def diff_mode():
     for line in diff.splitlines():
         if line.startswith("+++ b/"):
             current_file = line[6:]
+            path = ROOT / current_file
+            if path.is_file() and not path.is_symlink() and reviewed_fixture(current_file, path.read_bytes()):
+                reviewed.add(current_file)
         elif line.startswith("@@") and current_file:
             m = re.search(r"\+(\d+)", line)
             lineno = int(m.group(1)) if m else 0
         elif line.startswith("+") and not line.startswith("+++") and current_file:
+            if current_file in reviewed:
+                lineno += 1
+                continue
             for rid, rx, name in PATTERNS:
                 m = rx.search(line[1:])
                 if m:
@@ -150,10 +171,12 @@ def diff_mode():
         if any(part in "/" + path for part in ALLOW_PATH_PARTS):
             continue
         try:
-            text = (ROOT / path).read_text(errors="replace")
+            file = ROOT / path
+            text = os.readlink(file) if file.is_symlink() else file.read_text(errors="replace")
         except OSError:
             continue
-        findings.extend(scan_text(path, text))
+        if file.is_symlink() or not reviewed_fixture(path, file.read_bytes()):
+            findings.extend(scan_text(path, text))
     return findings
 
 
@@ -175,14 +198,19 @@ def scan_commits(commits):
         ).stdout
         current_file = None
         lineno = 0
+        reviewed = set()
         for line in diff.splitlines():
             if line.startswith("+++ b/"):
                 current_file = line[6:]
+                if current_file.startswith("datasets/eval/"):
+                    content = subprocess.check_output(["git", "show", f"{commit}:{current_file}"], cwd=ROOT)
+                    if reviewed_fixture(current_file, content):
+                        reviewed.add(current_file)
             elif line.startswith("@@") and current_file:
                 m = re.search(r"\+(\d+)", line)
                 lineno = int(m.group(1)) if m else 0
             elif line.startswith("+") and not line.startswith("+++") and current_file:
-                added = scan_text(current_file, line[1:])
+                added = [] if current_file in reviewed else scan_text(current_file, line[1:])
                 for finding in added:
                     finding["line"] = lineno
                 findings.extend(added)
@@ -213,7 +241,7 @@ def main():
             ).stdout.splitlines()
             findings = scan_commits(commits)
         else:
-            findings = diff_mode() if args.mode == "diff" else history_mode()
+            findings = diff_mode(args.base or os.environ.get("QUALITY_BASE")) if args.mode == "diff" else history_mode()
         live, expired = load_exceptions()
     except Exception as exc:  # noqa: BLE001 — scanner error must not pass
         print(f"scanner error: {exc}", file=sys.stderr)

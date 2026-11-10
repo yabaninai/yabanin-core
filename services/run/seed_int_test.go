@@ -124,6 +124,14 @@ func TestApplySeed_IdempotentAndKeyPrintedOnce(t *testing.T) {
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT balance_cents FROM org_credits WHERE org_id = $1`, first.OrgID).Scan(&balance))
 	require.Equal(t, int64(seedCreditsCents+credits.DefaultStarterGrantCents), balance)
+	require.Equal(t, int64(1), countRow(t, pool,
+		`SELECT count(*) FROM credit_transactions WHERE org_id = $1 AND invoice_ref = 'seed-opening-balance'`, first.OrgID))
+	var ledgerCents, ledgerMicro int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT sum(amount_cents), sum(amount_micro_usd) FROM credit_transactions WHERE org_id = $1`,
+		first.OrgID).Scan(&ledgerCents, &ledgerMicro))
+	require.Equal(t, balance, ledgerCents, "fresh seed wallet and ledger must reconcile after repeated seeding")
+	require.Equal(t, balance*10000, ledgerMicro)
 
 	var hardLimit bool
 	var monthly string
@@ -131,6 +139,22 @@ func TestApplySeed_IdempotentAndKeyPrintedOnce(t *testing.T) {
 		`SELECT monthly_limit_usd::text, hard_limit FROM team_budgets WHERE team_id = $1`, first.TeamID).Scan(&monthly, &hardLimit))
 	require.Equal(t, "50.00", monthly)
 	require.True(t, hardLimit)
+}
+
+func TestApplySeed_PreservesExistingWalletHistory(t *testing.T) {
+	pool := testdb.Postgres(t)
+	t.Setenv(credits.StarterGrantEnvVar, "0")
+	opts := seedTestOptions(t, true)
+	orgID, err := seedOrg(t.Context(), pool, opts)
+	require.NoError(t, err)
+	_, err = pool.Exec(t.Context(), `INSERT INTO org_credits (org_id, balance_cents) VALUES ($1, 77)`, orgID)
+	require.NoError(t, err)
+	var output strings.Builder
+	_, err = ApplySeed(t.Context(), pool, seedTestEncryptor(t, "existing"), opts, slog.Default(), &output)
+	require.NoError(t, err)
+	require.Equal(t, int64(77), countRow(t, pool, `SELECT balance_cents FROM org_credits WHERE org_id = $1`, orgID))
+	require.Zero(t, countRow(t, pool, `SELECT count(*) FROM credit_transactions WHERE org_id = $1`, orgID),
+		"seeding must not fabricate an opening transaction for an existing wallet")
 }
 
 func TestApplySeed_ProviderProfileStoresEncryptedUpstreamKey(t *testing.T) {

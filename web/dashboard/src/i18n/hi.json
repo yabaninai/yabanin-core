@@ -1811,6 +1811,15 @@
       }
     },
     "unitsSpend": {
+      "summary": "Cost, credits, tokens and environmental estimates",
+      "actualCost": "Recorded cost",
+      "counterfactualCost": "What-if cost",
+      "creditsSpent": "Credits spent",
+      "tokensUsed": "Tokens used",
+      "carbonEstimate": "Estimated CO₂e",
+      "carbonSource": "Configured model factors",
+      "carbonMethod": "CO₂e is calculated from recorded tokens and configured model factors, not measured hardware emissions. Exact describes the accounting calculation, not physical measurement. Review missing-usage and missing-factor notices before interpreting a total, including zero. Water and energy consumption are not tracked here.",
+      "scopeMismatch": "The response does not match the selected organization. Reload this view.",
       "title": "यूनिट और खर्च",
       "purpose": "चुनी गई विंडो में इस संगठन की खपत, हर उस यूनिट में मापी गई जिसका वह वास्तव में उपयोग करता है — पैसा, क्रेडिट, टोकन और कार्बन।",
       "from": "से",

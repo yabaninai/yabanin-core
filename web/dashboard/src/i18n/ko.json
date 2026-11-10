@@ -1801,6 +1801,15 @@
       }
     },
     "unitsSpend": {
+      "summary": "Cost, credits, tokens and environmental estimates",
+      "actualCost": "Recorded cost",
+      "counterfactualCost": "What-if cost",
+      "creditsSpent": "Credits spent",
+      "tokensUsed": "Tokens used",
+      "carbonEstimate": "Estimated CO₂e",
+      "carbonSource": "Configured model factors",
+      "carbonMethod": "CO₂e is calculated from recorded tokens and configured model factors, not measured hardware emissions. Exact describes the accounting calculation, not physical measurement. Review missing-usage and missing-factor notices before interpreting a total, including zero. Water and energy consumption are not tracked here.",
+      "scopeMismatch": "The response does not match the selected organization. Reload this view.",
       "title": "단위 및 지출",
       "purpose": "선택한 기간 동안 이 조직이 소비한 내용을 실제 사용하는 각 단위(화폐, 크레딧, 토큰, 탄소)별로 측정합니다.",
       "from": "부터",
