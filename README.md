@@ -21,6 +21,14 @@ On Windows, use WSL2 with Docker integration. Keep localhost ports **3000**
 container images; you do not need Go or Node.js installed on your computer
 (see [First-start timing](#first-start-timing)).
 
+### One command
+
+`bash scripts/quickstart/demo.sh` runs the steps below for you: configure,
+build, start, seed, then a summary pointing at the dashboard and where the
+API key and admin password were printed. Rerunning it is safe; `--fresh`
+wipes the demo database and issues new credentials (destructive). The
+numbered steps are the manual path that explains each command.
+
 ### 1. Download, configure, and start
 
 ```bash

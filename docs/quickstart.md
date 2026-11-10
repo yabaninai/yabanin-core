@@ -77,6 +77,22 @@ and follow [artifact verification](onprem/offline-bundle.md).
 The steps below build Yabanin from this checkout. They do not download a
 prebuilt Yabanin release. Third-party Compose images are pinned by digest.
 
+## One-command demo
+
+From a verified checkout, one script runs steps 2 to 4 (configuration,
+build and start, and seed) and prints where the API key and admin
+password appear:
+
+```bash
+bash scripts/quickstart/demo.sh
+```
+
+Rerunning it is safe: the running stack and existing credentials are
+reused, and the summary notes that the password was issued on the first
+run. `--fresh` wipes the disposable demo database and keys and issues new
+ones (destructive). The numbered steps below are the manual path; each one
+explains what the script chains.
+
 ## 2. Generate local configuration
 
 ```bash
