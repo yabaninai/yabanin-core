@@ -1,18 +1,7 @@
 package inbox
 
-// E06-P01 W03-C03: contract/drift guard for the W03-C01 scoring law.
-//
-// Three guards, deliberately beyond the unit battery (scoring_test.go):
-//
-//  1. Adapter realism: a REAL CoreAdapter feed must score — the summary
-//     token is the only v1 carrier of the finding verdict, so an adapter
-//     format change must turn this file red, not silently downgrade every
-//     fold to "no verdict".
-//  2. Law anchors: the reviewed numeric anchors re-pinned here, so a
-//     semantic change that ships with an "updated" unit battery still
-//     trips the contract file.
-//  3. Artifact presence: the W03-C03 deliverable document must exist and
-//     carry the law's markers.
+// Public scoring contract: production adapter compatibility, fixed numerical
+// anchors and documentation must agree with the pure scoring functions.
 
 import (
 	"os"
@@ -28,7 +17,7 @@ import (
 )
 
 // Compile-time exported-surface pin: the law's names are part of the
-// package contract (the future wiring card consumes them).
+// package contract.
 var (
 	_ func(...string) (string, error)             = Escalate
 	_ func(secevents.Event) (string, bool, error) = EventVerdict
@@ -81,10 +70,7 @@ func TestScoringContractAdapterFeedIsScoreable(t *testing.T) {
 		"2 distinct complete events: 0.6 + 0.3*(1/5) + 0.1")
 }
 
-// TestScoringContractLawAnchors re-pins the REVIEWED anchor values. These
-// intentionally duplicate scoring_test.go: the contract file is the
-// reviewed artifact, so changing the law means changing this file in the
-// open, not just the unit battery.
+// TestScoringContractLawAnchors pins numeric behavior independently of the unit cases.
 func TestScoringContractLawAnchors(t *testing.T) {
 	one, err := ScoreEvents([]secevents.Event{scFinding("c-1", SeverityLow, 1)})
 	require.NoError(t, err)
@@ -113,13 +99,10 @@ func TestScoringContractLawAnchors(t *testing.T) {
 	require.ErrorIs(t, err, ErrNoVerdict, "the law never invents a severity")
 }
 
-// TestScoringContractArtifactDocumentsTheLaw guards the W03-C03 deliverable
-// document: it must exist in the tree and carry the law's markers (loose
-// markers — content churn is fine, losing the law's statement is not).
-func TestScoringContractArtifactDocumentsTheLaw(t *testing.T) {
-	b, err := os.ReadFile(filepath.Join("..", "..", "artifacts", "enterprise-beta", "E06-P01",
-		"W03-SEVERITY-CONFIDENCE-2026-11-07.md"))
-	require.NoError(t, err, "the W03-C03 artifact must exist in the tree")
+// TestScoringContractDocumentsTheLaw requires the public contract and its formulas.
+func TestScoringContractDocumentsTheLaw(t *testing.T) {
+	b, err := os.ReadFile(filepath.Join("..", "..", "docs", "contracts", "inbox-scoring.md"))
+	require.NoError(t, err, "the public scoring contract must exist in the tree")
 	doc := string(b)
 	for _, marker := range []string{
 		"escalation = max",
@@ -135,6 +118,6 @@ func TestScoringContractArtifactDocumentsTheLaw(t *testing.T) {
 		"0.76",
 		"ErrNoVerdict",
 	} {
-		require.Contains(t, doc, marker, "artifact must state the law marker %q", marker)
+		require.Contains(t, doc, marker, "contract must state the law marker %q", marker)
 	}
 }

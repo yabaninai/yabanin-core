@@ -221,7 +221,7 @@ func findRepoFile(t *testing.T, rel string) string {
 			return candidate
 		}
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil || dir == filepath.Dir(dir) {
-			t.Skipf("committed corpus not present (searched from %s): %s", dir, rel)
+			t.Fatalf("committed corpus is required (searched from %s): %s", dir, rel)
 		}
 		dir = filepath.Dir(dir)
 	}
