@@ -1,0 +1,4733 @@
+{
+ "task": "CUI-00-01",
+ "generated": "static source audit (no runtime verification; see limits in ui-capability-matrix.md)",
+ "sources": {
+  "product": "yabanin-core",
+  "worktree": "/home/ubuntu/dev/core-cui00-a",
+  "branch": "task/cui00-01",
+  "task_base": "ffc01005dfde91953161ea02b96feae8756c0e1c",
+  "routes": "services/admin/handlers/*.go route registration literals (chi)",
+  "openapi_snapshot": "docs/api/admin.openapi.yaml \u2014 273 operations, byte-frozen; deltas in docs/api/OPENAPI-DELTA.md",
+  "ui": "web/dashboard/src/App.tsx (36 hash routes) + web/dashboard/src/api/*.ts clients"
+ },
+ "state_definitions": {
+  "verified": "registered on the admin router AND present in the OpenAPI snapshot (source-level consistency only; workflow acceptance unverified)",
+  "partial": "registered but absent from the OpenAPI snapshot (route registration is authoritative); includes conditional registrations",
+  "missing": "in the snapshot but not registered (stale spec) \u2014 none found",
+  "protocol_only": "transport/protocol/health/data-plane endpoint excluded from the admin capability surface, with per-entry reason",
+  "unavailable": "surface referenced by the dashboard (or gateway) with no admin-route registration"
+ },
+ "summary": {
+  "task_base": "ffc01005dfde91953161ea02b96feae8756c0e1c",
+  "route_registrations_raw": 303,
+  "route_registrations_unique_method_path": 301,
+  "capability_records": 307,
+  "openapi_operations": 273,
+  "openapi_ops_without_registration": 0,
+  "registered_not_in_openapi": 28,
+  "registered_not_in_openapi_admin_scope": 18,
+  "registered_not_in_openapi_protocol": 10,
+  "snapshot_ops_covered_by_registration": 273,
+  "registration_records_carrying_operationId": 274,
+  "states": {
+   "protocol_only": 36,
+   "verified": 248,
+   "partial": 19,
+   "unavailable": 4
+  },
+  "methods_on_registered_routes": {
+   "GET": 150,
+   "POST": 74,
+   "DELETE": 34,
+   "PUT": 34,
+   "PATCH": 11
+  },
+  "duplicate_registrations": {
+   "GET /api/feedback/export": 2,
+   "GET /api/me": 2
+  },
+  "ui_hash_routes_in_dashboard": 36
+ },
+ "capabilities": [
+  {
+   "capability_id": "cap-001-get-",
+   "method": "GET",
+   "path": "/",
+   "handler": "h.dashboard()",
+   "handler_ref": "services/admin/handlers/router_console.go:57",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:57 (mountConsole)",
+    "openapi": "dashboard"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-002-get-api-admin-users",
+   "method": "GET",
+   "path": "/api/admin-users",
+   "handler": "h.ListAdminUsers()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:55",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "admin-users [admins.ts:18]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:55 (mountOrgsRoot)",
+    "openapi": "listAdminUsers",
+    "ui": "admins.ts:18"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-003-post-api-admin-users",
+   "method": "POST",
+   "path": "/api/admin-users",
+   "handler": "h.CreateAdminUser()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:56",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "admin-users [admins.ts:18]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:56 (mountOrgsRoot)",
+    "openapi": "createAdminUser",
+    "ui": "admins.ts:18"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-004-delete-api-admin-users-id",
+   "method": "DELETE",
+   "path": "/api/admin-users/{id}",
+   "handler": "h.DeleteAdminUser()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:59",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:59 (mountOrgsRoot)",
+    "openapi": "deleteAdminUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-005-get-api-admin-users-id",
+   "method": "GET",
+   "path": "/api/admin-users/{id}",
+   "handler": "h.GetAdminUser()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:57",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:57 (mountOrgsRoot)",
+    "openapi": "getAdminUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-006-put-api-admin-users-id",
+   "method": "PUT",
+   "path": "/api/admin-users/{id}",
+   "handler": "h.UpdateAdminUser()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:58",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:58 (mountOrgsRoot)",
+    "openapi": "updateAdminUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-007-get-api-agent-keys",
+   "method": "GET",
+   "path": "/api/agent-keys",
+   "handler": "h.ListAgentKeys()",
+   "handler_ref": "services/admin/handlers/router_keys.go:26",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:26 (mountKeys)",
+    "openapi": "listAgentKeys"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-008-post-api-agent-keys",
+   "method": "POST",
+   "path": "/api/agent-keys",
+   "handler": "h.CreateAgentKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:27",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:27 (mountKeys)",
+    "openapi": "createAgentKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-009-post-api-agent-keys-delegate",
+   "method": "POST",
+   "path": "/api/agent-keys/delegate",
+   "handler": "h.CreateDelegatedAgentKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:29",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:29 (mountKeys)",
+    "openapi": "createDelegatedAgentKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-010-get-api-agent-keys-id",
+   "method": "GET",
+   "path": "/api/agent-keys/{id}",
+   "handler": "h.GetAgentKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:30",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:30 (mountKeys)",
+    "openapi": "getAgentKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-011-delete-api-agent-keys-id-budget",
+   "method": "DELETE",
+   "path": "/api/agent-keys/{id}/budget",
+   "handler": "h.DeleteAgentBudget()",
+   "handler_ref": "services/admin/handlers/router_keys.go:34",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:34 (mountKeys)",
+    "openapi": "deleteAgentBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-012-get-api-agent-keys-id-budget",
+   "method": "GET",
+   "path": "/api/agent-keys/{id}/budget",
+   "handler": "h.GetAgentBudget()",
+   "handler_ref": "services/admin/handlers/router_keys.go:32",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:32 (mountKeys)",
+    "openapi": "getAgentBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-013-put-api-agent-keys-id-budget",
+   "method": "PUT",
+   "path": "/api/agent-keys/{id}/budget",
+   "handler": "h.UpsertAgentBudget()",
+   "handler_ref": "services/admin/handlers/router_keys.go:33",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:33 (mountKeys)",
+    "openapi": "upsertAgentBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-014-get-api-agent-keys-id-delegations",
+   "method": "GET",
+   "path": "/api/agent-keys/{id}/delegations",
+   "handler": "h.ListPrincipalDelegations()",
+   "handler_ref": "services/admin/handlers/router_keys.go:39",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:39 (mountKeys)",
+    "openapi": "listPrincipalDelegations"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-015-post-api-agent-keys-id-delegations",
+   "method": "POST",
+   "path": "/api/agent-keys/{id}/delegations",
+   "handler": "h.IssuePrincipalDelegation()",
+   "handler_ref": "services/admin/handlers/router_keys.go:38",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:38 (mountKeys)",
+    "openapi": "issuePrincipalDelegation"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-016-post-api-agent-keys-id-delegations-delegationID-revoke",
+   "method": "POST",
+   "path": "/api/agent-keys/{id}/delegations/{delegationID}/revoke",
+   "handler": "h.RevokePrincipalDelegation()",
+   "handler_ref": "services/admin/handlers/router_keys.go:40",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:40 (mountKeys)",
+    "openapi": "revokePrincipalDelegation"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-017-post-api-agent-keys-id-revoke",
+   "method": "POST",
+   "path": "/api/agent-keys/{id}/revoke",
+   "handler": "h.RevokeAgentKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:31",
+   "grant_scope": "session+CSRF+org:agent-keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:31 (mountKeys)",
+    "openapi": "revokeAgentKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-018-get-api-agent-profiles",
+   "method": "GET",
+   "path": "/api/agent-profiles",
+   "handler": "h.ListAgentProfiles()",
+   "handler_ref": "services/admin/handlers/router_keys.go:47",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:47 (mountKeysRoot)",
+    "openapi": "listAgentProfiles"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-019-post-api-agent-profiles",
+   "method": "POST",
+   "path": "/api/agent-profiles",
+   "handler": "h.CreateAgentProfile()",
+   "handler_ref": "services/admin/handlers/router_keys.go:48",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:48 (mountKeysRoot)",
+    "openapi": "createAgentProfile"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-020-delete-api-agent-profiles-id",
+   "method": "DELETE",
+   "path": "/api/agent-profiles/{id}",
+   "handler": "h.DeleteAgentProfile()",
+   "handler_ref": "services/admin/handlers/router_keys.go:51",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:51 (mountKeysRoot)",
+    "openapi": "deleteAgentProfile"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-021-get-api-agent-profiles-id",
+   "method": "GET",
+   "path": "/api/agent-profiles/{id}",
+   "handler": "h.GetAgentProfile()",
+   "handler_ref": "services/admin/handlers/router_keys.go:49",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:49 (mountKeysRoot)",
+    "openapi": "getAgentProfile"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-022-put-api-agent-profiles-id",
+   "method": "PUT",
+   "path": "/api/agent-profiles/{id}",
+   "handler": "h.UpdateAgentProfile()",
+   "handler_ref": "services/admin/handlers/router_keys.go:50",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:50 (mountKeysRoot)",
+    "openapi": "updateAgentProfile"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-023-get-api-analytics-cost-global",
+   "method": "GET",
+   "path": "/api/analytics/cost/global",
+   "handler": "h.GlobalCostStatsHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:67",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:67 (mountAnalyticsRoot)",
+    "openapi": "globalCostAnalytics"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-024-get-api-analytics-error-breakdown",
+   "method": "GET",
+   "path": "/api/analytics/error-breakdown",
+   "handler": "h.apiErrorBreakdown()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:22",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:22 (mountAnalytics)",
+    "openapi": "analyticsErrorBreakdown"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-025-get-api-analytics-label-keys",
+   "method": "GET",
+   "path": "/api/analytics/label-keys",
+   "handler": "h.apiAnalyticsLabelKeys()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:31",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:31 (mountAnalytics)",
+    "openapi": "analyticsLabelKeys"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-026-get-api-analytics-latency",
+   "method": "GET",
+   "path": "/api/analytics/latency",
+   "handler": "h.apiLatency()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:24",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:24 (mountAnalytics)",
+    "openapi": "analyticsLatency"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-027-get-api-analytics-quality",
+   "method": "GET",
+   "path": "/api/analytics/quality",
+   "handler": "h.QualityScoresHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:73",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:73 (mountAnalyticsRoot)",
+    "openapi": "qualityScores"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-028-get-api-analytics-query",
+   "method": "GET",
+   "path": "/api/analytics/query",
+   "handler": "h.apiAnalyticsQuery()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:26",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:26 (mountAnalytics)",
+    "openapi": "analyticsQuery"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-029-get-api-analytics-recent-errors",
+   "method": "GET",
+   "path": "/api/analytics/recent-errors",
+   "handler": "h.apiRecentErrors()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:25",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:25 (mountAnalytics)",
+    "openapi": "analyticsRecentErrors"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-030-get-api-analytics-savings",
+   "method": "GET",
+   "path": "/api/analytics/savings",
+   "handler": "h.SavingsReportHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:68",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:68 (mountAnalyticsRoot)",
+    "openapi": "savingsReport"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-031-get-api-analytics-shadow",
+   "method": "GET",
+   "path": "/api/analytics/shadow",
+   "handler": "h.ShadowComparisonHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:70",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:70 (mountAnalyticsRoot)",
+    "openapi": "shadowComparison"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-032-get-api-analytics-stats",
+   "method": "GET",
+   "path": "/api/analytics/stats",
+   "handler": "h.apiAnalyticsStats()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:19",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:19 (mountAnalytics)",
+    "openapi": "analyticsStats"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-033-get-api-analytics-tasks",
+   "method": "GET",
+   "path": "/api/analytics/tasks",
+   "handler": "h.apiTaskAnalytics()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:23",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:23 (mountAnalytics)",
+    "openapi": "analyticsTasks"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-034-get-api-analytics-time-series",
+   "method": "GET",
+   "path": "/api/analytics/time-series",
+   "handler": "h.apiTimeSeries()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:21",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:21 (mountAnalytics)",
+    "openapi": "analyticsTimeSeries"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-035-get-api-analytics-top-models",
+   "method": "GET",
+   "path": "/api/analytics/top-models",
+   "handler": "h.apiTopModels()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:20",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:20 (mountAnalytics)",
+    "openapi": "analyticsTopModels"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-036-get-api-analytics-top-orgs",
+   "method": "GET",
+   "path": "/api/analytics/top-orgs",
+   "handler": "h.apiTopOrgs()",
+   "handler_ref": "services/admin/handlers/router_audit.go:26",
+   "grant_scope": "session+CSRF+root(MustBeRoot)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_audit.go:26 (mountAudit)",
+    "openapi": "analyticsTopOrgs"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-037-get-api-analytics-views",
+   "method": "GET",
+   "path": "/api/analytics/views",
+   "handler": "h.ListAnalyticsViews()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:27",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:27 (mountAnalytics)",
+    "openapi": "listAnalyticsViews"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-038-post-api-analytics-views",
+   "method": "POST",
+   "path": "/api/analytics/views",
+   "handler": "h.CreateAnalyticsView()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:28",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:28 (mountAnalytics)",
+    "openapi": "createAnalyticsView"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-039-delete-api-analytics-views-id",
+   "method": "DELETE",
+   "path": "/api/analytics/views/{id}",
+   "handler": "h.DeleteAnalyticsView()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:30",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:30 (mountAnalytics)",
+    "openapi": "deleteAnalyticsView"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-040-put-api-analytics-views-id",
+   "method": "PUT",
+   "path": "/api/analytics/views/{id}",
+   "handler": "h.UpdateAnalyticsView()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:29",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:29 (mountAnalytics)",
+    "openapi": "updateAnalyticsView"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-041-get-api-analytics-org-id-cache",
+   "method": "GET",
+   "path": "/api/analytics/{org_id}/cache",
+   "handler": "h.CacheAnalyticsHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:63",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:63 (mountAnalyticsRoot)",
+    "openapi": "orgCacheAnalytics"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-042-get-api-analytics-org-id-cost",
+   "method": "GET",
+   "path": "/api/analytics/{org_id}/cost",
+   "handler": "h.CostAnalyticsHandler()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:66",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:66 (mountAnalyticsRoot)",
+    "openapi": "orgCostAnalytics"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-043-get-api-api-keys",
+   "method": "GET",
+   "path": "/api/api-keys",
+   "handler": "h.ListAPIKeys()",
+   "handler_ref": "services/admin/handlers/router_keys.go:17",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:17 (mountKeys)",
+    "openapi": "listAPIKeys"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-044-post-api-api-keys",
+   "method": "POST",
+   "path": "/api/api-keys",
+   "handler": "h.CreateAPIKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:18",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:18 (mountKeys)",
+    "openapi": "createAPIKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-045-delete-api-api-keys-id",
+   "method": "DELETE",
+   "path": "/api/api-keys/{id}",
+   "handler": "h.DeleteAPIKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:23",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:23 (mountKeys)",
+    "openapi": "deleteAPIKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-046-get-api-api-keys-id",
+   "method": "GET",
+   "path": "/api/api-keys/{id}",
+   "handler": "h.GetAPIKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:19",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:19 (mountKeys)",
+    "openapi": "getAPIKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-047-put-api-api-keys-id",
+   "method": "PUT",
+   "path": "/api/api-keys/{id}",
+   "handler": "h.UpdateAPIKeyActive()",
+   "handler_ref": "services/admin/handlers/router_keys.go:20",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:20 (mountKeys)",
+    "openapi": "updateAPIKeyActive"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-048-put-api-api-keys-id-labels",
+   "method": "PUT",
+   "path": "/api/api-keys/{id}/labels",
+   "handler": "h.UpdateAPIKeyLabels()",
+   "handler_ref": "services/admin/handlers/router_keys.go:21",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:21 (mountKeys)",
+    "openapi": "updateAPIKeyLabels"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-049-post-api-api-keys-id-rotate",
+   "method": "POST",
+   "path": "/api/api-keys/{id}/rotate",
+   "handler": "h.RotateAPIKey()",
+   "handler_ref": "services/admin/handlers/router_keys.go:22",
+   "grant_scope": "session+CSRF+org:keys.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:22 (mountKeys)",
+    "openapi": "rotateAPIKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-050-get-api-audit-logs",
+   "method": "GET",
+   "path": "/api/audit-logs",
+   "handler": "h.ListAuditLogs()",
+   "handler_ref": "services/admin/handlers/router_audit.go:19",
+   "grant_scope": "session+CSRF+global audit read",
+   "ui_surface": "audit-log [audit.ts:38]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_audit.go:19 (mountAudit)",
+    "openapi": "listAuditLogs",
+    "ui": "audit.ts:38"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-051-get-api-budgets",
+   "method": "GET",
+   "path": "/api/budgets",
+   "handler": "h.BudgetCaps()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:113",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:113 (mountCurrenciesRoutes)",
+    "openapi": "getBudgetCapsStatus"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-052-get-api-cache-analytics",
+   "method": "GET",
+   "path": "/api/cache/analytics",
+   "handler": "h.CacheAnalytics()",
+   "handler_ref": "services/admin/handlers/router_ops.go:19",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:19 (mountOps)",
+    "openapi": "cacheAnalytics"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-053-get-api-cache-experiments",
+   "method": "GET",
+   "path": "/api/cache/experiments",
+   "handler": "h.ListExperimentsHandler()",
+   "handler_ref": "services/admin/handlers/router_ops.go:24",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:24 (mountOps)",
+    "openapi": "listCacheExperiments"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-054-post-api-cache-experiments",
+   "method": "POST",
+   "path": "/api/cache/experiments",
+   "handler": "h.CreateExperimentHandler()",
+   "handler_ref": "services/admin/handlers/router_ops.go:23",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:23 (mountOps)",
+    "openapi": "createCacheExperiment"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-055-get-api-cache-experiments-exp-id-results",
+   "method": "GET",
+   "path": "/api/cache/experiments/{exp_id}/results",
+   "handler": "h.GetExperimentResultsHandler()",
+   "handler_ref": "services/admin/handlers/router_ops.go:25",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:25 (mountOps)",
+    "openapi": "cacheExperimentResults"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-056-post-api-cache-flush",
+   "method": "POST",
+   "path": "/api/cache/flush",
+   "handler": "h.FlushCache()",
+   "handler_ref": "services/admin/handlers/router_ops.go:18",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:18 (mountOps)",
+    "openapi": "flushCache"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-057-post-api-cache-warm",
+   "method": "POST",
+   "path": "/api/cache/warm",
+   "handler": "h.WarmCache()",
+   "handler_ref": "services/admin/handlers/router_ops.go:20",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:20 (mountOps)",
+    "openapi": "warmCache"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-058-get-api-client-config-agent",
+   "method": "GET",
+   "path": "/api/client-config/{agent}",
+   "handler": "h.ClientConfig()",
+   "handler_ref": "services/admin/handlers/router_console.go:41",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:41 (mountConsole)",
+    "openapi": "getClientConfig"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-059-get-api-credits-ledger",
+   "method": "GET",
+   "path": "/api/credits/ledger",
+   "handler": "h.CreditsLedger()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:114",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:114 (mountCurrenciesRoutes)",
+    "openapi": "getCreditsLedgerView"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-060-get-api-credits-low-balance",
+   "method": "GET",
+   "path": "/api/credits/low-balance",
+   "handler": "h.billing.lowBalance",
+   "handler_ref": "services/admin/handlers/router_billing.go:75",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:75 (mountBillingRoot)",
+    "openapi": "listLowBalanceOrgs"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-061-get-api-entitlement-diagnostics",
+   "method": "GET",
+   "path": "/api/entitlement/diagnostics",
+   "handler": "h.apiEntitlementDiagnostics()",
+   "handler_ref": "services/admin/handlers/entitlement_diagnostics_handlers.go:101",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/entitlement_diagnostics_handlers.go:101 (mountEntitlementDiagnostics)",
+    "openapi": "getEntitlementDiagnostics"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-062-get-api-feedback",
+   "method": "GET",
+   "path": "/api/feedback",
+   "handler": "h.ListFeedbackHandler()",
+   "handler_ref": "services/admin/handlers/router_ops.go:68",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "feedback [feedback.ts:40]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:68 (mountOps)",
+    "openapi": "listFeedback",
+    "ui": "feedback.ts:40",
+    "availability": "registered only when feedback.lister wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-063-get-api-feedback-export",
+   "method": "GET",
+   "path": "/api/feedback/export",
+   "handler": "r.Get(\"/api/feedback/export\", func(w http.ResponseWriter, r *http.Request) {",
+   "handler_ref": "services/admin/handlers/router_ops.go:50",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:50 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when feedback.exporter wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-064-get-api-feedback-export",
+   "method": "GET",
+   "path": "/api/feedback/export",
+   "handler": "h.ExportFeedbackHandler()",
+   "handler_ref": "services/admin/handlers/router_ops.go:69",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:69 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when feedback.exporter wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-065-get-api-guard-packs",
+   "method": "GET",
+   "path": "/api/guard-packs",
+   "handler": "h.guardPacks.handleList",
+   "handler_ref": "services/admin/handlers/guardpacks.go:120",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:120 (mountGuard)",
+    "openapi": "listGuardPacks"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-066-post-api-guard-packs-activate",
+   "method": "POST",
+   "path": "/api/guard-packs/activate",
+   "handler": "h.guardPacks.handleActivate",
+   "handler_ref": "services/admin/handlers/guardpacks.go:118",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:118 (mountGuard)",
+    "openapi": "activateGuardPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-067-post-api-guard-packs-rollback",
+   "method": "POST",
+   "path": "/api/guard-packs/rollback",
+   "handler": "h.guardPacks.handleRollback",
+   "handler_ref": "services/admin/handlers/guardpacks.go:119",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:119 (mountGuard)",
+    "openapi": "rollbackGuardPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-068-post-api-guard-packs-simulate",
+   "method": "POST",
+   "path": "/api/guard-packs/simulate",
+   "handler": "h.guardPacks.handleSimulate",
+   "handler_ref": "services/admin/handlers/guardpacks.go:123",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:123 (mountGuard)",
+    "openapi": "simulateGuardPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-069-get-api-guard-packs-status",
+   "method": "GET",
+   "path": "/api/guard-packs/status",
+   "handler": "h.guardPacks.handleStatus",
+   "handler_ref": "services/admin/handlers/guardpacks.go:121",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:121 (mountGuard)",
+    "openapi": "getGuardPackStatus"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-070-post-api-guard-packs-validate",
+   "method": "POST",
+   "path": "/api/guard-packs/validate",
+   "handler": "h.guardPacks.handleValidate",
+   "handler_ref": "services/admin/handlers/guardpacks.go:122",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/guardpacks.go:122 (mountGuard)",
+    "openapi": "validateGuardPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-071-delete-api-label-policy",
+   "method": "DELETE",
+   "path": "/api/label-policy",
+   "handler": "h.DeleteLabelPolicy()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:35",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:35 (mountAnalytics)",
+    "openapi": "deleteLabelPolicy"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-072-get-api-label-policy",
+   "method": "GET",
+   "path": "/api/label-policy",
+   "handler": "h.GetLabelPolicy()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:32",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:32 (mountAnalytics)",
+    "openapi": "getLabelPolicy"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-073-put-api-label-policy",
+   "method": "PUT",
+   "path": "/api/label-policy",
+   "handler": "h.PutLabelPolicy()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:34",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:34 (mountAnalytics)",
+    "openapi": "putLabelPolicy"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-074-post-api-label-policy-test",
+   "method": "POST",
+   "path": "/api/label-policy/test",
+   "handler": "h.TestLabelPolicy()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:33",
+   "grant_scope": "session+CSRF+org:analytics.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:33 (mountAnalytics)",
+    "openapi": "testLabelPolicy"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-075-get-api-lineage-request-id",
+   "method": "GET",
+   "path": "/api/lineage/{request_id}",
+   "handler": "h.GetLineageByRequest()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:49",
+   "grant_scope": "session+CSRF+org:lineage.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:49 (mountExplorer)",
+    "openapi": "getLineage"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-076-post-api-lineage-request-id-verify",
+   "method": "POST",
+   "path": "/api/lineage/{request_id}/verify",
+   "handler": "h.VerifyLineage()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:51",
+   "grant_scope": "session+CSRF+org:lineage.verify",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:51 (mountExplorer)",
+    "openapi": "verifyLineage"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-077-get-api-me",
+   "method": "GET",
+   "path": "/api/me",
+   "handler": "h.Me()",
+   "handler_ref": "services/admin/handlers/router_console.go:22",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:22 (mountConsole)",
+    "openapi": "me"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-078-get-api-me",
+   "method": "GET",
+   "path": "/api/me",
+   "handler": "h.PortalMe()",
+   "handler_ref": "services/admin/handlers/router_portal.go:24",
+   "grant_scope": "portal session + portal CSRF (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:24 (mountPortal)",
+    "openapi": "me"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-079-get-api-me-keys",
+   "method": "GET",
+   "path": "/api/me/keys",
+   "handler": "h.PortalListKeys()",
+   "handler_ref": "services/admin/handlers/router_portal.go:25",
+   "grant_scope": "portal session + portal CSRF (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:25 (mountPortal)",
+    "openapi": "portalListKeys"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-080-post-api-me-keys",
+   "method": "POST",
+   "path": "/api/me/keys",
+   "handler": "h.PortalCreateKey()",
+   "handler_ref": "services/admin/handlers/router_portal.go:26",
+   "grant_scope": "portal session + portal CSRF (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:26 (mountPortal)",
+    "openapi": "portalCreateKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-081-delete-api-me-keys-id",
+   "method": "DELETE",
+   "path": "/api/me/keys/{id}",
+   "handler": "h.PortalDeleteKey()",
+   "handler_ref": "services/admin/handlers/router_portal.go:27",
+   "grant_scope": "portal session + portal CSRF (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:27 (mountPortal)",
+    "openapi": "portalDeleteKey"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-082-get-api-me-onboarding",
+   "method": "GET",
+   "path": "/api/me/onboarding",
+   "handler": "h.MyOnboarding()",
+   "handler_ref": "services/admin/handlers/router_console.go:51",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:51 (mountConsole)",
+    "openapi": "adminMyOnboardingGet"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-083-post-api-me-onboarding",
+   "method": "POST",
+   "path": "/api/me/onboarding",
+   "handler": "h.MarkMyOnboarding()",
+   "handler_ref": "services/admin/handlers/router_console.go:52",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:52 (mountConsole)",
+    "openapi": "adminMyOnboardingMark"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-084-post-api-me-password",
+   "method": "POST",
+   "path": "/api/me/password",
+   "handler": "h.ChangeMyPassword()",
+   "handler_ref": "services/admin/handlers/router_console.go:26",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:26 (mountConsole)",
+    "openapi": "adminChangeMyPassword"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-085-get-api-model-aliases",
+   "method": "GET",
+   "path": "/api/model-aliases",
+   "handler": "h.ListModelAliases()",
+   "handler_ref": "services/admin/handlers/router_models.go:18",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:18 (mountModels)",
+    "openapi": "listModelAliases"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-086-post-api-model-aliases",
+   "method": "POST",
+   "path": "/api/model-aliases",
+   "handler": "h.CreateModelAlias()",
+   "handler_ref": "services/admin/handlers/router_models.go:19",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:19 (mountModels)",
+    "openapi": "createModelAlias"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-087-delete-api-model-aliases-alias",
+   "method": "DELETE",
+   "path": "/api/model-aliases/{alias}",
+   "handler": "h.DeleteModelAlias()",
+   "handler_ref": "services/admin/handlers/router_models.go:20",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:20 (mountModels)",
+    "openapi": "deleteModelAlias"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-088-get-api-models",
+   "method": "GET",
+   "path": "/api/models",
+   "handler": "h.ListModels()",
+   "handler_ref": "services/admin/handlers/router_models.go:13",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "models [models.ts:41; models.ts:86]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:13 (mountModels)",
+    "openapi": "listModels",
+    "ui": "models.ts:41; models.ts:86"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-089-post-api-models",
+   "method": "POST",
+   "path": "/api/models",
+   "handler": "h.CreateModel()",
+   "handler_ref": "services/admin/handlers/router_models.go:14",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "models [models.ts:41; models.ts:86]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:14 (mountModels)",
+    "openapi": "createModel",
+    "ui": "models.ts:41; models.ts:86"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-090-delete-api-models-name",
+   "method": "DELETE",
+   "path": "/api/models/{name}",
+   "handler": "h.DeleteModel()",
+   "handler_ref": "services/admin/handlers/router_models.go:17",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:17 (mountModels)",
+    "openapi": "deleteModel"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-091-get-api-models-name",
+   "method": "GET",
+   "path": "/api/models/{name}",
+   "handler": "h.GetModel()",
+   "handler_ref": "services/admin/handlers/router_models.go:15",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:15 (mountModels)",
+    "openapi": "getModel"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-092-put-api-models-name",
+   "method": "PUT",
+   "path": "/api/models/{name}",
+   "handler": "h.UpdateModel()",
+   "handler_ref": "services/admin/handlers/router_models.go:16",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:16 (mountModels)",
+    "openapi": "updateModel"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-093-post-api-models-name-bump-version",
+   "method": "POST",
+   "path": "/api/models/{name}/bump-version",
+   "handler": "h.BumpModelVersion()",
+   "handler_ref": "services/admin/handlers/router_models.go:34",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:34 (mountModels)",
+    "openapi": "bumpModelVersion"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-094-get-api-organizations",
+   "method": "GET",
+   "path": "/api/organizations",
+   "handler": "h.ListOrganizations()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:41",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "orgs [orgs.ts:18; orgs.ts:26]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:41 (mountOrgsRoot)",
+    "openapi": "listOrganizations",
+    "ui": "orgs.ts:18; orgs.ts:26"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-095-post-api-organizations",
+   "method": "POST",
+   "path": "/api/organizations",
+   "handler": "h.CreateOrganization()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:42",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "orgs [orgs.ts:18; orgs.ts:26]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:42 (mountOrgsRoot)",
+    "openapi": "createOrganization",
+    "ui": "orgs.ts:18; orgs.ts:26"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-096-delete-api-organizations-id",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}",
+   "handler": "h.DeleteOrganization()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:45",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:45 (mountOrgsRoot)",
+    "openapi": "deleteOrganization"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-097-get-api-organizations-id",
+   "method": "GET",
+   "path": "/api/organizations/{id}",
+   "handler": "h.GetOrganization()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:43",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:43 (mountOrgsRoot)",
+    "openapi": "getOrganization"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-098-put-api-organizations-id",
+   "method": "PUT",
+   "path": "/api/organizations/{id}",
+   "handler": "h.UpdateOrganization()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:44",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:44 (mountOrgsRoot)",
+    "openapi": "updateOrganization"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-099-get-api-organizations-id-a2a-agents",
+   "method": "GET",
+   "path": "/api/organizations/{id}/a2a/agents",
+   "handler": "h.ListA2AAgents()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:42",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:42 (mountMCP)",
+    "openapi": "listA2AAgents",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-100-post-api-organizations-id-a2a-agents",
+   "method": "POST",
+   "path": "/api/organizations/{id}/a2a/agents",
+   "handler": "h.CreateA2AAgent()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:41",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:41 (mountMCP)",
+    "openapi": "createA2AAgent",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-101-delete-api-organizations-id-a2a-agents-name",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/a2a/agents/{name}",
+   "handler": "h.DeleteA2AAgent()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:45",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:45 (mountMCP)",
+    "openapi": "deleteA2AAgent",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-102-get-api-organizations-id-a2a-agents-name",
+   "method": "GET",
+   "path": "/api/organizations/{id}/a2a/agents/{name}",
+   "handler": "h.GetA2AAgent()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:43",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:43 (mountMCP)",
+    "openapi": "getA2AAgent",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-103-patch-api-organizations-id-a2a-agents-name",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/a2a/agents/{name}",
+   "handler": "h.UpdateA2AAgent()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:44",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:44 (mountMCP)",
+    "openapi": "updateA2AAgent",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-104-get-api-organizations-id-cache-settings",
+   "method": "GET",
+   "path": "/api/organizations/{id}/cache-settings",
+   "handler": "h.GetOrgCacheSettings()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:62",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:62 (mountOrgsRoot)",
+    "openapi": "getOrgCacheSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-105-patch-api-organizations-id-cache-settings",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/cache-settings",
+   "handler": "h.UpdateOrgCacheSettings()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:63",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:63 (mountOrgsRoot)",
+    "openapi": "updateOrgCacheSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-106-get-api-organizations-id-canary-rollouts",
+   "method": "GET",
+   "path": "/api/organizations/{id}/canary-rollouts",
+   "handler": "h.canaryRollouts.handleList",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:114",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:114 (mountCanaryRollouts)",
+    "openapi": "listCanaryRollouts"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-107-post-api-organizations-id-canary-rollouts",
+   "method": "POST",
+   "path": "/api/organizations/{id}/canary-rollouts",
+   "handler": "h.canaryRollouts.handleCreate",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:115",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:115 (mountCanaryRollouts)",
+    "openapi": "createCanaryRollout"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-108-delete-api-organizations-id-canary-rollouts-rolloutId",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/canary-rollouts/{rolloutId}",
+   "handler": "h.canaryRollouts.handleRemove",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:118",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:118 (mountCanaryRollouts)",
+    "openapi": "deleteCanaryRollout"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-109-get-api-organizations-id-canary-rollouts-rolloutId",
+   "method": "GET",
+   "path": "/api/organizations/{id}/canary-rollouts/{rolloutId}",
+   "handler": "h.canaryRollouts.handleGet",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:116",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:116 (mountCanaryRollouts)",
+    "openapi": "getCanaryRollout"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-110-put-api-organizations-id-canary-rollouts-rolloutId",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/canary-rollouts/{rolloutId}",
+   "handler": "h.canaryRollouts.handleUpdate",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:117",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:117 (mountCanaryRollouts)",
+    "openapi": "updateCanaryRollout"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-111-get-api-organizations-id-canary-rollouts-rolloutId-recommendation",
+   "method": "GET",
+   "path": "/api/organizations/{id}/canary-rollouts/{rolloutId}/recommendation",
+   "handler": "h.canaryRollouts.handleRecommendation",
+   "handler_ref": "services/admin/handlers/canary_rollouts.go:119",
+   "grant_scope": "session+CSRF+org:routing.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/canary_rollouts.go:119 (mountCanaryRollouts)",
+    "openapi": "getCanaryRolloutRecommendation"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-112-get-api-organizations-id-developers",
+   "method": "GET",
+   "path": "/api/organizations/{id}/developers",
+   "handler": "h.ListDevelopers()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:27",
+   "grant_scope": "session+CSRF+org:members.manage (portal store required)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:27 (mountOrgs)",
+    "openapi": "listDevelopers"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-113-post-api-organizations-id-developers",
+   "method": "POST",
+   "path": "/api/organizations/{id}/developers",
+   "handler": "h.CreateDeveloper()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:28",
+   "grant_scope": "session+CSRF+org:members.manage (portal store required)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:28 (mountOrgs)",
+    "openapi": "createDeveloper"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-114-delete-api-organizations-id-developers-userID",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/developers/{userID}",
+   "handler": "h.DeleteDeveloper()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:30",
+   "grant_scope": "session+CSRF+org:members.manage (portal store required)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:30 (mountOrgs)",
+    "openapi": "deleteDeveloper"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-115-put-api-organizations-id-developers-userID",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/developers/{userID}",
+   "handler": "h.UpdateDeveloper()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:29",
+   "grant_scope": "session+CSRF+org:members.manage (portal store required)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:29 (mountOrgs)",
+    "openapi": "updateDeveloper"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-116-get-api-organizations-id-inventory",
+   "method": "GET",
+   "path": "/api/organizations/{id}/inventory",
+   "handler": "h.ListInventory(h.inventory.lister)",
+   "handler_ref": "services/admin/handlers/router_inventory.go:52",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 until SetInventory",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_inventory.go:52 (mountInventory)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when SetInventory wired",
+    "spec_delta": "OPENAPI-DELTA.md 2026-11-07 INVENTORY-LIST"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-117-post-api-organizations-id-inventory-import-mcp",
+   "method": "POST",
+   "path": "/api/organizations/{id}/inventory/import/mcp",
+   "handler": "h.ImportMCPInventory(h.inventory.mcpRunner)",
+   "handler_ref": "services/admin/handlers/router_inventory.go:53",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 until SetInventory",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_inventory.go:53 (mountInventory)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when SetInventory wired",
+    "spec_delta": "OPENAPI-DELTA.md 2026-11-07 INVENTORY-IMPORT"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-118-post-api-organizations-id-inventory-import-models",
+   "method": "POST",
+   "path": "/api/organizations/{id}/inventory/import/models",
+   "handler": "h.ImportModelsInventory(h.inventory.modelRunner)",
+   "handler_ref": "services/admin/handlers/router_inventory.go:54",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 until SetInventory",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_inventory.go:54 (mountInventory)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when SetInventory wired",
+    "spec_delta": "OPENAPI-DELTA.md 2026-11-07 INVENTORY-MODELS-IMPORT"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-119-get-api-organizations-id-lineage",
+   "method": "GET",
+   "path": "/api/organizations/{id}/lineage",
+   "handler": "h.ListLineageByOrg()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:50",
+   "grant_scope": "session+CSRF+org:lineage.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:50 (mountExplorer)",
+    "openapi": "listOrgLineage"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-120-get-api-organizations-id-mcp-servers",
+   "method": "GET",
+   "path": "/api/organizations/{id}/mcp/servers",
+   "handler": "h.ListMCPServers()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:17",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:17 (mountMCP)",
+    "openapi": "listMCPServers",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-121-post-api-organizations-id-mcp-servers",
+   "method": "POST",
+   "path": "/api/organizations/{id}/mcp/servers",
+   "handler": "h.CreateMCPServer()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:16",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:16 (mountMCP)",
+    "openapi": "createMCPServer",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-122-delete-api-organizations-id-mcp-servers-name",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/mcp/servers/{name}",
+   "handler": "h.DeleteMCPServer()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:20",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:20 (mountMCP)",
+    "openapi": "deleteMCPServer",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-123-get-api-organizations-id-mcp-servers-name",
+   "method": "GET",
+   "path": "/api/organizations/{id}/mcp/servers/{name}",
+   "handler": "h.GetMCPServer()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:18",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:18 (mountMCP)",
+    "openapi": "getMCPServer",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-124-patch-api-organizations-id-mcp-servers-name",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/mcp/servers/{name}",
+   "handler": "h.UpdateMCPServer()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:19",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:19 (mountMCP)",
+    "openapi": "updateMCPServer",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-125-delete-api-organizations-id-mcp-servers-name-credential",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/credential",
+   "handler": "h.DeleteMCPServerCredential()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:56",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:56 (mountMCP)",
+    "openapi": "deleteMCPServerCredential",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-126-get-api-organizations-id-mcp-servers-name-credential",
+   "method": "GET",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/credential",
+   "handler": "h.GetMCPServerCredential()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:55",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:55 (mountMCP)",
+    "openapi": "getMCPServerCredential",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-127-put-api-organizations-id-mcp-servers-name-credential",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/credential",
+   "handler": "h.PutMCPServerCredential()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:54",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:54 (mountMCP)",
+    "openapi": "putMCPServerCredential",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-128-get-api-organizations-id-mcp-servers-name-grants",
+   "method": "GET",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/grants",
+   "handler": "h.ListMCPGrants()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:47",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:47 (mountMCP)",
+    "openapi": "listMCPGrants",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-129-post-api-organizations-id-mcp-servers-name-grants",
+   "method": "POST",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/grants",
+   "handler": "h.CreateMCPGrant()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:48",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:48 (mountMCP)",
+    "openapi": "createMCPGrant",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-130-delete-api-organizations-id-mcp-servers-name-grants-agent-id",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/grants/{agent_id}",
+   "handler": "h.DeleteMCPGrant()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:50",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:50 (mountMCP)",
+    "openapi": "deleteMCPGrant",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-131-patch-api-organizations-id-mcp-servers-name-grants-agent-id",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/mcp/servers/{name}/grants/{agent_id}",
+   "handler": "h.UpdateMCPGrant()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:49",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:49 (mountMCP)",
+    "openapi": "updateMCPGrant",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-132-get-api-organizations-id-members",
+   "method": "GET",
+   "path": "/api/organizations/{id}/members",
+   "handler": "h.ListOrgMembers()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:16",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:16 (mountOrgs)",
+    "openapi": "listOrgMembers"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-133-post-api-organizations-id-members",
+   "method": "POST",
+   "path": "/api/organizations/{id}/members",
+   "handler": "h.CreateOrgMember()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:17",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:17 (mountOrgs)",
+    "openapi": "createOrgMember"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-134-post-api-organizations-id-members-invite",
+   "method": "POST",
+   "path": "/api/organizations/{id}/members/invite",
+   "handler": "h.CreateInvite()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:23",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:23 (mountOrgs)",
+    "openapi": "createMemberInvite"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-135-get-api-organizations-id-members-invites",
+   "method": "GET",
+   "path": "/api/organizations/{id}/members/invites",
+   "handler": "h.ListInvites()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:22",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:22 (mountOrgs)",
+    "openapi": "listMemberInvites"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-136-post-api-organizations-id-members-invites-inviteID-resend",
+   "method": "POST",
+   "path": "/api/organizations/{id}/members/invites/{inviteID}/resend",
+   "handler": "h.ResendInvite()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:24",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:24 (mountOrgs)",
+    "openapi": "resendMemberInvite"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-137-post-api-organizations-id-members-invites-inviteID-revoke",
+   "method": "POST",
+   "path": "/api/organizations/{id}/members/invites/{inviteID}/revoke",
+   "handler": "h.RevokeInvite()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:25",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:25 (mountOrgs)",
+    "openapi": "revokeMemberInvite"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-138-delete-api-organizations-id-members-userID",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/members/{userID}",
+   "handler": "h.DeleteOrgMember()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:19",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:19 (mountOrgs)",
+    "openapi": "deleteOrgMember"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-139-put-api-organizations-id-members-userID",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/members/{userID}",
+   "handler": "h.UpdateOrgMember()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:18",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:18 (mountOrgs)",
+    "openapi": "updateOrgMember"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-140-get-api-organizations-id-original-retention",
+   "method": "GET",
+   "path": "/api/organizations/{id}/original-retention",
+   "handler": "h.GetOrgOriginalRetention()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:33",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:33 (mountOrgs)",
+    "openapi": "getOrgOriginalRetention"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-141-patch-api-organizations-id-original-retention",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/original-retention",
+   "handler": "h.UpdateOrgOriginalRetention()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:34",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:34 (mountOrgs)",
+    "openapi": "updateOrgOriginalRetention"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-142-get-api-organizations-id-partials",
+   "method": "GET",
+   "path": "/api/organizations/{id}/partials",
+   "handler": "h.promptStudio.handlePartialList",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:120",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:120 (mountPromptStudio)",
+    "openapi": "listPartials"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-143-post-api-organizations-id-partials",
+   "method": "POST",
+   "path": "/api/organizations/{id}/partials",
+   "handler": "h.promptStudio.handlePartialCreate",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:121",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:121 (mountPromptStudio)",
+    "openapi": "createPartial"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-144-delete-api-organizations-id-partials-partialName",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/partials/{partialName}",
+   "handler": "h.promptStudio.handlePartialRemove",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:123",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:123 (mountPromptStudio)",
+    "openapi": "deletePartial"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-145-put-api-organizations-id-partials-partialName",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/partials/{partialName}",
+   "handler": "h.promptStudio.handlePartialUpdate",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:122",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:122 (mountPromptStudio)",
+    "openapi": "updatePartial"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-146-get-api-organizations-id-policies",
+   "method": "GET",
+   "path": "/api/organizations/{id}/policies",
+   "handler": "h.policyPipes.handleList",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:161",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:161 (mountPolicyPipelines)",
+    "openapi": "listPolicyPipelines"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-147-post-api-organizations-id-policies",
+   "method": "POST",
+   "path": "/api/organizations/{id}/policies",
+   "handler": "h.policyPipes.handleCreate",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:162",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:162 (mountPolicyPipelines)",
+    "openapi": "createPolicyPipeline"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-148-get-api-organizations-id-policies-drift",
+   "method": "GET",
+   "path": "/api/organizations/{id}/policies/drift",
+   "handler": "h.policyPipes.handleDrift",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:167",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:167 (mountPolicyPipelines)",
+    "openapi": "getPolicyPipelinesDrift"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-149-post-api-organizations-id-policies-validate",
+   "method": "POST",
+   "path": "/api/organizations/{id}/policies/validate",
+   "handler": "h.policyPipes.handleValidate",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:166",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:166 (mountPolicyPipelines)",
+    "openapi": "validatePolicyPipeline"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-150-delete-api-organizations-id-policies-policyId",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/policies/{policyId}",
+   "handler": "h.policyPipes.handleRemove",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:170",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:170 (mountPolicyPipelines)",
+    "openapi": "deletePolicyPipeline"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-151-get-api-organizations-id-policies-policyId",
+   "method": "GET",
+   "path": "/api/organizations/{id}/policies/{policyId}",
+   "handler": "h.policyPipes.handleGet",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:168",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:168 (mountPolicyPipelines)",
+    "openapi": "getPolicyPipeline"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-152-put-api-organizations-id-policies-policyId",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/policies/{policyId}",
+   "handler": "h.policyPipes.handleUpdate",
+   "handler_ref": "services/admin/handlers/policy_pipelines.go:169",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_pipelines.go:169 (mountPolicyPipelines)",
+    "openapi": "updatePolicyPipeline"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-153-get-api-organizations-id-policy-decisions",
+   "method": "GET",
+   "path": "/api/organizations/{id}/policy-decisions",
+   "handler": "h.policyDecisions.handleList",
+   "handler_ref": "services/admin/handlers/policy_decisions.go:67",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/policy_decisions.go:67 (mountPolicyDecisions)",
+    "openapi": "listPolicyDecisions"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-154-get-api-organizations-id-policy-packs",
+   "method": "GET",
+   "path": "/api/organizations/{id}/policy-packs",
+   "handler": "h.ListPolicyPacks()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:70",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:70 (mountOrgsRoot)",
+    "openapi": "listPolicyPacks"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-155-delete-api-organizations-id-policy-packs-packID",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/policy-packs/{packID}",
+   "handler": "h.DeletePolicyPack()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:72",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:72 (mountOrgsRoot)",
+    "openapi": "deletePolicyPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-156-put-api-organizations-id-policy-packs-region",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/policy-packs/{region}",
+   "handler": "h.UpsertPolicyPack()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:71",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:71 (mountOrgsRoot)",
+    "openapi": "upsertPolicyPack"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-157-get-api-organizations-id-prompts",
+   "method": "GET",
+   "path": "/api/organizations/{id}/prompts",
+   "handler": "h.promptStudio.handleList",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:114",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:114 (mountPromptStudio)",
+    "openapi": "listPrompts"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-158-post-api-organizations-id-prompts",
+   "method": "POST",
+   "path": "/api/organizations/{id}/prompts",
+   "handler": "h.promptStudio.handleCreate",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:115",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:115 (mountPromptStudio)",
+    "openapi": "createPrompt"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-159-delete-api-organizations-id-prompts-promptId",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/prompts/{promptId}",
+   "handler": "h.promptStudio.handleRemove",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:118",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:118 (mountPromptStudio)",
+    "openapi": "deletePrompt"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-160-get-api-organizations-id-prompts-promptId",
+   "method": "GET",
+   "path": "/api/organizations/{id}/prompts/{promptId}",
+   "handler": "h.promptStudio.handleGet",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:116",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:116 (mountPromptStudio)",
+    "openapi": "getPrompt"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-161-put-api-organizations-id-prompts-promptId",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/prompts/{promptId}",
+   "handler": "h.promptStudio.handleUpdate",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:117",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:117 (mountPromptStudio)",
+    "openapi": "updatePrompt"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-162-post-api-organizations-id-prompts-promptId-labels",
+   "method": "POST",
+   "path": "/api/organizations/{id}/prompts/{promptId}/labels",
+   "handler": "h.promptStudio.handlePromoteLabel",
+   "handler_ref": "services/admin/handlers/prompt_studio.go:119",
+   "grant_scope": "session+CSRF+org:policies.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/prompt_studio.go:119 (mountPromptStudio)",
+    "openapi": "promotePromptLabel"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-163-get-api-organizations-id-region",
+   "method": "GET",
+   "path": "/api/organizations/{id}/region",
+   "handler": "h.regionHandlers.GetOrgRegion",
+   "handler_ref": "services/admin/handlers/router_ops.go:30",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:30 (mountOps)",
+    "openapi": "getOrgRegion",
+    "availability": "registered only when regionHandlers wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-164-put-api-organizations-id-region",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/region",
+   "handler": "h.regionHandlers.UpdateOrgRegion",
+   "handler_ref": "services/admin/handlers/router_ops.go:31",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:31 (mountOps)",
+    "openapi": "updateOrgRegion",
+    "availability": "registered only when regionHandlers wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-165-get-api-organizations-id-requests",
+   "method": "GET",
+   "path": "/api/organizations/{id}/requests",
+   "handler": "h.apiOrgRequests()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:42",
+   "grant_scope": "session+CSRF+org:requests.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:42 (mountExplorer)",
+    "openapi": "listOrgRequests"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-166-get-api-organizations-id-requests-archive-search",
+   "method": "GET",
+   "path": "/api/organizations/{id}/requests/archive-search",
+   "handler": "h.apiOrgArchiveSearch()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:45",
+   "grant_scope": "session+CSRF+org:requests.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:45 (mountExplorer)",
+    "openapi": "searchOrgRequestArchive"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-167-get-api-organizations-id-requests-export",
+   "method": "GET",
+   "path": "/api/organizations/{id}/requests/export",
+   "handler": "h.apiOrgRequestExport()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:44",
+   "grant_scope": "session+CSRF+org:requests.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:44 (mountExplorer)",
+    "openapi": "exportOrgRequests"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-168-get-api-organizations-id-requests-stats",
+   "method": "GET",
+   "path": "/api/organizations/{id}/requests/stats",
+   "handler": "h.apiOrgRequestStats()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:43",
+   "grant_scope": "session+CSRF+org:requests.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:43 (mountExplorer)",
+    "openapi": "orgRequestStats"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-169-get-api-organizations-id-requests-request-id",
+   "method": "GET",
+   "path": "/api/organizations/{id}/requests/{request_id}",
+   "handler": "h.apiOrgRequestDetail()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:46",
+   "grant_scope": "session+CSRF+org:requests.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:46 (mountExplorer)",
+    "openapi": "orgRequestDetail"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-170-get-api-organizations-id-residency",
+   "method": "GET",
+   "path": "/api/organizations/{id}/residency",
+   "handler": "h.GetOrgResidency()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:73",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:73 (mountOrgsRoot)",
+    "openapi": "getOrgResidency"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-171-put-api-organizations-id-residency",
+   "method": "PUT",
+   "path": "/api/organizations/{id}/residency",
+   "handler": "h.UpdateOrgResidency()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:74",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:74 (mountOrgsRoot)",
+    "openapi": "updateOrgResidency"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-172-get-api-organizations-id-routing",
+   "method": "GET",
+   "path": "/api/organizations/{id}/routing",
+   "handler": "h.GetOrgRoutingSettings()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:66",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:66 (mountOrgsRoot)",
+    "openapi": "getOrgRoutingSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-173-patch-api-organizations-id-routing",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/routing",
+   "handler": "h.UpdateOrgRoutingSettings()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:67",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:67 (mountOrgsRoot)",
+    "openapi": "updateOrgRoutingSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-174-get-api-organizations-id-scim-tokens",
+   "method": "GET",
+   "path": "/api/organizations/{id}/scim/tokens",
+   "handler": "h.ListScimTokens()",
+   "handler_ref": "services/admin/handlers/router_scim.go:48",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:48 (mountSCIMAdmin)",
+    "openapi": "listScimTokens"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-175-post-api-organizations-id-scim-tokens",
+   "method": "POST",
+   "path": "/api/organizations/{id}/scim/tokens",
+   "handler": "h.CreateScimToken()",
+   "handler_ref": "services/admin/handlers/router_scim.go:49",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:49 (mountSCIMAdmin)",
+    "openapi": "createScimToken"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-176-delete-api-organizations-id-scim-tokens-tokenID",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/scim/tokens/{tokenID}",
+   "handler": "h.RevokeScimToken()",
+   "handler_ref": "services/admin/handlers/router_scim.go:50",
+   "grant_scope": "session+CSRF+org:members.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:50 (mountSCIMAdmin)",
+    "openapi": "revokeScimToken"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-177-get-api-organizations-id-security-inbox",
+   "method": "GET",
+   "path": "/api/organizations/{id}/security-inbox",
+   "handler": "h.apiOrgSecurityInbox()",
+   "handler_ref": "services/admin/handlers/security_inbox_handlers.go:551",
+   "grant_scope": "session+CSRF+org:security.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/security_inbox_handlers.go:551 (mountSecurityInbox)",
+    "openapi": "listOrgSecurityInbox"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-178-get-api-organizations-id-security-inbox-incident-id",
+   "method": "GET",
+   "path": "/api/organizations/{id}/security-inbox/{incident_id}",
+   "handler": "h.apiOrgSecurityIncident()",
+   "handler_ref": "services/admin/handlers/security_inbox_handlers.go:552",
+   "grant_scope": "session+CSRF+org:security.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/security_inbox_handlers.go:552 (mountSecurityInbox)",
+    "openapi": "getOrgSecurityIncident"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-179-patch-api-organizations-id-security-inbox-incident-id",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/security-inbox/{incident_id}",
+   "handler": "h.apiOrgSecurityIncidentPatch()",
+   "handler_ref": "services/admin/handlers/security_inbox_handlers.go:554",
+   "grant_scope": "session+CSRF+org:security.read",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/security_inbox_handlers.go:554 (mountSecurityInbox)",
+    "openapi": "patchOrgSecurityIncident"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-180-get-api-organizations-id-spend-alert",
+   "method": "GET",
+   "path": "/api/organizations/{id}/spend-alert",
+   "handler": "h.GetOrgSpendAlertSettings()",
+   "handler_ref": "services/admin/handlers/router_billing.go:58",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:58 (mountBillingRoot)",
+    "openapi": "getOrgSpendAlertSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-181-patch-api-organizations-id-spend-alert",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/spend-alert",
+   "handler": "h.UpdateOrgSpendAlertSettings()",
+   "handler_ref": "services/admin/handlers/router_billing.go:59",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:59 (mountBillingRoot)",
+    "openapi": "updateOrgSpendAlertSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-182-get-api-organizations-id-team-budgets",
+   "method": "GET",
+   "path": "/api/organizations/{id}/team-budgets",
+   "handler": "h.ListOrgTeamBudgets()",
+   "handler_ref": "services/admin/handlers/router_billing.go:39",
+   "grant_scope": "session+CSRF+org:budgets.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:39 (mountBilling)",
+    "openapi": "listOrgTeamBudgets"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-183-get-api-organizations-id-tool-calls",
+   "method": "GET",
+   "path": "/api/organizations/{id}/tool-calls",
+   "handler": "h.apiOrgToolCalls()",
+   "handler_ref": "services/admin/handlers/router_analytics.go:60",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_analytics.go:60 (mountAnalyticsRoot)",
+    "openapi": "orgToolCalls"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-184-get-api-organizations-id-tool-policies",
+   "method": "GET",
+   "path": "/api/organizations/{id}/tool-policies",
+   "handler": "h.ListToolPolicies()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:32",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:32 (mountMCP)",
+    "openapi": "listToolPolicies",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-185-post-api-organizations-id-tool-policies",
+   "method": "POST",
+   "path": "/api/organizations/{id}/tool-policies",
+   "handler": "h.CreateToolPolicy()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:31",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:31 (mountMCP)",
+    "openapi": "createToolPolicy",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-186-get-api-organizations-id-tool-policies-presets",
+   "method": "GET",
+   "path": "/api/organizations/{id}/tool-policies/presets",
+   "handler": "h.ListToolPolicyPresets()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:33",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:33 (mountMCP)",
+    "openapi": "listToolPolicyPresets",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-187-post-api-organizations-id-tool-policies-presets-preset",
+   "method": "POST",
+   "path": "/api/organizations/{id}/tool-policies/presets/{preset}",
+   "handler": "h.ApplyToolPolicyPreset()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:34",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:34 (mountMCP)",
+    "openapi": "applyToolPolicyPreset",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-188-delete-api-organizations-id-tool-policies-name",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/tool-policies/{name}",
+   "handler": "h.DeleteToolPolicy()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:37",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:37 (mountMCP)",
+    "openapi": "deleteToolPolicy",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-189-get-api-organizations-id-tool-policies-name",
+   "method": "GET",
+   "path": "/api/organizations/{id}/tool-policies/{name}",
+   "handler": "h.GetToolPolicy()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:35",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:35 (mountMCP)",
+    "openapi": "getToolPolicy",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-190-patch-api-organizations-id-tool-policies-name",
+   "method": "PATCH",
+   "path": "/api/organizations/{id}/tool-policies/{name}",
+   "handler": "h.UpdateToolPolicy()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:36",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:36 (mountMCP)",
+    "openapi": "updateToolPolicy",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-191-post-api-organizations-orgID-templates-export",
+   "method": "POST",
+   "path": "/api/organizations/{orgID}/templates/export",
+   "handler": "h.templateHandlers.Export",
+   "handler_ref": "services/admin/handlers/router_ops.go:43",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:43 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when templateHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-192-put-api-organizations-orgID-templates-templateID-subscribe",
+   "method": "PUT",
+   "path": "/api/organizations/{orgID}/templates/{templateID}/subscribe",
+   "handler": "h.templateHandlers.Subscribe",
+   "handler_ref": "services/admin/handlers/router_ops.go:45",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:45 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when templateHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-193-get-api-organizations-orgID-verticals",
+   "method": "GET",
+   "path": "/api/organizations/{orgID}/verticals",
+   "handler": "h.verticalHandlers.List",
+   "handler_ref": "services/admin/handlers/router_ops.go:36",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:36 (mountOps)",
+    "openapi": "listVerticals",
+    "availability": "registered only when verticalHandlers wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-194-delete-api-organizations-orgID-verticals-vertical",
+   "method": "DELETE",
+   "path": "/api/organizations/{orgID}/verticals/{vertical}",
+   "handler": "h.verticalHandlers.Disable",
+   "handler_ref": "services/admin/handlers/router_ops.go:38",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:38 (mountOps)",
+    "openapi": "disableVertical",
+    "availability": "registered only when verticalHandlers wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-195-post-api-organizations-orgID-verticals-vertical",
+   "method": "POST",
+   "path": "/api/organizations/{orgID}/verticals/{vertical}",
+   "handler": "h.verticalHandlers.Enable",
+   "handler_ref": "services/admin/handlers/router_ops.go:37",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:37 (mountOps)",
+    "openapi": "enableVertical",
+    "availability": "registered only when verticalHandlers wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-196-get-api-organizations-org-id-fleet-installations",
+   "method": "GET",
+   "path": "/api/organizations/{org_id}/fleet/installations",
+   "handler": "h.apiOrgFleetInstallations()",
+   "handler_ref": "services/admin/handlers/fleet_handlers.go:232",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/fleet_handlers.go:232 (mountFleet)",
+    "openapi": "listOrgFleetInstallations"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-197-get-api-organizations-org-id-fleet-installations-deployment-id",
+   "method": "GET",
+   "path": "/api/organizations/{org_id}/fleet/installations/{deployment_id}",
+   "handler": "h.apiOrgFleetInstallation()",
+   "handler_ref": "services/admin/handlers/fleet_handlers.go:233",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/fleet_handlers.go:233 (mountFleet)",
+    "openapi": "getOrgFleetInstallation"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-198-get-api-orgs-id-caps",
+   "method": "GET",
+   "path": "/api/orgs/{id}/caps",
+   "handler": "h.GetOrgCaps()",
+   "handler_ref": "services/admin/handlers/caps_handlers.go:49",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/caps_handlers.go:49 (mountOrgCapsRoutes)",
+    "openapi": "getOrgCaps"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-199-put-api-orgs-id-caps",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/caps",
+   "handler": "h.PutOrgCaps()",
+   "handler_ref": "services/admin/handlers/caps_handlers.go:50",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/caps_handlers.go:50 (mountOrgCapsRoutes)",
+    "openapi": "putOrgCaps"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-200-get-api-orgs-id-credits-balance",
+   "method": "GET",
+   "path": "/api/orgs/{id}/credits/balance",
+   "handler": "h.billing.credit.HandleGetBalance",
+   "handler_ref": "services/admin/handlers/router_billing.go:47",
+   "grant_scope": "session+CSRF+org credits read (credits.read gate)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:47 (mountBilling)",
+    "openapi": "getOrgCreditBalance",
+    "availability": "registered only when billing.credit wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-201-get-api-orgs-id-credits-grace",
+   "method": "GET",
+   "path": "/api/orgs/{id}/credits/grace",
+   "handler": "h.GetOrgBudgetSettings()",
+   "handler_ref": "services/admin/handlers/org_settings_handlers.go:65",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_settings_handlers.go:65 (mountOrgBudgetSettingsRoutes)",
+    "openapi": "getOrgBudgetSettings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-202-put-api-orgs-id-credits-grace",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/credits/grace",
+   "handler": "h.PutOrgGraceFloor()",
+   "handler_ref": "services/admin/handlers/org_settings_handlers.go:66",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_settings_handlers.go:66 (mountOrgBudgetSettingsRoutes)",
+    "openapi": "putOrgGraceFloor"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-203-post-api-orgs-id-credits-topup",
+   "method": "POST",
+   "path": "/api/orgs/{id}/credits/topup",
+   "handler": "h.billing.credit.HandleTopUp",
+   "handler_ref": "services/admin/handlers/router_billing.go:72",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:72 (mountBillingRoot)",
+    "openapi": "topUpOrgCredits"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-204-get-api-orgs-id-credits-transactions",
+   "method": "GET",
+   "path": "/api/orgs/{id}/credits/transactions",
+   "handler": "h.billing.credit.HandleGetTransactions",
+   "handler_ref": "services/admin/handlers/router_billing.go:48",
+   "grant_scope": "session+CSRF+org credits read (credits.read gate)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:48 (mountBilling)",
+    "openapi": "listOrgCreditTransactions",
+    "availability": "registered only when billing.credit wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-205-put-api-orgs-id-output-cap",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/output-cap",
+   "handler": "h.PutOrgDefaultOutputCap()",
+   "handler_ref": "services/admin/handlers/org_settings_handlers.go:68",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_settings_handlers.go:68 (mountOrgBudgetSettingsRoutes)",
+    "openapi": "putOrgDefaultOutputCap"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-206-get-api-orgs-id-provider-credentials",
+   "method": "GET",
+   "path": "/api/orgs/{id}/provider-credentials",
+   "handler": "h.orgCreds.handleList",
+   "handler_ref": "services/admin/handlers/org_credentials.go:268",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:268 (mountOrgCredentials)",
+    "openapi": "listOrgCredentials"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-207-post-api-orgs-id-provider-credentials",
+   "method": "POST",
+   "path": "/api/orgs/{id}/provider-credentials",
+   "handler": "h.orgCreds.handleCreate",
+   "handler_ref": "services/admin/handlers/org_credentials.go:269",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:269 (mountOrgCredentials)",
+    "openapi": "createOrgCredential"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-208-delete-api-orgs-id-provider-credentials-credId",
+   "method": "DELETE",
+   "path": "/api/orgs/{id}/provider-credentials/{credId}",
+   "handler": "h.orgCreds.handleRemove",
+   "handler_ref": "services/admin/handlers/org_credentials.go:271",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:271 (mountOrgCredentials)",
+    "openapi": "deleteOrgCredential"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-209-put-api-orgs-id-provider-credentials-credId",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/provider-credentials/{credId}",
+   "handler": "h.orgCreds.handleUpdate",
+   "handler_ref": "services/admin/handlers/org_credentials.go:270",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:270 (mountOrgCredentials)",
+    "openapi": "updateOrgCredential"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-210-post-api-orgs-id-provider-credentials-credId-models",
+   "method": "POST",
+   "path": "/api/orgs/{id}/provider-credentials/{credId}/models",
+   "handler": "h.orgCreds.handleListModels",
+   "handler_ref": "services/admin/handlers/org_credentials.go:273",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:273 (mountOrgCredentials)",
+    "openapi": "listOrgCredentialModels"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-211-post-api-orgs-id-provider-credentials-credId-test",
+   "method": "POST",
+   "path": "/api/orgs/{id}/provider-credentials/{credId}/test",
+   "handler": "h.orgCreds.handleTest",
+   "handler_ref": "services/admin/handlers/org_credentials.go:272",
+   "grant_scope": "session+CSRF+org:keys.manage (BYOK variant)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_credentials.go:272 (mountOrgCredentials)",
+    "openapi": "testOrgCredential"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-212-get-api-orgs-id-resale-pricing",
+   "method": "GET",
+   "path": "/api/orgs/{id}/resale-pricing",
+   "handler": "h.billing.resale.HandleGetOrgResalePricing",
+   "handler_ref": "services/admin/handlers/router_billing.go:82",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:82 (mountBillingRoot)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-213-put-api-orgs-id-resale-pricing",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/resale-pricing",
+   "handler": "h.billing.resale.HandleCreateOrUpdateResalePricing",
+   "handler_ref": "services/admin/handlers/router_billing.go:78",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:78 (mountBillingRoot)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-214-put-api-orgs-id-reservations-mode",
+   "method": "PUT",
+   "path": "/api/orgs/{id}/reservations-mode",
+   "handler": "h.PutOrgReservationsMode()",
+   "handler_ref": "services/admin/handlers/org_settings_handlers.go:67",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/org_settings_handlers.go:67 (mountOrgBudgetSettingsRoutes)",
+    "openapi": "putOrgReservationsMode"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-215-get-api-pricing",
+   "method": "GET",
+   "path": "/api/pricing",
+   "handler": "h.ListPricingHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:62",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:62 (mountBillingRoot)",
+    "openapi": "listPricing"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-216-post-api-pricing",
+   "method": "POST",
+   "path": "/api/pricing",
+   "handler": "h.CreatePricingHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:63",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:63 (mountBillingRoot)",
+    "openapi": "createPricing"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-217-get-api-pricing-export-csv",
+   "method": "GET",
+   "path": "/api/pricing/export.csv",
+   "handler": "h.ExportPricingCSVHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:67",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:67 (mountBillingRoot)",
+    "openapi": "exportPricingCSV"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-218-post-api-pricing-import",
+   "method": "POST",
+   "path": "/api/pricing/import",
+   "handler": "h.ImportPricingHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:64",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:64 (mountBillingRoot)",
+    "openapi": "importPricing"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-219-delete-api-pricing-id",
+   "method": "DELETE",
+   "path": "/api/pricing/{id}",
+   "handler": "h.DeletePricingHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:66",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:66 (mountBillingRoot)",
+    "openapi": "deletePricing"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-220-put-api-pricing-id",
+   "method": "PUT",
+   "path": "/api/pricing/{id}",
+   "handler": "h.UpdatePricingHandler()",
+   "handler_ref": "services/admin/handlers/router_billing.go:65",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:65 (mountBillingRoot)",
+    "openapi": "updatePricing"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-221-get-api-providers-health",
+   "method": "GET",
+   "path": "/api/providers/health",
+   "handler": "h.ProviderHealth()",
+   "handler_ref": "services/admin/handlers/router_models.go:57",
+   "grant_scope": "admin session+CSRF; org gates in handler (routing.manage/analytics.read)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:57 (mountRoutingViews)",
+    "openapi": "getProviderHealth"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-222-get-api-rates-catalog",
+   "method": "GET",
+   "path": "/api/rates/catalog",
+   "handler": "h.RatesCatalogView()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:115",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:115 (mountCurrenciesRoutes)",
+    "openapi": "getRatesCatalog"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-223-post-api-rates-diff",
+   "method": "POST",
+   "path": "/api/rates/diff",
+   "handler": "h.RatesCatalogDiff()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:116",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:116 (mountCurrenciesRoutes)",
+    "openapi": "postRatesDiff"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-224-post-api-rates-promote",
+   "method": "POST",
+   "path": "/api/rates/promote",
+   "handler": "h.RatesCatalogPromote()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:117",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:117 (mountCurrenciesRoutes)",
+    "openapi": "postRatesPromote"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-225-get-api-regions",
+   "method": "GET",
+   "path": "/api/regions",
+   "handler": "h.regionHandlers.ListRegions",
+   "handler_ref": "services/admin/handlers/router_ops.go:29",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:29 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when regionHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-226-get-api-reseller-pricing",
+   "method": "GET",
+   "path": "/api/reseller-pricing",
+   "handler": "h.billing.resale.HandleListResalePricing",
+   "handler_ref": "services/admin/handlers/router_billing.go:79",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:79 (mountBillingRoot)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-227-delete-api-reseller-pricing-id",
+   "method": "DELETE",
+   "path": "/api/reseller-pricing/{id}",
+   "handler": "h.billing.resale.HandleDeleteResalePricing",
+   "handler_ref": "services/admin/handlers/router_billing.go:81",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:81 (mountBillingRoot)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-228-get-api-reseller-pricing-id",
+   "method": "GET",
+   "path": "/api/reseller-pricing/{id}",
+   "handler": "h.billing.resale.HandleGetResalePricing",
+   "handler_ref": "services/admin/handlers/router_billing.go:80",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:80 (mountBillingRoot)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-229-get-api-retrain-status",
+   "method": "GET",
+   "path": "/api/retrain/status",
+   "handler": "h.retrainHandlers.Status",
+   "handler_ref": "services/admin/handlers/router_ops.go:74",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:74 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when retrainHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-230-post-api-root-payload-grants",
+   "method": "POST",
+   "path": "/api/root/payload-grants",
+   "handler": "\"/api/root/payload-grants\", h.apiRootRequestPayloadGrant()",
+   "handler_ref": "services/admin/handlers/router_console.go:33",
+   "grant_scope": "session+CSRF+root(MustBeRoot)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:33 (mountConsole)",
+    "openapi": "createRootRequestPayloadGrant"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-231-get-api-routing-actual",
+   "method": "GET",
+   "path": "/api/routing/actual",
+   "handler": "h.RoutingActual()",
+   "handler_ref": "services/admin/handlers/router_models.go:55",
+   "grant_scope": "admin session+CSRF; org gates in handler (routing.manage/analytics.read)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:55 (mountRoutingViews)",
+    "openapi": "getRoutingActual"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-232-get-api-routing-map",
+   "method": "GET",
+   "path": "/api/routing/map",
+   "handler": "h.RoutingMap()",
+   "handler_ref": "services/admin/handlers/router_models.go:51",
+   "grant_scope": "admin session+CSRF; org gates in handler (routing.manage/analytics.read)",
+   "ui_surface": "routing-map [routing.ts:63]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:51 (mountRoutingViews)",
+    "openapi": "getRoutingMap",
+    "ui": "routing.ts:63"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-233-get-api-routing-snapshot",
+   "method": "GET",
+   "path": "/api/routing/snapshot",
+   "handler": "h.RoutingSnapshot()",
+   "handler_ref": "services/admin/handlers/router_models.go:56",
+   "grant_scope": "admin session+CSRF; org gates in handler (routing.manage/analytics.read)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:56 (mountRoutingViews)",
+    "openapi": "getRoutingSnapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-234-get-api-rules",
+   "method": "GET",
+   "path": "/api/rules",
+   "handler": "h.ListRoutingRules()",
+   "handler_ref": "services/admin/handlers/router_models.go:26",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "rules [rules.ts:14; rules.ts:18]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:26 (mountModels)",
+    "openapi": "listRoutingRules",
+    "ui": "rules.ts:14; rules.ts:18"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-235-post-api-rules",
+   "method": "POST",
+   "path": "/api/rules",
+   "handler": "h.CreateRoutingRule()",
+   "handler_ref": "services/admin/handlers/router_models.go:27",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "rules [rules.ts:14; rules.ts:18]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:27 (mountModels)",
+    "openapi": "createRoutingRule",
+    "ui": "rules.ts:14; rules.ts:18"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-236-post-api-rules-preview",
+   "method": "POST",
+   "path": "/api/rules/preview",
+   "handler": "h.PreviewRoutingRule()",
+   "handler_ref": "services/admin/handlers/router_models.go:25",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "rules [rules.ts:90]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:25 (mountModels)",
+    "openapi": "previewRoutingRule",
+    "ui": "rules.ts:90"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-237-delete-api-rules-id",
+   "method": "DELETE",
+   "path": "/api/rules/{id}",
+   "handler": "h.DeleteRoutingRule()",
+   "handler_ref": "services/admin/handlers/router_models.go:31",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:31 (mountModels)",
+    "openapi": "deleteRoutingRule"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-238-get-api-rules-id",
+   "method": "GET",
+   "path": "/api/rules/{id}",
+   "handler": "h.GetRoutingRule()",
+   "handler_ref": "services/admin/handlers/router_models.go:28",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:28 (mountModels)",
+    "openapi": "getRoutingRule"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-239-put-api-rules-id",
+   "method": "PUT",
+   "path": "/api/rules/{id}",
+   "handler": "h.UpdateRoutingRule()",
+   "handler_ref": "services/admin/handlers/router_models.go:29",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:29 (mountModels)",
+    "openapi": "updateRoutingRule"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-240-put-api-rules-id-enable",
+   "method": "PUT",
+   "path": "/api/rules/{id}/enable",
+   "handler": "h.UpdateRoutingRuleEnabled()",
+   "handler_ref": "services/admin/handlers/router_models.go:30",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:30 (mountModels)",
+    "openapi": "updateRoutingRuleEnabled"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-241-get-api-sovereign-models",
+   "method": "GET",
+   "path": "/api/sovereign/models",
+   "handler": "h.sovereignHandlers.ListModels",
+   "handler_ref": "services/admin/handlers/router_models.go:38",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:38 (mountModels)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when sovereignHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-242-put-api-sovereign-models-name",
+   "method": "PUT",
+   "path": "/api/sovereign/models/{name}",
+   "handler": "h.sovereignHandlers.ToggleModel",
+   "handler_ref": "services/admin/handlers/router_models.go:39",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:39 (mountModels)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when sovereignHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-243-get-api-sovereign-policy-org-id",
+   "method": "GET",
+   "path": "/api/sovereign/policy/{org_id}",
+   "handler": "h.sovereignHandlers.GetPolicy",
+   "handler_ref": "services/admin/handlers/router_models.go:40",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:40 (mountModels)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when sovereignHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-244-put-api-sovereign-policy-org-id",
+   "method": "PUT",
+   "path": "/api/sovereign/policy/{org_id}",
+   "handler": "h.sovereignHandlers.UpdatePolicy",
+   "handler_ref": "services/admin/handlers/router_models.go:41",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_models.go:41 (mountModels)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when sovereignHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-245-get-api-teams",
+   "method": "GET",
+   "path": "/api/teams",
+   "handler": "h.ListTeams()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:48",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "members [members.ts:85]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:48 (mountOrgsRoot)",
+    "openapi": "listTeams",
+    "ui": "members.ts:85"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-246-post-api-teams",
+   "method": "POST",
+   "path": "/api/teams",
+   "handler": "h.CreateTeam()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:49",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "members [members.ts:85]",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:49 (mountOrgsRoot)",
+    "openapi": "createTeam",
+    "ui": "members.ts:85"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-247-delete-api-teams-id",
+   "method": "DELETE",
+   "path": "/api/teams/{id}",
+   "handler": "h.DeleteTeam()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:52",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:52 (mountOrgsRoot)",
+    "openapi": "deleteTeam"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-248-get-api-teams-id",
+   "method": "GET",
+   "path": "/api/teams/{id}",
+   "handler": "h.GetTeam()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:50",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:50 (mountOrgsRoot)",
+    "openapi": "getTeam"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-249-put-api-teams-id",
+   "method": "PUT",
+   "path": "/api/teams/{id}",
+   "handler": "h.UpdateTeam()",
+   "handler_ref": "services/admin/handlers/router_orgs.go:51",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_orgs.go:51 (mountOrgsRoot)",
+    "openapi": "updateTeam"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-250-delete-api-teams-id-budget",
+   "method": "DELETE",
+   "path": "/api/teams/{id}/budget",
+   "handler": "h.DeleteTeamBudget()",
+   "handler_ref": "services/admin/handlers/router_billing.go:38",
+   "grant_scope": "session+CSRF+org:budgets.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:38 (mountBilling)",
+    "openapi": "deleteTeamBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-251-get-api-teams-id-budget",
+   "method": "GET",
+   "path": "/api/teams/{id}/budget",
+   "handler": "h.GetTeamBudget()",
+   "handler_ref": "services/admin/handlers/router_billing.go:36",
+   "grant_scope": "session+CSRF+org:budgets.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:36 (mountBilling)",
+    "openapi": "getTeamBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-252-put-api-teams-id-budget",
+   "method": "PUT",
+   "path": "/api/teams/{id}/budget",
+   "handler": "h.UpsertTeamBudget()",
+   "handler_ref": "services/admin/handlers/router_billing.go:37",
+   "grant_scope": "session+CSRF+org:budgets.manage",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_billing.go:37 (mountBilling)",
+    "openapi": "upsertTeamBudget"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-253-get-api-templates-marketplace",
+   "method": "GET",
+   "path": "/api/templates/marketplace",
+   "handler": "h.templateHandlers.ListAvailable",
+   "handler_ref": "services/admin/handlers/router_ops.go:44",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "partial",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:44 (mountOps)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when templateHandlers wired"
+   },
+   "next_leaf": "spec-delta leaf: document in docs/api/OPENAPI-DELTA.md (snapshot is byte-frozen)"
+  },
+  {
+   "capability_id": "cap-254-post-api-tool-policies",
+   "method": "POST",
+   "path": "/api/tool-policies",
+   "handler": "h.CreateToolPolicy()",
+   "handler_ref": "services/admin/handlers/router_mcp.go:30",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01); 503 without DB store",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_mcp.go:30 (mountMCP)",
+    "openapi": "createToolPolicyDirect",
+    "availability": "registered only when MCP stores (DB) wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-255-get-api-units-spend",
+   "method": "GET",
+   "path": "/api/units/spend",
+   "handler": "h.UnitsSpend()",
+   "handler_ref": "services/admin/handlers/currencies_handlers.go:112",
+   "grant_scope": "admin session+CSRF; org gates in handlers",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/currencies_handlers.go:112 (mountCurrenciesRoutes)",
+    "openapi": "getUnitsSpend"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-256-get-api-version",
+   "method": "GET",
+   "path": "/api/version",
+   "handler": "h.Version()",
+   "handler_ref": "services/admin/handlers/router_console.go:32",
+   "grant_scope": "admin session+CSRF",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_console.go:32 (mountConsole)",
+    "openapi": "adminVersion"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-257-get-api-whitelist-api-keys-target-id",
+   "method": "GET",
+   "path": "/api/whitelist/api-keys/{target_id}",
+   "handler": "h.listKeyWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:54",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:54 (mountKeysRoot)",
+    "openapi": "listKeyWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-258-post-api-whitelist-api-keys-target-id",
+   "method": "POST",
+   "path": "/api/whitelist/api-keys/{target_id}",
+   "handler": "h.addKeyWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:55",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:55 (mountKeysRoot)",
+    "openapi": "addKeyWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-259-delete-api-whitelist-api-keys-target-id-model-name",
+   "method": "DELETE",
+   "path": "/api/whitelist/api-keys/{target_id}/{model_name}",
+   "handler": "h.removeKeyWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:56",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:56 (mountKeysRoot)",
+    "openapi": "removeKeyWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-260-get-api-whitelist-teams-target-id",
+   "method": "GET",
+   "path": "/api/whitelist/teams/{target_id}",
+   "handler": "h.listTeamWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:57",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:57 (mountKeysRoot)",
+    "openapi": "listTeamWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-261-post-api-whitelist-teams-target-id",
+   "method": "POST",
+   "path": "/api/whitelist/teams/{target_id}",
+   "handler": "h.addTeamWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:58",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:58 (mountKeysRoot)",
+    "openapi": "addTeamWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-262-delete-api-whitelist-teams-target-id-model-name",
+   "method": "DELETE",
+   "path": "/api/whitelist/teams/{target_id}/{model_name}",
+   "handler": "h.removeTeamWhitelist()",
+   "handler_ref": "services/admin/handlers/router_keys.go:59",
+   "grant_scope": "session+CSRF+root(MustBeRoot)+org-scope(S01)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_keys.go:59 (mountKeysRoot)",
+    "openapi": "removeTeamWhitelist"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-263-get-auth-login",
+   "method": "GET",
+   "path": "/auth/login",
+   "handler": "h.LoginPage()",
+   "handler_ref": "services/admin/handlers/router_public.go:74",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:74 (mountPublic)",
+    "openapi": "adminLoginPage"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-264-get-auth-oidc-callback",
+   "method": "GET",
+   "path": "/auth/oidc/callback",
+   "handler": "h.OIDCCallback()",
+   "handler_ref": "services/admin/handlers/router_public.go:96",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:96 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-265-get-auth-oidc-login",
+   "method": "GET",
+   "path": "/auth/oidc/login",
+   "handler": "h.ssoStartRateLimitMiddleware(h.OIDCLogin())",
+   "handler_ref": "services/admin/handlers/router_public.go:95",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:95 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-266-post-auth-saml-acs",
+   "method": "POST",
+   "path": "/auth/saml/acs",
+   "handler": "h.SAMLACS()",
+   "handler_ref": "services/admin/handlers/router_public.go:107",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:107 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-267-get-auth-saml-login",
+   "method": "GET",
+   "path": "/auth/saml/login",
+   "handler": "h.ssoStartRateLimitMiddleware(h.SAMLLogin())",
+   "handler_ref": "services/admin/handlers/router_public.go:106",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:106 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-268-get-auth-saml-metadata",
+   "method": "GET",
+   "path": "/auth/saml/metadata",
+   "handler": "h.SAMLMetadata()",
+   "handler_ref": "services/admin/handlers/router_public.go:105",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:105 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-269-get-auth-saml-slo",
+   "method": "GET",
+   "path": "/auth/saml/slo",
+   "handler": "h.SAMLSLO()",
+   "handler_ref": "services/admin/handlers/router_public.go:110",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:110 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-270-post-auth-saml-slo",
+   "method": "POST",
+   "path": "/auth/saml/slo",
+   "handler": "h.SAMLSLO()",
+   "handler_ref": "services/admin/handlers/router_public.go:111",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:111 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-271-get-auth-csrf",
+   "method": "GET",
+   "path": "/auth/csrf",
+   "handler": "h.CSRFToken()",
+   "handler_ref": "services/admin/handlers/router_public.go:84",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:84 (mountPublic)",
+    "openapi": "adminCSRF"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-272-post-auth-ee-session",
+   "method": "POST",
+   "path": "/auth/ee/session",
+   "handler": "h.eeSessionValidation()",
+   "handler_ref": "services/admin/handlers/router_public.go:123",
+   "grant_scope": "EE internal guard (transport)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:123 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-273-get-health",
+   "method": "GET",
+   "path": "/health",
+   "handler": "r.Get(\"/health\", func(w http.ResponseWriter, r *http.Request) {",
+   "handler_ref": "services/admin/handlers/router_public.go:64",
+   "grant_scope": "public (liveness probe)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:64 (mountPublic)",
+    "openapi": "adminHealth"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-274-get-internal-analytics-cost",
+   "method": "GET",
+   "path": "/internal/analytics/cost",
+   "handler": "h.internalCostReport()",
+   "handler_ref": "services/admin/handlers/internal_api.go:31",
+   "grant_scope": "internal service key (service-to-service)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/internal_api.go:31 (mountInternalAPI)",
+    "openapi": "internalCost"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-275-get-internal-analytics-savings",
+   "method": "GET",
+   "path": "/internal/analytics/savings",
+   "handler": "h.internalSavingsReport()",
+   "handler_ref": "services/admin/handlers/internal_api.go:30",
+   "grant_scope": "internal service key (service-to-service)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/internal_api.go:30 (mountInternalAPI)",
+    "openapi": "internalSavings"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-276-get-internal-api-keys",
+   "method": "GET",
+   "path": "/internal/api-keys",
+   "handler": "h.internalAPIKeys()",
+   "handler_ref": "services/admin/handlers/internal_api.go:29",
+   "grant_scope": "internal service key (service-to-service)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/internal_api.go:29 (mountInternalAPI)",
+    "openapi": "internalListAPIKeys"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-277-get-invite-token",
+   "method": "GET",
+   "path": "/invite/{token}",
+   "handler": "h.InvitePage()",
+   "handler_ref": "services/admin/handlers/router_public.go:133",
+   "grant_scope": "public invite token flow",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:133 (mountPublic)",
+    "openapi": "memberInvitePage"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-278-post-invite-token",
+   "method": "POST",
+   "path": "/invite/{token}",
+   "handler": "h.HandleInviteAccept()",
+   "handler_ref": "services/admin/handlers/router_public.go:134",
+   "grant_scope": "public invite token flow",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:134 (mountPublic)",
+    "openapi": "memberInviteAccept"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-279-post-auth-login",
+   "method": "POST",
+   "path": "/auth/login",
+   "handler": "h.loginRateLimitMiddleware(h.HandleLogin())",
+   "handler_ref": "services/admin/handlers/router_public.go:76",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:76 (mountPublic)",
+    "openapi": "adminLogin"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-280-get-auth-logout",
+   "method": "GET",
+   "path": "/auth/logout",
+   "handler": "h.HandleLogout()",
+   "handler_ref": "services/admin/handlers/router_public.go:77",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:77 (mountPublic)",
+    "openapi": "adminLogoutGet"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-281-post-auth-logout",
+   "method": "POST",
+   "path": "/auth/logout",
+   "handler": "adminauth.CSRFValidation()).Post(\"/logout\", h.HandleLogout()",
+   "handler_ref": "services/admin/handlers/router_public.go:81",
+   "grant_scope": "public session transport (rate-limited)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:81 (mountPublic)",
+    "openapi": "adminLogout"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-282-get-metrics",
+   "method": "GET",
+   "path": "/metrics",
+   "handler": "httpmw.MethodGuard(http.MethodGet, http.MethodHead)).Handle(\"/metrics\", metrics.PrometheusHandler()",
+   "handler_ref": "services/admin/handlers/router_public.go:71",
+   "grant_scope": "public + bearer metrics token (GET/HEAD)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_public.go:71 (mountPublic)",
+    "openapi": "absent from snapshot"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-283-get-portal",
+   "method": "GET",
+   "path": "/portal",
+   "handler": "h.PortalHome()",
+   "handler_ref": "services/admin/handlers/router_portal.go:19",
+   "grant_scope": "public page (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:19 (mountPortal)",
+    "openapi": "portalHome",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-284-get-portal-callback",
+   "method": "GET",
+   "path": "/portal/callback",
+   "handler": "h.PortalCallback()",
+   "handler_ref": "services/admin/handlers/router_portal.go:18",
+   "grant_scope": "public page (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:18 (mountPortal)",
+    "openapi": "portalCallback",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-285-post-portal-keys",
+   "method": "POST",
+   "path": "/portal/keys",
+   "handler": "h.PortalCreateKeyPage()",
+   "handler_ref": "services/admin/handlers/router_portal.go:20",
+   "grant_scope": "portal session (form flow; auth enforced in handler)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:20 (mountPortal)",
+    "openapi": "portalCreateKeyPage",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-286-post-portal-keys-id-revoke",
+   "method": "POST",
+   "path": "/portal/keys/{id}/revoke",
+   "handler": "h.PortalRevokeKeyPage()",
+   "handler_ref": "services/admin/handlers/router_portal.go:21",
+   "grant_scope": "portal session (form flow; auth enforced in handler)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:21 (mountPortal)",
+    "openapi": "portalRevokeKeyPage",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-287-get-portal-login",
+   "method": "GET",
+   "path": "/portal/login",
+   "handler": "h.PortalLogin()",
+   "handler_ref": "services/admin/handlers/router_portal.go:17",
+   "grant_scope": "public page (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:17 (mountPortal)",
+    "openapi": "portalLogin",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-288-post-portal-logout",
+   "method": "POST",
+   "path": "/portal/logout",
+   "handler": "h.PortalLogout()",
+   "handler_ref": "services/admin/handlers/router_portal.go:23",
+   "grant_scope": "portal session + portal CSRF (opt-in portal)",
+   "ui_surface": "none (API-only)",
+   "state": "verified",
+   "evidence": {
+    "registration": "services/admin/handlers/router_portal.go:23 (mountPortal)",
+    "openapi": "portalLogout",
+    "availability": "registered only when portal.enabled wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-289-get-scim-v2-Groups",
+   "method": "GET",
+   "path": "/scim/v2/Groups",
+   "handler": "h.SCIMListGroups()",
+   "handler_ref": "services/admin/handlers/router_scim.go:36",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:36 (mountSCIM)",
+    "openapi": "scimListGroups"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-290-post-scim-v2-Groups",
+   "method": "POST",
+   "path": "/scim/v2/Groups",
+   "handler": "h.SCIMCreateGroup()",
+   "handler_ref": "services/admin/handlers/router_scim.go:37",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:37 (mountSCIM)",
+    "openapi": "scimCreateGroup"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-291-delete-scim-v2-Groups-id",
+   "method": "DELETE",
+   "path": "/scim/v2/Groups/{id}",
+   "handler": "h.SCIMDeleteGroup()",
+   "handler_ref": "services/admin/handlers/router_scim.go:40",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:40 (mountSCIM)",
+    "openapi": "scimDeleteGroup"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-292-get-scim-v2-Groups-id",
+   "method": "GET",
+   "path": "/scim/v2/Groups/{id}",
+   "handler": "h.SCIMGetGroup()",
+   "handler_ref": "services/admin/handlers/router_scim.go:38",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:38 (mountSCIM)",
+    "openapi": "scimGetGroup"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-293-patch-scim-v2-Groups-id",
+   "method": "PATCH",
+   "path": "/scim/v2/Groups/{id}",
+   "handler": "h.SCIMPatchGroup()",
+   "handler_ref": "services/admin/handlers/router_scim.go:39",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:39 (mountSCIM)",
+    "openapi": "scimPatchGroup"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-294-get-scim-v2-ResourceTypes",
+   "method": "GET",
+   "path": "/scim/v2/ResourceTypes",
+   "handler": "h.SCIMResourceTypes()",
+   "handler_ref": "services/admin/handlers/router_scim.go:27",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:27 (mountSCIM)",
+    "openapi": "scimResourceTypes"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-295-get-scim-v2-Schemas",
+   "method": "GET",
+   "path": "/scim/v2/Schemas",
+   "handler": "h.SCIMSchemas()",
+   "handler_ref": "services/admin/handlers/router_scim.go:26",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:26 (mountSCIM)",
+    "openapi": "scimSchemas"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-296-get-scim-v2-ServiceProviderConfig",
+   "method": "GET",
+   "path": "/scim/v2/ServiceProviderConfig",
+   "handler": "h.SCIMServiceProviderConfig()",
+   "handler_ref": "services/admin/handlers/router_scim.go:23",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:23 (mountSCIM)",
+    "openapi": "scimServiceProviderConfig"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-297-get-scim-v2-Users",
+   "method": "GET",
+   "path": "/scim/v2/Users",
+   "handler": "h.SCIMListUsers()",
+   "handler_ref": "services/admin/handlers/router_scim.go:29",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:29 (mountSCIM)",
+    "openapi": "scimListUsers"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-298-post-scim-v2-Users",
+   "method": "POST",
+   "path": "/scim/v2/Users",
+   "handler": "h.SCIMCreateUser()",
+   "handler_ref": "services/admin/handlers/router_scim.go:30",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:30 (mountSCIM)",
+    "openapi": "scimCreateUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-299-delete-scim-v2-Users-id",
+   "method": "DELETE",
+   "path": "/scim/v2/Users/{id}",
+   "handler": "h.SCIMDeleteUser()",
+   "handler_ref": "services/admin/handlers/router_scim.go:34",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:34 (mountSCIM)",
+    "openapi": "scimDeleteUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-300-get-scim-v2-Users-id",
+   "method": "GET",
+   "path": "/scim/v2/Users/{id}",
+   "handler": "h.SCIMGetUser()",
+   "handler_ref": "services/admin/handlers/router_scim.go:31",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:31 (mountSCIM)",
+    "openapi": "scimGetUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-301-patch-scim-v2-Users-id",
+   "method": "PATCH",
+   "path": "/scim/v2/Users/{id}",
+   "handler": "h.SCIMPatchUser()",
+   "handler_ref": "services/admin/handlers/router_scim.go:33",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:33 (mountSCIM)",
+    "openapi": "scimPatchUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-302-put-scim-v2-Users-id",
+   "method": "PUT",
+   "path": "/scim/v2/Users/{id}",
+   "handler": "h.SCIMPutUser()",
+   "handler_ref": "services/admin/handlers/router_scim.go:32",
+   "grant_scope": "SCIM bearer token (IdP principal)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_scim.go:32 (mountSCIM)",
+    "openapi": "scimPutUser"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-303-post-v1-feedback",
+   "method": "POST",
+   "path": "/v1/feedback",
+   "handler": "handler.ServeHTTP",
+   "handler_ref": "services/admin/handlers/router_ops.go:85",
+   "grant_scope": "API key (agent data plane; in-handler auth)",
+   "ui_surface": "none (API-only)",
+   "state": "protocol_only",
+   "evidence": {
+    "registration": "services/admin/handlers/router_ops.go:85 (mountFeedback)",
+    "openapi": "absent from snapshot",
+    "availability": "registered only when feedback.collector wired"
+   },
+   "next_leaf": null
+  },
+  {
+   "capability_id": "cap-u01-GET-api-organizations-id-mcp-user-credentials",
+   "method": "GET",
+   "path": "/api/organizations/{id}/mcp/user-credentials",
+   "handler": "no admin route (store method adminstore.Store.ListMCPUserCredentials exists)",
+   "handler_ref": "web/dashboard/src/api/mcpCredentials.ts:142-150",
+   "grant_scope": "unreachable (would be root-only + org-scope family if mounted)",
+   "ui_surface": "mcp-credentials [mcpCredentials.ts:145]",
+   "state": "unavailable",
+   "evidence": {
+    "registration": "none \u2014 no route literal in services/admin/handlers (verified by grep over services/)",
+    "openapi": "absent from snapshot",
+    "ui": "mcpCredentials.ts:145 \u2014 client renders explicit \"endpoint not available\" state on 404"
+   },
+   "next_leaf": "backend wiring leaf: mount ListMCPUserCredentials (root-only + S01) or retire the client call"
+  },
+  {
+   "capability_id": "cap-u02-DELETE-api-organizations-id-mcp-user-credentials-server-agent",
+   "method": "DELETE",
+   "path": "/api/organizations/{id}/mcp/user-credentials/{server}/{agentId}",
+   "handler": "no admin route",
+   "handler_ref": "web/dashboard/src/api/mcpCredentials.ts:163-171",
+   "grant_scope": "unreachable",
+   "ui_surface": "mcp-credentials [mcpCredentials.ts:165]",
+   "state": "unavailable",
+   "evidence": {
+    "registration": "none",
+    "openapi": "absent from snapshot",
+    "ui": "mcpCredentials.ts:165 \u2014 same honest-404 handling as the list call"
+   },
+   "next_leaf": "same wiring leaf as cap-u01"
+  },
+  {
+   "capability_id": "cap-u03-POST-api-mcp-credentials-server",
+   "method": "POST",
+   "path": "/api/mcp/credentials/{server}",
+   "handler": "gateway mcpSubmitUserCredential (agent-principal yag_ surface, NOT admin service)",
+   "handler_ref": "pkg/gateway/mcpcredflow.go:77; pkg/gateway/gateway.go:2018 family",
+   "grant_scope": "gateway agent principal (yag_ key); deployment-dependent reachability from dashboard origin",
+   "ui_surface": "mcp-credentials [mcpCredentials.ts:176]",
+   "state": "unavailable",
+   "evidence": {
+    "registration": "gateway service, not the admin router",
+    "openapi": "absent from admin snapshot (gateway surface)",
+    "ui": "mcpCredentials.ts:176 \u2014 exposed for per-row actions; fails honestly when origin does not proxy"
+   },
+   "next_leaf": "deployment proxy decision + document as gateway capability (CUI-00-02 scope)"
+  },
+  {
+   "capability_id": "cap-u04-POST-api-mcp-auth-server-begin",
+   "method": "POST",
+   "path": "/api/mcp/auth/{server}/begin",
+   "handler": "gateway mcpOAuthBegin (agent-principal surface, NOT admin service)",
+   "handler_ref": "pkg/gateway/mcpcredflow.go:119; pkg/gateway/gateway.go:2018 family",
+   "grant_scope": "gateway agent principal (yag_ key); deployment-dependent",
+   "ui_surface": "mcp-credentials [mcpCredentials.ts:183]",
+   "state": "unavailable",
+   "evidence": {
+    "registration": "gateway service, not the admin router",
+    "openapi": "absent from admin snapshot (gateway surface)",
+    "ui": "mcpCredentials.ts:183"
+   },
+   "next_leaf": "same as cap-u03"
+  }
+ ]
+}
