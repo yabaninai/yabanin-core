@@ -67,4 +67,25 @@ describe('shell scope auto-selection (IMP-31)', () => {
       ...ROOT, explicitInUrl: false, currentOrg: '', listedOrgs: null,
     }), '', 'a not-yet-loaded directory does not guess')
   })
+
+  it('root: a remembered org that resolves nowhere is re-anchored (stale demo DB)', () => {
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: false, currentOrg: 'org-gone', listedOrgs: [ORG_A],
+    }), 'org-a', 'the single listed org is adopted')
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: false, currentOrg: 'org-gone', listedOrgs: [ORG_A, ORG_B],
+    }), '', 'several orgs fall back to the honest "All organizations" view')
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: false, currentOrg: 'org-b', memberships: [ORG_B], listedOrgs: [ORG_A],
+    }), 'org-b', 'a root membership still anchors the org')
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: false, currentOrg: 'org-gone', listedOrgs: null,
+    }), 'org-gone', 'an unloaded directory does not guess')
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: false, currentOrg: 'org-gone', listedOrgs: [],
+    }), 'org-gone', 'an empty directory does not guess either')
+    assert.equal(resolveScopeOrg({
+      ...ROOT, explicitInUrl: true, currentOrg: 'org-gone', listedOrgs: [ORG_A],
+    }), 'org-gone', 'a deep link still wins even against a stale org')
+  })
 })

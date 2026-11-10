@@ -1019,6 +1019,7 @@
     "organization": "المنظمة",
     "keyName": "اسم المفتاح",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "الفريق الافتراضي (يُعيَّن تلقائيًا)",
     "working": "جارٍ العمل…",
     "createKey": "إنشاء المفتاح",
     "createOrgFirst": "أنشئ منظمة أولًا.",

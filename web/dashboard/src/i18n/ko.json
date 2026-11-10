@@ -989,6 +989,7 @@
     "organization": "조직",
     "keyName": "키 이름",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "기본 팀 (자동 할당)",
     "working": "처리 중…",
     "createKey": "키 생성",
     "createOrgFirst": "먼저 조직을 생성하세요.",

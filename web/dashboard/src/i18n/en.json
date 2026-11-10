@@ -995,6 +995,7 @@
     "organization": "Organization",
     "keyName": "Key name",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "Default team (assigned automatically)",
     "working": "Working…",
     "createKey": "Create key",
     "createOrgFirst": "Create an organization first.",

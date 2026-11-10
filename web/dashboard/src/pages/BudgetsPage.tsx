@@ -8,6 +8,7 @@ import {
   type AgentBudget, type AgentKey, type CreditBalance, type LowBalanceOrgsResponse,
   type OrgSpendAlertSettings, type TeamSpendSummary,
 } from '../api/client'
+import { ApiError } from '../api/http'
 import { OrgSelect } from '../components/OrgSelect'
 import { PageHeader } from '../components/astra/PageHeader'
 import { StateNotice } from '../components/astra/StateNotice'
@@ -289,7 +290,13 @@ export function BudgetsPage() {
       runs.push(
         getOrgSpendAlert(org, opts)
           .then(a => { if (live()) { setAlert(a); setAlertError('') } })
-          .catch((e: unknown) => { if (live()) { setAlert(null); setAlertError(errorOf(e)) } }),
+          .catch((e: unknown) => {
+            if (!live()) return
+            // A fresh org has no spend-alert row and the GET 404s — that is
+            // "not configured" (alerts off), not a failure. Real errors stay.
+            if (e instanceof ApiError && e.status === 404) { setAlert(null); setAlertError(''); return }
+            setAlert(null); setAlertError(errorOf(e))
+          }),
       )
       runs.push(
         fetchCreditBalance(org, opts)

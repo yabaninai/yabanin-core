@@ -995,6 +995,7 @@
     "organization": "संगठन",
     "keyName": "की का नाम",
     "keyNamePlaceholder": "prod-backend",
+    "teamDefaultOption": "डिफ़ॉल्ट टीम (स्वतः आवंटित)",
     "working": "कार्य हो रहा है…",
     "createKey": "की बनाएँ",
     "createOrgFirst": "पहले एक संगठन बनाएँ।",
