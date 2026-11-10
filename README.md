@@ -15,7 +15,8 @@ with production traffic.
   endpoint coverage.
 - **Automatic model routing.** Match prompt complexity to cheap, mid, or premium
   model pools, balance requests across pool members, and override routing per
-  organization. [Task classifier](docs/classifier.md)
+  organization. Inspect the final model choice and routing reasons through
+  `X-Yabanin-Decision`. [Task classifier](docs/classifier.md)
 - **Retries and fallback.** Retry eligible failures, switch to configured fallback
   models, and use circuit breakers for failing upstreams.
   [Request path](docs/architecture.md)
@@ -25,6 +26,14 @@ with production traffic.
 - **Access and spend controls.** Organization roles, API keys, rate limits,
   credits, and budget caps keep shared model access manageable.
   [Organization setup](docs/organization-setup.md)
+- **Usage beyond dollars.** View recorded USD cost, wallet credits, tokens and
+  factor-based CO₂e estimates in one organization-scoped report. Keep scenario
+  costs separate from recorded spend, with data-quality labels and coverage
+  notices. [Usage and impact accounting](docs/usage-and-impact.md)
+- **Versioned pricing with provenance.** Inspect the active price catalog,
+  preview a replacement and promote a reviewed pricing pack. Catalog versions,
+  digests and source dates make cost calculations traceable.
+  [Pricing and accounting](docs/usage-and-impact.md#prices-and-data-quality)
 - **Programmable guardrails.** Compose YAML policies for PII, secrets, and prompt
   injection checks, masking, external scanners, and LLM judges. Preview decisions
   in shadow mode before enforcement; the pipeline is opt-in.
@@ -35,8 +44,9 @@ with production traffic.
   [Agent governance](docs/agent-governance.md)
 - **Usage visibility and offline audits.** Inspect request history and usage in
   the React dashboard, manage the gateway through the admin API and `yb` CLI,
-  and simulate cache reuse and cheaper routing from local logs with
-  [offline spend audit](docs/audit.md).
+  and simulate cache reuse and cheaper routing from local logs. Export Markdown,
+  JSON or a standalone HTML report without a running gateway or provider calls.
+  [Offline spend audit](docs/audit.md)
 - **Signed request records.** Optional Ed25519-signed lineage preserves model
   and region-related claims in a tamper-evident ledger. Signatures verify record
   integrity, not the physical location of inference. [Lineage](docs/lineage.md)
@@ -44,6 +54,25 @@ with production traffic.
 Costs depend on configured prices and recorded usage. The bundled reference
 prices have limited coverage and may be outdated. Configure current prices
 before relying on cost reports. The mock quickstart makes no paid provider calls.
+
+### Cost, resources and environmental estimates
+
+The dashboard's **Budgets → Units & spend** view keeps five quantities separate:
+
+| Quantity | What it represents |
+| --- | --- |
+| Recorded cost · USD | Recorded request cost under the configured pricing data |
+| What-if cost · USD | A counterfactual scenario, not another charge or guaranteed savings |
+| Credits spent | Wallet usage settlements; one credit equals USD 0.01 |
+| Tokens used | Recorded input and output tokens, with estimated or missing usage identified |
+| Estimated CO₂e · grams | Token usage multiplied by configured model carbon factors |
+
+Carbon factors must be supplied by the operator; the quickstart does not include
+a populated emissions catalog. CO₂e is a model-based estimate, not a hardware
+measurement. Carbon-cap status is informational, and this view does not measure
+water or electricity consumption. Monetary accounting remains USD-based; credits
+and tokens are separate units, not foreign-exchange conversion. See the
+[calculation and coverage details](docs/usage-and-impact.md).
 
 ## Quickstart with Docker Compose
 
@@ -179,6 +208,7 @@ Restarting later reuses the layer cache and the named database volume, so
 | Connect an application | [Compatibility](docs/compatibility.md) · [SDKs](docs/clients/sdk-versions.md) |
 | Set up access and provider keys | [Organizations](docs/organization-setup.md) · [BYOK](docs/byok.md) |
 | Configure routing and policies | [Providers](docs/providers.md) · [Pipeline](docs/pipeline.md) |
+| Understand cost, credits, tokens and CO₂e | [Usage and impact accounting](docs/usage-and-impact.md) |
 | Inspect a local request log | [Spend audit](docs/audit.md) · [CLI](docs/cli.md) |
 | Deploy and operate | [Deployment](docs/deployment-options.md) · [Production runbook](docs/runbooks/production.md) |
 | Build and contribute | [Development](docs/DEVELOPMENT.md) · [Contributing](CONTRIBUTING.md) |

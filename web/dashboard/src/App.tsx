@@ -159,7 +159,7 @@ type NavAccess = {
       // AUX-15: budgets & alerts center — team budgets under budgets.manage
       // (agent budgets additionally need agent_keys.manage; the spend-alert
       // and credits sections gate on root inside the page).
-      { id: 'budgets', labelKey: 'app.navBudgets', icon: <PiggyBank size={16} />, access: { anyOrg: ['budgets.manage'] } },
+      { id: 'budgets', labelKey: 'app.navBudgets', icon: <PiggyBank size={16} />, access: { anyOrg: ['budgets.manage', 'agent_keys.manage', 'analytics.read'] } },
       { id: 'exports', labelKey: 'app.navExports', icon: <Upload size={16} />, access: { anyOrg: ['budgets.read'] } },
       // AUX-16: whitelist/aliases/teams-listing routes are MustBeRoot today;
       // members/developers sit under the org-scoped members.manage.

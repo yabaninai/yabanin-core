@@ -755,7 +755,7 @@ export function BudgetsPage() {
       {org && perms.loading && <StateNotice state="loading" message={t('budgets.checkingRights')} />}
 
       {/* Rights resolved, but no section has a usable server-side path. */}
-      {org && !perms.loading && !canBudgets && !canAgentKeys && !isRoot && (
+      {org && !perms.loading && !canBudgets && !canAgentKeys && !canAnalytics && !isRoot && (
         <StateNotice state="empty" message={t('budgets.noAccess')} />
       )}
 

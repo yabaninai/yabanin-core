@@ -4,8 +4,10 @@ import { useTranslation } from 'react-i18next'
 import { ApiError } from '../../api/transport'
 import { getUnitSpendRollup, type UnitSpendLine, type UnitSpendRollup } from '../../api/currencies'
 import { IdChip } from '../../components/astra/IdChip'
+import { MetricStrip, type Metric } from '../../components/astra/MetricStrip'
 import { StateNotice } from '../../components/astra/StateNotice'
-import { formatDateTime, formatNumber } from '../../i18n/format'
+import { formatDateTime, formatNumber, uiLocale } from '../../i18n/format'
+import { formatUnitAmount, labelSpendLines } from '../../lib/unitSpend'
 
 // Currencies UI slice 5 (brief 2026-11-02 §6.1): the units & spend rollup —
 // GET /api/units/spend, one line per measured unit (USD, credits, tokens,
@@ -50,14 +52,17 @@ function draftToRFC3339(value: string): string | undefined {
 
 function UnitsSpendSection({ org }: { org: string }) {
   const { t } = useTranslation()
-  const [rollup, setRollup] = useState<UnitSpendRollup | null>(null)
-  const [error, setError] = useState<ApiError | null>(null)
+  const [response, setResponse] = useState<{ scope: string; data: UnitSpendRollup } | null>(null)
+  const [failure, setFailure] = useState<{ scope: string; error: ApiError } | null>(null)
   const [loading, setLoading] = useState(true)
 
   // Draft window bounds (datetime-local strings); applied drives the request.
   const [draftFrom, setDraftFrom] = useState('')
   const [draftTo, setDraftTo] = useState('')
   const [applied, setApplied] = useState<{ from?: string; to?: string }>({})
+  const scope = JSON.stringify([org, applied.from, applied.to])
+  const rollup = response?.scope === scope ? response.data : null
+  const error = failure?.scope === scope ? failure.error : null
 
   // Scope guard: on org change the previous effect's AbortController fires,
   // so a delayed org-A response can never land in org B (TP-06 pattern).
@@ -65,25 +70,26 @@ function UnitsSpendSection({ org }: { org: string }) {
 
   const load = useCallback(async (signal?: AbortSignal) => {
     setLoading(true)
+    setResponse(null)
+    setFailure(null)
     try {
       const r = await getUnitSpendRollup(org, applied.from || applied.to ? applied : undefined, { signal })
       if (signal?.aborted) return
-      setRollup(r)
-      setError(null)
+      if (r.org_id !== org) throw new ApiError(502, t('budgets.unitsSpend.scopeMismatch'))
+      setResponse({ scope, data: r })
     } catch (e) {
       if (signal?.aborted || (e as { name?: string })?.name === 'AbortError') return
-      setRollup(null)
-      setError(e instanceof ApiError ? e : null)
+      setFailure({ scope, error: e instanceof ApiError ? e : new ApiError(0, t('budgets.unitsSpend.loadFailed')) })
     } finally {
       if (!signal?.aborted) setLoading(false)
     }
-  }, [org, applied])
+  }, [org, applied, scope, t])
 
   useEffect(() => {
     const ctrl = new AbortController()
     abortRef.current = ctrl
     void load(ctrl.signal)
-    return () => { ctrl.abort() }
+    return () => { ctrl.abort(); abortRef.current?.abort() }
   }, [load])
 
   const retry = () => {
@@ -98,13 +104,28 @@ function UnitsSpendSection({ org }: { org: string }) {
     to: draftToRFC3339(draftTo),
   })
 
-  const renderLine = (line: UnitSpendLine, i: number) => {
+  const describedLines = labelSpendLines(rollup?.lines ?? [])
+  const amountText = (line: UnitSpendLine) => formatUnitAmount(line.amount, uiLocale()) ?? t('budgets.unitsSpend.unknownAmount')
+  const metrics: Metric[] = describedLines.map(({ line, labelKey }) => ({
+    label: labelKey ? t(labelKey) : line.unit,
+    value: amountText(line),
+    unit: line.unit === 'gCO2e' ? 'gCO₂e' : line.unit,
+    source: line.unit === 'gCO2e'
+      ? t('budgets.unitsSpend.carbonSource')
+      : FIDELITY_KEYS[line.fidelity] ? t(FIDELITY_KEYS[line.fidelity]) : line.fidelity,
+    coverage: line.note,
+    state: line.amount === null || !Number.isFinite(line.amount) || line.fidelity === 'unknown'
+      ? 'unknown'
+      : line.fidelity !== 'exact' || line.unit === 'gCO2e' ? 'warning' : 'ok',
+  }))
+
+  const renderLine = ({ line, labelKey, id }: ReturnType<typeof labelSpendLines>[number]) => {
     const familyKey = FAMILY_KEYS[line.family]
     const fidelityKey = FIDELITY_KEYS[line.fidelity]
     return (
-      <tr key={`${line.unit}-${i}`} data-testid={`spend-line-${line.unit}`}>
+      <tr key={id} data-testid={`spend-line-${line.unit}`}>
         <th scope="row" className="py-2 pe-4 text-start align-top font-medium text-[color:var(--astra-ink)]">
-          {line.unit}
+          {labelKey ? t(labelKey) : line.unit}
           {line.note && (
             <span className="block max-w-[34ch] text-xs font-normal text-[color:var(--astra-text-muted)]">{line.note}</span>
           )}
@@ -114,7 +135,7 @@ function UnitsSpendSection({ org }: { org: string }) {
             <span className="text-[color:var(--astra-text-muted)]">{t('budgets.unitsSpend.unknownAmount')}</span>
           ) : (
             <>
-              <span className="font-medium">{formatNumber(line.amount)}</span>{' '}
+              <span className="font-medium">{amountText(line)}</span>{' '}
               <span className="text-[color:var(--astra-text-muted)]">{line.unit}</span>
             </>
           )}
@@ -198,6 +219,12 @@ function UnitsSpendSection({ org }: { org: string }) {
           {rollup.lines.length === 0 && (
             <StateNotice state="empty" message={t('budgets.unitsSpend.empty')} />
           )}
+          {rollup.lines.length > 0 && <MetricStrip metrics={metrics} aria-label={t('budgets.unitsSpend.summary')} />}
+          {rollup.lines.some(line => line.unit === 'gCO2e') && (
+            <p className="text-sm text-[color:var(--astra-text-muted)]" data-testid="units-spend-carbon-method">
+              {t('budgets.unitsSpend.carbonMethod')}
+            </p>
+          )}
           {rollup.lines.length > 0 && (
             <div className="overflow-x-auto">
               <table className="w-full text-sm">
@@ -212,7 +239,7 @@ function UnitsSpendSection({ org }: { org: string }) {
                   </tr>
                 </thead>
                 <tbody className="divide-y divide-[color:var(--astra-rule)]">
-                  {rollup.lines.map(renderLine)}
+                  {describedLines.map(renderLine)}
                 </tbody>
               </table>
             </div>
