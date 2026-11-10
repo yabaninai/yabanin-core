@@ -224,7 +224,7 @@ jobs:
           test -s "${RUNNER_TEMP}/yabanin-image.tar"
 
       - name: Upload image payload
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-payload
           path: ${{ runner.temp }}/yabanin-image.tar
@@ -232,7 +232,7 @@ jobs:
           retention-days: 1
 
       - name: Upload digest
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: image-digest
           # Single explicit file upload: the file lands at the artifact root,
@@ -332,7 +332,7 @@ jobs:
           echo "sbom: $(wc -c < "${RUNNER_TEMP}/sbom-image.spdx.json") bytes for digest ${DIGEST}"
 
       - name: Upload SBOM
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: sbom-image
           path: ${{ runner.temp }}/sbom-image.spdx.json

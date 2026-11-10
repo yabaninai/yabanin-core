@@ -314,7 +314,7 @@ jobs:
 
       - name: Upload quality evidence
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: quality-changed-evidence
           path: artifacts/quality/
@@ -410,7 +410,7 @@ jobs:
 
       - name: Upload credits test log
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: credits-tests-log
           path: credits-tests.log
