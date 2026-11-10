@@ -46,6 +46,6 @@ Numerical anchors retained by the contract tests:
 - Nine distinct complete events: `0.9`.
 - Two complete events with the same event ID: `0.71`.
 
-[Implementation](../../pkg/inbox/scoring.go) ·
-[Behavior tests](../../pkg/inbox/scoring_test.go) ·
-[Adapter and contract tests](../../pkg/inbox/scoring_contract_test.go)
+[Implementation](https://github.com/yabaninai/yabanin-core/blob/main/pkg/inbox/scoring.go) ·
+[Behavior tests](https://github.com/yabaninai/yabanin-core/blob/main/pkg/inbox/scoring_test.go) ·
+[Adapter and contract tests](https://github.com/yabaninai/yabanin-core/blob/main/pkg/inbox/scoring_contract_test.go)

@@ -28,6 +28,6 @@ The following tests specify the shared boundaries:
 - `TestTextTypes_EmptyAndWhitespaceRefused`: whitespace-only payloads are rejected.
 - `TestTextTypes_ParseRefusesUnknown`: values outside the closed set return `ErrUnsupportedType`.
 
-[Implementation](../../pkg/dataclass/texttypes.go) ·
-[Boundary tests](../../pkg/dataclass/texttypes_test.go) ·
-[Matrix consistency test](../../pkg/dataclass/texttypes_matrix_test.go)
+[Implementation](https://github.com/yabaninai/yabanin-core/blob/main/pkg/dataclass/texttypes.go) ·
+[Boundary tests](https://github.com/yabaninai/yabanin-core/blob/main/pkg/dataclass/texttypes_test.go) ·
+[Matrix consistency test](https://github.com/yabaninai/yabanin-core/blob/main/pkg/dataclass/texttypes_matrix_test.go)
