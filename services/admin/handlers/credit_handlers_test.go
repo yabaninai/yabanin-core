@@ -134,6 +134,25 @@ func TestHandleGetBalance_MissingOrgID(t *testing.T) {
 	assert.Contains(t, resp["error"], "org ID is required")
 }
 
+// ---- TestHandleLowBalance ----
+
+// A no-hit low-balance query must encode org_ids as [], never null: the
+// dashboard BudgetsPage contract is string[] and null crashed the whole page
+// on fresh demo orgs (nil Go slice → JSON null → null.includes).
+func TestHandleLowBalance_EmptyListEncodesJSONArray(t *testing.T) {
+	store := credits.NewStore(nil, slog.Default()) // nil DB → LowBalanceOrgs returns nil, nil
+	h := NewCreditHandlers(store, slog.Default())
+
+	rw := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodGet, "/api/credits/low-balance", nil)
+	h.HandleLowBalance(rw, req)
+
+	require.Equal(t, http.StatusOK, rw.Code)
+	raw := strings.TrimSpace(rw.Body.String())
+	assert.Equal(t, `{"count":0,"org_ids":[],"threshold_cents":-500}`, raw,
+		"org_ids must encode as [] with count 0, not null")
+}
+
 // ---- TestHandleGetTransactions ----
 
 func TestHandleGetTransactions_DefaultLimitReturnsEmpty(t *testing.T) {

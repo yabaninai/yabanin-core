@@ -419,7 +419,7 @@ func ApplySeed(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Encrypto
 	res.KeyIssued = issued
 	res.KeyPlaintext = keyPlaintext
 
-	adminCreated, adminExists, err := seedAdmin(ctx, pool, opts)
+	adminCreated, adminExists, err := seedAdmin(ctx, pool, opts, orgID)
 	if err != nil {
 		return res, err
 	}
@@ -554,17 +554,22 @@ func seedAPIKey(ctx context.Context, pool *pgxpool.Pool, orgID, teamID string, o
 	return keyID, plaintext, true, nil
 }
 
-func seedAdmin(ctx context.Context, pool *pgxpool.Pool, opts SeedOptions) (created, exists bool, err error) {
+func seedAdmin(ctx context.Context, pool *pgxpool.Pool, opts SeedOptions, orgID string) (created, exists bool, err error) {
 	if opts.AdminPassword == nil {
 		var existsRow bool
 		if err := pool.QueryRow(ctx,
 			`SELECT EXISTS(SELECT 1 FROM admin_users WHERE email = $1)`, opts.AdminEmail).Scan(&existsRow); err != nil {
 			return false, false, fmt.Errorf("seed admin lookup: %w", err)
 		}
-		if existsRow {
-			return false, true, nil
+		if !existsRow {
+			return false, false, fmt.Errorf("seed admin: %s does not exist and no password was supplied; use --admin-password-stdin or YABANIN_ADMIN_PASSWORD_FILE", opts.AdminEmail)
 		}
-		return false, false, fmt.Errorf("seed admin: %s does not exist and no password was supplied; use --admin-password-stdin or YABANIN_ADMIN_PASSWORD_FILE", opts.AdminEmail)
+		// Existing admin (re-run): still (re-)ensure the org membership below
+		// — stands seeded before the membership existed must converge too.
+		if err := seedAdminOrgMembership(ctx, pool, opts.AdminEmail, orgID); err != nil {
+			return false, true, err
+		}
+		return false, true, nil
 	}
 
 	hash, err := adminauth.HashPassword(*opts.AdminPassword)
@@ -579,8 +584,33 @@ func seedAdmin(ctx context.Context, pool *pgxpool.Pool, opts SeedOptions) (creat
 	if err != nil {
 		return false, false, fmt.Errorf("seed admin user: %w", err)
 	}
+	if err := seedAdminOrgMembership(ctx, pool, opts.AdminEmail, orgID); err != nil {
+		return false, false, err
+	}
 	if tag.RowsAffected() == 0 {
 		return false, true, nil
 	}
 	return true, false, nil
+}
+
+// seedAdminOrgMembership pins the seeded root admin as org-admin of the
+// seeded org. Root alone intentionally holds no org role: org-wide request
+// metadata (the request explorer) answers empty for a bare root, which made
+// the quickstart dashboard show "No data" while analytics counted the
+// requests. The membership is the demo stand's explicit grant — the admin
+// keeps is_root and can administer every other org as root regardless.
+func seedAdminOrgMembership(ctx context.Context, pool *pgxpool.Pool, adminEmail, orgID string) error {
+	var adminID string
+	if err := pool.QueryRow(ctx,
+		`SELECT id FROM admin_users WHERE email = $1`, adminEmail).Scan(&adminID); err != nil {
+		return fmt.Errorf("seed admin id lookup: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `
+		INSERT INTO admin_org_memberships (user_id, org_id, role)
+		VALUES ($1, $2, 'org-admin')
+		ON CONFLICT (user_id, org_id) DO NOTHING`,
+		adminID, orgID); err != nil {
+		return fmt.Errorf("seed admin org membership: %w", err)
+	}
+	return nil
 }

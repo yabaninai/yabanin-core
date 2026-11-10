@@ -721,7 +721,9 @@ export function BudgetsPage() {
 
   const balanceLow = balance != null && balance.balance_cents < 500
   const balanceCritical = balance != null && balance.balance_cents <= -100
-  const orgOnLowList = lowBalance != null && lowBalance.org_ids.includes(orgId.trim())
+  // org_ids is contractually string[], but a pre-fix backend encodes a
+  // no-hit list as null — tolerate it instead of crashing the whole page.
+  const orgOnLowList = lowBalance != null && (lowBalance.org_ids ?? []).includes(orgId.trim())
   const org = orgId.trim()
 
   return (

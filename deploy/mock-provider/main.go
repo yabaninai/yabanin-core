@@ -165,6 +165,65 @@ func buildResponse(req ChatCompletionRequest) ChatCompletionResponse {
 	}
 }
 
+// ChunkDelta is the streaming delta of one chat.completion.chunk frame.
+// It reuses ResponseMsg: role first, then content and/or tool_calls pieces.
+type chunkChoice struct {
+	Index        int         `json:"index"`
+	Delta        ResponseMsg `json:"delta"`
+	FinishReason *string     `json:"finish_reason"`
+}
+
+type chatChunk struct {
+	ID      string        `json:"id"`
+	Object  string        `json:"object"`
+	Created int64         `json:"created"`
+	Model   string        `json:"model"`
+	Choices []chunkChoice `json:"choices"`
+	Usage   *Usage        `json:"usage,omitempty"`
+}
+
+// streamFrames renders the full SSE payload for a streaming request: OpenAI
+// chat.completion.chunk frames ending with a terminal data: [DONE] event.
+// The gateway's drain (pkg/provider/stream.go) requires the [DONE]
+// terminator — a plain JSON body is not a stream, and the request used to be
+// recorded as failed with an injected client-facing error frame.
+func streamFrames(req ChatCompletionRequest) []string {
+	resp := buildResponse(req)
+	choice := resp.Choices[0]
+	id := "chatcmpl-stream-" + resp.ID[9:] // strip "chatcmpl-" prefix reuse
+	mk := func(delta ResponseMsg, finish *string, usage *Usage) string {
+		payload, err := json.Marshal(chatChunk{
+			ID: id, Object: "chat.completion.chunk", Created: resp.Created, Model: resp.Model,
+			Choices: []chunkChoice{{Index: 0, Delta: delta, FinishReason: finish}},
+			Usage:   usage,
+		})
+		if err != nil {
+			return "data: {}\n\n" // unreachable: the structs always marshal
+		}
+		return "data: " + string(payload) + "\n\n"
+	}
+
+	frames := []string{mk(ResponseMsg{Role: "assistant"}, nil, nil)}
+	if choice.FinishReason == "tool_calls" {
+		for _, call := range choice.Message.ToolCalls {
+			frames = append(frames, mk(ResponseMsg{ToolCalls: []ToolCall{call}}, nil, nil))
+		}
+	} else {
+		// Split the canned content into two deltas so consumers see a real
+		// incremental stream, not one bulk frame.
+		content := choice.Message.Content
+		half := len(content) / 2
+		frames = append(frames,
+			mk(ResponseMsg{Content: content[:half]}, nil, nil),
+			mk(ResponseMsg{Content: content[half:]}, nil, nil),
+		)
+	}
+	finish := choice.FinishReason
+	frames = append(frames, mk(ResponseMsg{}, &finish, &resp.Usage))
+	frames = append(frames, "data: [DONE]\n\n")
+	return frames
+}
+
 func main() {
 	port := os.Getenv("MOCK_PROVIDER_PORT")
 	if port == "" {
@@ -185,6 +244,20 @@ func main() {
 		var req ChatCompletionRequest
 		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 			http.Error(w, fmt.Sprintf("bad request: %v", err), http.StatusBadRequest)
+			return
+		}
+
+		if req.Stream {
+			w.Header().Set("Content-Type", "text/event-stream")
+			w.Header().Set("Cache-Control", "no-cache")
+			for _, frame := range streamFrames(req) {
+				if _, err := fmt.Fprintf(w, "%s", frame); err != nil {
+					return
+				}
+				if f, ok := w.(http.Flusher); ok {
+					f.Flush()
+				}
+			}
 			return
 		}
 

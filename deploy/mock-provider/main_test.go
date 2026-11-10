@@ -67,3 +67,86 @@ func TestMarkerNotAtStartStaysPlain(t *testing.T) {
 		t.Fatal("marker not at start must stay in the plain branch")
 	}
 }
+
+func TestStreamFrames_PlainRequest(t *testing.T) {
+	frames := streamFrames(ChatCompletionRequest{Model: "mock-model", Stream: true, Messages: lastUserMsg("hello")})
+	if len(frames) < 4 {
+		t.Fatalf("frame count = %d, want >= 4 (role, deltas, finish, DONE)", len(frames))
+	}
+	if got := frames[len(frames)-1]; got != "data: [DONE]\n\n" {
+		t.Fatalf("last frame = %q, want data: [DONE]", got)
+	}
+	for i, f := range frames[:len(frames)-1] {
+		if !strings.HasPrefix(f, "data: {") || !strings.HasSuffix(f, "\n\n") {
+			t.Fatalf("frame %d is not a complete SSE event: %q", i, f)
+		}
+		var chunk struct {
+			Object  string `json:"object"`
+			Choices []struct {
+				Delta struct {
+					Role    string `json:"role"`
+					Content string `json:"content"`
+				} `json:"delta"`
+				FinishReason *string `json:"finish_reason"`
+			} `json:"choices"`
+			Usage *struct {
+				TotalTokens int `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal([]byte(f[len("data: "):]), &chunk); err != nil {
+			t.Fatalf("frame %d is not JSON: %v (%q)", i, err, f)
+		}
+		if chunk.Object != "chat.completion.chunk" {
+			t.Fatalf("frame %d object = %q", i, chunk.Object)
+		}
+	}
+	first := frames[0]
+	if !strings.Contains(first, `"role":"assistant"`) {
+		t.Fatalf("first frame must carry the role delta: %q", first)
+	}
+	last := frames[len(frames)-2]
+	if !strings.Contains(last, `"finish_reason":"stop"`) || !strings.Contains(last, `"total_tokens":20`) {
+		t.Fatalf("finish frame must carry finish_reason stop and usage: %q", last)
+	}
+	var content strings.Builder
+	for _, f := range frames[1 : len(frames)-2] {
+		content.WriteString(extractDeltaContent(t, f))
+	}
+	if content.String() != "Mock response to: hello" {
+		t.Fatalf("reassembled content = %q", content.String())
+	}
+}
+
+func extractDeltaContent(t *testing.T, frame string) string {
+	t.Helper()
+	var chunk struct {
+		Choices []struct {
+			Delta struct {
+				Content string `json:"content"`
+			} `json:"delta"`
+		} `json:"choices"`
+	}
+	if err := json.Unmarshal([]byte(frame[len("data: "):]), &chunk); err != nil {
+		t.Fatalf("frame not JSON: %v", err)
+	}
+	if len(chunk.Choices) != 1 {
+		t.Fatalf("frame must have exactly one choice: %q", frame)
+	}
+	return chunk.Choices[0].Delta.Content
+}
+
+func TestStreamFrames_ToolTask(t *testing.T) {
+	frames := streamFrames(ChatCompletionRequest{Model: "mock-model", Stream: true,
+		Messages: lastUserMsg("[tool-task] refactor the retry loop")})
+	joined := strings.Join(frames, "")
+	if !strings.Contains(joined, `"tool_calls"`) {
+		t.Fatalf("tool stream must carry tool_calls deltas: %s", joined)
+	}
+	last := frames[len(frames)-2]
+	if !strings.Contains(last, `"finish_reason":"tool_calls"`) {
+		t.Fatalf("tool stream must finish with tool_calls: %q", last)
+	}
+	if frames[len(frames)-1] != "data: [DONE]\n\n" {
+		t.Fatal("tool stream must end with the [DONE] terminator")
+	}
+}
