@@ -51,12 +51,16 @@ func deadRedisPublisher() *eventpub.RedisPublisher {
 // publish. Package-random shuffle order exposed the race: a previous
 // test's retry backoff landed its publish_failed increment after the next
 // test's `before` snapshot, breaking exact delta assertions.
+// The semaphore waits use a generous 10s deadline: the helper's job is to
+// catch leaked tokens (a hang), not to bound publish latency, and the
+// parallel -race quality gate can starve the retry ladder's ~650ms of
+// backoff sleeps well past the old 1-2s deadlines.
 func requirePublishQuiescence(t *testing.T) {
 	t.Helper()
 	for i := 0; i < cap(eventPublishSem); i++ {
 		select {
 		case eventPublishSem <- struct{}{}:
-		case <-time.After(2 * time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatalf("publish semaphore not empty at slot %d — leaked tokens", i)
 		}
 	}
@@ -76,7 +80,7 @@ func TestPublishEventBacklogFullCounted(t *testing.T) {
 	for i := 0; i < cap(eventPublishSem); i++ {
 		select {
 		case eventPublishSem <- struct{}{}:
-		case <-time.After(time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatalf("publish semaphore not empty at slot %d — leaked tokens", i)
 		}
 	}
@@ -84,7 +88,7 @@ func TestPublishEventBacklogFullCounted(t *testing.T) {
 		for i := 0; i < cap(eventPublishSem); i++ {
 			select {
 			case <-eventPublishSem:
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatalf("publish semaphore did not drain at slot %d", i)
 			}
 		}

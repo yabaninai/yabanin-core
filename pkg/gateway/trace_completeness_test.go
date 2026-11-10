@@ -388,7 +388,7 @@ func TestPublishEventBacklogFullStampsRequestRow(t *testing.T) {
 	for i := 0; i < cap(eventPublishSem); i++ {
 		select {
 		case eventPublishSem <- struct{}{}:
-		case <-time.After(time.Second):
+		case <-time.After(10 * time.Second):
 			t.Fatalf("publish semaphore not empty at slot %d — leaked tokens", i)
 		}
 	}
@@ -396,7 +396,7 @@ func TestPublishEventBacklogFullStampsRequestRow(t *testing.T) {
 		for i := 0; i < cap(eventPublishSem); i++ {
 			select {
 			case <-eventPublishSem:
-			case <-time.After(time.Second):
+			case <-time.After(10 * time.Second):
 				t.Fatalf("publish semaphore did not drain at slot %d", i)
 			}
 		}
