@@ -16,7 +16,7 @@ RUN npm run build
 
 # Serve stage
 # nginx:alpine digest-pinned 2026-10-25 via `docker buildx imagetools inspect` (relprep §9 follow-up)
-FROM nginx:alpine@sha256:a3554c0d0b48177b1413c26e01f695334428020d9df01243fbae3e11cfd17417
+FROM nginx:alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e91ca6c3a11
 COPY --from=builder /src/web/dashboard/dist /usr/share/nginx/html
 COPY web/dashboard/nginx-main.conf /etc/nginx/nginx.conf
 COPY web/dashboard/nginx.conf /etc/nginx/conf.d/default.conf

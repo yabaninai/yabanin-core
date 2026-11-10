@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    image: pgvector/pgvector:pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f  # pinned 2026-11-10 (was: pgvector/pgvector:pg16)
     env_file:
       - .env
     environment:
@@ -30,7 +30,7 @@ services:
       - app-internal
 
   redis:
-    image: redis:7-alpine@sha256:57e4255cc971b1c8d6f8a6ca283ac01bc3ecdd914273ef6bfaede87aaecd6541  # pinned 2026-10-25 (was: redis:7-alpine)
+    image: redis:7-alpine@sha256:7b1753b4c5ad8458906c272a8132b8c15f5557b000379eb115fb239706a384b7  # pinned 2026-11-10 (was: redis:7-alpine)
     command: redis-server --appendonly yes
     ports:
       - "6379:6379"
@@ -54,7 +54,7 @@ services:
 
   # --- Migrations (runs once on first up) ---
   migrate:
-    image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a  # pinned 2026-10-25 (was: pgvector/pgvector:pg16)
+    image: pgvector/pgvector:pg16@sha256:0dd3149a06e4579a0d70d8fef9945636cd514005e7237deb27f9b67886f8dc4f  # pinned 2026-11-10 (was: pgvector/pgvector:pg16)
     depends_on:
       postgres:
         condition: service_healthy

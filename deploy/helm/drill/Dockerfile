@@ -6,7 +6,7 @@
 #
 # Drill-only: the image runs as the postgres user (non-root, container policy) and
 # carries no application code or credentials.
-FROM postgres:16-alpine
+FROM postgres:16-alpine@sha256:aa6cb33cf4c19c765cefcf48d96176258800870a9a1e930ad126200f9d825139  # pinned 2026-11-10 (was: postgres:16-alpine)
 
 ARG PATRONI_VERSION=4.1.5
 ARG PSYCOPG_VERSION=3.3.6
