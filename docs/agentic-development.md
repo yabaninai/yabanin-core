@@ -59,48 +59,14 @@ Every tool below is just a different spelling of that one call. Replace
 real key. These are verified against the gateway contract; none of them require
 a running stand to read.
 
-### OpenCode (`make opencode-remote-wire` does this)
+### OpenCode
 
-`make opencode-remote-wire` writes an `opencode.jsonc` that defaults new
-sessions to the `glm-research` orchestrator (`yabanin/glm-5.3`) and routes
-`glm-build` plus the legacy `yabanin` / `luna` / `sol-review` / `reason` /
-`code` / `complex-code` execution agents through the gateway on
-`yabanin/glm-5.3-flash`. The minimal form (the local dev stand
-`make stand-opencode` was retired 2026-10-12):
+Follow the [OpenCode client guide](clients/opencode.md) to configure your
+gateway URL, API key and a model ID returned by `GET /v1/models`. Model
+availability and routing depend on your gateway configuration.
 
-```json
-{
-  "$schema": "https://opencode.ai/config.json",
-  "model": "yabanin/glm-5.3",
-  "default_agent": "glm-research",
-  "provider": {
-    "yabanin": {
-      "npm": "@ai-sdk/openai-compatible",
-      "name": "Yabanin Gateway",
-      "options": {
-        "baseURL": "https://yabanin.ai/gw/v1",
-        "apiKey": "yb_…"
-      },
-      "models": {
-        "glm-5.3": { "name": "GLM-5.3 (orchestration)" },
-        "glm-5.3-flash": { "name": "GLM-5.3 Flash (execution)" }
-      }
-    }
-  },
-  "agent": {
-    "glm-research": { "model": "yabanin/glm-5.3" },
-    "glm-build": { "model": "yabanin/glm-5.3-flash" },
-    "reason": { "model": "yabanin/glm-5.3-flash" },
-    "code": { "model": "yabanin/glm-5.3-flash" },
-    "complex-code": { "model": "yabanin/glm-5.3-flash" }
-  }
-}
-```
-
-The model names are deployment configuration (your registry / org routing), not
-a fixed list — point each agent at whatever your org registers. See
-[OpenCode Integration](./opencode-integration.md) for the routing contract and
-the `tr_delegate` subscription-executor sidecar.
+See [OpenCode integration](opencode-integration.md) for routing, accounting and
+session controls. Configure local agent profiles and permissions in OpenCode.
 
 ### Claude Code
 
