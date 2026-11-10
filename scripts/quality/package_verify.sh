@@ -4,6 +4,11 @@
 set -euo pipefail
 cd "$(dirname "$0")/../.."
 
+if [ ! -f scripts/quality/scan_delivered_bytes.sh ]; then
+  echo "FAIL: missing delivered-bytes scanner scripts/quality/scan_delivered_bytes.sh" >&2
+  exit 1
+fi
+
 if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   echo "FAIL: Docker daemon unavailable; packaging verification cannot run" >&2
   exit 1
@@ -238,8 +243,10 @@ fi
 # dashboard deliverable image. vite currently emits none, so green means the
 # deliverable is map-free; any future *.map in the image fails this gate.
 echo "== dashboard deliverable contents (sourcemaps fail closed)"
-if ! run_once "pkgverify-dashboard-$RUN_ID" "$OUT/dashboard-sourcemaps.txt" 45 \
+if run_once "pkgverify-dashboard-$RUN_ID" "$OUT/dashboard-sourcemaps.txt" 45 \
   --entrypoint /bin/sh "$DASH_IMAGE" -c 'find /usr/share/nginx/html -name "*.map" -print'; then
+  :
+else
   code=$?
   echo "FAIL: dashboard sourcemap probe exited $code; see $OUT/dashboard-sourcemaps.txt" >&2
   fail=1

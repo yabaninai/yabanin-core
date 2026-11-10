@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""NEXT-22 alert-hygiene checker (no external tools pinned).
+"""Static checks for the public monitoring templates and operator runbook.
 
 (1) Every metric referenced in alert expressions is DECLARED in the scanned
     Go packages (pkg/metrics + pkg/shadow canonical registry, plus the
@@ -15,10 +15,10 @@
 (4) Notification routing verified (N13-P04-T04, machine half of the
     test-firing card): Alertmanager root/child routes resolve to real
     receivers, every rule severity routes (critical keeps its Telegram
-    fan-out), the compose entrypoint renders every __X__ placeholder
-    (an unrendered placeholder ships a literal URL / unquoted chat_id and
-    kills the delivery path), and the documented test-fire procedure in
-    docs/runbooks/alerts.md matches the actual routing config.
+    fan-out), every __X__ placeholder has documented operator rendering and
+    config validation, and Prometheus loads the shipped rules and declares
+    the Alertmanager target. This does not certify an installed deployment
+    or live delivery; quickstart does not install the monitoring stack.
 (5) Noise bounds verified (N13-P04-T04): every alert has a positive `for:`
     (absent()-style alerts exempt), group_wait/group_interval/
     repeat_interval exist and are ordered (group_wait <= group_interval,
@@ -35,7 +35,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent.parent
 RULES = ROOT / "deploy/prometheus/alert-rules.yml"
 ALERTMANAGER = ROOT / "deploy/alertmanager/alertmanager.yml"
-COMPOSE = ROOT / "deploy/docker-compose.prod.yml"
+PROMETHEUS = ROOT / "deploy/prometheus/prometheus.yml"
 TESTFIRE_RUNBOOK = ROOT / "docs/runbooks/alerts.md"
 RUNBOOKS = [
     ROOT / "docs/runbooks/alerts.md",
@@ -167,12 +167,15 @@ def parse_alertmanager(text):
         "root_receiver": None,
         "children": [],  # (match_key, match_value, receiver)
         "receivers": [],
+        "receiver_kinds": {},
         "timings": {},  # group_wait / group_interval / repeat_interval / resolve_timeout
         "inhibit_critical_warning": False,
         "inhibit_equal_alertname": False,
         "placeholders": set(),
     }
     info["receivers"] = re.findall(r"^\s*- name:\s*\"?([\w-]+)", text, re.M)
+    for block in re.finditer(r'^  - name:\s*"?([\w-]+)"?\s*\n(.*?)(?=^  - name:|^[a-z_]+:|\Z)', text, re.M | re.S):
+        info["receiver_kinds"][block.group(1)] = set(re.findall(r"^    ([a-z_]+)_configs:", block.group(2), re.M))
     root = re.search(r"^  receiver:\s*\"?([\w-]+)", text, re.M)
     if root:
         info["root_receiver"] = root.group(1)
@@ -197,16 +200,39 @@ def parse_alertmanager(text):
     return info
 
 
-def compose_alertmanager_block(text):
-    """The alertmanager service block of docker-compose.prod.yml (env
-    defaults + entrypoint sed rendering). Scoped so ALERT_* env keys of
-    other services can never satisfy the rendering check."""
-    start = re.search(r"^  alertmanager:\s*$", text, re.M)
-    if not start:
-        return None
-    rest = text[start.start() + 1:]
-    nxt = re.search(r"^  [\w-]+:\s*$", rest, re.M)
-    return rest[:nxt.start()] if nxt else rest
+def prometheus_problems(text):
+    """Check the shipped reference wiring; do not assume a private stack exists."""
+    problems = []
+    sections = dict(re.findall(r"^([a-z_]+):[^\n]*\n(.*?)(?=^[a-z_]+:|\Z)", text, re.M | re.S))
+    rules = sections.get("rule_files", "")
+    if not re.search(r'^\s*-\s*["\']?alert-rules\.yml["\']?\s*$', rules, re.M):
+        problems.append("prometheus: shipped alert-rules.yml is not loaded by rule_files")
+    alerting = sections.get("alerting", "")
+    if not re.search(r"^  alertmanagers:\s*$", alerting, re.M) or not re.search(
+            r"targets:\s*\[\s*[\"']alertmanager:9093[\"']\s*\]", alerting):
+        problems.append("prometheus: reference Alertmanager target alertmanager:9093 is missing")
+    return problems
+
+
+def rendering_problems(am, testfire_md):
+    """Public config is a template, rendered by the operator as documented."""
+    problems = []
+    text = testfire_md or ""
+    documented = set(re.findall(r"__([A-Z0-9_]+)__", text))
+    expected = {"ALERT_WEBHOOK_URL", "ALERT_TG_BOT_TOKEN", "ALERT_TG_CHAT_ID"}
+    if am["placeholders"] != expected:
+        problems.append("rendering: template placeholders differ from the supported webhook/Telegram inputs")
+    for name in sorted(am["placeholders"] - documented):
+        problems.append(f"rendering: placeholder __{name}__ has no operator instruction")
+    for name in sorted(documented - am["placeholders"]):
+        problems.append(f"rendering: documented placeholder __{name}__ is absent from template")
+    if "amtool check-config" not in text:
+        problems.append("rendering: runbook must require amtool check-config before installation")
+    if "YAML integer" not in text:
+        problems.append("rendering: runbook must state that chat ID is a YAML integer")
+    if "does not expand" not in text:
+        problems.append("rendering: runbook must explain that Alertmanager does not expand template variables")
+    return problems
 
 
 def testfire_section(text):
@@ -219,7 +245,7 @@ def testfire_section(text):
     return rest[:nxt.start()] if nxt else rest
 
 
-def notify_noise_problems(alerts, am, compose_text, testfire_md):
+def notify_noise_problems(alerts, am, prometheus_text, testfire_md):
     """Routing + noise checks (N13-P04-T04). Returns problem strings."""
     problems = []
 
@@ -255,33 +281,12 @@ def notify_noise_problems(alerts, am, compose_text, testfire_md):
             "matches severity=critical (critical fan-out silently degrades "
             "to the default receiver)")
 
-    # -- rendering consistency: placeholders <-> compose sed <-> env defaults
-    if not am["placeholders"]:
-        problems.append(
-            "rendering: no __X__ placeholders in alertmanager.yml (the "
-            "compose entrypoint renders nothing — env vars are ignored)")
-    else:
-        block = compose_alertmanager_block(compose_text or "")
-        seds = set(re.findall(r"s\|__([A-Z0-9_]+)__\|", block)) if block else set()
-        envs = set(re.findall(r"^\s*([A-Z][A-Z0-9_]*):\s*", block, re.M)) if block else set()
-        if block is None:
-            problems.append(
-                "rendering: alertmanager service block not found in "
-                "deploy/docker-compose.prod.yml")
-        for ph in sorted(am["placeholders"]):
-            if block is not None and ph not in seds:
-                problems.append(
-                    f"rendering: placeholder __{ph}__ has no sed in the "
-                    "compose alertmanager entrypoint (ships as a literal; "
-                    "unquoted chat_id would fail config load)")
-            if block is not None and ph not in envs:
-                problems.append(
-                    f"rendering: no env default for {ph} in the compose "
-                    "alertmanager environment block")
-        for ph in sorted(seds - am["placeholders"]):
-            problems.append(
-                f"rendering: compose sed renders __{ph}__ which no longer "
-                "exists in alertmanager.yml (drift)")
+    for key, value, receiver in am["children"]:
+        if key == "severity" and value == "critical" and not {"webhook", "telegram"}.issubset(am["receiver_kinds"].get(receiver, set())):
+            problems.append("notification: critical receiver must retain webhook and Telegram fan-out")
+
+    problems.extend(rendering_problems(am, testfire_md))
+    problems.extend(prometheus_problems(prometheus_text))
 
     # -- noise bound: every alert persists (for:) before firing
     for a in alerts:
@@ -302,6 +307,8 @@ def notify_noise_problems(alerts, am, compose_text, testfire_md):
             problems.append(
                 f"alertmanager: route {key} missing (notification "
                 "grouping/repeat noise unbounded)")
+        elif duration_seconds(am["timings"][key]) is None or duration_seconds(am["timings"][key]) <= 0:
+            problems.append(f"alertmanager: invalid route timing {key}")
     gw = duration_seconds(am["timings"].get("group_wait"))
     gi = duration_seconds(am["timings"].get("group_interval"))
     rp = duration_seconds(am["timings"].get("repeat_interval"))
@@ -364,10 +371,9 @@ def main() -> int:
     try:
         text = RULES.read_text()
         alerts = parse_rules(text)
-        runbook = "\n".join(
-            p.read_text(errors="replace") for p in RUNBOOKS if p.exists())
+        runbooks = {str(p.relative_to(ROOT)): p.read_text() for p in RUNBOOKS}
         am_text = ALERTMANAGER.read_text()
-        compose_text = COMPOSE.read_text()
+        prometheus_text = PROMETHEUS.read_text()
         testfire_md = testfire_section(TESTFIRE_RUNBOOK.read_text())
     except OSError as exc:
         print(f"scanner error: {exc}", file=sys.stderr)
@@ -379,7 +385,11 @@ def main() -> int:
 
     declared = declared_metric_names()
     problems = []
+    if len({a["name"] for a in alerts}) != len(alerts):
+        problems.append("rules: duplicate alert name")
     for a in alerts:
+        if not a["expr"].strip():
+            problems.append(f"{a['name']}: empty expression")
         for metric in sorted(expr_metrics(a["expr"])):
             if metric == "up" or metric.startswith("node_"):
                 continue  # synthetic scrape-health metric from Prometheus itself
@@ -390,8 +400,11 @@ def main() -> int:
         if not rb:
             problems.append(f"{a['name']}: missing runbook_url annotation")
         else:
-            anchor = rb.split("#", 1)[-1]
-            if f"## {anchor}" not in runbook:
+            document, separator, anchor = rb.partition("#")
+            runbook = runbooks.get(document, "")
+            if not separator or not anchor or not (
+                    re.search(r"^#{1,6}\s+" + re.escape(anchor) + r"\s*$", runbook, re.M)
+                    or "{#" + anchor + "}" in runbook):
                 problems.append(
                     f"{a['name']}: runbook anchor #{anchor} missing in runbook set "
                     "(alerts.md / budget-reservations-alerts.md / otel-export.md)")
@@ -402,8 +415,9 @@ def main() -> int:
             problems.append(f"SLO metric missing: {slo}")
 
     # Notification routing + noise bounds (N13-P04-T04)
-    problems.extend(notify_noise_problems(alerts, am, compose_text, testfire_md))
+    problems.extend(notify_noise_problems(alerts, am, prometheus_text, testfire_md))
 
+    print("Scope: public configuration templates and runbooks; installed monitoring and notification delivery are not tested")
     print(f"alert check: {len(alerts)} alerts, {len(problems)} problem(s)")
     for p in problems:
         print(f"  ✗ {p}")
