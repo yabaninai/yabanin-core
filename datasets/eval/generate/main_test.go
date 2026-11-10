@@ -3,12 +3,20 @@ package main
 import (
 	"bytes"
 	"os"
-	"path/filepath"
 	"testing"
 )
 
 func TestCommittedBundlesReproduce(t *testing.T) {
-	raw, err := os.ReadFile("../golden_routing.jsonl")
+	root, err := os.OpenRoot("..")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := root.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	raw, err := root.ReadFile("golden_routing.jsonl")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -17,7 +25,7 @@ func TestCommittedBundlesReproduce(t *testing.T) {
 		t.Fatal(err)
 	}
 	for name, generated := range files {
-		committed, err := os.ReadFile(filepath.Join("..", name))
+		committed, err := root.ReadFile(name)
 		if err != nil {
 			t.Fatal(err)
 		}
