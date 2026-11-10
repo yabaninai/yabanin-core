@@ -1,0 +1,198 @@
+{
+  "classifier": "rule_tier",
+  "generated_by": "authored synthetic expectations; verified by public fixture tests",
+  "rows": [
+    {
+      "id": "easy-definition",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-summary",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-translation",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-extract",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-question",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-list",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-uppercase",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-format",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-rephrase",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "easy-mixed-keywords",
+      "expect_class": "easy",
+      "got_class": "easy",
+      "match": true
+    },
+    {
+      "id": "medium-greeting",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-statement",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-unicode",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-code",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-tools",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-code-question",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-length",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-neutral",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-punctuation",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "medium-cjk",
+      "expect_class": "medium",
+      "got_class": "medium",
+      "match": true
+    },
+    {
+      "id": "hard-debug",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-design",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-analyze",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-investigate",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-tests",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-uppercase",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-precedence",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-architecture",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-long",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-fence",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-tools",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    },
+    {
+      "id": "hard-optimize",
+      "expect_class": "hard",
+      "got_class": "hard",
+      "match": true
+    }
+  ]
+}
