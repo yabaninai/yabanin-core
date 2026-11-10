@@ -295,10 +295,7 @@ func (h *CreditHandlers) HandleLowBalance(w http.ResponseWriter, r *http.Request
 		writeJSON(w, http.StatusInternalServerError, apiError{Error: err.Error()})
 		return
 	}
-	// The wire contract is a JSON array (web LowBalanceOrgsResponse.org_ids:
-	// string[]). A no-hit query yields a Go nil slice, which encodes as null
-	// and crashed the dashboard budgets page on every fresh demo org
-	// (null.includes). Encode the empty answer as [].
+	// A nil slice encodes as null; the client contract is [].
 	if orgIDs == nil {
 		orgIDs = []string{}
 	}

@@ -570,8 +570,7 @@ func seedAdmin(ctx context.Context, pool *pgxpool.Pool, opts SeedOptions, orgID 
 		if !existsRow {
 			return false, false, fmt.Errorf("seed admin: %s does not exist and no password was supplied; use --admin-password-stdin or YABANIN_ADMIN_PASSWORD_FILE", opts.AdminEmail)
 		}
-		// Existing admin (re-run): still (re-)ensure the org membership below
-		// — stands seeded before the membership existed must converge too.
+		// Re-run: converge stands seeded before this membership existed.
 		if err := seedAdminOrgMembership(ctx, pool, opts.AdminEmail, orgID); err != nil {
 			return false, true, err
 		}
@@ -599,12 +598,7 @@ func seedAdmin(ctx context.Context, pool *pgxpool.Pool, opts SeedOptions, orgID 
 	return true, false, nil
 }
 
-// seedAdminOrgMembership pins the seeded root admin as org-admin of the
-// seeded org. Root alone intentionally holds no org role: org-wide request
-// metadata (the request explorer) answers empty for a bare root, which made
-// the quickstart dashboard show "No data" while analytics counted the
-// requests. The membership is the demo stand's explicit grant — the admin
-// keeps is_root and can administer every other org as root regardless.
+// seedAdminOrgMembership pins the seeded root admin as org-admin of the seeded org.
 func seedAdminOrgMembership(ctx context.Context, pool *pgxpool.Pool, adminEmail, orgID string) error {
 	var adminID string
 	if err := pool.QueryRow(ctx,

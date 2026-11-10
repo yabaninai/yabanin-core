@@ -136,9 +136,6 @@ func TestHandleGetBalance_MissingOrgID(t *testing.T) {
 
 // ---- TestHandleLowBalance ----
 
-// A no-hit low-balance query must encode org_ids as [], never null: the
-// dashboard BudgetsPage contract is string[] and null crashed the whole page
-// on fresh demo orgs (nil Go slice → JSON null → null.includes).
 func TestHandleLowBalance_EmptyListEncodesJSONArray(t *testing.T) {
 	store := credits.NewStore(nil, slog.Default()) // nil DB → LowBalanceOrgs returns nil, nil
 	h := NewCreditHandlers(store, slog.Default())

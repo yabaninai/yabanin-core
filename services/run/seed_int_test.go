@@ -114,10 +114,6 @@ func TestApplySeed_IdempotentAndKeyPrintedOnce(t *testing.T) {
 	require.Equal(t, int64(1), countRow(t, pool, `SELECT count(*) FROM models_registry WHERE model_name = $1`, opts.ModelName))
 	require.Equal(t, int64(1), countRow(t, pool, `SELECT count(*) FROM org_credits WHERE org_id = $1`, first.OrgID))
 	require.Equal(t, int64(1), countRow(t, pool, `SELECT count(*) FROM admin_users WHERE email = $1`, opts.AdminEmail))
-	// The seeded root admin holds exactly one org-admin membership on the
-	// seeded org (re-run keeps one row): a bare root gets no org-wide
-	// request metadata, which left the request explorer empty while
-	// analytics counted the requests.
 	require.Equal(t, int64(1), countRow(t, pool,
 		`SELECT count(*) FROM admin_org_memberships m
 		 JOIN admin_users u ON u.id = m.user_id
