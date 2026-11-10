@@ -202,14 +202,23 @@ func TestBreaker_RetryAfter_JitterSpreadsRefusals(t *testing.T) {
 	cfg.Window = time.Minute
 	cfg.RetryAfterJitter = 1
 	b := NewBreaker(cfg)
+	// start is captured before RecordFailure so the decay of the OPEN-state
+	// base is bounded: RetryAfter jitters the REMAINING window, which shrinks
+	// with the wall clock between the breaker opening and each draw. A hint
+	// drawn after elapsed time d satisfies ra >= OpenTimeout-d; measuring
+	// `after` post-draw gives after >= d, so ra >= OpenTimeout-after is a
+	// race-free lower bound, and ra < 2*OpenTimeout always holds because the
+	// widened base is strictly below 2x the full timeout.
+	start := time.Now()
 	b.RecordFailure()
 
 	const samples = 64
 	seen := make(map[time.Duration]bool, samples)
 	for i := 0; i < samples; i++ {
 		ra := b.RetryAfter()
-		if ra < cfg.OpenTimeout || ra >= 2*cfg.OpenTimeout {
-			t.Fatalf("hint %d must be in [1s, 2s), got %v", i, ra)
+		after := time.Since(start)
+		if ra < cfg.OpenTimeout-after || ra >= 2*cfg.OpenTimeout {
+			t.Fatalf("hint %d must be in [remaining, 2*OpenTimeout) allowing for base decay, got %v (decay bound %v)", i, ra, after)
 		}
 		seen[ra] = true
 	}
