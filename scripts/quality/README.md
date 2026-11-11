@@ -57,9 +57,11 @@ make quality-full QUALITY_BASE="$TASK_BASE"
 The full profile covers static analysis, Go tests with race detection, public
 routing/guard evaluations, dashboard and site builds, SDK tests, module
 integration, secrets, dependencies, licenses, container policy, packaging,
-monitoring configuration and database recovery. Evaluation corpora are synthetic
-regression samples, not production accuracy benchmarks. Private program claims
-and planning ledgers are outside the product profile.
+monitoring configuration and database recovery. Changed Go files additionally
+run the changed-complexity gate (`go-complexity`, differential analyzer in
+`complexity/go/`; thresholds and receipt policy in its README). Evaluation
+corpora are synthetic regression samples, not production accuracy benchmarks.
+Private program claims and planning ledgers are outside the product profile.
 
 The full profile does not include `make quality-integration` (gateway integration)
 or browser acceptance. Run those when required by the changed behavior. Verify

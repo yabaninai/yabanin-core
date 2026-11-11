@@ -11,13 +11,16 @@ Threshold decisions (QG-C01-02): a content-identical copy of a function
 whose base original still exists at head is a DUPLICATE, measured as
 added/changed content under the full thresholds; only a move whose original
 is gone carries pre-existing debt (listed in the untouched-debt ledger,
-never blocking). The 11-15 band passes only with a source-bound
-stronger-model review receipt (see scripts/quality/complexity/go/README.md
-for the schema); receipts never unblock >15 bodies for new/changed code.
+never blocking). Since QG-C01-03 duplicate resolution covers the whole head
+tree: the surviving original may live in a changed or an untouched file.
+The 11-15 band passes only with a source-bound stronger-model review
+receipt (see scripts/quality/complexity/go/README.md for the schema);
+receipts never unblock >15 bodies for new/changed code.
 
 Python 3.9+ standard library plus the Go toolchain (used only to parse and
-measure; the product is never built). This script measures and reports; gate
-wiring (Makefile/quality.py integration) is child QG-C01-03.
+measure; the product is never built). Wired as the product `go-complexity`
+changed gate (Makefile `_quality-go-complexity`, selected by
+scripts/quality/quality.py) since QG-C01-03.
 
 Usage:
   go_complexity.py --base <git-ref> [--report PATH|-] [--receipt PATH] [--root DIR]
@@ -41,7 +44,7 @@ import sys
 import tarfile
 import tempfile
 
-VERSION = "1.1.0"
+VERSION = "1.2.0"
 HELPER = Path(__file__).resolve().parent / "go_funcscan.go"
 HELPER_VERSION_FIELD = "helper_source_sha256"
 
@@ -89,10 +92,12 @@ MOVED_MATCHING = (
     "blank lines: every position maps to line 1); a head function whose "
     "hash matches any base function (repo-wide at base) is moved/renamed, "
     "not re-measured as new content; a receiver or body change is a content "
-    "change. Duplicate rule (QG-C01-02): if the matched base original still "
-    "exists at head with identical content, the head copy is a duplicate and "
-    "is measured as added/changed content under the full thresholds. Move "
-    "policy: a move whose original is gone carries pre-existing debt without "
+    "change. Duplicate rule (QG-C01-02): if the matched base original "
+    "still exists anywhere in the head tree with identical content (its "
+    "own file changed or untouched — whole-tree resolution since "
+    "QG-C01-03), the head copy is a duplicate and is measured as "
+    "added/changed content under the full thresholds. Move policy: a move "
+    "whose original is gone carries pre-existing debt without "
     "re-measurement but is listed in the untouched-debt ledger (kind "
     "'moved', never blocking); at most one head function may claim a given "
     "base original as its move origin"
@@ -144,6 +149,15 @@ def names(raw: bytes) -> set:
 
 def changed_go_files(root: Path, revision: str) -> list:
     raw = run_git(root, "diff", "--name-only", "--no-renames", "-z", revision, "--")
+    raw += run_git(root, "ls-files", "--others", "--exclude-standard", "-z")
+    paths = sorted(names(raw))
+    return [path for path in paths
+            if is_measured_go_path(path) and (root / path).is_file()]
+
+
+def head_go_files(root: Path) -> list:
+    """Every measured Go file present at head (tracked plus untracked)."""
+    raw = run_git(root, "ls-files", "-z", "--", "*.go")
     raw += run_git(root, "ls-files", "--others", "--exclude-standard", "-z")
     paths = sorted(names(raw))
     return [path for path in paths
@@ -299,7 +313,26 @@ def receipt_decision(receipt, record):
     return True, None
 
 
-def analyze(head_scan, by_name, by_hash, receipt):
+def head_tree_index(tree_scan: dict) -> dict:
+    """Index every parseable function in the whole head tree.
+
+    Duplicate resolution (whole-tree since QG-C01-03) must see originals
+    living in unchanged head files too: a copy whose original survives
+    anywhere at head is measured as added/changed content, not escaped as
+    a move. Files outside the changed set are never measured, so parse
+    failures there cannot block the run — they are simply unindexable.
+    """
+    index = {}
+    for entry in tree_scan["files"]:
+        if not entry.get("parse_ok"):
+            continue
+        for function in entry.get("functions") or ():
+            record = dict(function, file=entry["path"])
+            index[(record["file"], record["name"])] = record
+    return index
+
+
+def analyze(head_scan, by_name, by_hash, receipt, tree_index):
     """Diff head functions against the base index.
 
     Returns (entries, untouched). Untouched functions stay out of the report
@@ -307,7 +340,6 @@ def analyze(head_scan, by_name, by_hash, receipt):
     """
     entries, untouched = [], []
     consumed = set()
-    head_index = {}
     for entry in head_scan["files"]:
         if not entry.get("parse_ok"):
             raise AnalyzerError(
@@ -315,12 +347,8 @@ def analyze(head_scan, by_name, by_hash, receipt):
                 f"{entry['path']}: {entry.get('error', 'parse error')}")
         for head in entry["functions"]:
             record = dict(head, file=entry["path"])
-            head_index[(record["file"], record["name"])] = record
-    for entry in head_scan["files"]:
-        for head in entry["functions"]:
-            record = dict(head, file=entry["path"])
             kind, base, note = match_kind(record, by_name, by_hash, consumed,
-                                          head_index)
+                                          tree_index)
             if kind == "untouched":
                 untouched.append(record)
                 continue
@@ -645,8 +673,13 @@ def main(argv=None) -> int:
             base_paths = [tree / relative for relative in base_go_files(tree)]
             base_scan = scan_functions(base_paths, tree, tree)
         head_scan = scan_functions([root / path for path in head_files], root, root)
+        # Whole-tree head index for duplicate resolution; skipped entirely
+        # for a diff with no changed Go files (fast docs-only pass).
+        tree_scan = (scan_functions([root / path for path in head_go_files(root)],
+                                    root, root) if head_files else {"files": []})
         by_name, by_hash, base_failures = index_base(base_scan)
-        entries, untouched = analyze(head_scan, by_name, by_hash, receipt)
+        entries, untouched = analyze(head_scan, by_name, by_hash, receipt,
+                                     head_tree_index(tree_scan))
         moved = [item for item in entries if item["kind"] == "moved"]
         debt = debt_summary(untouched, moved)
         analyzer = analyzer_meta(head_scan, model_strength_order())

@@ -1,4 +1,4 @@
-.PHONY: all lint-design docs-verify docs-lang docs-mdx lint-helm build gateway loggerd admin migrate unified audit-dist release-artifacts run-gateway run-loggerd run-admin run-mcp run-subscription-bridge dev-opencode opencode-remote-wire test test-short test-integration test-subscription-bridge lint analyze analyze-fast analyze-security analyze-tests install-analysis-tools security-tools-install security-db-update security-db-status security-start security-status security-stop security-scan security-runtime security-release quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-changed docker-build-all docker-up docker-down demo demo-down docker-clean migrate-up migrate-region tidy measure-savings train-classifier yb evaluate-routing evaluate-guards policies-reconcile policies-reconcile-apply spend-reconcile deploy release helm-install helm-upgrade helm-rollback profile backup licenses-report help clean bench bench-cache bench-cache-live pricing-refresh pricing-pack pricing-verify load-test-chat load-test-cache load-test-mixed helm-lint build-migrate licenses-image
+.PHONY: all lint-design docs-verify docs-lang docs-mdx lint-helm build gateway loggerd admin migrate unified audit-dist release-artifacts run-gateway run-loggerd run-admin run-mcp run-subscription-bridge dev-opencode opencode-remote-wire test test-short test-integration test-subscription-bridge lint analyze analyze-fast analyze-security analyze-tests install-analysis-tools security-tools-install security-db-update security-db-status security-start security-status security-stop security-scan security-runtime security-release quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-changed quality-go-complexity docker-build-all docker-up docker-down demo demo-down docker-clean migrate-up migrate-region tidy measure-savings train-classifier yb evaluate-routing evaluate-guards policies-reconcile policies-reconcile-apply spend-reconcile deploy release helm-install helm-upgrade helm-rollback profile backup licenses-report help clean bench bench-cache bench-cache-live pricing-refresh pricing-pack pricing-verify load-test-chat load-test-cache load-test-mixed helm-lint build-migrate licenses-image
 
 MODULE := github.com/reireirei/yabanin
 GO_SCOPE := python3 scripts/quality/go_scope.py
@@ -209,7 +209,7 @@ QUALITY_JOBS ?= 1
 SDK_PYTHON ?= python3
 export QUALITY_BASE QUALITY_EXECUTE
 
-.PHONY: quality quality-help quality-eval quality-integration quality-self quality-prune quality-plan _quality-plan quality-preflight
+.PHONY: quality quality-help quality-eval quality-integration quality-self quality-prune quality-plan _quality-plan quality-preflight quality-go-complexity
 quality: quality-changed ## Quality gate inferred from the working-tree diff
 
 quality-help: ## Show scripts/quality quality.py help
@@ -223,10 +223,10 @@ QUALITY_PRUNE_ARGS ?=
 quality-prune: ## Prune old artifacts/quality runs (helper not in public export)
 	@echo "quality-prune: pruning helper is not part of the public export; remove artifacts/quality/<run-id> manually"; exit 77
 
-quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-eval quality-integration quality-self quality-licenses quality-plan: ## Quality gate profile via scripts/quality (see make quality-help)
+quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-eval quality-integration quality-self quality-licenses quality-plan quality-go-complexity: ## Quality gate profile via scripts/quality (see make quality-help)
 	@python3 scripts/quality/quality.py run $(patsubst quality-%,%,$@) --jobs "$(QUALITY_JOBS)"
 
-.PHONY: _quality-self _quality-fast _quality-static _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-package
+.PHONY: _quality-self _quality-fast _quality-static _quality-go-complexity _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-package
 _quality-self:
 	bash -n scripts/quality/run.sh scripts/quality/changed.sh scripts/ci/run-with-report.sh scripts/security/govulncheck-classify.sh
 	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
@@ -240,6 +240,17 @@ _quality-static:
 	$(MAKE) analyze-fast
 	$(MAKE) lint
 	bash scripts/lint_helm.sh
+
+# Changed-Go complexity gate (QG-C01): differential analyzer over the task
+# base (QUALITY_BASE, exported by quality-changed; HEAD for working-tree-only
+# diffs). Fails when changed function bodies exceed cyclomatic 15, or sit in
+# 11-15 without a valid stronger-model review receipt (GO_COMPLEXITY_RECEIPT
+# points at the receipt JSON; schema in scripts/quality/complexity/go/README.md).
+# Untouched legacy debt is reported in the ledger and never fails the gate.
+_quality-go-complexity:
+	python3 scripts/quality/complexity/go/go_complexity.py \
+		--base "$${QUALITY_BASE:-HEAD}" --report - \
+		$${GO_COMPLEXITY_RECEIPT:+--receipt "$$GO_COMPLEXITY_RECEIPT"}
 
 _quality-security:
 	$(MAKE) analyze-security

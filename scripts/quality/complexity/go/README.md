@@ -5,8 +5,8 @@ base commit and the current working tree (head = committed + uncommitted +
 untracked), scores each body with gocyclo-style cyclomatic complexity (the
 classification metric; cognitive complexity is reported as informational),
 and summarizes untouched legacy debt separately. It is the measurement core
-for the Go complexity gate (QG-C01); wiring into `make quality-changed`
-lands in QG-C01-03.
+of the `go-complexity` gate (QG-C01), wired into `make quality-changed` since
+QG-C01-03: any changed `.go` file (root or nested module) selects the gate.
 
 Python 3.9+ standard library plus the Go toolchain (used only to parse and
 measure via `go_funcscan.go`; the product is never built).
@@ -17,6 +17,19 @@ measure via `go_funcscan.go`; the product is never built).
 python3 scripts/quality/complexity/go/go_complexity.py \
   --base "$TASK_BASE" [--receipt receipt.json] [--report PATH|-] [--root DIR]
 ```
+
+Through the quality framework (what CI and `make quality-changed` run):
+
+```bash
+make _quality-go-complexity                    # base defaults to HEAD
+QUALITY_BASE="$TASK_BASE" make _quality-go-complexity
+```
+
+The gate recipe writes the JSON report to stdout (`--report -`) and the
+human summary to stderr, and forwards an optional receipt through the
+`GO_COMPLEXITY_RECEIPT` environment variable (path to the receipt JSON;
+keep receipts outside the tracked source tree — `artifacts/` is ignored).
+The gate never writes files into the working tree.
 
 Exit codes: `0` all changed bodies within policy; `1` gate failure — a
 changed body >15, an 11–15 body without an accepted receipt, or a rejected
@@ -109,21 +122,20 @@ or body change does not.
   still exists at head with identical content is a free duplicate — it is
   measured as `added` (or `changed` when it replaced an existing slot)
   under the full thresholds, with `duplicate_of` naming the surviving
-  original. Duplicate resolution is scoped to the changed head files the
-  analyzer measures: a >15 copy whose original also lives in a changed
-  file is always measured under the full thresholds; a copy whose
-  original resides in an unchanged file is not resolvable as a duplicate
-  and classifies as `moved`, landing in the `untouched_debt` ledger —
-  non-blocking (`exit 0`), the debt still reported and visible.
+  original. Since QG-C01-03 duplicate resolution is whole-tree: the
+  original counts as surviving when it lives anywhere in the head tree —
+  its own file changed or untouched — so a >15 copy cannot escape
+  measurement as a "move" by leaving its original's file out of the
+  changed set.
 - **Body changed during a move:** classified as regular content
   (`added`/`changed`) and fully measured.
 - **Formatting-only edits:** produce no changed-function entries; they must
   not suppress existing findings either (debt summaries still run).
 
-Known limitation: whole-tree duplicate detection — resolving duplicate
-originals that live in unchanged head files — is deferred to the
-gate-wiring follow-up (QG-C01-03); today such copies remain in the
-untouched-debt ledger as visible, non-blocking moved debt.
+Unchanged files' own legacy debt (functions in files outside the changed
+set) is not part of this diff's `untouched_debt` ledger — that ledger covers
+untouched functions in changed files plus carried moves; whole-tree
+baseline debt tracking is QG-C02 scope.
 
 ## Report schema (`go-complexity-diff/2`)
 
@@ -161,7 +173,19 @@ oracle values independent of the analyzer's own computation:
   still blocks;
 - rename + reformat of a >15 function with the original removed is a move
   that carries into the debt ledger without blocking;
+- whole-tree duplicate resolution (QG-C01-03): a >15 copy whose original
+  lives untouched in an unchanged file still blocks as added content
+  (`duplicate_of` recorded), instead of escaping as a move;
 - same-file gofmt/blank-line-only change yields zero changed functions.
+
+Gate-wiring controls (QG-C01-03) drive the recipe extracted live from the
+product `Makefile` through `make` in fixture repos: >15 without receipt
+fails, invalid receipts fail (same-model over 15, stale over 11–15),
+untouched debt passes, a valid 11–15 receipt passes via
+`GO_COMPLEXITY_RECEIPT`, a docs-only diff measures zero bodies, and
+`quality.py` routing selects the gate for `.go` diffs (root and nested)
+and never for docs-only diffs. `test_go_complexity_gate.py` binds the same
+invariants as a self-gate unit test.
 
 The fixture templates intentionally contain high-complexity bodies; they
 are test inputs, not shipped logic, and are `.go.tmpl` so the module never

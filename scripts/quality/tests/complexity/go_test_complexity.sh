@@ -15,6 +15,12 @@
 # QG-C01-02 controls add receipt validation (schema/SHA/model/staleness/
 # binding rejections with distinct errors), the free-duplicate loophole,
 # the carry-on-move debt ledger and gofmt/blank-line invariance.
+# QG-C01-03 controls add whole-tree duplicate resolution (original in an
+# unchanged file) and the real Makefile gate wiring: the live recipe is
+# extracted from the product Makefile and driven through make, covering
+# >15 without receipt, invalid receipts (same-model over 15, stale over
+# 11-15), untouched-debt pass, valid 11-15 receipt via
+# GO_COMPLEXITY_RECEIPT and a docs-only diff.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
@@ -805,6 +811,227 @@ PY
     scenario_failed=0
 }
 
+# ---------------------------------------------------------------------------
+scenario_treewide_duplicate() {
+    # QG-C01-03 whole-tree duplicate resolution: duplicate detection indexes
+    # the entire head tree, not only changed files. A content-identical copy
+    # of a >15 function whose original survives untouched in an UNCHANGED
+    # file is still measured as added content and blocks — it cannot escape
+    # as a "move" merely because its original's file left the changed set.
+    # (Against the pre-1.2.0 analyzer this control fails: the copy was
+    # mislabeled moved and the run exited 0.)
+    local repo
+    repo=$(new_repo treedup)
+    local base
+    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
+    # Head rewrites sample.go byte-identical (git reports no change for it)
+    # and adds the duplicate in a brand-new file.
+    EXTRA_FILES="treedup.go:go_fn_debt_duplicate_head.go.tmpl" \
+        build_head "$repo" $BASE_BLOCKS go_fn_debt_base.go.tmpl
+    run_analyzer "$repo" "$base" "$WORK/treedup.json"
+    python3 - "$RC" "$WORK/treedup.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+entries = report["changed_functions"]
+by_name = {e["function"]: e for e in entries}
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [treewide-dup] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+duplicate = by_name.get("HeavyDuplicate", {})
+debt = report["untouched_debt"]
+check("exit-1", rc == 1, f"rc={rc}")
+check("blocked-line-named", "BLOCKED HeavyDuplicate" in out, out[:300])
+check("duplicate-of-unchanged-original",
+      duplicate.get("kind") == "added" and duplicate.get("new_cyclomatic") == 18
+      and duplicate.get("classification") == "blocks"
+      and duplicate.get("duplicate_of") == "sample.go:HeavyOriginal",
+      str(duplicate))
+check("no-moved-escape",
+      all(e.get("classification") != "ok_moved_unchanged" for e in entries),
+      str([(e["function"], e["classification"]) for e in entries]))
+check("only-new-file-measured",
+      report["run"].get("measured_head_files") == ["treedup.go"],
+      str(report["run"].get("measured_head_files")))
+check("unchanged-file-debt-outside-diff-ledger",
+      # sample.go left the changed set, so its legacy debt (HeavyOriginal 18,
+      # LegacyUntouched 25) is baseline debt, not this diff's ledger; the
+      # duplicate itself blocks as added content above. Whole-tree baseline
+      # debt tracking is QG-C02 scope.
+      debt.get("untouched_functions") == 0 and debt.get("cyclomatic_gt15") == 0
+      and debt.get("functions_gt15") == [],
+      json.dumps(debt))
+sys.exit(1 if failures else 0)
+PY
+    finish_scenario treewide-duplicate $?
+}
+
+# ---------------------------------------------------------------------------
+scenario_gate_wiring() {
+    # QG-C01-03 real gate wiring: extract the live _quality-go-complexity
+    # recipe from the product Makefile and drive it through make in fixture
+    # repos that carry a committed copy of the analyzer package (committed
+    # at base so the copy itself never enters the measured diff). Controls:
+    # >15 without receipt fails, invalid receipts fail (same-model over 15,
+    # stale over 11-15), untouched debt passes, a valid 11-15 receipt passes
+    # via GO_COMPLEXITY_RECEIPT, a docs-only diff passes with zero measured
+    # bodies, and quality.py actually routes .go changes to the gate.
+    # Pull the recipe straight from the product Makefile: the control fails
+    # (empty extract) the moment the target is removed or renamed.
+    sed -n '/^_quality-go-complexity:/,/^$/p' "$ROOT/Makefile" >"$WORK/gate.mk"
+    if [ ! -s "$WORK/gate.mk" ] || ! grep -q "go_complexity.py" "$WORK/gate.mk"; then
+        printf 'FAIL [gate-wiring] recipe-extracted-from-product-makefile\n'
+        scenario_failed=$((scenario_failed + 1))
+    else
+        printf 'PASS [gate-wiring] recipe-extracted-from-product-makefile\n'
+    fi
+
+    gate_repo() { # name -> dir with the gate + analyzer committed at base
+        local dir
+        dir=$(new_repo "$1")
+        mkdir -p "$dir/scripts/quality/complexity"
+        cp -r "$ROOT/scripts/quality/complexity/go" \
+            "$dir/scripts/quality/complexity/go"
+        cp "$WORK/gate.mk" "$dir/gate.mk"
+        echo "$dir"
+    }
+
+    run_gate() { # repo base [receipt-path]
+        env QUALITY_BASE="$2" ${3:+GO_COMPLEXITY_RECEIPT="$3"} \
+            make -C "$1" -f gate.mk _quality-go-complexity \
+            >"$WORK/gate-out.txt" 2>&1
+        GATE_RC=$?
+    }
+
+    export GIT_AUTHOR_DATE="2026-11-01T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-01T09:00:00+00:00"
+    local heavy_repo heavy_base heavy_head
+    heavy_repo=$(gate_repo gateheavy)
+    heavy_base=$(build_base "$heavy_repo")
+    export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
+    build_head "$heavy_repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_head.go.tmpl
+    heavy_head=$(git -C "$heavy_repo" rev-parse HEAD)
+
+    local band_repo band_base band_head
+    band_repo=$(gate_repo gateband)
+    band_base=$(build_base "$band_repo")
+    build_head "$band_repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    band_head=$(git -C "$band_repo" rev-parse HEAD)
+
+    local debt_repo debt_base
+    debt_repo=$(gate_repo gatedebt)
+    debt_base=$(build_base "$debt_repo")
+    build_head "$debt_repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_ok_head.go.tmpl
+
+    local quiet_repo quiet_base
+    quiet_repo=$(gate_repo gatedocs)
+    quiet_base=$(build_base "$quiet_repo")
+    printf 'documentation-only change\n' >"$quiet_repo/NOTE.md"
+    commit_all "$quiet_repo" note
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+    gate_case() { # name repo base want-rc-zero substr...
+        local name=$1 repo=$2 base=$3 want_zero=$4
+        shift 4
+        run_gate "$repo" "$base" "${RECEIPT:-}"
+        local ok=1 sub
+        if [ "$want_zero" = yes ] && [ "$GATE_RC" -ne 0 ]; then ok=0; fi
+        if [ "$want_zero" = no ] && [ "$GATE_RC" -eq 0 ]; then ok=0; fi
+        for sub in "$@"; do
+            grep -q "$sub" "$WORK/gate-out.txt" || ok=0
+        done
+        if [ "$ok" -eq 1 ]; then
+            printf 'PASS [gate-wiring] %s\n' "$name"
+        else
+            printf 'FAIL [gate-wiring] %s: make-rc=%s want-zero=%s out=%s\n' \
+                "$name" "$GATE_RC" "$want_zero" "$(head -c 300 "$WORK/gate-out.txt")"
+            scenario_failed=$((scenario_failed + 1))
+        fi
+    }
+
+    RECEIPT="" gate_case over-15-no-receipt-blocks "$heavy_repo" "$heavy_base" no \
+        "BLOCKED HeavyChanged"
+    make_receipt "$WORK/gate-same-model.json" "$heavy_head" "$heavy_base" fixture-impl \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:HeavyChanged"]'
+    RECEIPT="$WORK/gate-same-model.json" \
+        gate_case over-15-same-model-receipt-fails "$heavy_repo" "$heavy_base" no \
+        "BLOCKED HeavyChanged" "equals implementer_model"
+    make_receipt "$WORK/gate-stale.json" "$band_head" "$band_base" fixture-senior \
+        fixture-impl 2026-11-04 approve-exception '["sample.go:BorderlineFn"]'
+    RECEIPT="$WORK/gate-stale.json" \
+        gate_case band-stale-receipt-fails "$band_repo" "$band_base" no \
+        "stale receipt" "NEEDS REVIEW RECEIPT BorderlineFn"
+    RECEIPT="" gate_case untouched-debt-passes "$debt_repo" "$debt_base" yes \
+        "untouched legacy debt: 1 >15" "changed function bodies: 2"
+    RECEIPT="" gate_case docs-only-zero-bodies "$quiet_repo" "$quiet_base" yes \
+        "changed function bodies: 0"
+
+    # A fresh dated repo gives the valid receipt a same-day commit.
+    export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
+    local band2_repo band2_base band2_head
+    band2_repo=$(gate_repo gateband2)
+    band2_base=$(build_base "$band2_repo")
+    build_head "$band2_repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    band2_head=$(git -C "$band2_repo" rev-parse HEAD)
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+    make_receipt "$WORK/gate-valid.json" "$band2_head" "$band2_base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    RECEIPT="$WORK/gate-valid.json" \
+        gate_case band-valid-receipt-passes "$band2_repo" "$band2_base" yes \
+        '"status": "accepted"'
+
+    # Binding the routing: quality.py must select the gate for .go diffs
+    # (root and nested) and never for docs-only diffs.
+    python3 - "$ROOT" <<'PY'
+import importlib.util
+from pathlib import Path
+import sys
+
+root = Path(sys.argv[1])
+sys.path.insert(0, str(root / "scripts/quality"))
+spec = importlib.util.spec_from_file_location(
+    "quality", root / "scripts/quality/quality.py")
+quality = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(quality)
+
+checks = [
+    ("go-diff-selects-gate", "go-complexity" in quality.classify(["cmd/gateway/main.go"])),
+    ("nested-go-diff-selects-gate", "go-complexity" in quality.classify(["sdks/go/client.go"])),
+    ("full-profile-contains-gate", "go-complexity" in quality.expand(["full"])),
+    ("docs-diff-excludes-gate", "go-complexity" not in quality.classify(["README.md"])),
+    ("manifests-exclude-gate", "go-complexity" not in quality.classify(["go.mod", "go.sum"])),
+]
+failed = [name for name, ok in checks if not ok]
+for name, ok in checks:
+    print(("PASS" if ok else "FAIL") + f" [gate-wiring] routing-{name}")
+sys.exit(1 if failed else 0)
+PY
+    if [ $? -ne 0 ]; then
+        scenario_failed=$((scenario_failed + 1))
+    fi
+
+    if [ "$scenario_failed" -ne 0 ]; then
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' gate-wiring
+    else
+        printf 'scenario %-18s OK\n\n' gate-wiring
+    fi
+    scenario_failed=0
+}
+
 scenario_clean_pass
 scenario_block_over_15
 scenario_receipt_band
@@ -814,6 +1041,8 @@ scenario_moved_debt_carry
 scenario_formatting_only
 scenario_determinism
 scenario_moved_modified
+scenario_treewide_duplicate
+scenario_gate_wiring
 
 echo "fixture result: $total_failed failed scenario assertion group(s)"
 exit $([ "$total_failed" -eq 0 ] && echo 0 || echo 1)
