@@ -1,10 +1,11 @@
 # TS/JS complexity differential analyzer
 
 `analyze.mjs` measures added/changed/moved TypeScript and JavaScript function
-bodies between a base revision and the current working tree, and reports
-untouched legacy debt separately. It is the measurement core for the frontend
-complexity gate (QG-C02); wiring it into `make quality-changed`, receipt
-validation and stricter moved-code debt rules land in later children.
+bodies between a base revision and the current working tree, reports
+untouched legacy debt separately (including debt carried by renames and
+relocations — a rename never resets debt), and enforces the review band
+(11-15) through validated stronger-model review receipts. It is the
+measurement core for the frontend complexity gate (QG-C02).
 
 This analyzer is self-contained Node.js (no npm dependencies of its own). It
 parses with the dashboard's pinned TypeScript compiler.
@@ -13,7 +14,8 @@ parses with the dashboard's pinned TypeScript compiler.
 
 ```bash
 node scripts/quality/complexity/ts/analyze.mjs \
-  --base "$TASK_BASE" [--scope web/dashboard/] [--receipt ID] \
+  --base "$TASK_BASE" [--scope web/dashboard/] [--receipt FILE] \
+  [--model-order weakest,...,strongest] [--debt-out FILE] \
   [--json-out FILE] [--repo PATH] [--quiet]
 ```
 
@@ -22,17 +24,27 @@ node scripts/quality/complexity/ts/analyze.mjs \
   the diff is the working tree against `HEAD`.
 - `--scope` — repeatable path prefix filter; defaults to `web/dashboard/`.
   Files with extensions `.ts .tsx .js .jsx .mjs .cjs` are measured.
-- `--receipt` — recorded verbatim in the report; review-band functions are
-  marked `receipt-recorded` instead of `required`. Validation of the receipt
-  (identity, base, hash binding, model capability) is QG-C02-02.
+- `--receipt` — **path to a review receipt JSON file** (breaking change from
+  1.0, which recorded the value verbatim). See *Review receipts*. A provided
+  receipt is validated in full; an invalid receipt blocks exactly like a
+  missing one.
+- `--model-order` — comma-separated model identifiers ordered weakest to
+  strongest (for example `--model-order impl-lite,impl-strong`). When given,
+  both receipt models must appear in the ordering and the reviewer must rank
+  strictly above the implementer. Without it, only reviewer ≠ implementer is
+  enforced (the inequality is always required).
+- `--debt-out` — write the full untouched-debt ledger (schema
+  `ts-complexity-debt/1`, see *Debt ledger*) to this file. Never blocks.
 - `--repo` — target repository (default: the checkout holding this script;
   `TS_COMPLEXITY_REPO_ROOT` overrides that default, used by the fixture
   runner for analyzer copies in temp directories).
 
 JSON goes to stdout (deterministic: no timestamps, sorted entries); the human
-summary and `BLOCK ...` offender lines go to stderr. Exit codes: `0` clean,
-`1` at least one changed body is over the block limit, `2` tool error (bad
-base, missing merge base, parse failure, TypeScript pin drift).
+summary, `BLOCK ...`, `RECEIPT INVALID ...` and `NEEDS REVIEW RECEIPT ...`
+lines go to stderr. Exit codes: `0` clean; `1` a changed body is over the
+block limit, the review band lacks a receipt, or a provided receipt is
+invalid; `2` tool error (bad base, missing merge base, parse failure,
+TypeScript pin drift, unreadable source file).
 
 ## Parser pinning
 
@@ -42,6 +54,10 @@ The parser is the `typescript` package installed under
 every run. Drift is a hard error, and both versions plus `pin_matches` are
 recorded in the report. Parse diagnostics in any in-scope file fail the run
 (exit 2) naming the file — a parser failure is never silently skipped.
+
+The same holds for source reads: a file absent from the working tree is
+treated as deleted, but any other read failure (permissions, I/O) is a tool
+error that exits 2 naming the file.
 
 ## Metric rules
 
@@ -54,7 +70,7 @@ Cognitive complexity, Sonar-style, with explicit counting rules:
 - `+1` flat for each logical operator token `&&`, `||`, `??` (a run of n
   same-kind operators scores n, which is Sonar's sequence rule reduced to
   per-operator counting).
-- `+1` flat for `break`/`continue` with a label.
+- `+1` flat for each `break`/`continue` with a label.
 - Nesting increases by one inside: `if` bodies, loop bodies, `switch` case
   bodies, `catch` bodies, and ternary branches.
 - Deviation from Sonar, deliberate: nested function-likes (closures, arrow
@@ -65,10 +81,64 @@ Cognitive complexity, Sonar-style, with explicit counting rules:
   labeled break/continue.
 
 Classification (per the maintainability standard): `<=10` ok, `11-15`
-review (stronger-model review receipt required — recorded only at this
-stage), `>15` block. Only `added` and `changed` bodies can fail the run
-(exit 1, offender named on stderr); `moved` bodies and untouched legacy debt
-are reported, never re-flagged here.
+review, `>15` block. Every `added`/`changed` body over 15 fails the run
+(exit 1, offender named on stderr). Every `added`/`changed` body in the
+11-15 review band needs a valid receipt: `review` is `required` (no receipt
+given), `receipt-invalid` (receipt given but failed validation) or
+`receipt-recorded`. `moved` bodies are exempt from the review band — they
+carry their base measurement, delta 0 — but they stay visible as carried
+debt in the debt ledger.
+
+## Review receipts (`ts-complexity-review-receipt/1`)
+
+A receipt is a JSON object binding one independent review to the exact
+analyzed commits, the review-band functions and both model identities:
+
+```json
+{
+  "schema": "ts-complexity-review-receipt/1",
+  "source_commit": "<analyzed head commit>",
+  "base_commit": "<analyzed merge base>",
+  "implementer_model": "impl-lite",
+  "reviewer_model": "impl-strong",
+  "verdict": "approve",
+  "reviewed_at": "2026-11-10T09:00:00.000Z",
+  "functions": ["web/dashboard/src/lib/band.ts:borderlineTwelve"]
+}
+```
+
+Valid means all of the following; each failed check yields its own precise
+error, listed in `report.receipt.errors` and on stderr as
+`RECEIPT INVALID ...` lines:
+
+- `schema` is exactly `ts-complexity-review-receipt/1`; every field is
+  present and non-empty (`functions` a non-empty list of `file:name`
+  strings).
+- `source_commit`/`base_commit` equal the analyzed head commit and merge
+  base — a receipt for any other change is refused.
+- `reviewer_model` differs from `implementer_model` (always), and with
+  `--model-order` both appear in the ordering with the reviewer strictly
+  stronger.
+- `verdict` is one of `approve`, `reject`, `require_refactoring` and only
+  `approve` clears the band.
+- `reviewed_at` parses as ISO-8601, is no more than 30 days old (mirroring
+  the bounded-exception expiry in the maintainability standard) and at most
+  24h in the future (clock-skew tolerance).
+- every review-band function of the run is bound as exact `file:name` in
+  `functions` (extra entries are allowed).
+
+One invalid receipt blocks the run (exit 1) with all of its errors; a valid
+receipt is echoed in `report.receipt` with `valid: true`. Regardless of any
+receipt, bodies over 15 always block.
+
+Relationship to the Go gate (`scripts/quality/complexity/go`): the
+discipline is shared and the placeholder fields `reviewer_model`,
+`verdict` and `functions` mirror the Go schema. Deliberate divergences:
+Go's single `base_sha` becomes `source_commit` + `base_commit` here; this
+schema adds `implementer_model`, `reviewed_at` and `schema`; Go's
+`functions` entries are bare names while this gate binds exact
+`file:name` pairs, because the TS/JS diff can contain same-named functions
+in different files.
 
 ## Body extraction and identity
 
@@ -80,23 +150,41 @@ heuristic (`useX` → hook, `X...` → component), not a semantic claim.
 
 A body fingerprint is the SHA-256 of the function body printed by the
 TypeScript printer with comments removed and whitespace collapsed, so
-formatting-only and comment-only edits keep the fingerprint stable. Match
-order per changed file:
+formatting-only and comment-only edits keep the fingerprint stable. Matching
+per changed file runs in three survivor-first passes:
 
-1. identical fingerprint → unchanged (same qualified name) or renamed/moved
-   within the file (different name) — status `moved`, never re-flagged;
-2. same own name and kind → `changed` (old/new complexity and delta);
-3. otherwise, a fingerprint found in the pool of base-side bodies that
-   vanished from other changed files → `moved` across files;
-4. else `added`. Base-side bodies consumed by nobody are `deleted` (counted
-   in the summary only, per the fixture contract).
+1. **Survivors** — a base body that still exists at head under its own
+   qualified name with an identical fingerprint is unchanged; it is never
+   re-measured and can never back a rename or move. Pairing survivors first
+   makes the result independent of file order: a duplicate copy appearing
+   earlier in the file cannot steal the original's identity.
+2. **In-file renames** — identical fingerprint, different name (any
+   syntactic form: declaration → function expression, default export →
+   renamed arrow). Each vanished original backs at most one rename; later
+   identical copies fall through to duplicate handling.
+3. **Changed** — same own name and kind, different content → `changed` with
+   old/new complexity and delta.
+
+Bodies still unmatched after the three passes are resolved globally:
+
+- an identical fingerprint in the pool of base bodies that vanished from
+  *other* changed files → `moved` (cross-file), `moved_from` names the
+  origin;
+- otherwise, if the fingerprint exists anywhere at base, the body is a
+  **duplicate**: status `added` with `duplicate_of` naming the original,
+  and it is measured as new code — an identical copy of a blocking body
+  blocks, and a copy of a function whose original still exists cannot
+  escape measurement as a fake "move". A cross-file duplicate whose
+  original lives in an unchanged file is a plain `added` (the unchanged
+  file is not part of the diff, so `duplicate_of` cannot point at it);
+- else plain `added`. Base-side bodies consumed by nobody are `deleted`
+  (counted in the summary only, per the fixture contract).
 
 Known limitation: renaming a function *and* editing its body in the same
 change classifies as `added`, losing the old baseline; a rename that also
-renames parameters breaks fingerprint identity the same way. Stricter
-rename handling that preserves baseline debt is QG-C02-02 scope.
+renames parameters breaks fingerprint identity the same way.
 
-## Report schema (`ts-complexity-diff/1`)
+## Report schema (`ts-complexity-diff/2`)
 
 - `analyzer` — name/version/metric + threshold limits.
 - `parser` — typescript version, lockfile pin, `pin_matches`.
@@ -104,39 +192,76 @@ rename handling that preserves baseline debt is QG-C02-02 scope.
   commit, file counts, and content digests binding the report to the exact
   head source (`source_digest`) and base tree (`base_source_digest`, git
   blob IDs from `ls-tree`).
-- `receipt` — the `--receipt` value or null.
+- `receipt` — null, or the validated receipt object: `path`, `valid`,
+  `errors[]`, and the echoed document fields. The full validation verdict,
+  not a verbatim echo.
 - `changed_functions[]` — `file, name (qualified with `::`), kind, role,
-  line, fingerprint, status (added/changed/moved), moved_from, old/new
-  complexity, delta, classification, review`.
-- `summary` — added/changed/moved/deleted counts, review and blocking.
+  line, fingerprint, status (added/changed/moved), moved_from,
+  duplicate_of, old/new complexity, delta, classification, review`.
+- `summary` — added/changed/moved/deleted counts, review and blocking,
+  plus `review_unreceipted` (band entries with no receipt at all) and
+  `receipt_errors` (count of receipt validation failures). The run exits 1
+  when `blocking + review_unreceipted + receipt_errors > 0`.
 - `untouched_debt` — counts of untouched functions by classification plus
   the ten highest scores (a full inventory belongs in CI artifacts).
-- `failures[]` — blocking offenders, `file: name (cognitive complexity N > 15)`.
+- `failures[]` — blocking complexity offenders only,
+  `file: name (cognitive complexity N > 15)`; receipt problems are surfaced
+  via `receipt.errors`, `RECEIPT INVALID` and `NEEDS REVIEW RECEIPT` lines.
+
+## Debt ledger (`ts-complexity-debt/1`, `--debt-out`)
+
+The ledger is the untruncated inventory behind `untouched_debt`: every
+function above the ok limit that this change did not touch (`kind
+"untouched"`) plus debt carried by renamed or relocated bodies (`kind
+"moved"`, matching the Go gate's `debt_summary` semantics). Entries are
+`{file, function, complexity, kind, function_kind}` sorted by file, then
+function; split into `functions_gt15` and `functions_11_to_15` with counts
+in `summary` (`untouched_*`/`moved_*` per band, plus totals). The ledger
+records debt; it never blocks, and unlike the report it carries a
+`generated_at` timestamp.
 
 ## Fixtures
 
-`scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds a throwaway
-git repository from `ts_fixtures/` (base and head states) and asserts:
+`scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds three
+throwaway git repositories from `ts_fixtures/` and asserts 40 checks:
 
-- the changed-function control classes C1–C13: changed/added/moved/deleted
-  bodies, nested-closure attribution, untouched debt, and pinned metric
-  paths with exact scores — `switch` case-clause counting, `catch`-clause
-  counting, class getter/setter/method bodies, async function and async
-  arrow bodies;
-- fingerprint stability: a whitespace/comment-only reformatted body is in
-  the diff but produces no changed-function entry, only its untouched-debt
-  measurement;
-- byte-determinism of two consecutive runs;
-- receipt state: with `--receipt`, a review-band entry is marked
-  `receipt-recorded` and the receipt id is echoed verbatim in the report;
-  without it the same entry stays `required` (receipt validation is
-  QG-C02-02 scope);
-- mutation guards: every guarded control has a mutant (M1a–M6 plus
-  M-switch/M-catch/M-class/M-async) that disables exactly one counting or
-  extraction path via a single exact-string replacement (target uniqueness
+- the main repo (base/head) pins the changed-function control classes
+  C1–C13: changed/added/moved/deleted bodies, nested-closure attribution,
+  untouched debt, and pinned metric paths with exact scores — `switch`
+  case-clause counting, `catch`-clause counting, class getter/setter/method
+  bodies, async function and async arrow bodies; fingerprint stability
+  under a whitespace/comment-only reformat; byte-determinism of two
+  consecutive runs (C7);
+- the receipt repo (`ts_fixtures/receipt/`) pins receipt enforcement: C8 —
+  a valid stronger-model receipt clears the single review-band function
+  (exit 0, `review: receipt-recorded`); R1–R10 — receipts failing exactly
+  one validation class each (wrong source commit, wrong base commit,
+  reviewer = implementer, weaker reviewer per `--model-order`, stale,
+  unbound function, `reject` verdict, unknown verdict, malformed JSON,
+  missing file) are all rejected with their precise error; R11 — without a
+  receipt the band blocks (exit 1) with a `NEEDS REVIEW RECEIPT` line and
+  `failures` stays complexity-only;
+- the rename repo (`ts_fixtures/rename/`) pins rename/duplicate handling:
+  C14 — a byte-identical copy (`heavyCopy`) of a surviving original
+  (`heavyOriginal`) is `added` with `duplicate_of` and blocks at 16 > 15;
+  C15 — `--debt-out` lists the untouched `heavyOriginal` and the renamed
+  `legacyHeavyRenamed` (reformatted body, status moved) untruncated with
+  per-kind counts; C16 — a function declaration renamed into a const
+  function expression and a default export renamed into a re-exported
+  arrow both stay moves; C17 — an unreadable changed file exits 2 naming
+  the file (requires a non-root user, since root ignores file modes);
+- mutation guards: every guarded control has a mutant (M1a–M6,
+  M-switch/M-catch/M-class/M-async, plus M-receipt bound to R1 and M-dup
+  bound to C14) that disables exactly one counting, extraction, receipt or
+  duplicate path via a single exact-string replacement (target uniqueness
   asserted, crashed mutants rejected), and the battery passes only when the
-  target control fails on that mutant — a disabled metric path cannot keep
-  the battery green.
+  target control fails on that mutant — a disabled path cannot keep the
+  battery green.
+
+Fixture coupling: C13 pins `files_changed_in_scope === 7` for the main repo;
+the rename and receipt scenarios deliberately live in separate fixture
+repositories so the main repo's changed-file census (and every existing
+control) stays stable.
 
 The fixture templates intentionally contain high-complexity bodies; they are
 test inputs, not shipped logic, and are excluded from the analyzer's
