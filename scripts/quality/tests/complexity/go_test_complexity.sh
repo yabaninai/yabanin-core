@@ -91,24 +91,48 @@ run_analyzer() { # repo base report [extra...]
     RC=$?
 }
 
-# make_receipt writes a schema go-complexity-review-receipt/1 document;
+# make_receipt writes a schema go-complexity-review-receipt/2 document
+# bound to exact function bodies (body_sha256) and the active gate config;
 # overrides per control are applied by the caller via these arguments.
-make_receipt() { # path head_sha base_sha reviewer impl date verdict functions-json
-    python3 - "$@" <<'PY'
+make_receipt() { # path head_sha base_sha reviewer impl date verdict bindings-json [config-override]
+    ROOT="$ROOT" python3 - "$@" <<'PY'
+import importlib.util
 import json
+import os
 import sys
+from pathlib import Path
 
-path, head, base, reviewer, implementer, date, verdict, functions = sys.argv[1:9]
+path, head, base, reviewer, implementer, date, verdict, bindings = sys.argv[1:9]
+override = sys.argv[9] if len(sys.argv) > 9 else None
+gate = Path(os.environ["ROOT"]) / "scripts/quality/complexity/go/go_complexity.py"
+spec = importlib.util.spec_from_file_location("gate", gate)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
 json.dump({
-    "schema": "go-complexity-review-receipt/1",
+    "schema": "go-complexity-review-receipt/2",
     "source_commit": head,
     "base_commit": base,
     "implementer_model": implementer,
     "reviewer_model": reviewer,
     "review_date": date,
     "verdict": verdict,
-    "functions": json.loads(functions),
+    "gate_config_sha256": override or module.gate_config_digest(),
+    "bindings": json.loads(bindings),
 }, open(path, "w"), indent=2)
+PY
+}
+
+# report_body_sha256 extracts a changed function's body hash from a report
+# so a receipt can bind the exact bytes under review.
+report_body_sha256() { # report-path file function
+    python3 - "$@" <<'PY'
+import json
+import sys
+
+report = json.load(open(sys.argv[1]))
+entries = report["changed_functions"]
+entry = {(e.get("file"), e["function"]): e for e in entries}.get((sys.argv[2], sys.argv[3]), {})
+print(entry.get("body_sha256") or "")
 PY
 }
 
@@ -301,8 +325,12 @@ PY
     printf '%s [receipt] missing-receipt-path-fails\n' "$(echo "$check_receipt_missing" | tr a-z A-Z)"
     [ "$check_receipt_missing" = pass ] || none_rc=$((none_rc + 1))
 
+    local body_sha
+    body_sha=$(report_body_sha256 "$WORK/receipt-none.json" sample.go BorderlineFn)
+    [ -n "$body_sha" ] || { printf 'FAIL [receipt] body-hash-extract\n'; none_rc=$((none_rc + 1)); }
     make_receipt "$WORK/receipt.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$body_sha\"}]"
     run_analyzer "$repo" "$base" "$WORK/receipt-ok.json" --receipt "$WORK/receipt.json"
     python3 - "$RC" "$WORK/receipt-ok.json" "$WORK/out.txt" <<'PY'
 import json
@@ -449,29 +477,56 @@ scenario_receipt_validation() {
     head=$(git -C "$repo" rev-parse HEAD)
     unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
 
+    run_analyzer "$repo" "$base" "$WORK/rv-scan.json"
+    local body_sha
+    body_sha=$(report_body_sha256 "$WORK/rv-scan.json" sample.go BorderlineFn)
+    [ -n "$body_sha" ] || { printf 'FAIL [receipt-validation] body-hash-extract\n'; }
+    local bind_borderline
+    bind_borderline="[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$body_sha\"}]"
+    local bind_elsewhere
+    bind_elsewhere='[{"function": "other.go:Elsewhere", "body_sha256": "1111111111111111111111111111111111111111111111111111111111111111"}]'
     local zeros=0000000000000000000000000000000000000000
+    local zeros64=0000000000000000000000000000000000000000000000000000000000000000
+    local config_sha
+    config_sha=$(python3 -c 'import importlib.util, pathlib, sys
+gate = pathlib.Path(sys.argv[1])
+spec = importlib.util.spec_from_file_location("gate", gate)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+print(module.gate_config_digest())' "$ROOT/scripts/quality/complexity/go/go_complexity.py")
     make_receipt "$WORK/rv-valid.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-source.json" "$zeros" "$base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-basesha.json" "$head" "$zeros" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-same.json" "$head" "$base" fixture-impl \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-weaker.json" "$head" "$base" fixture-junior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-stale.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-04 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-04 approve-exception "$bind_borderline"
     make_receipt "$WORK/rv-verdict.json" "$head" "$base" fixture-senior \
         fixture-impl 2026-11-05 approve '["sample.go:BorderlineFn"]'
     make_receipt "$WORK/rv-unbound.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["other.go:Elsewhere"]'
+        fixture-impl 2026-11-05 approve-exception "$bind_elsewhere"
     make_receipt "$WORK/rv-refactor.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-05 require-refactor '["sample.go:BorderlineFn"]'
-    printf '%s\n' "{\"schema\": \"go-complexity-review-receipt/1\", \"source_commit\": \"$head\", \"base_commit\": \"$base\", \"reviewer_model\": \"fixture-senior\", \"review_date\": \"2026-11-05\", \"verdict\": \"approve-exception\", \"functions\": [\"sample.go:BorderlineFn\"]}" >"$WORK/rv-noimpl.json"
+        fixture-impl 2026-11-05 require-refactor "$bind_borderline"
+    printf '%s\n' "{\"schema\": \"go-complexity-review-receipt/2\", \"source_commit\": \"$head\", \"base_commit\": \"$base\", \"reviewer_model\": \"fixture-senior\", \"review_date\": \"2026-11-05\", \"verdict\": \"approve-exception\", \"gate_config_sha256\": \"$config_sha\", \"bindings\": $bind_borderline}" >"$WORK/rv-noimpl.json"
+    printf '%s\n' "{\"schema\": \"go-complexity-review-receipt/1\", \"source_commit\": \"$head\", \"base_commit\": \"$base\", \"implementer_model\": \"fixture-impl\", \"reviewer_model\": \"fixture-senior\", \"review_date\": \"2026-11-05\", \"verdict\": \"approve-exception\", \"functions\": [\"sample.go:BorderlineFn\"]}" >"$WORK/rv-legacy.json"
+    make_receipt "$WORK/rv-stalebody.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$zeros64\"}]"
+    make_receipt "$WORK/rv-badconfig.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception "$bind_borderline" "$zeros64"
+    printf '%s\n' "{\"schema\": \"go-complexity-review-receipt/2\", \"source_commit\": \"$head\", \"base_commit\": \"$base\", \"implementer_model\": \"fixture-impl\", \"reviewer_model\": \"fixture-senior\", \"review_date\": \"2026-11-05\", \"verdict\": \"approve-exception\", \"gate_config_sha256\": \"$config_sha\", \"bindings\": [{\"function\": \"sample.go:BorderlineFn\"}]}" >"$WORK/rv-malformed.json"
 
     local case name substring receipt_file
-    for case in "wrong-source-sha|source_commit mismatch|$WORK/rv-source.json" \
+    for case in "legacy-schema-1|unsupported schema|$WORK/rv-legacy.json" \
+                "stale-body-hash|does not match the current function body|$WORK/rv-stalebody.json" \
+                "wrong-gate-config|gate_config_sha256 does not match|$WORK/rv-badconfig.json" \
+                "malformed-binding|must have exactly function and body_sha256|$WORK/rv-malformed.json" \
+                "wrong-source-sha|source_commit mismatch|$WORK/rv-source.json" \
                 "wrong-base-sha|base_commit mismatch|$WORK/rv-basesha.json" \
                 "same-model|equals implementer_model|$WORK/rv-same.json" \
                 "weaker-reviewer|not stronger than|$WORK/rv-weaker.json" \
@@ -637,8 +692,12 @@ sys.exit(1 if failures else 0)
 PY
     record duplicate-over-15 $([ $? -eq 0 ] && echo pass || echo fail)
 
+    local dup_body
+    dup_body=$(report_body_sha256 "$WORK/dup.json" dup.go HeavyDuplicate)
+    [ -n "$dup_body" ] || { printf 'FAIL [duplicate] dup-body-hash-extract\n'; scenario_failed=$((scenario_failed + 1)); }
     make_receipt "$WORK/dup-receipt.json" "$head" "$base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["dup.go:HeavyDuplicate"]'
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"dup.go:HeavyDuplicate\", \"body_sha256\": \"$dup_body\"}]"
     run_analyzer "$repo" "$base" "$WORK/dup-receipt-run.json" --receipt "$WORK/dup-receipt.json"
     python3 - "$RC" "$WORK/dup-receipt-run.json" "$WORK/out.txt" <<'PY'
 import json
@@ -963,13 +1022,23 @@ scenario_gate_wiring() {
 
     RECEIPT="" gate_case over-15-no-receipt-blocks "$heavy_repo" "$heavy_base" no \
         "BLOCKED HeavyChanged"
+    run_analyzer "$heavy_repo" "$heavy_base" "$WORK/gate-heavy.json"
+    local heavy_body
+    heavy_body=$(report_body_sha256 "$WORK/gate-heavy.json" sample.go HeavyChanged)
+    [ -n "$heavy_body" ] || { printf 'FAIL [gate-wiring] heavy-body-hash-extract\n'; scenario_failed=$((scenario_failed + 1)); }
     make_receipt "$WORK/gate-same-model.json" "$heavy_head" "$heavy_base" fixture-impl \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:HeavyChanged"]'
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:HeavyChanged\", \"body_sha256\": \"$heavy_body\"}]"
     RECEIPT="$WORK/gate-same-model.json" \
         gate_case over-15-same-model-receipt-fails "$heavy_repo" "$heavy_base" no \
         "BLOCKED HeavyChanged" "equals implementer_model"
+    run_analyzer "$band_repo" "$band_base" "$WORK/gate-band.json"
+    local band_body
+    band_body=$(report_body_sha256 "$WORK/gate-band.json" sample.go BorderlineFn)
+    [ -n "$band_body" ] || { printf 'FAIL [gate-wiring] band-body-hash-extract\n'; scenario_failed=$((scenario_failed + 1)); }
     make_receipt "$WORK/gate-stale.json" "$band_head" "$band_base" fixture-senior \
-        fixture-impl 2026-11-04 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-04 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$band_body\"}]"
     RECEIPT="$WORK/gate-stale.json" \
         gate_case band-stale-receipt-fails "$band_repo" "$band_base" no \
         "stale receipt" "NEEDS REVIEW RECEIPT BorderlineFn"
@@ -987,8 +1056,13 @@ scenario_gate_wiring() {
     build_head "$band2_repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
     band2_head=$(git -C "$band2_repo" rev-parse HEAD)
     unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+    run_analyzer "$band2_repo" "$band2_base" "$WORK/gate-band2.json"
+    local band2_body
+    band2_body=$(report_body_sha256 "$WORK/gate-band2.json" sample.go BorderlineFn)
+    [ -n "$band2_body" ] || { printf 'FAIL [gate-wiring] band2-body-hash-extract\n'; scenario_failed=$((scenario_failed + 1)); }
     make_receipt "$WORK/gate-valid.json" "$band2_head" "$band2_base" fixture-senior \
-        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$band2_body\"}]"
     RECEIPT="$WORK/gate-valid.json" \
         gate_case band-valid-receipt-passes "$band2_repo" "$band2_base" yes \
         '"status": "accepted"'
