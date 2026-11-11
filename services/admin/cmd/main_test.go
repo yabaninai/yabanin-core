@@ -69,7 +69,7 @@ func TestAdminShutdownDeadlock(t *testing.T) {
 	// With the fix (sync.WaitGroup), we don't read from errCh here.
 	// The old buggy code would hang on <-errCh. Verify it doesn't block.
 	select {
-	case <-errCh:
+	case <-errCh: //nolint:errcheck // any delivery is the failure; the error value carries no decision
 		t.Fatal("unexpected: got error from errCh after clean shutdown")
 	case <-time.After(2 * time.Second):
 		t.Log("PASS: no deadlock — errCh read does not block (fixed via WaitGroup)")
