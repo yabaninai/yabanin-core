@@ -17,7 +17,7 @@ env:
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -26,21 +26,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Run go vet
         run: go vet ./...
 
@@ -71,62 +63,37 @@ jobs:
   # gateway compiles at load time), no database, default runner.
   policies:
     name: Policy declarations (G1)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Validate deploy/policies (strict, dry-run)
         run: go run ./cmd/yb policies validate --dir deploy/policies --include-pack
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
-      - name: Cache golangci-lint
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/golangci-lint
-            ~/go/bin/golangci-lint
-          key: ${{ runner.os }}-golangci-lint-v2.15.0-${{ hashFiles('.golangci.yml') }}
-
-      # v2.12.2 fails typecheck with "export data version 5"; v2.15.0 also aligns with the Makefile pin.
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Install golangci-lint
         run: go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.15.0
 
@@ -137,12 +104,25 @@ jobs:
 
       - name: Security scan (govulncheck)
         run: |
-          make install-analysis-tools security-tools-install security-db-update
+          make install-analysis-tools install-critical-tools security-tools-install security-db-update
           make analyze-security
+
+      - name: Check changed Go policy and critical behavior after push
+        if: github.event_name == 'push'
+        env:
+          QUALITY_BASE: ${{ github.event.before }}
+        run: make analyze-go-policy analyze-critical-go _quality-go-complexity
+
+      - name: Retain post-push Go gate evidence
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: post-push-go-quality
+          path: artifacts/quality/
 
   helm:
     name: Helm validation
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -168,7 +148,7 @@ jobs:
 
   docs-site:
     name: Docs site build (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: web/site
@@ -189,7 +169,7 @@ jobs:
 
   docs-lang:
     name: Docs language gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -199,7 +179,7 @@ jobs:
 
   dashboard:
     name: Dashboard build (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: web/dashboard
@@ -219,7 +199,7 @@ jobs:
 
   python-sdk:
     name: Python SDK tests (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: sdks/python
@@ -240,7 +220,7 @@ jobs:
 
   node-sdk:
     name: Node SDK tests (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: sdks/node
@@ -265,7 +245,7 @@ jobs:
   quality-changed:
     name: Quality (changed gates)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 90
     steps:
       - name: Checkout repository
@@ -273,11 +253,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-          cache: true
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -306,7 +288,7 @@ jobs:
           npm ci --prefix sdks/node --no-audit --no-fund
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
-          make install-analysis-tools security-tools-install security-db-update
+          make install-analysis-tools install-critical-tools security-tools-install security-db-update
 
       # NEXT-14: QUALITY_JOBS=2 overlaps one light gate with the serialized
       # heavy Go lane on the 2-vCPU hosted runner; heavy and Docker gates stay
@@ -330,7 +312,7 @@ jobs:
   integration:
     name: Integration tests (blocking)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 60
     # Strict env parsing — a malformed numeric env value fails the
     # blocking gate instead of falling back to a default.
@@ -342,21 +324,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Docker preflight
         run: docker info > /dev/null
 
@@ -369,7 +343,7 @@ jobs:
   integration-nightly:
     name: Integration tests (nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 30
     services:
       postgres:
@@ -387,21 +361,13 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
-
-      - name: Cache Go modules
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cache/go-build
-            ~/go/pkg/mod
-          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
-          restore-keys: |
-            ${{ runner.os }}-go-
-
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Run integration tests
         run: go test -race -count=1 -tags=integration ./services/gateway/integration/...
 
