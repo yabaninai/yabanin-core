@@ -1,18 +1,28 @@
 // Fixture runner for the TS/JS complexity differential analyzer.
 //
-// Builds a throwaway git repository from ts_fixtures/ (base and head
-// states), runs scripts/quality/complexity/ts/analyze.mjs against it and
-// asserts exit codes plus report contents for the changed-function control
-// classes C1-C13, including pinned metric paths (switch case clauses, catch
-// clauses, class getter/setter/method bodies, async bodies) and fingerprint
-// stability under reformat-only edits. Each guarded control is re-checked
-// against a deliberately mutated copy of the analyzer (single exact-string
-// replacement, target uniqueness asserted) so every guarded control is
-// proven to fail on its intended assertion. Also checks byte-determinism
-// of two consecutive runs and --receipt state recording. Exit 0 only if
-// all controls pass on the real analyzer and fail on their mutants.
+// Builds throwaway git repositories from ts_fixtures/ (base and head
+// states) and runs scripts/quality/complexity/ts/analyze.mjs against them:
+//
+//   * the main fixture repo pins changed-function controls C1-C13 (metric
+//     paths, fingerprint stability under reformat-only edits, rename/move
+//     recognition, untouched debt, byte-determinism);
+//   * the receipt fixture repo pins review-band receipt enforcement: C8
+//     (a valid stronger-model receipt clears the 11-15 band) and R1-R11
+//     (every invalid-receipt class is rejected with its precise error, and
+//     a missing receipt blocks with NEEDS REVIEW);
+//   * the rename fixture repo pins duplicate and rename handling: C14
+//     (a byte-identical copy of a surviving original is measured and
+//     blocks), C15 (the --debt-out ledger lists untouched and moved debt
+//     untruncated), C16 (function-expression/default-export renames stay
+//     moves) and C17 (an unreadable changed file exits 2 naming the file).
+//
+// Each guarded control is re-checked against a deliberately mutated copy of
+// the analyzer (single exact-string replacement, target uniqueness
+// asserted) so every guarded control is proven to fail on its intended
+// assertion. Exit 0 only if all 40 checks pass on the real analyzer and all
+// 12 mutants are detected.
 import { execFileSync, spawnSync } from "node:child_process";
-import { cpSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -22,29 +32,36 @@ const ANALYZER_DIR = join(HERE, "..", "..", "complexity", "ts");
 const FIXTURES = join(HERE, "ts_fixtures");
 const PRODUCT_ROOT = fileURLToPath(new URL("../../../..", import.meta.url));
 const BLOCKING_LINE = "web/dashboard/src/pages/MegaList.tsx: MegaList (cognitive complexity 16 > 15)";
+const DUPLICATE_LINE = "web/dashboard/src/lib/dup.ts: heavyCopy (cognitive complexity 16 > 15)";
+const BAND_FILE = "web/dashboard/src/lib/band.ts";
+const BAND_BINDING = `${BAND_FILE}:borderlineTwelve`;
+const MODEL_ORDER = ["--model-order", "impl-lite,impl-strong"];
+const RECEIPT_SCHEMA = "ts-complexity-review-receipt/1";
 
 function runGit(repo, ...args) {
   execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "pipe"] });
 }
 
-function buildFixtureRepo(target) {
-  cpSync(join(FIXTURES, "base"), target, { recursive: true });
+function buildFixtureRepo(target, scenario) {
+  const root = join(FIXTURES, scenario);
+  cpSync(join(root, "base"), target, { recursive: true });
   runGit(target, "init", "-q");
   runGit(target, "config", "user.email", "fixtures@local.test");
   runGit(target, "config", "user.name", "fixture runner");
   runGit(target, "config", "commit.gpgsign", "false");
   runGit(target, "add", "-A");
   runGit(target, "commit", "-qm", "fixture base");
-  cpSync(join(FIXTURES, "head"), target, { recursive: true });
+  cpSync(join(root, "head"), target, { recursive: true });
   runGit(target, "add", "-A");
   runGit(target, "commit", "-qm", "fixture head");
-  return execFileSync("git", ["-C", target, "rev-parse", "HEAD~1"]).toString("utf8").trim();
+  const sha = (ref) => execFileSync("git", ["-C", target, "rev-parse", ref]).toString("utf8").trim();
+  return { repo: target, base: sha("HEAD~1"), head: sha("HEAD") };
 }
 
-function runAnalyzer(analyzerDir, repo, baseSha, extraArgs = []) {
+function runAnalyzer(analyzerDir, scenario, extraArgs = []) {
   const result = spawnSync(
     "node",
-    [join(analyzerDir, "analyze.mjs"), "--repo", repo, "--base", baseSha, ...extraArgs],
+    [join(analyzerDir, "analyze.mjs"), "--repo", scenario.repo, "--base", scenario.base, ...extraArgs],
     { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env: { ...process.env, TS_COMPLEXITY_REPO_ROOT: PRODUCT_ROOT } },
   );
   return { code: result.status, stdout: result.stdout, stderr: result.stderr };
@@ -171,7 +188,113 @@ const CONTROLS = [
   },
 ];
 
-const MUTATIONS = [
+// A rejected receipt must exit 1, mark itself invalid, count its errors and
+// name the exact failed check.
+function receiptRejected(report, run, fragment) {
+  return Boolean(run.code === 1
+    && report.receipt && report.receipt.valid === false
+    && report.summary.receipt_errors >= 1
+    && report.receipt.errors.some((error) => error.includes(fragment)));
+}
+
+const RECEIPT_CASES = [
+  { id: "R1", label: "receipt bound to another source commit is rejected", fragment: "does not match analyzed head", fields: { source_commit: "USE_BASE" } },
+  { id: "R2", label: "receipt bound to another base commit is rejected", fragment: "does not match analyzed base", fields: { base_commit: "USE_HEAD" } },
+  { id: "R3", label: "reviewer equal to implementer is rejected", fragment: "equals implementer_model", fields: { reviewer_model: "impl-lite" } },
+  { id: "R4", label: "weaker reviewer than implementer is rejected", fragment: "is not stronger than implementer_model", fields: { implementer_model: "impl-strong", reviewer_model: "impl-lite" } },
+  { id: "R5", label: "stale receipt (older than 30 days) is rejected", fragment: "is stale (older than 30 days)", fields: { reviewed_at: "2020-01-01T00:00:00Z" } },
+  { id: "R6", label: "receipt not binding the review-band function is rejected", fragment: "does not bind review-band function", fields: { functions: ["web/dashboard/src/lib/quiet.ts:quietHelper"] } },
+  { id: "R7", label: "reject verdict does not approve the change", fragment: "does not approve the reviewed change", fields: { verdict: "reject" } },
+  { id: "R8", label: "unknown verdict value is rejected", fragment: "is not one of: approve, reject, require_refactoring", fields: { verdict: "maybe" } },
+  { id: "R9", label: "malformed receipt JSON is rejected", fragment: "cannot be parsed as JSON", raw: "{" },
+  { id: "R10", label: "missing receipt file is rejected", fragment: "receipt file cannot be read", path: "does-not-exist.json" },
+];
+
+function receiptControls(receiptScenario) {
+  const controls = [
+    {
+      id: "C8", label: "valid stronger-model receipt clears the review band",
+      check: (report, run) => {
+        const entry = findEntry(report, "borderlineTwelve");
+        return Boolean(run.code === 0 && report.receipt && report.receipt.valid === true
+          && report.summary.review === 1 && report.summary.review_unreceipted === 0
+          && report.summary.receipt_errors === 0
+          && entry && entry.classification === "review" && entry.review === "receipt-recorded");
+      },
+    },
+  ];
+  for (const receiptCase of RECEIPT_CASES) {
+    controls.push({
+      id: receiptCase.id,
+      label: receiptCase.label,
+      check: (report, run) => receiptRejected(report, run, receiptCase.fragment),
+    });
+  }
+  controls.push({
+    id: "R11", label: "review band without receipt blocks with NEEDS REVIEW",
+    check: (report, run) => Boolean(run.code === 1 && report.receipt === null
+      && report.failures.length === 0 && report.summary.review_unreceipted === 1
+      && findEntry(report, "borderlineTwelve")?.review === "required"
+      && run.stderr.includes(`NEEDS REVIEW RECEIPT ${BAND_FILE}: borderlineTwelve (cognitive complexity 12 in 11-15)`)),
+  });
+  return controls;
+}
+
+function renameControls(ledger) {
+  return [
+    {
+      id: "C14", label: "duplicate copy of a surviving original blocks as added",
+      check: (report, run) => {
+        const copy = findEntry(report, "heavyCopy");
+        return Boolean(run.code === 1 && report.failures.length === 1
+          && report.failures[0] === DUPLICATE_LINE
+          && copy && copy.status === "added" && copy.classification === "block"
+          && copy.new_complexity === 16
+          && copy.duplicate_of && copy.duplicate_of.name === "heavyOriginal"
+          && copy.duplicate_of.file === "web/dashboard/src/lib/dup.ts"
+          && findEntry(report, "heavyOriginal") === null
+          && report.changed_functions.every((entry) => entry.name !== "legacyHeavyRenamed" || entry.classification !== "block"));
+      },
+    },
+    {
+      id: "C15", label: "--debt-out ledger lists untouched and moved debt untruncated",
+      check: () => {
+        const gt15 = ledger.functions_gt15;
+        return Boolean(ledger.schema === "ts-complexity-debt/1"
+          && ledger.summary.untouched_functions === 1
+          && ledger.summary.untouched_gt15 === 1 && ledger.summary.untouched_11_to_15 === 0
+          && ledger.summary.moved_gt15 === 1 && ledger.summary.moved_11_to_15 === 0
+          && ledger.summary.functions_gt15 === 2 && ledger.summary.functions_11_to_15 === 0
+          && gt15.length === 2
+          && gt15[0].file === "web/dashboard/src/lib/dup.ts" && gt15[0].function === "heavyOriginal"
+          && gt15[0].kind === "untouched" && gt15[0].complexity === 16 && gt15[0].function_kind === "function"
+          && gt15[1].file === "web/dashboard/src/lib/legacy2.ts" && gt15[1].function === "legacyHeavyRenamed"
+          && gt15[1].kind === "moved" && gt15[1].complexity === 25 && gt15[1].function_kind === "function"
+          && ledger.functions_11_to_15.length === 0);
+      },
+    },
+    {
+      id: "C16", label: "function-expression and default-export renames stay moves",
+      check: (report) => {
+        const expr = findEntry(report, "exprTargetMoved");
+        const def = findEntry(report, "renamedDefault");
+        return Boolean(expr && expr.status === "moved" && expr.kind === "function-expression"
+          && expr.moved_from && expr.moved_from.name === "exprTarget"
+          && expr.moved_from.file === "web/dashboard/src/lib/exprs.ts" && expr.delta === 0
+          && def && def.status === "moved" && def.kind === "arrow"
+          && def.moved_from && def.moved_from.name === "defaultTarget"
+          && def.moved_from.file === "web/dashboard/src/lib/exprs.ts"
+          && report.summary.added === 1 && report.summary.moved === 3);
+      },
+    },
+    {
+      id: "C17", label: "unreadable changed file exits 2 naming the file",
+      check: () => eaccessSurfaces(),
+    },
+  ];
+}
+
+const BASE_MUTATIONS = [
   { id: "M1a", file: "analyze.mjs", find: "const OK_LIMIT = 10;", replace: "const OK_LIMIT = 5;", control: "C1" },
   { id: "M1b", file: "analyze.mjs", find: "const BLOCK_LIMIT = 15;", replace: "const BLOCK_LIMIT = 1e9;", control: "C2" },
   { id: "M3", file: "analyze.mjs", find: "const movedFrom = bodyPool.get(record.fingerprint)?.shift() || null;", replace: "const movedFrom = null;", control: "C3" },
@@ -229,15 +352,6 @@ function record(rows, id, label, ok) {
   return ok ? 0 : 1;
 }
 
-function evaluateControls(rows, report, first) {
-  let failures = 0;
-  for (const control of CONTROLS) {
-    const outcome = evaluateControl(control, report, first);
-    failures += record(rows, control.id, control.label, outcome.ok);
-  }
-  return failures;
-}
-
 function isDeterministic(first, second) {
   return second.stdout === first.stdout && second.code === first.code;
 }
@@ -258,25 +372,16 @@ function parseReport(run, label) {
   }
 }
 
-function receiptRecorded(receiptReport, receiptRun, plainReport) {
-  const borderline = findEntry(receiptReport, "borderlineDetailed");
-  const plain = findEntry(plainReport, "borderlineDetailed");
-  return receiptReport.receipt === "QG-C02-02-placeholder"
-    && receiptRun.code === 1
-    && Boolean(borderline && borderline.classification === "review")
-    && borderline.review === "receipt-recorded"
-    && Boolean(plain && plain.review === "required");
-}
-
-function runMutation(mutation, repo, baseSha, work) {
-  const control = CONTROLS.find((entry) => entry.id === mutation.control);
+function runMutation(mutation, scenarios, work) {
+  const control = ALL_CONTROLS.get(mutation.control);
+  const scenario = scenarios[mutation.repo ?? "main"];
   const mutantDir = join(work, `mutant-${mutation.id}`);
   cpSync(ANALYZER_DIR, mutantDir, { recursive: true });
   const guardError = applyMutation(ANALYZER_DIR, mutantDir, mutation);
   if (guardError) {
     return { label: `guard: ${guardError}`, detected: false, failed: true };
   }
-  const mutantRun = runAnalyzer(mutantDir, repo, baseSha);
+  const mutantRun = runAnalyzer(mutantDir, scenario, mutation.args ?? []);
   // Only a completed run counts: a crashed mutant (exit 2) must not
   // masquerade as an intended-assertion failure.
   if (mutantRun.code !== 0 && mutantRun.code !== 1) {
@@ -294,27 +399,127 @@ function emit(rows, failures) {
   process.stderr.write(`ts fixture runner: ${rows.length - failures}/${rows.length} checks passed\n`);
 }
 
+// C17: an unreadable changed file is a tool error, not a silent skip. The
+// fixture repo is disposable; permissions are always restored.
+let MAIN_SCENARIO = null;
+function eaccessSurfaces() {
+  const target = join(MAIN_SCENARIO.repo, "web/dashboard/src/pages/MegaList.tsx");
+  chmodSync(target, 0o000);
+  let run;
+  try {
+    run = runAnalyzer(ANALYZER_DIR, MAIN_SCENARIO);
+  } finally {
+    chmodSync(target, 0o644);
+  }
+  return Boolean(run.code === 2
+    && run.stderr.includes("cannot read web/dashboard/src/pages/MegaList.tsx")
+    && run.stderr.includes("EACCES"));
+}
+
+function writeReceipt(receiptDir, name, scenario, overrides) {
+  const path = join(receiptDir, name);
+  if (overrides.raw !== undefined) {
+    writeFileSync(path, overrides.raw);
+    return path;
+  }
+  const fields = Object.fromEntries(
+    Object.entries(overrides.fields ?? {}).map(([key, value]) => [
+      key,
+      value === "USE_BASE" ? scenario.base : value === "USE_HEAD" ? scenario.head : value,
+    ]),
+  );
+  const document = {
+    schema: RECEIPT_SCHEMA,
+    source_commit: scenario.head,
+    base_commit: scenario.base,
+    implementer_model: "impl-lite",
+    reviewer_model: "impl-strong",
+    verdict: "approve",
+    reviewed_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    functions: [BAND_BINDING],
+    ...fields,
+  };
+  writeFileSync(path, `${JSON.stringify(document, null, 2)}\n`);
+  return path;
+}
+
 function main() {
   const work = mkdtempSync(join(tmpdir(), "ts-complexity-fixtures-"));
-  const repo = join(work, "repo");
   let failures = 0;
   const rows = [];
   let fatal = null;
+  const scenarios = {};
   try {
-    const baseSha = buildFixtureRepo(repo);
-    const first = runAnalyzer(ANALYZER_DIR, repo, baseSha);
+    scenarios.main = buildFixtureRepo(join(work, "main-repo"), "");
+    scenarios.rename = buildFixtureRepo(join(work, "rename-repo"), "rename");
+    scenarios.receipt = buildFixtureRepo(join(work, "receipt-repo"), "receipt");
+    MAIN_SCENARIO = scenarios.main;
+
+    const first = runAnalyzer(ANALYZER_DIR, scenarios.main);
     const report = parseReport(first, "analyzer run");
-    const second = runAnalyzer(ANALYZER_DIR, repo, baseSha);
-    const receiptRun = runAnalyzer(ANALYZER_DIR, repo, baseSha, ["--receipt", "QG-C02-02-placeholder"]);
-    const receiptReport = parseReport(receiptRun, "--receipt run");
-
-    failures += evaluateControls(rows, report, first);
+    const second = runAnalyzer(ANALYZER_DIR, scenarios.main);
+    for (const control of CONTROLS) {
+      const outcome = evaluateControl(control, report, first);
+      failures += record(rows, control.id, control.label, outcome.ok);
+    }
     failures += record(rows, "C7", "two consecutive runs are byte-identical", isDeterministic(first, second));
-    failures += record(rows, "C8", "--receipt recorded and reflected on review-band entries",
-      receiptRecorded(receiptReport, receiptRun, report));
 
-    for (const mutation of MUTATIONS) {
-      const outcome = runMutation(mutation, repo, baseSha, work);
+    const receiptDir = join(work, "receipts");
+    mkdirSync(receiptDir, { recursive: true });
+    const validPath = writeReceipt(receiptDir, "valid.json", scenarios.receipt, {});
+    const receiptPaths = new Map();
+    for (const receiptCase of RECEIPT_CASES) {
+      receiptPaths.set(receiptCase.id, receiptCase.path
+        ? join(receiptDir, receiptCase.path)
+        : writeReceipt(receiptDir, `${receiptCase.id.toLowerCase()}.json`, scenarios.receipt, receiptCase));
+    }
+
+    const receiptControlsForRun = receiptControls(scenarios.receipt);
+    const validRun = runAnalyzer(ANALYZER_DIR, scenarios.receipt, ["--receipt", validPath, ...MODEL_ORDER]);
+    const validOutcome = evaluateControl(receiptControlsForRun[0], parseReport(validRun, "valid receipt run"), validRun);
+    failures += record(rows, "C8", receiptControlsForRun[0].label, validOutcome.ok);
+
+    const plainRun = runAnalyzer(ANALYZER_DIR, scenarios.receipt);
+    const r11 = receiptControlsForRun[receiptControlsForRun.length - 1];
+    const plainOutcome = evaluateControl(r11, parseReport(plainRun, "no-receipt run"), plainRun);
+    failures += record(rows, "R11", r11.label, plainOutcome.ok);
+
+    for (let index = 0; index < RECEIPT_CASES.length; index += 1) {
+      const receiptCase = RECEIPT_CASES[index];
+      const control = receiptControlsForRun[index + 1];
+      const run = runAnalyzer(ANALYZER_DIR, scenarios.receipt, ["--receipt", receiptPaths.get(receiptCase.id), ...MODEL_ORDER]);
+      const outcome = evaluateControl(control, parseReport(run, `${receiptCase.id} run`), run);
+      failures += record(rows, control.id, control.label, outcome.ok);
+    }
+
+    const renameRun = runAnalyzer(ANALYZER_DIR, scenarios.rename);
+    const renameReport = parseReport(renameRun, "rename run");
+    const debtPath = join(work, "rename-debt.json");
+    runAnalyzer(ANALYZER_DIR, scenarios.rename, ["--debt-out", debtPath]);
+    const ledger = JSON.parse(readFileSync(debtPath, "utf8"));
+    for (const control of renameControls(ledger)) {
+      const outcome = evaluateControl(control, renameReport, renameRun);
+      failures += record(rows, control.id, control.label, outcome.ok);
+    }
+
+    const mutations = [
+      ...BASE_MUTATIONS,
+      {
+        id: "M-receipt", file: "analyze.mjs",
+        find: "const valid = errors.length === 0;",
+        replace: "const valid = true;",
+        control: "R1", repo: "receipt",
+        args: ["--receipt", receiptPaths.get("R1"), ...MODEL_ORDER],
+      },
+      {
+        id: "M-dup", file: "analyze.mjs",
+        find: 'status: "added", moved_from: null, duplicate_of: duplicateOf,',
+        replace: 'status: duplicateOf ? "moved" : "added", moved_from: duplicateOf, duplicate_of: null,',
+        control: "C14", repo: "rename",
+      },
+    ];
+    for (const mutation of mutations) {
+      const outcome = runMutation(mutation, scenarios, work);
       rows.push([mutation.id, outcome.label, outcome.detected ? "DETECTED" : "MISSED"]);
       if (!outcome.detected) failures += 1;
     }
@@ -329,6 +534,11 @@ function main() {
   }
   emit(rows, failures);
   process.exit(failures > 0 ? 1 : 0);
+}
+
+const ALL_CONTROLS = new Map();
+for (const control of [...CONTROLS, ...receiptControls(null), ...renameControls(null)]) {
+  ALL_CONTROLS.set(control.id, control);
 }
 
 main();
