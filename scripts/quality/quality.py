@@ -45,7 +45,7 @@ PROFILES = {
     "eval": ["routing", "guards"],
     "integration": ["integration"],
     "int-modules": ["int-modules"],
-    "full": ["self", "static", "security", "tests", "routing", "guards",
+    "full": ["self", "go-complexity", "static", "security", "tests", "routing", "guards",
              "dashboard", "site", "design", "node-sdk", "python-sdk", "bridge",
              "go-sdk", "docs", "nested-go", "int-modules",
              "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
@@ -64,7 +64,7 @@ RELEASE_PLAN_DATA = {RELEASE_PLAN_DIR + "PLAN-DATA.md"}
 # suites, image builds, disposable PG drills). Docker Desktop runs the daemon
 # in a CPU-limited VM; overlapping them starves time-sensitive tests into
 # flakes (observed 2026-10-06: slowlog/timing failures under jobs=4). They
-HEAVY_GATES = {"static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets"}
+HEAVY_GATES = {"static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity"}
 LIGHT_GATES = LEAVES - HEAVY_GATES
 DOCKER_GATES = {"tests", "int-modules", "integration", "package", "dr", "image-scan"}
 # NEXT-14b: ordering constraints for the parallel scheduler. The browser gate
@@ -145,6 +145,9 @@ def classify(paths):
         if path.startswith(("sdks/go/", "deploy/mock-provider/", "deploy/mock-embedder/", "scripts/loadtest/")):
             if path.endswith((".go", ".mod", ".sum")):
                 gates = ["go-sdk"] if path.startswith("sdks/go/") else ["nested-go"]
+                if path.endswith(".go"):
+                    # Changed function bodies are measured wherever they live.
+                    gates.insert(0, "go-complexity")
                 if path.endswith((".mod", ".sum")):
                     gates.append("licenses")
                 add(gates, path)
@@ -169,6 +172,10 @@ def classify(paths):
             add(["int-modules"], path)
         elif path.endswith(".go") or Path(path).name in ("go.mod", "go.sum") or path.startswith("migrations/"):
             gates = ["static", "security", "tests", "routing", "guards"]
+            if path.endswith(".go"):
+                # QG-C01: changed function bodies must pass the complexity
+                # differential gate (manifests/go.sum carry no function bodies).
+                gates.insert(0, "go-complexity")
             if Path(path).name in ("go.mod", "go.sum"):
                 gates.append("licenses")
             add(gates, path)
