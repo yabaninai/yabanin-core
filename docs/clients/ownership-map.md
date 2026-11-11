@@ -2,7 +2,8 @@
 
 Source-bound snapshot at commit `243ab5b34d04ba0e83fb10df7b206f88e42629d7`. This
 document maps every user-facing command and credential path across the harness,
-client-config rendering, CI attribution and the subscription bridge, and records
+client-config rendering, the LiteLLM migration commands, CI attribution, `yb run`
+label injection and the subscription bridge, and records
 residual work only — it does not decide any fix. It is the ownership companion
 to `docs/clients/modes-audit.md`, which classifies integration modes and
 evidence.
@@ -21,6 +22,14 @@ Rules used throughout:
 
 ## 1. Command inventory
 
+The tables in §1.1–§1.4 enumerate all 18 credential/client leaf commands: §1.1
+four profile/key commands, §1.2 six `yb harness` leaves (`yb harness connect
+--session` is a flag variant of `yb harness connect`), §1.3 `yb client-config`
+plus the three `yb migrate-litellm` leaves, §1.4 four `yb ci` leaves; the bare
+`yb migrate-litellm` group only dispatches to its leaves. `yb run` injects
+attribution labels only (producer rows in §2.1); the credential-free
+`yb delegate` surface is §1.5 and the subscription bridge is §1.6.
+
 ### 1.1 Profiles and stored keys — owner `pkg/trcli`
 
 | Command | Entry point | Effect | Credential flow (names only) | Durable state |
@@ -35,7 +44,7 @@ Rules used throughout:
 | Command | Entry point | Effect | Credential flow | Durable state |
 | --- | --- | --- | --- | --- |
 | `yb harness list` | `pkg/trcli/harness.go:34` | Tool, support, installed, config path, connected/drift | Reads config files only; per-tool detection via adapter `Detect` with a managed-block marker (`pkg/harness/adapters/codex.go:26`) and a literal `codex --version` probe (`pkg/trcli/harness.go:611`) | none (reads tool configs) |
-| `yb harness connect [<tool>]` | `pkg/trcli/harness.go:85` | Plan, diff, confirm, apply tool edits inside managed blocks (`docs/harness.md:19`) | `--gateway-url`; gateway probed with the `default` profile key (`pkg/trcli/harness.go:468`); models fetched via `GET /v1/models` (`pkg/trcli/harness.go:436`) | Transactions under `~/.yabanin/harness` with per-file backups, modes and pre/post SHA256 (`pkg/harness/state.go:24`, `docs/harness.md:29`) |
+| `yb harness connect [<tool>]` | `pkg/trcli/harness.go:85` | Plan, diff, confirm, apply tool edits inside managed blocks (`docs/harness.md:19`) | `--gateway-url`; gateway probed with the `default` profile key (`pkg/trcli/harness.go:468`); models fetched via `GET /v1/models` (`pkg/trcli/harness.go:436`) | Transactions under `~/.yabanin/harness` with per-file backups, modes and pre/post SHA256 (`pkg/harness/state.go:25`, `docs/harness.md:29`) |
 | `yb harness connect --session [--session-ttl 8h]` | flags `pkg/trcli/harness.go:103` | Remember session mode for the tool | Persists `{session: true, ttl}` per tool (`pkg/trcli/session_harness.go:13`) | `harness.<tool>` map in `~/.yabanin/config.json` (`pkg/trcli/session_harness.go:22`) |
 | `yb harness disconnect` | `pkg/trcli/harness.go:179` | Roll back the last applied transaction | none | Restores backups recorded in the transaction |
 | `yb harness status` | `pkg/trcli/harness.go:227` | Show transactions and drift | none | reads `~/.yabanin/harness` |
@@ -49,9 +58,12 @@ cursor, cline, roo-code, kilo-code, zed, jetbrains, copilot, gemini-cli
 
 ### 1.3 Client config rendering — owners `pkg/clientconfig`, `pkg/trcli`
 
-| Command | Entry point | Effect | Credential flow |
-| --- | --- | --- | --- |
-| `yb client-config --client <c>` | `pkg/trcli/client_config.go:16` | Print a client configuration pointing at the gateway (never applies it) | `--key-env` (default `YABANIN_API_KEY`, `pkg/trcli/client_config.go:31`), `--key-mode env\|helper` (`pkg/trcli/client_config.go:32`); the rendered output never contains key material (`pkg/clientconfig/clientconfig.go:5`) |
+| Command | Entry point | Effect | Credential flow | Durable state |
+| --- | --- | --- | --- | --- |
+| `yb client-config --client <c>` | `pkg/trcli/client_config.go:16` | Print a client configuration pointing at the gateway (never applies it) | `--key-env` (default `YABANIN_API_KEY`, `pkg/trcli/client_config.go:31`), `--key-mode env\|helper` (`pkg/trcli/client_config.go:32`); the rendered output never contains key material (`pkg/clientconfig/clientconfig.go:5`) | none (stdout only) |
+| `yb migrate-litellm dry-run` | `pkg/trcli/litellm_migrate.go:65` (group `:23`) | Analyze an operator LiteLLM proxy config into the reviewed migration report — no writes | Reads operator LiteLLM YAML (`--config`, `pkg/trcli/litellm_migrate.go:71`) that may contain credential values; refused-secret fields are never copied into the report (refusal note below) | optional `--out` report file, mode `0600` (`pkg/trcli/litellm_migrate.go:92`); stdout otherwise |
+| `yb migrate-litellm apply` | `pkg/trcli/litellm_migrate.go:117` | Apply a reviewed migration report to the target catalog; without `--yes` prints a write-free preview, and the gated apply refuses before any write | Consumes only the reviewed dry-run report — never raw LiteLLM configuration (`pkg/trcli/litellm_migrate.go:5`, `--report` required `:196`); refusals list every problem | Writes the target catalog (`--catalog`) and apply ledger `<catalog>.litellm-apply-ledger.json` (default `pkg/clientconfig/litellm_apply.go:73`) with `.litellm-backup` siblings (`:85`); atomic `0600` writes (`:612`) |
+| `yb migrate-litellm rollback` | `pkg/trcli/litellm_migrate.go:203` | Roll back the last apply, restoring byte-identical pre-state | none — reads the catalog/ledger backup set only | Restores both touched files from the backups; backups are removed only after both are restored and verified (`pkg/clientconfig/litellm_apply.go:912`, catalog write `:948`, ledger write `:967`) |
 
 Renders (`pkg/trcli/client_config.go:73`): codex TOML, claude-code settings
 JSON or env snippet, opencode provider JSON, continue YAML, cline
@@ -93,7 +105,7 @@ All CI commands require `YABANIN_GATEWAY_URL` (`pkg/trcli/ci.go:198`).
 through the in-process FakeExecutor only (`pkg/trcli/delegate.go:41`,
 `pkg/trcli/delegate.go:60`); state is one JSON file per episode under
 `<workspace>/.yabanin/delegate` (`pkg/trcli/delegate.go:49`) with optional
-isolated git worktrees under `.yabanin/worktrees` (`pkg/trcli/delegate.go:87`).
+isolated git worktrees under `.yabanin/worktrees` (`pkg/trcli/delegate.go:88`).
 `yb delegate jit …` operates the Postgres-backed elevation queue
 (`pkg/trcli/delegate.go:328`). None of these commands reads or stores gateway
 credentials; `--pg-uri` is passed per invocation as a flag.
@@ -116,18 +128,22 @@ credentials (§6 NC2); provider identity stays with the local provider CLIs.
 | `YABANIN_API_KEY` | `yb ci env`/`yb ci exec` child env (`pkg/trcli/ci.go:276`, `pkg/trcli/ci_exec.go:129`); shell rc managed block via `yb key print` (`pkg/harness/adapters/shell.go:65`) | key lookups (`pkg/trcli/harness.go:563`), `yb key print` (`pkg/trcli/login.go:112`), rendered `{env:…}`/`${…}` references | `pkg/clientconfig/clientconfig.go:25` |
 | `YABANIN_CI_KEY` (default `--key-env`) | caller of `yb ci` | `lookupCIKey` (`pkg/trcli/ci.go:225`) | `pkg/trcli/ci.go:22` |
 | `YABANIN_GATEWAY_URL` | caller | overrides stored profile URL (`pkg/trcli/login.go:266`); required for CI (`pkg/trcli/ci.go:198`); session gateway fallback (`pkg/trcli/session_harness.go:54`) | — |
-| `YABANIN_LABELS` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:266`) | codex `env_http_headers X-Yabanin-Labels` (`pkg/clientconfig/codex.go:40`) | — |
+| `YABANIN_LABELS` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:266`); `yb run <tool> -- <cmd>` injects the encoded labels (codex and default branches, `pkg/trcli/run.go:83`, `:96`) | codex `env_http_headers X-Yabanin-Labels` (`pkg/clientconfig/codex.go:40`) | — |
 | `YABANIN_SESSION_KEY_ID` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:279`, `pkg/trcli/ci_exec.go:134`) | pipeline tooling (informational) | — |
 | `ANTHROPIC_BASE_URL` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:267`) | Claude Code | `pkg/harness/adapters/claudecode.go:63` |
 | `ANTHROPIC_AUTH_TOKEN` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:275`, `pkg/trcli/ci_exec.go:131`); rendered snippet (`pkg/clientconfig/claudecode.go:56`) | Claude Code | `pkg/harness/adapters/claudecode.go:53` |
-| `ANTHROPIC_CUSTOM_HEADERS` | `yb ci` builds it with the labels header (`pkg/trcli/ci.go:268`); harness merges (`pkg/harness/adapters/claudecode.go:66`) | Claude Code | — |
+| `ANTHROPIC_CUSTOM_HEADERS` | `yb ci` builds it with the labels header (`pkg/trcli/ci.go:268`); `yb run claude-code -- <cmd>` appends the `X-Yabanin-Labels` line (`pkg/trcli/run.go:88`); harness merges (`pkg/harness/adapters/claudecode.go:66`) | Claude Code | — |
 | `CLAUDE_CODE_GATEWAY_HINT_HEADERS` | rendered claude settings/snippet | Claude Code | `pkg/clientconfig/claudecode.go:34` |
 | `OPENAI_API_KEY` | `yb ci env`/`yb ci exec` (`pkg/trcli/ci.go:274`, `pkg/trcli/ci_exec.go:130`) | OpenAI-compatible tools | — |
 | `OPENAI_BASE_URL` | `--openai-env` (`pkg/trcli/ci.go:271`, `pkg/trcli/ci_exec.go:137`) | OpenAI-compatible tools | — |
 | `AIDER_OPENAI_API_KEY` | rendered env line / harness fish block | Aider | `pkg/clientconfig/aider.go:31`, `pkg/harness/adapters/aider.go:39` |
 | `CLAUDE_CONFIG_DIR` | `yb ci exec --isolate` | Claude Code (temp, empty) | `pkg/trcli/ci_exec.go:182` |
 | `CODEX_HOME` | `yb ci exec` overlay | Codex CLI; also honored by the harness adapter when resolving `config.toml` | `pkg/trcli/ci_exec.go:164`, `pkg/harness/adapters/codex.go:75` |
-| `OPENCODE_CONFIG_CONTENT` | `yb ci exec` overlay merge | OpenCode | `pkg/trcli/ci_exec.go:172` |
+| `OPENCODE_CONFIG_CONTENT` | `yb ci exec` overlay merge; `yb run opencode -- <cmd>` merges the labels into the config content (`pkg/trcli/run.go:90`, `:94`) | OpenCode | `pkg/trcli/ci_exec.go:172` |
+
+`yb run <tool> -- <cmd>` (`pkg/trcli/run.go:32`) is labels-only: its env
+injection (`pkg/trcli/run.go:80`) carries attribution labels — or a label
+header/config merge — and never key material.
 
 ### 2.2 Subscription-bridge environment variables
 
@@ -183,7 +199,7 @@ credentials (§6 NC2); provider identity stays with the local provider CLIs.
 | credential store | `pkg/trcli/credstore` | — | `secret-tool` when installed (`pkg/trcli/credstore/open_linux.go`), macOS keychain via `security -i`, else file fallback | fallback below |
 | `~/.yabanin/credentials.json` | `pkg/trcli/credstore` | `0600` (`pkg/trcli/credstore/file.go:38`) | plaintext key map — fallback when `secret-tool` is absent (warning `pkg/trcli/credstore/file.go:10`) | R5 |
 | `~/.yabanin/sessions/<sha256>.json` | `pkg/trcli` | dir `0700` (`pkg/trcli/session.go:210`), file `0600` (`:236`) | cached session key `{id, key, expires_at, labels}`; cache key = `tool\|gateway\|labels` (`pkg/trcli/session.go:207`); valid until 10 min before expiry (`:225`); sweep ≤100 files (`:247`); deleted by `yb logout` (`pkg/trcli/login.go:93`) | contains the session key value |
-| `~/.yabanin/harness` | `pkg/harness` | `0600` (`docs/harness.md:29`) | applied transactions, backups, pre/post SHA256 (`pkg/harness/state.go:24`) | — |
+| `~/.yabanin/harness` | `pkg/harness` | `0600` (`docs/harness.md:29`) | applied transactions, backups, pre/post SHA256 (`pkg/harness/state.go:25`) | — |
 | `~/.codex/config.toml` (or `$CODEX_HOME/config.toml`) | adapters | — | managed block; helper auth or `env_key` | `pkg/harness/adapters/codex.go:78` |
 | `~/.claude/settings.json` | adapters | — | `apiKeyHelper`, `env` block; conflicting helper requires `--force` | `pkg/harness/adapters/claudecode.go:45` |
 | `~/.config/opencode/opencode.json` | adapters | — | managed provider; `.jsonc` refuses auto-edit | `pkg/harness/adapters/opencode.go:22`, `:32` |
@@ -191,7 +207,7 @@ credentials (§6 NC2); provider identity stays with the local provider CLIs.
 | `~/.aider.conf.yml` + shell rc line | adapters | — | base URL/model + env key line | `pkg/harness/adapters/aider.go:21`, `:39` |
 | `~/.bashrc` / `~/.zshrc` / `~/.config/fish/config.fish` | adapters | — | `export YABANIN_API_KEY="$(yb key print …)"` | `pkg/harness/adapters/shell.go:44`, `:65` |
 | `yabanin-ci.json`, `yabanin-pipeline.json` | `pkg/trcli` | `0600` (`pkg/trcli/ci.go:369`) | attribution/usage reports, session id, no key value | — |
-| `<workspace>/.yabanin/delegate`, `.yabanin/worktrees` | `pkg/trcli` | — | episode state, evidence envelopes, isolated worktrees | `pkg/trcli/delegate.go:49`, `:87` |
+| `<workspace>/.yabanin/delegate`, `.yabanin/worktrees` | `pkg/trcli` | — | episode state, evidence envelopes, isolated worktrees | `pkg/trcli/delegate.go:49`, `:88` |
 | (none) | subscription-bridge | — | runs are in-memory only (`services/subscription-bridge/src/server.ts:49`); no credential persistence | — |
 
 ## 4. Gateway client-facing surfaces — owner `pkg/gateway`
@@ -200,7 +216,7 @@ credentials (§6 NC2); provider identity stays with the local provider CLIs.
 | --- | --- | --- |
 | `/v1/yabanin` route group (auth-only) | `pkg/gateway/gateway.go:1979` | session keys: mint (`:1981`), revoke (`:1982`), finish (`:1983`), usage (`:1984`), own usage (`:1985`), label policy (`:1986`) |
 | session-key mint policy | `pkg/gateway/sessionkeys_api.go:78` | parent must be a plain API key (no agent, no session), `CanMintSessions`, else `403 session_mint_not_allowed`; TTL 60–43200 s (`:26`, `:102`); session cannot outlive parent (`:139`); mint rate limit `yb:skey:mint:{parent}:{minute}`, 60/min (`:28`, `:195`); log records id/parent/ttl, never the key (`:164`) |
-| auth normalization | `pkg/gateway/auth.go:71` | `x-api-key` copied to `Authorization` when absent, then deleted; Bearer parsed at `:81` |
+| auth normalization | `pkg/gateway/auth.go:71` | `x-api-key` copied to `Authorization` when absent, then deleted; `Authorization` header read at `:81`, `TrimPrefix("Bearer ")` at `:88` (lowercase fallback `:90`) |
 | label middleware | `pkg/gateway/labels_mw.go:34` | merges request + principal labels, rejects secret-shaped values, strips label headers after resolution, emits dropped/missing diagnostics |
 
 ## 5. CI and quality ownership
