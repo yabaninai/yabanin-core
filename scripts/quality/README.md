@@ -91,3 +91,11 @@ waivers to obtain a passing result.
 License metadata exceptions are versioned, scoped and expire. They do not waive
 vulnerabilities or grant release clearance. Preserve complete upstream notices
 and follow the separate release review process before distributing artifacts.
+
+## Go policy and critical behavior
+
+Install `make install-analysis-tools install-critical-tools`. Changed Go work and
+the full profile include `go-policy` and `critical-go`; see the
+[scope, budgets and negative controls](go_policy/README.md). Preserve the original
+task base for local execution and candidate evidence. Untouched analyzer debt is
+reported separately. A missing tool or missing relevant critical coverage blocks.

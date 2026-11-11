@@ -103,6 +103,8 @@ GOLANGCI_BIN := $(GO_BIN)/golangci-lint
 GOVULNCHECK_BIN := $(GO_BIN)/govulncheck
 GOLANGCI_VERSION := v2.15.0
 GOVULNCHECK_VERSION := v1.6.0
+GREMLINS_BIN := $(GO_BIN)/gremlins
+GREMLINS_VERSION := v0.6.0
 
 install-analysis-tools: ## Install pinned golangci-lint and govulncheck
 	@if ! $(GOLANGCI_BIN) version 2>/dev/null | grep -q "2.15.0"; then \
@@ -531,3 +533,19 @@ clean: ## Remove root binaries, coverage.out, nohup.out, test-results/, dist/
 	rm -f yabanin yabanin-gateway yabanin-loggerd yabanin-admin yabanin-mcp yabanin-migrate yb
 	rm -f coverage.out nohup.out
 	rm -rf test-results dist
+
+.PHONY: install-critical-tools analyze-go-policy analyze-critical-go _quality-go-policy _quality-critical-go
+install-critical-tools:
+	go install -ldflags="-X main.version=$(patsubst v%,%,$(GREMLINS_VERSION))" github.com/go-gremlins/gremlins/cmd/gremlins@$(GREMLINS_VERSION)
+
+analyze-go-policy:
+	python3 scripts/quality/go_policy/policy.py --base "$(or $(QUALITY_BASE),HEAD)" --linter "$(GOLANGCI_BIN)" --output "artifacts/quality/go-policy-$$(date +%s%N)"
+
+analyze-critical-go:
+	python3 scripts/quality/go_policy/critical.py --base "$(or $(QUALITY_BASE),HEAD)" --gremlins "$(GREMLINS_BIN)" --output "artifacts/quality/critical-go-$$(date +%s%N)"
+
+_quality-go-policy:
+	$(MAKE) analyze-go-policy
+
+_quality-critical-go:
+	$(MAKE) analyze-critical-go
