@@ -28,7 +28,7 @@ mechanical verification.
 
 ## 1. Scope and selection rule
 
-The dashboard routes are the `Page` union in `web/dashboard/src/App.tsx:68-76`
+The dashboard routes are the `Page` union in `web/dashboard/src/App.tsx:68-80`
 — 36 route ids. Twenty views are bound here under this selection rule:
 
 - **R1 — recorded traffic surfaces (17):** every route whose primary content
@@ -99,7 +99,7 @@ Route → nav gate: each view's header below cites its gate line in
   `services/admin/handlers/feedback_handler.go:144-152`).
 - Null-means-unknown: money/measure pointers render "unknown"/"not
   configured", never a fabricated zero (`web/dashboard/src/api/currencies.ts:9-11`;
-  `web/dashboard/src/pages/ComparePage.tsx:366` for `t('common.unknown')` on Overview).
+  `web/dashboard/src/pages/OverviewPage.tsx:366` for `t('common.unknown')` on Overview).
 
 ### 2.3 Retention substrate (shared facts)
 
@@ -166,7 +166,7 @@ Route → nav gate: each view's header below cites its gate line in
 
 - **Source:** `useCompareReports` (shadow backbone + latency/quality
   supplements) → `GET /api/analytics/shadow` (+ latency, quality);
-  window default 30d (`services/admin/handlers/cost_handlers.go:78, 102`);
+  window default 30d (`services/admin/handlers/cost_handlers.go:77, 101`);
   endpoint named at `web/dashboard/src/pages/ComparePage.tsx:23`.
 - **UNITS:** money `type: 'money', unit: 'USD'` via `formatMoney`
   (`web/dashboard/src/pages/ComparePage.tsx:86-87`); `delta_pct` renders signed with one decimal
@@ -294,7 +294,8 @@ Route → nav gate: each view's header below cites its gate line in
   `getRequestDetail` (web/dashboard/src/pages/RequestExplorerPage.tsx:862); CSV export
   of selected rows (:925-927, :1273);
   cross-links to the policy decision log (web/dashboard/src/pages/RequestExplorerPage.tsx:6).
-- **UNITS:** money USD via `formatMoneyCell` (web/dashboard/src/pages/RequestExplorerPage.tsx:981; web/dashboard/src/lib/columnFormat.ts:14 import); latency ms;
+- **UNITS:** money USD via `formatMoneyCell` (web/dashboard/src/pages/RequestExplorerPage.tsx:981;
+  import :14; definition `web/dashboard/src/lib/columnFormat.ts:55`); latency ms;
   success rate = fraction × 100 at one decimal (web/dashboard/src/pages/RequestExplorerPage.tsx:1093); latency stats
   rounded ms with `ms` unit (web/dashboard/src/pages/RequestExplorerPage.tsx:1094-1095); token pairs "input / output".
 - **IDENTITY:** row identity = `request_id` (wire row `RequestRow`,
@@ -483,7 +484,9 @@ Route → nav gate: each view's header below cites its gate line in
   — GET returns `threshold_usd`, `webhook_url`, `last_alert_at`, and the
   computed `spend_today` (`web/dashboard/src/api/budgets.ts:41-52`; handler doc
   `services/admin/handlers/spend_alert_handlers.go:12`).
-- **UNITS:** `threshold_usd` USD (null = disabled, :55-60);
+- **UNITS:** `threshold_usd` USD, where null disables alerts — the PATCH
+  validation rejects anything but "positive or null (to disable)"
+  (`services/admin/handlers/spend_alert_handlers.go:48-51`);
   `spend_today` USD computed server-side; `last_alert_at` datetime.
 - **IDENTITY:** one receiver config per org; the webhook URL is the receiver
   identity (must be http(s), `web/dashboard/src/api/exports.ts` `isValidWebhookUrl`).
@@ -553,23 +556,52 @@ Route → nav gate: each view's header below cites its gate line in
 ### V-20 Models (`models`, root-only, `web/dashboard/src/App.tsx:185`)
 
 - **Source:** `listModels` / `listAllModels` → `GET /api/models`
-  (`web/dashboard/src/api/models.ts:40, 50`; mount `services/admin/handlers/router_models.go:11`);
-  page loads paged with URL sort (`web/dashboard/src/pages/ModelsPage.tsx:178`).
-- **UNITS:** no measured units — names, providers, tiers
-  (`MODEL_TIERS = easy|medium|hard|premium`, `web/dashboard/src/api/models.ts:38`), context
-  bands, enable flags.
-- **IDENTITY:** `model_name` is the registry key (create/update/delete/
-  set-enabled all bind it, `web/dashboard/src/api/models.ts:61-113`); row order is the
-  server's (AUX-02 allowlist sort, `web/dashboard/src/pages/ModelsPage.tsx:67`).
-- **COVERAGE:** full registry, paged (`PAGE_SIZE`,
-  web/dashboard/src/pages/ModelsPage.tsx:178); every dashboard
+  (`web/dashboard/src/api/models.ts:40, 50`; mount
+  `services/admin/handlers/router_models.go:11`; lazy import
+  `web/dashboard/src/App.tsx:31`); the routed page is
+  `web/dashboard/src/pages/models/ModelsPage.tsx:40` — page and sort live in
+  the URL (`useTableUrlState('models')`, AUX-02, :47) and the list fetches
+  paged with server sort and `PAGE_SIZE = 25` (:61, :29); a header click
+  re-asks the backend and resets the page (AUX-12, :256-261).
+- **UNITS:** price in/out per 1M render via `formatMoneyCell`
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:311-329`) with the exact
+  `input / output USD / 1M` in the cell `title` (:324); an unmatched pricing
+  row renders `—`, never a zero price (:320); 7-day stats columns are
+  locale-grouped counts plus `p95_ms` (:265-288); `upstream_timeout_ms`
+  renders with an explicit `ms` unit (:584); tier is a label vocabulary
+  (`MODEL_TIERS = easy|medium|hard|premium`, `web/dashboard/src/api/models.ts:38`).
+- **IDENTITY:** `model_name` is the registry key — create/update/delete/
+  set-enabled all bind it on the wire (`web/dashboard/src/api/models.ts:61-113`);
+  in the page, the row id and the row-click inspector bind it
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:500, :510`); row order is
+  the server's — sort key/dir pass through to `listModels` (:61) and the
+  table runs `sortMode="server"` (:506); chain chips validate targets
+  against the loaded registry index (`listAllModels` :80, :85-89).
+- **COVERAGE:** the registry list is server-paged at 25/page
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:504-505` —
+  `pagination="external"` with the served `total`; a URL-restored page
+  beyond the served last page steps back :75-77); provider/tier/status
+  filters are client-side on the loaded page and labeled as such (AUX-04,
+  :127-134, :405-407, :457-461); the registry index walks server pages
+  capped at 10×100 (`web/dashboard/src/api/models.ts:47-48, 50`); the 7-day
+  stats columns cover the selected org only and stay hidden with a one-line
+  reason when no org is selected
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:118-124`). Every dashboard
   model attribution joins this registry (the pricing/registry join is the
   reason this catalog is in scope, §1 R3).
-- **MISSING-STATE:** an empty list on a legacy backend body renders as an
-  honest empty table — never a fabricated registry (`web/dashboard/src/pages/ModelsPage.tsx:101`);
-  create/toggle failures surface as notices (:205); `empty` computed
-  from `!loading && models.length === 0` (:384).
-- **RETENTION:** live configuration (no retention semantics); pricing
+- **MISSING-STATE:** `empty` is computed from `!listLoading && !list.error &&
+  list.data != null && rows.length === 0`
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:365-366`); a list body
+  without `data` degrades to an honest empty table, never a fabricated
+  registry (`resp.data ?? []` :63); first-load error renders error + retry
+  (:488-493) while a failed reload keeps the last good rows with the notice
+  above them (:478-483); mutation failures surface as an error notice via
+  `setActionError` (:177, :222, :237; rendered :380) and success is a plain
+  muted line, not a status banner (:377-379); unavailable stats columns are
+  hidden with a reason (:463-471).
+- **RETENTION:** live configuration (no retention semantics); the pricing
+  columns read the live pricing registry read-only
+  (`web/dashboard/src/pages/models/ModelsPage.tsx:91-96`) — pricing
   materialization from the rates catalog is versioned separately (V-19).
 
 ---
@@ -577,7 +609,7 @@ Route → nav gate: each view's header below cites its gate line in
 ## 4. Selection-rule proof obligations
 
 - The `Page` union enumerates 36 ids; 20 are bound above and 16 are residual
-  — the split is exhaustive and disjoint (`web/dashboard/src/App.tsx:68-76`).
+  — the split is exhaustive and disjoint (`web/dashboard/src/App.tsx:68-80`).
 - Every bound view cites at least one concrete source operation (fetch or
   handler) at `file:line` — see section 6 for the mechanical count.
 - Views sharing a fetch family (overview/cost/classifier/cache over cost
@@ -595,22 +627,35 @@ Route → nav gate: each view's header below cites its gate line in
 
 ## 6. Mechanical verification record
 
-Method, executed at the frozen base `34eb9783af26e7780d4ffa8a7c3e2deaf7593428`
-(HEAD of `task/cv00-03`, worktree clean except this file):
+Re-verification after the independent-review fixes (V-20 rebound to the
+routed `pages/models/ModelsPage.tsx`, citation and count corrections),
+executed against the working tree of `task/cv00-03`; the product tree is
+identical to the frozen base `34eb9783af26e7780d4ffa8a7c3e2deaf7593428`
+(only this document differs).
 
-1. Every `path:line`/`path:line-line` citation above (full repo-relative
-   paths; bare `:N` continuations bind to the last full citation in the same
-   bullet) was extracted mechanically and re-checked: the cited file exists
-   and every cited line/range falls inside the file at that revision.
-   Result: **236 distinct citations, 236 ok, 0 bad.**
+1. Every citation in this document was extracted and re-checked with this
+   grammar: a full citation is a repo-relative path (containing `/` and a
+   file extension) immediately followed by `:N` or `:N-M`, optionally with
+   comma-separated continuation specs (`:M`, `M`, `M-M`) in the same
+   parenthetical; a bare `:N`/`:N-M` (or comma list of `:M`) binds to the
+   most recent preceding full citation's path. Each resolved line or range
+   counts as one citation instance; distinct anchors are unique
+   (file, first-line, last-line) triples. Each anchor was checked: the cited
+   file exists and every cited line/range falls inside the file.
+   Result: **339 citation instances, 304 distinct (file,line-range) anchors,
+   0 bad.**
 2. Content spot-verification: the load-bearing lines (state-machine
    definitions, limits/defaults, retention deletes, gate mounts, unit
    formatters) were additionally grep-verified to contain the named symbols
    during authoring — every handler default, page size and window cited in
-   sections §2-3 was read from the tree, not from memory.
+   sections §2-3 was read from the tree, not from memory. The review-fixed
+   facts (V-20 rebinding, §2.2 Overview unknown-money line, V-09
+   `formatMoneyCell` import/definition, V-03 window defaults, V-17 threshold
+   validation, `Page`-union range) were each re-read from the cited source
+   lines after the fix pass.
 
 The `Page`-union split (section 1) was enumerated mechanically: 36 ids in
-`web/dashboard/src/App.tsx:68-76`, 20 bound + 16 residual, disjoint and
+`web/dashboard/src/App.tsx:68-80`, 20 bound + 16 residual, disjoint and
 exhaustive.
 
 ## 7. Residual and limits
