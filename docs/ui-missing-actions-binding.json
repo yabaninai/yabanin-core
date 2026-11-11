@@ -1,0 +1,3747 @@
+{
+ "schema": "ui-missing-actions-binding/1",
+ "task": "CUI-00-03 (plans/CORE.md:1639)",
+ "generated": "2026-11-11",
+ "base_commit": "34eb9783af26e7780d4ffa8a7c3e2deaf7593428",
+ "source_matrix": {
+  "doc": "docs/ui-grant-scope-matrix.md",
+  "base_commit": "243ab5b34d04ba0e83fb10df7b206f88e42629d7"
+ },
+ "method": "Rows are derived from the accepted ui-grant-scope-matrix warts (5), its unavailable org-scope rows and its 17 CLI/config-only groups (62 endpoints), plus the 4 unavailable records in ui-capability-matrix; MA-60..62 (SCIM token admin) and MA-73..75 (policy-packs) come from the task-brief verification set, not the matrix inputs. Every file:line citation in this file was resolved mechanically from the source at the recorded base commit. Client-absence claims were re-verified with case-insensitive searches (grep -ri) over web/dashboard/src (excluding *.test.*) so differently-cased spellings cannot split an enumeration; negative checks are encoded in this JSON and re-run by the checker.",
+ "scope_limit": {
+  "statement": "The binding set is exactly the source-matrix and task-brief inputs named in method. Independent review found 22 further live admin handlers with no dashboard caller that are absent from those inputs and from this enumeration; they are out of scope here and recorded as a follow-up gap for the owner (no binding work done for them in this document).",
+  "out_of_matrix_handler_count": 22,
+  "out_of_matrix_families": [
+   {
+    "family": "org-scoped analytics aggregates (stats, top-models, time-series, error-breakdown)",
+    "handlers": 4,
+    "routes": "services/admin/handlers/router_analytics.go:19-22"
+   },
+   {
+    "family": "cross-org top-orgs aggregate",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_audit.go:26"
+   },
+   {
+    "family": "routing actual/snapshot views",
+    "handlers": 2,
+    "routes": "services/admin/handlers/router_models.go:55-56"
+   },
+   {
+    "family": "self password change",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_console.go:26"
+   },
+   {
+    "family": "agent-key delegate + delegations",
+    "handlers": 4,
+    "routes": "services/admin/handlers/router_keys.go:29,38-40"
+   },
+   {
+    "family": "model bump-version",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_models.go:34"
+   },
+   {
+    "family": "canary-rollouts",
+    "handlers": 6,
+    "routes": "services/admin/handlers/canary_rollouts.go:114-119"
+   },
+   {
+    "family": "security-inbox reads + operator patch",
+    "handlers": 3,
+    "routes": "services/admin/handlers/security_inbox_handlers.go:551-554"
+   }
+  ]
+ },
+ "base_reproduction": {
+  "note": "Base-reproduction logs for the recorded pre-existing GO-2026-6859 gate failures, verified present in scratch and copied into this worktree's gitignored artifacts/quality/cui-00-03-base-repro/; hashes only, raw logs stay out of Git.",
+  "artifacts": [
+   {
+    "path": "artifacts/quality/cui-00-03-base-repro/base-security.log",
+    "sha256": "c1fa5d1d384c221bc49d18c95ae8b1db10a4e035d85fb50dd342bd5c3c008404",
+    "signature": "go mod verify clean; govulncheck disposition scan BLOCKED (analyze-security Error 3) on GO-2026-6859 REACHABLE findings; GO-2026-6909 NOT_AFFECTED; SAML disposition expires 2026-12-09"
+   },
+   {
+    "path": "artifacts/quality/cui-00-03-base-repro/base-deps.log",
+    "sha256": "cf580c6b43bf48ea67392ae9253c55a6419223aec4b3f15c13c4795405007a8e",
+    "signature": "dependency audit: 7 govulncheck module failures (reachable GO-2026-6859); trivy high/critical 0"
+   }
+  ]
+ },
+ "verdict_rule": "bound-in-full: the operator can drive the action from the dashboard at HEAD — handler, route registration, OpenAPI entry, dashboard API client and accepted evidence all have citations. residual-only: at least one of those links has no citation; the residual field names the missing link(s). Deliberate non-dashboard surfaces (IdP protocol, agent data plane, opt-in portal UI, gateway plane) are recorded as residual with the design disposition named, not as missing implementation.",
+ "counts": {
+  "total": 75,
+  "bound_in_full": 7,
+  "residual_only": 68
+ },
+ "families": [
+  {
+   "family": "warts/exports-nav",
+   "rows": [
+    {
+     "id": "MA-01",
+     "family": "warts/exports-nav",
+     "action": "Operator reads the org spend alert (exports screen)",
+     "endpoint": "GET /api/organizations/{id}/spend-alert",
+     "handler": {
+      "file": "services/admin/handlers/spend_alert_handlers.go",
+      "line": 13,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 58,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2110,
+      "expect": "get:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/budgets.ts",
+      "line": 51,
+      "expect": "getOrgSpendAlert"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/ExportsPage.tsx",
+      "line": 71,
+      "expect": "getOrgSpendAlert"
+     },
+     "evidence": [
+      {
+       "file": "web/dashboard/src/App.navGates.test.ts",
+       "line": 43,
+       "expect": "DOCUMENTED_WARTS"
+      },
+      {
+       "file": "services/admin/handlers/handler_test.go",
+       "line": 2083,
+       "expect": ""
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 182,
+       "expect": "GET /api/organizations/{id}/spend-alert"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "Matrix wart 1: nav gate references budgets.read (App.tsx:163); budgets.read is not a served permission — the wart is documented in App.navGates.test.ts — the item is effectively root-only although the endpoint chain is complete."
+    },
+    {
+     "id": "MA-02",
+     "family": "warts/exports-nav",
+     "action": "Operator updates the org spend alert (exports screen)",
+     "endpoint": "PATCH /api/organizations/{id}/spend-alert",
+     "handler": {
+      "file": "services/admin/handlers/spend_alert_handlers.go",
+      "line": 31,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 59,
+      "expect": ".Patch("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2117,
+      "expect": "patch:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/budgets.ts",
+      "line": 60,
+      "expect": "updateOrgSpendAlert"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/ExportsPage.tsx",
+      "line": 101,
+      "expect": "updateOrgSpendAlert"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/handler_test.go",
+       "line": 2086,
+       "expect": ""
+      },
+      {
+       "file": "web/dashboard/src/api/exports.ts",
+       "line": 19,
+       "expect": "updateOrgSpendAlert"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 183,
+       "expect": "PATCH /api/organizations/{id}/spend-alert"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "Same wart-1 nav gate as MA-01; both client functions are re-exported through the exports client (exports.ts:18-19)."
+    }
+   ]
+  },
+  {
+   "family": "unavailable/mc-4-user-credentials",
+   "rows": [
+    {
+     "id": "MA-03",
+     "family": "unavailable/mc-4-user-credentials",
+     "action": "Operator lists per-user MCP credentials",
+     "endpoint": "GET /api/organizations/{id}/mcp/user-credentials",
+     "handler": null,
+     "route": null,
+     "openapi": {
+      "absent": true,
+      "why": "no handler and no route registration at HEAD; the admin router answers JSON 404 (router.go:753)"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/mcpCredentials.ts",
+      "line": 142,
+      "expect": "listMcpUserCredentials"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/McpCredentialsPage.tsx",
+      "line": 309,
+      "expect": "listMcpUserCredentials"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 848,
+       "expect": "MC-4 contract hole"
+      },
+      {
+       "file": "pkg/adminstore/mcpcreds.go",
+       "line": 596,
+       "expect": "ListMCPUserCredentials"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "handler absent, route absent (deliberately unregistered MC-4 proposal), OpenAPI absent — client and store method already exist",
+     "note": "The UI renders the explicit unavailable state on JSON 404; the page caller is McpCredentialsPage.tsx (listMcpUserCredentials call)."
+    },
+    {
+     "id": "MA-04",
+     "family": "unavailable/mc-4-user-credentials",
+     "action": "Operator deletes a per-user MCP credential",
+     "endpoint": "DELETE /api/organizations/{id}/mcp/user-credentials/{server}/{agent_id}",
+     "handler": null,
+     "route": null,
+     "openapi": {
+      "absent": true,
+      "why": "no handler and no route registration at HEAD (same MC-4 contract hole)"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/mcpCredentials.ts",
+      "line": 163,
+      "expect": "deleteMcpUserCredential"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/McpCredentialsPage.tsx",
+      "line": 426,
+      "expect": "deleteMcpUserCredential"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 849,
+       "expect": "MC-4 contract hole"
+      },
+      {
+       "file": "pkg/adminstore/mcpcreds.go",
+       "line": 630,
+       "expect": "DeleteMCPUserCredential"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "handler absent, route absent, OpenAPI absent — client exists and the store lifecycle methods exist",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "unavailable/mc-3-gateway-flows",
+   "rows": [
+    {
+     "id": "MA-05",
+     "family": "unavailable/mc-3-gateway-flows",
+     "action": "Agent submits per-user header credential via gateway plane",
+     "endpoint": "POST /api/mcp/credentials/{server}",
+     "handler": {
+      "file": "pkg/gateway/mcpcredflow.go",
+      "line": 78,
+      "expect": "mcpSubmitUserCredential"
+     },
+     "route": {
+      "file": "pkg/gateway/gateway.go",
+      "line": 2011,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "gateway agent-key plane is deliberately excluded from the admin REST snapshot; pinned by the gatewayInfra golden map",
+      "disposition": {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 835,
+       "expect": "gatewayInfra"
+      }
+     },
+     "client": {
+      "file": "web/dashboard/src/api/mcpCredentials.ts",
+      "line": 174,
+      "expect": "submitMcpUserHeaders"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/McpCredentialsPage.tsx",
+      "line": 395,
+      "expect": "submitMcpUserHeaders"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 835,
+       "expect": "gatewayInfra"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "OpenAPI entry absent (deliberate gateway-plane exclusion, pinned); dashboard reachability is deployment-dependent (no reverse-proxy decision at HEAD)",
+     "note": "Mounted under the gateway's /api/mcp group (gateway.go:2011); the dashboard client targets the same path."
+    },
+    {
+     "id": "MA-06",
+     "family": "unavailable/mc-3-gateway-flows",
+     "action": "Agent starts per-user OAuth credential flow via gateway plane",
+     "endpoint": "POST /api/mcp/auth/{server}/begin",
+     "handler": {
+      "file": "pkg/gateway/mcpcredflow.go",
+      "line": 120,
+      "expect": "mcpOAuthBegin"
+     },
+     "route": {
+      "file": "pkg/gateway/gateway.go",
+      "line": 2012,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "gateway agent-key plane deliberately excluded from the admin REST snapshot; pinned by the gatewayInfra golden map",
+      "disposition": {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 835,
+       "expect": "gatewayInfra"
+      }
+     },
+     "client": {
+      "file": "web/dashboard/src/api/mcpCredentials.ts",
+      "line": 181,
+      "expect": "beginMcpUserOAuth"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/McpCredentialsPage.tsx",
+      "line": 409,
+      "expect": "beginMcpUserOAuth"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/ui_actions_inventory_test.go",
+       "line": 835,
+       "expect": "gatewayInfra"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "OpenAPI entry absent (deliberate); dashboard reachability deployment-dependent",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/cli-pricing-sync",
+   "rows": [
+    {
+     "id": "MA-07",
+     "family": "cli-only/cli-pricing-sync",
+     "action": "Operator reads the model catalogue (pricing-sync read leg; shared with the models page)",
+     "endpoint": "GET /api/models",
+     "handler": {
+      "file": "services/admin/handlers/crud.go",
+      "line": 849,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_models.go",
+      "line": 13,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1810,
+      "expect": "get:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/models.ts",
+      "line": 40,
+      "expect": "listModels"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/handler_test.go",
+       "line": 2650,
+       "expect": "TestListModels"
+      },
+      {
+       "file": "pkg/trcli/pricing_sync_test.go",
+       "line": 44,
+       "expect": "TestPricingSync_CLIUsesAdminModels"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 90,
+       "expect": "GET /api/models"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "Not dashboard-missing: the models page drives the same endpoint. Bound here because the accepted matrix lists it as the pricing-sync read leg."
+    },
+    {
+     "id": "MA-08",
+     "family": "cli-only/cli-pricing-sync",
+     "action": "Operator imports/syncs pricing (yb pricing sync)",
+     "endpoint": "POST /api/pricing/import",
+     "handler": {
+      "file": "services/admin/handlers/pricing_handlers.go",
+      "line": 139,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 64,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2795,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/pricing/import"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/pricing_handlers_test.go",
+       "line": 35,
+       "expect": "TestImportPricing_DryRunApplyAndRoot"
+      },
+      {
+       "file": "pkg/trcli/pricing_sync_test.go",
+       "line": 17,
+       "expect": "TestBuildPricingSync_ExactCompatAmbiguousAndLocal"
+      },
+      {
+       "file": "pkg/trcli/pricing_sync_day0_test.go",
+       "line": 28,
+       "expect": "TestPricingSyncDay0_FlagContract"
+      },
+      {
+       "file": "docs/analytics.md",
+       "line": 72,
+       "expect": "pricing sync"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 27,
+       "expect": "pricing sync"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 220,
+       "expect": "POST /api/pricing/import"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client (CLI-only at HEAD) and the CLI's X-Admin-Key credential is accepted only on /internal (internal_api.go), not on the session-authenticated admin router — matrix wart 3",
+     "note": "CLI consumer: pkg/trcli/pricing_sync.go:201 sends the admin header set in pkg/trcli/adminclient.go:21; server-side X-Admin-Key parsing lives in services/admin/handlers/internal_api.go:86 while the admin surface takes sessions (services/admin/handlers/router.go:422)."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/requests-archive-exports",
+   "rows": [
+    {
+     "id": "MA-09",
+     "family": "cli-only/requests-archive-exports",
+     "action": "Operator exports org request history",
+     "endpoint": "GET /api/organizations/{id}/requests/export",
+     "handler": {
+      "file": "services/admin/handlers/request_export.go",
+      "line": 28,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_analytics.go",
+      "line": 44,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1246,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/requests/export"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/request_export_test.go",
+       "line": 79,
+       "expect": "TestRequestExportAppliesPayloadMatrix"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 169,
+       "expect": "GET /api/organizations/{id}/requests/export"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "registered and OpenAPI-documented but no dashboard caller at HEAD (matrix wart 4) — curl/direct API only",
+     "note": null
+    },
+    {
+     "id": "MA-10",
+     "family": "cli-only/requests-archive-exports",
+     "action": "Operator searches the org request archive",
+     "endpoint": "GET /api/organizations/{id}/requests/archive-search",
+     "handler": {
+      "file": "services/admin/handlers/request_archive_search.go",
+      "line": 18,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_analytics.go",
+      "line": 45,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1309,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/archive-search"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/request_export_test.go",
+       "line": 108,
+       "expect": "TestArchiveSearchUsesSharedScopeAndLabelsHotSource"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 168,
+       "expect": "GET /api/organizations/{id}/requests/archive-search"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "registered and OpenAPI-documented but no dashboard caller at HEAD (matrix wart 4)",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "warts/guard-packs-cross-gate",
+   "rows": [
+    {
+     "id": "MA-11",
+     "family": "warts/guard-packs-cross-gate",
+     "action": "Platform security auditor reads the guard-pack activation journal",
+     "endpoint": "GET /api/audit-logs",
+     "handler": {
+      "file": "services/admin/handlers/audit_logs.go",
+      "line": 75,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_audit.go",
+      "line": 19,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1461,
+      "expect": "get:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/audit.ts",
+      "line": 37,
+      "expect": "listAuditLogs"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/GuardPacksPage.tsx",
+      "line": 92,
+      "expect": "listAuditLogs"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/audit_gate_auth01_test.go",
+       "line": 30,
+       "expect": "auth01ProbeAudit"
+      },
+      {
+       "file": "services/admin/handlers/audit_gate_auth01_test.go",
+       "line": 50,
+       "expect": "auth01ProbeAudit"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 54,
+       "expect": "GET /api/audit-logs"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "Matrix wart 5: the server grant is the global audit role (router_audit.go:19) but the guard-packs nav gate is rootOnly (App.tsx:184), so a non-root auditor cannot reach this caller from the dashboard. The guard-pack lifecycle endpoints themselves are bound and are not re-enumerated (guardpacks.go:118-123)."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/cli-service-api",
+   "rows": [
+    {
+     "id": "MA-12",
+     "family": "cli-only/cli-service-api",
+     "action": "Service reads org API keys (yb keys list)",
+     "endpoint": "GET /internal/api-keys",
+     "handler": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 38,
+      "expect": "internalAPIKeys"
+     },
+     "route": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 29,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 375,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/internal/"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/internal_api_test.go",
+       "line": 102,
+       "expect": "/internal/api-keys"
+      },
+      {
+       "file": "docs/cli.md",
+       "line": 44,
+       "expect": "keys list"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 280,
+       "expect": "GET /internal/api-keys"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — root service-key plane (X-Admin-Key), CLI by design at HEAD",
+     "note": "CLI consumer: pkg/trcli/adminclient.go:93 (yb keys list, docs/cli.md:44)."
+    },
+    {
+     "id": "MA-13",
+     "family": "cli-only/cli-service-api",
+     "action": "Service reads org savings analytics (yb spend)",
+     "endpoint": "GET /internal/analytics/savings",
+     "handler": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 61,
+      "expect": "internalSavingsReport"
+     },
+     "route": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 30,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 381,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/internal/"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/internal_api_test.go",
+       "line": 122,
+       "expect": "/internal/analytics/savings"
+      },
+      {
+       "file": "docs/cli.md",
+       "line": 118,
+       "expect": "yb spend"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 279,
+       "expect": "GET /internal/analytics/savings"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — service-key plane, CLI by design (the session-authenticated twin GET /api/analytics/savings is a different endpoint and IS bound, analytics.ts:95)",
+     "note": "CLI consumer: pkg/trcli/adminclient.go:108 (yb spend, docs/cli.md:118)."
+    },
+    {
+     "id": "MA-14",
+     "family": "cli-only/cli-service-api",
+     "action": "Service reads org cost report",
+     "endpoint": "GET /internal/analytics/cost",
+     "handler": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 88,
+      "expect": "internalCostReport"
+     },
+     "route": {
+      "file": "services/admin/handlers/internal_api.go",
+      "line": 31,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 387,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/internal/"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/internal_api_test.go",
+       "line": 122,
+       "expect": "/internal/analytics"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 278,
+       "expect": "GET /internal/analytics/cost"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no CLI consumer at HEAD (endpoint + OpenAPI + auth tests exist; unused service plane)",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/cache-ops",
+   "rows": [
+    {
+     "id": "MA-15",
+     "family": "cli-only/cache-ops",
+     "action": "Operator flushes the org cache",
+     "endpoint": "POST /api/cache/flush",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 96,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 18,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2698,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/flush"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/cache_handlers_test.go",
+       "line": 133,
+       "expect": "TestFlushCache_WithInvalidator"
+      },
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 37,
+       "expect": "POST /cache/flush"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 60,
+       "expect": "POST /api/cache/flush"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": null
+    },
+    {
+     "id": "MA-16",
+     "family": "cli-only/cache-ops",
+     "action": "Operator reads cache analytics",
+     "endpoint": "GET /api/cache/analytics",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 144,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 19,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2704,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/analytics"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/cache_handlers_test.go",
+       "line": 168,
+       "expect": "TestCacheAnalytics"
+      },
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 42,
+       "expect": "GET /cache/analytics"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 56,
+       "expect": "GET /api/cache/analytics"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": null
+    },
+    {
+     "id": "MA-17",
+     "family": "cli-only/cache-ops",
+     "action": "Operator warms the cache (deprecated)",
+     "endpoint": "POST /api/cache/warm",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 189,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 20,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2710,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/warm"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 47,
+       "expect": "POST /cache/warm"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 61,
+       "expect": "POST /api/cache/warm"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": "Endpoint is documented as deprecated (docs/api/cache-admin-api.md:47)."
+    },
+    {
+     "id": "MA-18",
+     "family": "cli-only/cache-ops",
+     "action": "Operator creates a cache A/B experiment",
+     "endpoint": "POST /api/cache/experiments",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 269,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 23,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2734,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/experiments"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 84,
+       "expect": "POST /cache/experiments"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 58,
+       "expect": "POST /api/cache/experiments"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": "No dedicated handler unit test at HEAD; the operator contract is carried by docs/api/cache-admin-api.md."
+    },
+    {
+     "id": "MA-19",
+     "family": "cli-only/cache-ops",
+     "action": "Operator lists cache experiments",
+     "endpoint": "GET /api/cache/experiments",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 305,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 24,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2729,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/experiments"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 98,
+       "expect": "GET /cache/experiments"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 57,
+       "expect": "GET /api/cache/experiments"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": "No dedicated handler unit test at HEAD."
+    },
+    {
+     "id": "MA-20",
+     "family": "cli-only/cache-ops",
+     "action": "Operator reads cache experiment results",
+     "endpoint": "GET /api/cache/experiments/{exp_id}/results",
+     "handler": {
+      "file": "services/admin/handlers/cache_handlers.go",
+      "line": 329,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 25,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2740,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/cache/experiments"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/api/cache-admin-api.md",
+       "line": 103,
+       "expect": "cache/experiments/{exp_id}/results"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 59,
+       "expect": "GET /api/cache/experiments/{exp_id}/results"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/curl operator surface at HEAD",
+     "note": "No dedicated handler unit test at HEAD."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/regions-catalog",
+   "rows": [
+    {
+     "id": "MA-21",
+     "family": "cli-only/regions-catalog",
+     "action": "Operator reads the region catalogue",
+     "endpoint": "GET /api/regions",
+     "handler": {
+      "file": "services/admin/handlers/region_handlers.go",
+      "line": 94,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 29,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/api/regions"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 227,
+       "expect": "GET /api/regions"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": "The org-scoped region endpoints are bound elsewhere (region-settings surface); the global catalogue has no dedicated handler unit test at HEAD (the region tests exercise the org-scoped paths)."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/verticals",
+   "rows": [
+    {
+     "id": "MA-22",
+     "family": "cli-only/verticals",
+     "action": "Operator lists enabled vertical packs",
+     "endpoint": "GET /api/organizations/{orgID}/verticals",
+     "handler": {
+      "file": "services/admin/handlers/vertical_handlers.go",
+      "line": 29,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 36,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2843,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/verticals"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/vertical_handlers_test.go",
+       "line": 29,
+       "expect": "TestVerticalHandlers_List_WithOrgID"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 195,
+       "expect": "GET /api/organizations/{orgID}/verticals"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/config surface at HEAD",
+     "note": null
+    },
+    {
+     "id": "MA-23",
+     "family": "cli-only/verticals",
+     "action": "Operator enables a vertical pack",
+     "endpoint": "POST /api/organizations/{orgID}/verticals/{vertical}",
+     "handler": {
+      "file": "services/admin/handlers/vertical_handlers.go",
+      "line": 46,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 37,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2851,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/verticals"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/vertical_handlers_test.go",
+       "line": 73,
+       "expect": "TestVerticalHandlers_Enable_Valid"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 197,
+       "expect": "POST /api/organizations/{orgID}/verticals/{vertical}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/config surface at HEAD",
+     "note": null
+    },
+    {
+     "id": "MA-24",
+     "family": "cli-only/verticals",
+     "action": "Operator disables a vertical pack",
+     "endpoint": "DELETE /api/organizations/{orgID}/verticals/{vertical}",
+     "handler": {
+      "file": "services/admin/handlers/vertical_handlers.go",
+      "line": 83,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 38,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2859,
+      "expect": "delete:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/verticals"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/vertical_handlers_test.go",
+       "line": 100,
+       "expect": "TestVerticalHandlers_Disable"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 196,
+       "expect": "DELETE /api/organizations/{orgID}/verticals/{vertical}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — CLI/config surface at HEAD",
+     "note": "VerticalHandlers.ListMarketplace (vertical_handlers.go:101) has no route registration at HEAD; it is recorded here because the accepted matrix's sovereign-marketplace group is the mounted marketplace surface."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/templates",
+   "rows": [
+    {
+     "id": "MA-25",
+     "family": "cli-only/templates",
+     "action": "Operator exports the org policy as a template",
+     "endpoint": "POST /api/organizations/{orgID}/templates/export",
+     "handler": {
+      "file": "services/admin/handlers/policy_template_handlers.go",
+      "line": 24,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 43,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/templates"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/policy_template_handlers_test.go",
+       "line": 28,
+       "expect": "TestPolicyTemplateHandlers_Export_Success"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 193,
+       "expect": "POST /api/organizations/{orgID}/templates/export"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": null
+    },
+    {
+     "id": "MA-26",
+     "family": "cli-only/templates",
+     "action": "Operator lists marketplace policy templates",
+     "endpoint": "GET /api/templates/marketplace",
+     "handler": {
+      "file": "services/admin/handlers/policy_template_handlers.go",
+      "line": 60,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 44,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/templates"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/policy_template_handlers_test.go",
+       "line": 56,
+       "expect": "TestPolicyTemplateHandlers_ListAvailable_WithNilMarketplace"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 255,
+       "expect": "GET /api/templates/marketplace"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": null
+    },
+    {
+     "id": "MA-27",
+     "family": "cli-only/templates",
+     "action": "Operator subscribes the org to a template",
+     "endpoint": "PUT /api/organizations/{orgID}/templates/{templateID}/subscribe",
+     "handler": {
+      "file": "services/admin/handlers/policy_template_handlers.go",
+      "line": 74,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 45,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/templates"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/policy_template_handlers_test.go",
+       "line": 70,
+       "expect": "TestPolicyTemplateHandlers_Subscribe_Success"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 194,
+       "expect": "PUT /api/organizations/{orgID}/templates/{templateID}/subscribe"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/retrain-status",
+   "rows": [
+    {
+     "id": "MA-28",
+     "family": "cli-only/retrain-status",
+     "action": "Operator reads classifier retrain status",
+     "endpoint": "GET /api/retrain/status",
+     "handler": {
+      "file": "services/admin/handlers/retrain_handlers.go",
+      "line": 40,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 74,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/retrain"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/retrain_handlers_test.go",
+       "line": 15,
+       "expect": "TestRetrainHandlers_Status_WithNilExporter"
+      },
+      {
+       "file": "services/admin/handlers/retrain_handlers_test.go",
+       "line": 29,
+       "expect": "TestRetrainHandlers_Status_WithTrigger"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 231,
+       "expect": "GET /api/retrain/status"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/inventory",
+   "rows": [
+    {
+     "id": "MA-29",
+     "family": "cli-only/inventory",
+     "action": "Operator lists the org registry inventory",
+     "endpoint": "GET /api/organizations/{id}/inventory",
+     "handler": {
+      "file": "services/admin/handlers/inventory_handlers.go",
+      "line": 151,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_inventory.go",
+      "line": 52,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot; the operator contract is pinned in docs/api/OPENAPI-DELTA.md",
+      "disposition": {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 35,
+       "expect": "INVENTORY-LIST"
+      }
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/inventory"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/inventory_handlers_test.go",
+       "line": 69,
+       "expect": "TestInventory_ListsOrgScoped"
+      },
+      {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 35,
+       "expect": "INVENTORY-LIST"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 118,
+       "expect": "GET /api/organizations/{id}/inventory"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client; spec carried by OPENAPI-DELTA.md rather than the snapshot",
+     "note": null
+    },
+    {
+     "id": "MA-30",
+     "family": "cli-only/inventory",
+     "action": "Operator imports MCP inventory",
+     "endpoint": "POST /api/organizations/{id}/inventory/import/mcp",
+     "handler": {
+      "file": "services/admin/handlers/inventory_handlers.go",
+      "line": 120,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_inventory.go",
+      "line": 53,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot; the operator contract is pinned in docs/api/OPENAPI-DELTA.md",
+      "disposition": {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 56,
+       "expect": "INVENTORY-IMPORT"
+      }
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/inventory"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/inventory_handlers_test.go",
+       "line": 242,
+       "expect": "TestInventoryImport_RunsAndAudits"
+      },
+      {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 56,
+       "expect": "INVENTORY-IMPORT"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 119,
+       "expect": "POST /api/organizations/{id}/inventory/import/mcp"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client; spec carried by OPENAPI-DELTA.md rather than the snapshot",
+     "note": null
+    },
+    {
+     "id": "MA-31",
+     "family": "cli-only/inventory",
+     "action": "Operator imports models from inventory",
+     "endpoint": "POST /api/organizations/{id}/inventory/import/models",
+     "handler": {
+      "file": "services/admin/handlers/inventory_handlers.go",
+      "line": 260,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_inventory.go",
+      "line": 54,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot; the operator contract is pinned in docs/api/OPENAPI-DELTA.md",
+      "disposition": {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 117,
+       "expect": "INVENTORY-MODELS-IMPORT"
+      }
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/inventory"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/inventory_handlers_test.go",
+       "line": 336,
+       "expect": "TestInventoryModelsImport_RunsAndAudits"
+      },
+      {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 117,
+       "expect": "INVENTORY-MODELS-IMPORT"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 120,
+       "expect": "POST /api/organizations/{id}/inventory/import/models"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client; spec carried by OPENAPI-DELTA.md rather than the snapshot",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/fleet-registry",
+   "rows": [
+    {
+     "id": "MA-32",
+     "family": "cli-only/fleet-registry",
+     "action": "Operator lists fleet installations",
+     "endpoint": "GET /api/organizations/{org_id}/fleet/installations",
+     "handler": {
+      "file": "services/admin/handlers/fleet_handlers.go",
+      "line": 158,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/fleet_handlers.go",
+      "line": 232,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 878,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/fleet"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/fleet_handlers_test.go",
+       "line": 107,
+       "expect": "TestFleetHandlers_ListAndDetail"
+      },
+      {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 199,
+       "expect": "FLEET-REGISTRY"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 198,
+       "expect": "GET /api/organizations/{org_id}/fleet/installations"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — read-only root registry surface at HEAD",
+     "note": null
+    },
+    {
+     "id": "MA-33",
+     "family": "cli-only/fleet-registry",
+     "action": "Operator reads one fleet installation",
+     "endpoint": "GET /api/organizations/{org_id}/fleet/installations/{deployment_id}",
+     "handler": {
+      "file": "services/admin/handlers/fleet_handlers.go",
+      "line": 188,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/fleet_handlers.go",
+      "line": 233,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 911,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/fleet"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/fleet_handlers_test.go",
+       "line": 107,
+       "expect": "TestFleetHandlers_ListAndDetail"
+      },
+      {
+       "file": "docs/api/OPENAPI-DELTA.md",
+       "line": 199,
+       "expect": "FLEET-REGISTRY"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 199,
+       "expect": "GET /api/organizations/{org_id}/fleet/installations/{deployment_id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — read-only root registry surface at HEAD",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/entitlement-diagnostics",
+   "rows": [
+    {
+     "id": "MA-34",
+     "family": "cli-only/entitlement-diagnostics",
+     "action": "Operator runs entitlement diagnostics",
+     "endpoint": "GET /api/entitlement/diagnostics",
+     "handler": {
+      "file": "services/admin/handlers/entitlement_diagnostics_handlers.go",
+      "line": 70,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/entitlement_diagnostics_handlers.go",
+      "line": 101,
+      "expect": "/api/entitlement/diagnostics"
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 352,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/entitlements"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/entitlement_diagnostics_handlers_test.go",
+       "line": 58,
+       "expect": "TestEntitlementDiagnostics_AuthBoundary"
+      },
+      {
+       "file": "services/admin/handlers/entitlement_diagnostics_handlers_test.go",
+       "line": 86,
+       "expect": "TestEntitlementDiagnostics_Snapshots"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 65,
+       "expect": "GET /api/entitlement/diagnostics"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — operator diagnostics surface at HEAD",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/sovereign-marketplace",
+   "rows": [
+    {
+     "id": "MA-35",
+     "family": "cli-only/sovereign-marketplace",
+     "action": "Operator lists sovereign models",
+     "endpoint": "GET /api/sovereign/models",
+     "handler": {
+      "file": "services/admin/handlers/sovereign_handlers.go",
+      "line": 25,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_models.go",
+      "line": 38,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/sovereign"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/sovereign-models.md",
+       "line": 3,
+       "expect": "sovereign"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 243,
+       "expect": "GET /api/sovereign/models"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 244,
+       "expect": "PUT /api/sovereign/models/{name}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 245,
+       "expect": "GET /api/sovereign/policy/{org_id}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 246,
+       "expect": "PUT /api/sovereign/policy/{org_id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": "Routing is pinned by the golden router inventory and the operator contract by docs/sovereign-models.md; no dedicated sovereign handler unit test exists at HEAD (adapters are tested per sovereign_adapters_test.go)."
+    },
+    {
+     "id": "MA-36",
+     "family": "cli-only/sovereign-marketplace",
+     "action": "Operator toggles a sovereign model",
+     "endpoint": "PUT /api/sovereign/models/{name}",
+     "handler": {
+      "file": "services/admin/handlers/sovereign_handlers.go",
+      "line": 39,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_models.go",
+      "line": 39,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/sovereign"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/sovereign-models.md",
+       "line": 3,
+       "expect": "sovereign"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 243,
+       "expect": "GET /api/sovereign/models"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 244,
+       "expect": "PUT /api/sovereign/models/{name}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 245,
+       "expect": "GET /api/sovereign/policy/{org_id}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 246,
+       "expect": "PUT /api/sovereign/policy/{org_id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": "Routing is pinned by the golden router inventory and the operator contract by docs/sovereign-models.md; no dedicated sovereign handler unit test exists at HEAD (adapters are tested per sovereign_adapters_test.go)."
+    },
+    {
+     "id": "MA-37",
+     "family": "cli-only/sovereign-marketplace",
+     "action": "Operator reads the sovereign policy",
+     "endpoint": "GET /api/sovereign/policy/{org_id}",
+     "handler": {
+      "file": "services/admin/handlers/sovereign_handlers.go",
+      "line": 60,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_models.go",
+      "line": 40,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/sovereign"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/sovereign-models.md",
+       "line": 3,
+       "expect": "sovereign"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 243,
+       "expect": "GET /api/sovereign/models"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 244,
+       "expect": "PUT /api/sovereign/models/{name}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 245,
+       "expect": "GET /api/sovereign/policy/{org_id}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 246,
+       "expect": "PUT /api/sovereign/policy/{org_id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": "Routing is pinned by the golden router inventory and the operator contract by docs/sovereign-models.md; no dedicated sovereign handler unit test exists at HEAD (adapters are tested per sovereign_adapters_test.go)."
+    },
+    {
+     "id": "MA-38",
+     "family": "cli-only/sovereign-marketplace",
+     "action": "Operator updates the sovereign policy",
+     "endpoint": "PUT /api/sovereign/policy/{org_id}",
+     "handler": {
+      "file": "services/admin/handlers/sovereign_handlers.go",
+      "line": 77,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_models.go",
+      "line": 41,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/sovereign"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "docs/sovereign-models.md",
+       "line": 3,
+       "expect": "sovereign"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 243,
+       "expect": "GET /api/sovereign/models"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 244,
+       "expect": "PUT /api/sovereign/models/{name}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 245,
+       "expect": "GET /api/sovereign/policy/{org_id}"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 246,
+       "expect": "PUT /api/sovereign/policy/{org_id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry",
+     "note": "Routing is pinned by the golden router inventory and the operator contract by docs/sovereign-models.md; no dedicated sovereign handler unit test exists at HEAD (adapters are tested per sovereign_adapters_test.go)."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/resale-pricing",
+   "rows": [
+    {
+     "id": "MA-39",
+     "family": "cli-only/resale-pricing",
+     "action": "Operator upserts resale pricing",
+     "endpoint": "PUT /api/orgs/{id}/resale-pricing",
+     "handler": {
+      "file": "services/admin/handlers/resale_handlers.go",
+      "line": 52,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 78,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/resale"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/resale_handlers_test.go",
+       "line": 66,
+       "expect": "TestHandleCreateOrUpdateResalePricing_NilPool"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 23,
+       "expect": "models_pricing"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 215,
+       "expect": "PUT /api/orgs/{id}/resale-pricing"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry (integration variants also cover the handlers)",
+     "note": null
+    },
+    {
+     "id": "MA-40",
+     "family": "cli-only/resale-pricing",
+     "action": "Operator lists resale pricing",
+     "endpoint": "GET /api/reseller-pricing",
+     "handler": {
+      "file": "services/admin/handlers/resale_handlers.go",
+      "line": 92,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 79,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/resale"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/resale_handlers_test.go",
+       "line": 101,
+       "expect": "TestHandleListResalePricing_NilPool"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 23,
+       "expect": "models_pricing"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 228,
+       "expect": "GET /api/reseller-pricing"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry (integration variants also cover the handlers)",
+     "note": null
+    },
+    {
+     "id": "MA-41",
+     "family": "cli-only/resale-pricing",
+     "action": "Operator reads one resale price",
+     "endpoint": "GET /api/reseller-pricing/{id}",
+     "handler": {
+      "file": "services/admin/handlers/resale_handlers.go",
+      "line": 139,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 80,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/resale"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/resale_handlers_test.go",
+       "line": 119,
+       "expect": "TestHandleGetResalePricing_NilPool"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 23,
+       "expect": "models_pricing"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 230,
+       "expect": "GET /api/reseller-pricing/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry (integration variants also cover the handlers)",
+     "note": null
+    },
+    {
+     "id": "MA-42",
+     "family": "cli-only/resale-pricing",
+     "action": "Operator deletes a resale price",
+     "endpoint": "DELETE /api/reseller-pricing/{id}",
+     "handler": {
+      "file": "services/admin/handlers/resale_handlers.go",
+      "line": 111,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 81,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/resale"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/resale_handlers_test.go",
+       "line": 144,
+       "expect": "TestHandleDeleteResalePricing_NilPool"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 23,
+       "expect": "models_pricing"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 229,
+       "expect": "DELETE /api/reseller-pricing/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry (integration variants also cover the handlers)",
+     "note": null
+    },
+    {
+     "id": "MA-43",
+     "family": "cli-only/resale-pricing",
+     "action": "Operator reads an org's resale pricing",
+     "endpoint": "GET /api/orgs/{id}/resale-pricing",
+     "handler": {
+      "file": "services/admin/handlers/resale_handlers.go",
+      "line": 176,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_billing.go",
+      "line": 82,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "not in the admin OpenAPI snapshot at HEAD (capability-matrix R1 drift)"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/resale"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/resale_handlers_test.go",
+       "line": 157,
+       "expect": "TestHandleGetOrgResalePricing_NilPool"
+      },
+      {
+       "file": "docs/getting-started-reseller.md",
+       "line": 23,
+       "expect": "models_pricing"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 214,
+       "expect": "GET /api/orgs/{id}/resale-pricing"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client and no OpenAPI snapshot entry (integration variants also cover the handlers)",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/root-payload-grants",
+   "rows": [
+    {
+     "id": "MA-44",
+     "family": "cli-only/root-payload-grants",
+     "action": "Root operator self-grants a single-use payload grant",
+     "endpoint": "POST /api/root/payload-grants",
+     "handler": {
+      "file": "services/admin/handlers/request_payload_grants.go",
+      "line": 25,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_console.go",
+      "line": 33,
+      "expect": "payload-grants"
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1397,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "/payload-grants"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/request_payload_grants_test.go",
+       "line": 97,
+       "expect": "TestRootPayloadSelfGrantIsExplicitAuditedAndSingleUse"
+      },
+      {
+       "file": "services/admin/handlers/request_payload_grants_test.go",
+       "line": 152,
+       "expect": "TestRootPayloadGrantListAndRevoke"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 232,
+       "expect": "POST /api/root/payload-grants"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — root console surface at HEAD",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "cli-only/feedback-data-plane",
+   "rows": [
+    {
+     "id": "MA-45",
+     "family": "cli-only/feedback-data-plane",
+     "action": "Agent submits classifier feedback (data plane)",
+     "endpoint": "POST /v1/feedback",
+     "handler": {
+      "file": "services/admin/handlers/feedback_handler.go",
+      "line": 35,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_ops.go",
+      "line": 85,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "absent": true,
+      "why": "agent data plane deliberately not part of the admin REST snapshot; pinned by the routes contract matrix",
+      "disposition": {
+       "file": "services/admin/handlers/routes_contract_matrix_test.go",
+       "line": 33,
+       "expect": "/v1/feedback"
+      }
+     },
+     "client": {
+      "absent": true,
+      "why": "no client function performs the POST — only comments and i18n descriptions reference it"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/routes_contract_matrix_test.go",
+       "line": 33,
+       "expect": "/v1/feedback"
+      },
+      {
+       "file": "services/admin/handlers/routes_contract_matrix_test.go",
+       "line": 133,
+       "expect": "/v1/feedback"
+      },
+      {
+       "file": "web/dashboard/src/api/feedback.ts",
+       "line": 39,
+       "expect": "listFeedback"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 303,
+       "expect": "POST /v1/feedback"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard/CLI client by design (agent data plane; only i18n descriptions reference it); collector enablement is config-gated, not an endpoint",
+     "note": "The admin read side (GET /api/feedback) IS bound on the dashboard (feedback.ts) — this row binds only the data-plane submit."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/scim-protocol",
+   "rows": [
+    {
+     "id": "MA-46",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP discovers SCIM service provider config",
+     "endpoint": "GET /scim/v2/ServiceProviderConfig",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 544,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 23,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1043,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 845,
+       "expect": "TestSCIMServiceProviderConfig"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 296,
+       "expect": "GET /scim/v2/ServiceProviderConfig"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-47",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP discovers SCIM schemas",
+     "endpoint": "GET /scim/v2/Schemas",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 672,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 26,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1049,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 1033,
+       "expect": "TestSCIMSchemasDiscovery"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 295,
+       "expect": "GET /scim/v2/Schemas"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-48",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP discovers SCIM resource types",
+     "endpoint": "GET /scim/v2/ResourceTypes",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 698,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 27,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1055,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 1089,
+       "expect": "TestSCIMResourceTypesDiscovery"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 294,
+       "expect": "GET /scim/v2/ResourceTypes"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-49",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP lists users",
+     "endpoint": "GET /scim/v2/Users",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 769,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 29,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1061,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 927,
+       "expect": "TestSCIMListUsers_Pagination"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 297,
+       "expect": "GET /scim/v2/Users"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-50",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP creates a user",
+     "endpoint": "POST /scim/v2/Users",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 856,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 30,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1066,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 395,
+       "expect": "TestSCIMCreateUser_OktaContract"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 298,
+       "expect": "POST /scim/v2/Users"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": "End-to-end token mint to user create is pinned by scim_deploy_int_test.go:56."
+    },
+    {
+     "id": "MA-51",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP reads a user",
+     "endpoint": "GET /scim/v2/Users/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 886,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 31,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1074,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 895,
+       "expect": "TestSCIMNoRouteConflicts"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 300,
+       "expect": "GET /scim/v2/Users/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-52",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP replaces a user",
+     "endpoint": "PUT /scim/v2/Users/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 903,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 32,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1083,
+      "expect": "put:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 490,
+       "expect": "TestSCIMPutUser_UserNameImmutable"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 302,
+       "expect": "PUT /scim/v2/Users/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-53",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP patches a user",
+     "endpoint": "PATCH /scim/v2/Users/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 953,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 33,
+      "expect": ".Patch("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1092,
+      "expect": "patch:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 460,
+       "expect": "TestSCIMPatchUser_EntraContract"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 301,
+       "expect": "PATCH /scim/v2/Users/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-54",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP deactivates a user",
+     "endpoint": "DELETE /scim/v2/Users/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1077,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 34,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1101,
+      "expect": "delete:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 516,
+       "expect": "TestSCIMDeleteUserDeactivates"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 299,
+       "expect": "DELETE /scim/v2/Users/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-55",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP lists groups",
+     "endpoint": "GET /scim/v2/Groups",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1128,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 36,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1111,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 1001,
+       "expect": "TestSCIMListGroups_Pagination"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 289,
+       "expect": "GET /scim/v2/Groups"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-56",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP creates a group",
+     "endpoint": "POST /scim/v2/Groups",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1177,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 37,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1116,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 559,
+       "expect": "TestSCIMGroupMembershipContract"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 290,
+       "expect": "POST /scim/v2/Groups"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-57",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP reads a group",
+     "endpoint": "GET /scim/v2/Groups/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1154,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 38,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1124,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 1263,
+       "expect": "TestSCIMGroupMembers_ExcludeDeactivated"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 292,
+       "expect": "GET /scim/v2/Groups/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-58",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP patches a group",
+     "endpoint": "PATCH /scim/v2/Groups/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1217,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 39,
+      "expect": ".Patch("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1133,
+      "expect": "patch:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 559,
+       "expect": "TestSCIMGroupMembershipContract"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 293,
+       "expect": "PATCH /scim/v2/Groups/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    },
+    {
+     "id": "MA-59",
+     "family": "cli-only/scim-protocol",
+     "action": "IdP deletes a group",
+     "endpoint": "DELETE /scim/v2/Groups/{id}",
+     "handler": {
+      "file": "services/admin/handlers/scim.go",
+      "line": 1341,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 40,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1142,
+      "expect": "delete:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 895,
+       "expect": "TestSCIMNoRouteConflicts"
+      },
+      {
+       "file": "docs/security.md",
+       "line": 17,
+       "expect": "SCIM"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 291,
+       "expect": "DELETE /scim/v2/Groups/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "no dashboard client — customer-IdP-driven protocol by design (bearer-authenticated provisioning server, docs/security.md:17)",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "finding/scim-token-admin",
+   "rows": [
+    {
+     "id": "MA-60",
+     "family": "finding/scim-token-admin",
+     "action": "Operator issues a SCIM provisioning token",
+     "endpoint": "POST /api/organizations/{id}/scim/tokens",
+     "handler": {
+      "file": "services/admin/handlers/scim_tokens_admin.go",
+      "line": 28,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 49,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1022,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_deploy_int_test.go",
+       "line": 56,
+       "expect": "TestSCIMDeployPath_TokenMintToCreateUser201"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 177,
+       "expect": "POST /api/organizations/{id}/scim/tokens"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "registered, permission-gated (members.manage, router_scim.go:47) and OpenAPI-documented, but NO dashboard or CLI caller exists at HEAD — operator token lifecycle is curl-only",
+     "note": "Verified by exhaustive case-insensitive search: zero 'scim' references anywhere in web/dashboard/src and pkg/trcli."
+    },
+    {
+     "id": "MA-61",
+     "family": "finding/scim-token-admin",
+     "action": "Operator lists SCIM tokens",
+     "endpoint": "GET /api/organizations/{id}/scim/tokens",
+     "handler": {
+      "file": "services/admin/handlers/scim_tokens_admin.go",
+      "line": 66,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 48,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1015,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 674,
+       "expect": "TestSCIMTokenLifecycle_Revoke401"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 176,
+       "expect": "GET /api/organizations/{id}/scim/tokens"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "registered, permission-gated (members.manage, router_scim.go:47) and OpenAPI-documented, but NO dashboard or CLI caller exists at HEAD — operator token lifecycle is curl-only",
+     "note": "Verified by exhaustive case-insensitive search: zero 'scim' references anywhere in web/dashboard/src and pkg/trcli."
+    },
+    {
+     "id": "MA-62",
+     "family": "finding/scim-token-admin",
+     "action": "Operator revokes a SCIM token",
+     "endpoint": "DELETE /api/organizations/{id}/scim/tokens/{tokenID}",
+     "handler": {
+      "file": "services/admin/handlers/scim_tokens_admin.go",
+      "line": 88,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_scim.go",
+      "line": 50,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 1031,
+      "expect": "delete:"
+     },
+     "client": {
+      "absent": true,
+      "negative": {
+       "scope": "web/dashboard/src",
+       "needle": "scim"
+      }
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/scim_test.go",
+       "line": 674,
+       "expect": "TestSCIMTokenLifecycle_Revoke401"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 178,
+       "expect": "DELETE /api/organizations/{id}/scim/tokens/{tokenID}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "registered, permission-gated (members.manage, router_scim.go:47) and OpenAPI-documented, but NO dashboard or CLI caller exists at HEAD — operator token lifecycle is curl-only",
+     "note": "Verified by exhaustive case-insensitive search: zero 'scim' references anywhere in web/dashboard/src and pkg/trcli."
+    }
+   ]
+  },
+  {
+   "family": "cli-only/developer-portal",
+   "rows": [
+    {
+     "id": "MA-63",
+     "family": "cli-only/developer-portal",
+     "action": "Developer starts OIDC login",
+     "endpoint": "GET /portal/login",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 94,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 17,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 217,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 18,
+       "expect": "TestPortalOIDC_InviteDomainAndUnverified"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 287,
+       "expect": "GET /portal/login"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-64",
+     "family": "cli-only/developer-portal",
+     "action": "Developer completes OIDC callback",
+     "endpoint": "GET /portal/callback",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 117,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 18,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 224,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 18,
+       "expect": "TestPortalOIDC_InviteDomainAndUnverified"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 284,
+       "expect": "GET /portal/callback"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-65",
+     "family": "cli-only/developer-portal",
+     "action": "Developer opens the portal home page",
+     "endpoint": "GET /portal",
+     "handler": {
+      "file": "services/admin/handlers/portal_page.go",
+      "line": 179,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 19,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 231,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_page_test.go",
+       "line": 16,
+       "expect": "TestPortalHome_NoSessionRedirects"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 283,
+       "expect": "GET /portal"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-66",
+     "family": "cli-only/developer-portal",
+     "action": "Developer creates a personal key (page flow)",
+     "endpoint": "POST /portal/keys",
+     "handler": {
+      "file": "services/admin/handlers/portal_page.go",
+      "line": 186,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 20,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 238,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_page_test.go",
+       "line": 28,
+       "expect": "TestPortalHome_KeyShownOnceAndNameEscaped"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 285,
+       "expect": "POST /portal/keys"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-67",
+     "family": "cli-only/developer-portal",
+     "action": "Developer revokes a key (page flow)",
+     "endpoint": "POST /portal/keys/{id}/revoke",
+     "handler": {
+      "file": "services/admin/handlers/portal_page.go",
+      "line": 209,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 21,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 245,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_page_test.go",
+       "line": 28,
+       "expect": "TestPortalHome_KeyShownOnceAndNameEscaped"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 286,
+       "expect": "POST /portal/keys/{id}/revoke"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-68",
+     "family": "cli-only/developer-portal",
+     "action": "Developer logs out of the portal",
+     "endpoint": "POST /portal/logout",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 241,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 23,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 256,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_page_test.go",
+       "line": 108,
+       "expect": "TestPortalHome_ExpiredSessionAndUnsetGateway"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 288,
+       "expect": "POST /portal/logout"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-69",
+     "family": "cli-only/developer-portal",
+     "action": "Developer reads own profile",
+     "endpoint": "GET /api/me",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 262,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 24,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 262,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 101,
+       "expect": "TestPortalKeys_LimitForeignAndPurge"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 80,
+       "expect": "GET /api/me"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-70",
+     "family": "cli-only/developer-portal",
+     "action": "Developer lists own keys",
+     "endpoint": "GET /api/me/keys",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 278,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 25,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 268,
+      "expect": "get:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 101,
+       "expect": "TestPortalKeys_LimitForeignAndPurge"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 81,
+       "expect": "GET /api/me/keys"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-71",
+     "family": "cli-only/developer-portal",
+     "action": "Developer creates a key (JSON API)",
+     "endpoint": "POST /api/me/keys",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 332,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 26,
+      "expect": ".Post("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 273,
+      "expect": "post:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 101,
+       "expect": "TestPortalKeys_LimitForeignAndPurge"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 82,
+       "expect": "POST /api/me/keys"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    },
+    {
+     "id": "MA-72",
+     "family": "cli-only/developer-portal",
+     "action": "Developer deletes a key (JSON API)",
+     "endpoint": "DELETE /api/me/keys/{id}",
+     "handler": {
+      "file": "services/admin/handlers/portal.go",
+      "line": 365,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_portal.go",
+      "line": 27,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 279,
+      "expect": "delete:"
+     },
+     "client": {
+      "absent": true,
+      "why": "no dashboard API client — the portal is its own server-rendered UI (opt-in via SetPortal; router_portal.go:16 gates the whole group)",
+      "surface": "portal UI"
+     },
+     "page_caller": null,
+     "evidence": [
+      {
+       "file": "services/admin/handlers/portal_test.go",
+       "line": 101,
+       "expect": "TestPortalKeys_LimitForeignAndPurge"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 83,
+       "expect": "DELETE /api/me/keys/{id}"
+      }
+     ],
+     "verdict": "residual-only",
+     "residual": "not a dashboard surface — opt-in developer portal UI by design; the dashboard does not duplicate these actions",
+     "note": null
+    }
+   ]
+  },
+  {
+   "family": "bound/policy-packs",
+   "rows": [
+    {
+     "id": "MA-73",
+     "family": "bound/policy-packs",
+     "action": "Operator lists policy packs",
+     "endpoint": "GET /api/organizations/{id}/policy-packs",
+     "handler": {
+      "file": "services/admin/handlers/policy_pack_handlers.go",
+      "line": 45,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_orgs.go",
+      "line": 70,
+      "expect": ".Get("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2036,
+      "expect": "get:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/orgSettings.ts",
+      "line": 198,
+      "expect": "listPolicyPacks"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/OrgSettingsPage.tsx",
+      "line": 208,
+      "expect": "listPolicyPacks"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/policy_pack_handlers_test.go",
+       "line": 180,
+       "expect": "TestHandler_ListPolicyPacks_EmptyArray"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 156,
+       "expect": "GET /api/organizations/{id}/policy-packs"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "Task-brief example correction: policy-pack editing is NOT CLI-only at this base — OrgSettingsPage drives all three operations through orgSettings.ts."
+    },
+    {
+     "id": "MA-74",
+     "family": "bound/policy-packs",
+     "action": "Operator upserts a policy pack",
+     "endpoint": "PUT /api/organizations/{id}/policy-packs/{region}",
+     "handler": {
+      "file": "services/admin/handlers/policy_pack_handlers.go",
+      "line": 98,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_orgs.go",
+      "line": 71,
+      "expect": ".Put("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2044,
+      "expect": "put:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/orgSettings.ts",
+      "line": 211,
+      "expect": "upsertPolicyPack"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/OrgSettingsPage.tsx",
+      "line": 375,
+      "expect": "upsertPolicyPack"
+     },
+     "evidence": [
+      {
+       "file": "services/admin/handlers/policy_pack_handlers_test.go",
+       "line": 151,
+       "expect": "TestHandler_UpsertPolicyPack_OK"
+      },
+      {
+       "file": "services/admin/handlers/policy_pack_handlers_test.go",
+       "line": 142,
+       "expect": "TestHandler_UpsertPolicyPack_InvalidRegion_400"
+      },
+      {
+       "file": "services/admin/handlers/policy_pack_handlers_test.go",
+       "line": 167,
+       "expect": "TestHandler_UpsertPolicyPack_DefaultPackID"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 158,
+       "expect": "PUT /api/organizations/{id}/policy-packs/{region}"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": null
+    },
+    {
+     "id": "MA-75",
+     "family": "bound/policy-packs",
+     "action": "Operator deletes a policy pack",
+     "endpoint": "DELETE /api/organizations/{id}/policy-packs/{packID}",
+     "handler": {
+      "file": "services/admin/handlers/policy_pack_handlers.go",
+      "line": 159,
+      "expect": ""
+     },
+     "route": {
+      "file": "services/admin/handlers/router_orgs.go",
+      "line": 72,
+      "expect": ".Delete("
+     },
+     "openapi": {
+      "file": "docs/api/admin.openapi.yaml",
+      "line": 2053,
+      "expect": "delete:"
+     },
+     "client": {
+      "file": "web/dashboard/src/api/orgSettings.ts",
+      "line": 219,
+      "expect": "deletePolicyPack"
+     },
+     "page_caller": {
+      "file": "web/dashboard/src/pages/OrgSettingsPage.tsx",
+      "line": 413,
+      "expect": "deletePolicyPack"
+     },
+     "evidence": [
+      {
+       "file": "web/dashboard/src/pages/OrgSettingsPage.tsx",
+       "line": 413,
+       "expect": "deletePolicyPack"
+      },
+      {
+       "file": "services/admin/handlers/router_orgs.go",
+       "line": 72,
+       "expect": "policy-packs"
+      },
+      {
+       "file": "services/admin/handlers/testdata/routes_admin.golden",
+       "line": 157,
+       "expect": "DELETE /api/organizations/{id}/policy-packs/{packID}"
+      }
+     ],
+     "verdict": "bound-in-full",
+     "residual": null,
+     "note": "No dedicated DELETE handler unit test at HEAD; the binding cites the verified page caller and the route registration."
+    }
+   ]
+  }
+ ]
+}
