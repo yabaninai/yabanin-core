@@ -44,7 +44,7 @@ import sys
 import tarfile
 import tempfile
 
-VERSION = "1.2.0"
+VERSION = "1.3.0"
 HELPER = Path(__file__).resolve().parent / "go_funcscan.go"
 HELPER_VERSION_FIELD = "helper_source_sha256"
 
@@ -58,7 +58,19 @@ DEBT_LIST_LIMIT = 50
 # the exact analyzed diff. Verdict "approve-exception" approves 11-15 bodies
 # and feeds the recorded-exception ledger for >15 bodies (which still block);
 # "require-refactor" is a structurally valid verdict that approves nothing.
-RECEIPT_SCHEMA = "go-complexity-review-receipt/1"
+RECEIPT_SCHEMA = "go-complexity-review-receipt/2"
+# Schema 2 binds each approval to the exact function body hash the
+# stronger model reviewed (body_sha256 from go_funcscan) and to the
+# decision-relevant gate configuration, so a receipt cannot survive a
+# body edit or a threshold/config change under the same name.
+def gate_config_digest() -> str:
+    material = json.dumps({
+        "schema": RECEIPT_SCHEMA,
+        "cyclomatic_ok_max": CYCLOMATIC_OK_MAX,
+        "cyclomatic_review_max": CYCLOMATIC_REVIEW_MAX,
+        "body_identity": "body_sha256@signature-without-name+body",
+    }, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(material.encode("utf-8")).hexdigest()
 RECEIPT_APPROVING_VERDICT = "approve-exception"
 RECEIPT_VERDICTS = (RECEIPT_APPROVING_VERDICT, "require-refactor")
 # Model strength ordering, strongest first. The reviewer named on a receipt
@@ -284,6 +296,7 @@ def build_entry(head, kind, base, classification):
         "function": head["name"],
         "line": head["line"],
         "kind": kind,
+        "body_sha256": head.get("body_sha256"),
         "old_cyclomatic": metric(base, "cyclomatic"),
         "new_cyclomatic": head["cyclomatic"],
         "old_cognitive": metric(base, "cognitive"),
@@ -309,8 +322,12 @@ def receipt_decision(receipt, record):
         return False, None
     if receipt.get("verdict") != RECEIPT_APPROVING_VERDICT:
         return False, f"receipt verdict is {receipt.get('verdict')!r}, not an approval"
-    if receipt_binding(record) not in receipt.get("functions", ()):
+    binding = receipt_bindings_map(receipt).get(receipt_binding(record))
+    if binding is None:
         return False, f"receipt does not bind {receipt_binding(record)}"
+    if binding != record.get("body_sha256"):
+        return False, (f"receipt body hash for {receipt_binding(record)} "
+                       f"does not match the current function body; re-review required")
     return True, None
 
 
@@ -362,7 +379,8 @@ def analyze(head_scan, by_name, by_hash, receipt, tree_index):
                     item["receipt_reason"] = reason
             if receipt is not None and classification == "blocks" \
                     and receipt.get("verdict") == RECEIPT_APPROVING_VERDICT \
-                    and receipt_binding(record) in receipt.get("functions", ()):
+                    and receipt_bindings_map(receipt).get(receipt_binding(record)) \
+                            == record.get("body_sha256"):
                 # Receipts never unblock >15; this records the reviewed
                 # exception in the ledger only (maintainability.md).
                 item["exception_receipt_recorded"] = True
@@ -458,6 +476,10 @@ def receipt_field_errors(document, head_sha, base_sha, head_date, order):
             return error
     if document.get("verdict") not in RECEIPT_VERDICTS:
         return f"unknown verdict {document.get('verdict')!r}; expected one of {RECEIPT_VERDICTS}"
+    config_digest = document.get("gate_config_sha256")
+    if config_digest != gate_config_digest():
+        return ("receipt gate_config_sha256 does not match the active gate "
+                "configuration; re-review required under the current thresholds")
     _, error = require_commit(document, "source_commit", head_sha,
                               "the analyzed head commit")
     if error:
@@ -490,16 +512,32 @@ def model_order_error(document, order):
     return None
 
 
-def receipt_functions_error(document):
-    functions = document.get("functions")
-    if not isinstance(functions, list) or not functions:
-        return "functions must be a non-empty list of 'file.go:Function' bindings"
-    for item in functions:
-        if not isinstance(item, str) or item.count(":") != 1:
-            return f"functions entry {item!r} is not a 'file.go:Function' binding"
-        path, name = item.split(":")
+def receipt_bindings_map(document):
+    """Validated 'file.go:Function' -> body_sha256 map from a receipt."""
+    bindings = {}
+    for item in document.get("bindings", ()):
+        bindings[item["function"]] = item["body_sha256"]
+    return bindings
+
+
+def receipt_bindings_error(document):
+    bindings = document.get("bindings")
+    if not isinstance(bindings, list) or not bindings:
+        return ("bindings must be a non-empty list of "
+                '{"function": "file.go:Function", "body_sha256": "<64 hex>"} objects')
+    for item in bindings:
+        if not isinstance(item, dict) or set(item) != {"function", "body_sha256"}:
+            return f"bindings entry {item!r} must have exactly function and body_sha256"
+        function = item["function"]
+        body = item["body_sha256"]
+        if not isinstance(function, str) or function.count(":") != 1:
+            return f"bindings function {function!r} is not a 'file.go:Function' binding"
+        path, name = function.split(":")
         if not path.endswith(".go") or not name:
-            return f"functions entry {item!r} is not a 'file.go:Function' binding"
+            return f"bindings function {function!r} is not a 'file.go:Function' binding"
+        if (not isinstance(body, str) or len(body) != 64
+                or not HEX_DIGITS.issuperset(body)):
+            return f"bindings body_sha256 for {function!r} is not a 64-char hex digest"
     return None
 
 
@@ -523,7 +561,7 @@ def validate_receipt(path, head_sha, base_sha, head_date, order):
     error = receipt_field_errors(document, head_sha, base_sha, head_date, order)
     if error:
         return None, error
-    error = receipt_functions_error(document)
+    error = receipt_bindings_error(document)
     if error:
         return None, error
     return document, None
@@ -584,7 +622,9 @@ def receipt_section(path, receipt, error):
             "implementer_model": receipt["implementer_model"],
             "reviewer_model": receipt["reviewer_model"],
             "verdict": receipt["verdict"], "review_date": receipt["review_date"],
-            "functions": sorted(receipt["functions"])}
+            "gate_config_sha256": receipt["gate_config_sha256"],
+            "bindings": sorted(receipt["bindings"],
+                               key=lambda item: item["function"])}
 
 
 def build_report(analyzer, run, entries, debt, base_failures, receipt):

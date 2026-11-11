@@ -52,25 +52,41 @@ owner decision.
 
 A receipt is the machine-checkable record of the independent
 stronger-model review required for the 11–15 band. Schema
-`go-complexity-review-receipt/1`:
+`go-complexity-review-receipt/2` binds every approval to the exact
+function bodies reviewed and to the active gate configuration, so a
+receipt cannot survive a body edit, a rename-with-rewrite, or a threshold
+change under the same function name:
 
 ```json
 {
-  "schema": "go-complexity-review-receipt/1",
+  "schema": "go-complexity-review-receipt/2",
   "source_commit": "<full 40-hex SHA of the analyzed head commit>",
   "base_commit": "<full 40-hex SHA of the analyzed base commit>",
   "implementer_model": "yabanin/glm-5.3",
   "reviewer_model": "<a strictly stronger model>",
   "review_date": "2026-11-10",
   "verdict": "approve-exception",
-  "functions": ["path/to/file.go:FunctionName", "other.go:Recv.Method"]
+  "gate_config_sha256": "<64-hex digest of the decision-relevant gate config>",
+  "bindings": [
+    {
+      "function": "path/to/file.go:FunctionName",
+      "body_sha256": "<64-hex body hash from the gate report>"
+    }
+  ]
 }
 ```
+
+`gate_config_sha256` is `sha256` over the canonical JSON of the schema id,
+both cyclomatic thresholds, and the body-identity scheme
+(`body_sha256@signature-without-name+body`); the analyzer recomputes it on
+every run and refuses receipts minted under a different configuration.
+`body_sha256` values come from the gate report's `changed_functions[]`
+entries, so receipts are minted from the same measurement they approve.
 
 Validation rejects any receipt with a precise, named reason (exit 1):
 
 - unreadable file, invalid JSON, or not an object;
-- `schema` other than `go-complexity-review-receipt/1`;
+- `schema` other than `go-complexity-review-receipt/2`;
 - `implementer_model`/`reviewer_model` missing or empty;
 - `verdict` not one of `approve-exception`, `require-refactor`;
 - `source_commit`/`base_commit` not a full 40-hex SHA, or not exactly the
@@ -83,12 +99,18 @@ Validation rejects any receipt with a precise, named reason (exit 1):
 - `reviewer_model` equal to `implementer_model` (self-review), either model
   absent from the configured strength ordering, or the reviewer not
   strictly stronger than the implementer;
-- `functions` entries that are not `file.go:Function` bindings.
+- `gate_config_sha256` not equal to the digest of the active gate
+  configuration (`receipt gate_config_sha256 does not match …`);
+- `bindings` entries that are not objects with exactly `function`
+  (`file.go:Function`) and `body_sha256` (64-hex).
 
 A structurally valid receipt approves an 11–15 body only when its verdict
-is `approve-exception` **and** its `functions` list binds that exact
-`file:function`; otherwise the body still fails with the precise reason
-(`receipt does not bind …` / `receipt verdict is 'require-refactor' …`).
+is `approve-exception` **and** one of its `bindings` matches that exact
+`file:function` **and** its `body_sha256` equals the hash of the function
+body being measured; otherwise the body still fails with the precise
+reason (`receipt does not bind …` / `receipt body hash … does not match
+the current function body; re-review required` / `receipt verdict is
+'require-refactor' …`).
 For >15 bodies a valid approving receipt is recorded on the entry
 (`exception_receipt_recorded`) and in the report for the bounded-exception
 ledger — the run still blocks.
@@ -149,10 +171,11 @@ baseline debt tracking is QG-C02 scope.
 - `receipt` — `null`, or the validated state: `rejected` with `reason`, or
   `accepted`/`valid_not_approving` with the bound fields echoed.
 - `changed_functions[]` — `file, function, line, kind
-  (added/changed/moved), old/new cyclomatic + cognitive, delta,
-  classification (ok/needs_review/blocks/ok_moved_unchanged), and where
-  relevant `receipt`, `receipt_reason`, `exception_receipt_recorded`,
-  `duplicate_of`, `from_file`, `from_function`.
+  (added/changed/moved), `body_sha256`, old/new cyclomatic + cognitive,
+  delta, classification (ok/needs_review/blocks/ok_moved_unchanged), and
+  where relevant `receipt`, `receipt_reason`,
+  `exception_receipt_recorded`, `duplicate_of`, `from_file`,
+  `from_function`.
 - `untouched_debt` — legacy and carried debt: counts plus the >15 list
   (capped), never blocking.
 
