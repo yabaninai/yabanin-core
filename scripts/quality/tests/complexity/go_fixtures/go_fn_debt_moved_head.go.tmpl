@@ -1,0 +1,53 @@
+// Fixture head: HeavyOriginal's base original was REMOVED from sample.go
+// and its body reappears here renamed and reformatted (blank lines,
+// one-line ifs, odd spaces — gofmt-equivalent content). Formatting must not
+// break the canonical body hash: this is a genuine move that carries its
+// pre-existing cyclomatic 18 debt into the untouched-debt ledger (kind
+// "moved") and never blocks.
+func HeavyMovedDebt(x int) int {
+	n := 0
+
+	if x>1 { n++ }
+	if x > 2 {
+		n += 2
+	}
+
+	if x>3 { n+=3 }
+	if x > 4 {
+		n += 4
+	}
+	if x > 5 {
+		n += 5
+	}
+	if x>6 { n+=6 }
+	if x > 7 {
+		n += 7
+	}
+	if x > 8 {
+		n += 8
+	}
+	if x>9 { n+=9 }
+
+	if x > 10 {
+		n += 10
+	}
+	if x > 11 {
+		n += 11
+	}
+	if x > 12 {
+		n += 12
+	}
+	if x>13 { n+=13 }
+	if x > 14 {
+		n += 14
+	}
+	if x > 15 {
+		n += 15
+	}
+	if x > 16 {
+		n += 16
+	}
+
+	if x>17 { n+=17 }
+	return   n
+}

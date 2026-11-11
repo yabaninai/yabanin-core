@@ -64,7 +64,11 @@ type scanResult struct {
 }
 
 func main() {
-	result := scanResult{GoVersion: runtime.Version()}
+	// Files starts as an empty (not nil) slice so zero input paths emit
+	// "files": [] per the output contract instead of JSON null, which
+	// would crash consumers iterating the field (e.g. a diff with no
+	// measured Go files).
+	result := scanResult{GoVersion: runtime.Version(), Files: []fileResult{}}
 	scanner := bufio.NewScanner(os.Stdin)
 	scanner.Buffer(make([]byte, 1024*1024), 1024*1024)
 	for scanner.Scan() {
