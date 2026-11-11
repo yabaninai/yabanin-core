@@ -1,16 +1,20 @@
 #!/usr/bin/env bash
-# QG-C01-01 fixtures: negative and boundary controls for the Go complexity
-# differential analyzer (scripts/quality/complexity/go/go_complexity.py).
+# QG-C01-01/QG-C01-02 fixtures: negative and boundary controls for the Go
+# complexity differential analyzer (scripts/quality/complexity/go/go_complexity.py).
 #
 # Each control asserts exact function names, kinds and hand-counted
 # complexity values — never just a non-zero exit. Every blocking control is
 # paired with a reverse-control run (refactored body, boundary score,
-# modified moved body) whose expected result is the opposite, proving the
-# assertion binds to the measured behavior rather than to any failure at
-# all. Expected cyclomatic values are hand-counted oracle constants,
-# independent of the analyzer's own computation:
+# modified moved body, genuine rename) whose expected result is the
+# opposite, proving the assertion binds to the measured behavior rather
+# than to any failure at all. Expected cyclomatic values are hand-counted
+# oracle constants, independent of the analyzer's own computation:
 #   legacy untouched 25 | simple 8 | heavy base 9 -> head 18 / refactored 8
-#   borderline 12 / boundary 10 | movable 2
+#   borderline 12 / boundary 10 | movable 2 | HeavyOriginal 18 (duplicate,
+#   moved-with-reformat) | FmtOne 4 / FmtTwo 3 (formatting-only)
+# QG-C01-02 controls add receipt validation (schema/SHA/model/staleness/
+# binding rejections with distinct errors), the free-duplicate loophole,
+# the carry-on-move debt ledger and gofmt/blank-line invariance.
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
@@ -18,6 +22,10 @@ ANALYZER="$ROOT/scripts/quality/complexity/go/go_complexity.py"
 FIXTURES="$ROOT/scripts/quality/tests/complexity/go_fixtures"
 WORK=$(mktemp -d /tmp/go-complexity-fixtures.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
+
+# Fixture fleet model tiers (strongest first) consumed by the analyzer's
+# receipt validation; the production default ordering lives in the script.
+export GO_COMPLEXITY_MODEL_ORDER="fixture-senior,fixture-impl,fixture-junior"
 
 BASE_BLOCKS="go_fn_legacy.go.tmpl go_fn_simple_base.go.tmpl go_fn_heavy_base.go.tmpl go_fn_movable_base.go.tmpl go_fn_removed_base.go.tmpl"
 RC=""
@@ -45,14 +53,18 @@ write_go() { # dest blocks...
     } >"$dest"
 }
 
-build_base() { # repo-dir -> prints base sha
-    write_go "$1/sample.go" $BASE_BLOCKS
+commit_all() { # repo-dir message
     git -C "$1" add -A >/dev/null
-    git -C "$1" commit -q -m "base"
+    git -C "$1" commit -q -m "$2"
+}
+
+build_base() { # repo-dir -> prints base sha ; BASE_EXTRA adds base blocks
+    write_go "$1/sample.go" $BASE_BLOCKS ${BASE_EXTRA:-}
+    commit_all "$1" base
     git -C "$1" rev-parse HEAD
 }
 
-build_head() { # repo-dir sample-blocks... ; extra files via $EXTRA_FILES="name:blocks..."
+build_head() { # repo-dir sample-blocks... ; extra files via $EXTRA_FILES="name:blocks,..."
     local repo=$1
     shift
     write_go "$repo/sample.go" "$@"
@@ -62,8 +74,7 @@ build_head() { # repo-dir sample-blocks... ; extra files via $EXTRA_FILES="name:
         blocks=${extra#*:}
         write_go "$repo/$name" ${blocks//,/ }
     done
-    git -C "$repo" add -A >/dev/null
-    git -C "$repo" commit -q -m "head"
+    commit_all "$repo" head
 }
 
 run_analyzer() { # repo base report [extra...]
@@ -72,6 +83,36 @@ run_analyzer() { # repo base report [extra...]
     python3 "$ANALYZER" --root "$repo" --base "$base" --report "$report" "$@" \
         >"$WORK/out.txt" 2>&1
     RC=$?
+}
+
+# make_receipt writes a schema go-complexity-review-receipt/1 document;
+# overrides per control are applied by the caller via these arguments.
+make_receipt() { # path head_sha base_sha reviewer impl date verdict functions-json
+    python3 - "$@" <<'PY'
+import json
+import sys
+
+path, head, base, reviewer, implementer, date, verdict, functions = sys.argv[1:9]
+json.dump({
+    "schema": "go-complexity-review-receipt/1",
+    "source_commit": head,
+    "base_commit": base,
+    "implementer_model": implementer,
+    "reviewer_model": reviewer,
+    "review_date": date,
+    "verdict": verdict,
+    "functions": json.loads(functions),
+}, open(path, "w"), indent=2)
+PY
+}
+
+record() { # label pass/fail
+    if [ "$2" = pass ]; then
+        printf 'PASS %s\n' "$1"
+    else
+        printf 'FAIL %s\n' "$1"
+        scenario_failed=$((scenario_failed + 1))
+    fi
 }
 
 finish_scenario() { # name python-exit-code
@@ -208,11 +249,17 @@ PY
 
 # ---------------------------------------------------------------------------
 scenario_receipt_band() {
+    # Fixed commit dates keep the same-day review_date of the valid receipt
+    # deterministic (stale = review_date before the source commit date).
+    export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
     local repo
     repo=$(new_repo receipt)
     local base
     base=$(build_base "$repo")
     build_head "$repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    local head
+    head=$(git -C "$repo" rev-parse HEAD)
 
     run_analyzer "$repo" "$base" "$WORK/receipt-none.json"
     python3 - "$RC" "$WORK/receipt-none.json" "$WORK/out.txt" <<'PY'
@@ -248,7 +295,8 @@ PY
     printf '%s [receipt] missing-receipt-path-fails\n' "$(echo "$check_receipt_missing" | tr a-z A-Z)"
     [ "$check_receipt_missing" = pass ] || none_rc=$((none_rc + 1))
 
-    printf '%s\n' "{\"reviewer_model\": \"placeholder-stronger-model\", \"verdict\": \"approve\", \"functions\": [\"BorderlineFn\"], \"base_sha\": \"$base\"}" >"$WORK/receipt.json"
+    make_receipt "$WORK/receipt.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
     run_analyzer "$repo" "$base" "$WORK/receipt-ok.json" --receipt "$WORK/receipt.json"
     python3 - "$RC" "$WORK/receipt-ok.json" "$WORK/out.txt" <<'PY'
 import json
@@ -268,10 +316,18 @@ def check(name, condition, detail=""):
 
 
 entry = {e["function"]: e for e in report["changed_functions"]}.get("BorderlineFn", {})
+receipt = report.get("receipt") or {}
 check("accepted-receipt-exit-0", rc == 0, f"rc={rc}")
 check("accepted-receipt-flagged",
       entry.get("classification") == "needs_review" and entry.get("receipt") is True,
       str(entry))
+check("accepted-receipt-recorded",
+      receipt.get("status") == "accepted"
+      and receipt.get("reviewer_model") == "fixture-senior"
+      and receipt.get("implementer_model") == "fixture-impl"
+      and receipt.get("source_commit") == report["run"]["head_sha"]
+      and receipt.get("base_commit") == report["run"]["base_sha"],
+      str(receipt))
 sys.exit(1 if failures else 0)
 PY
     local with_rc=$?
@@ -297,6 +353,7 @@ sys.exit(0 if condition else 1)
 PY
     local boundary_rc=$?
 
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
     total=$((none_rc + with_rc + boundary_rc))
     if [ "$total" -ne 0 ]; then
         scenario_failed=$((scenario_failed + 1))
@@ -368,9 +425,393 @@ PY
     finish_scenario moved-modified $?
 }
 
+# ---------------------------------------------------------------------------
+scenario_receipt_validation() {
+    # QG-C01-02 receipt policy: every invalid receipt must block (exit 1)
+    # with a distinct, precise error; only the fully bound stronger-model
+    # receipt passes the 11-15 band.
+    export GIT_AUTHOR_DATE="2026-11-01T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-01T09:00:00+00:00"
+    local repo
+    repo=$(new_repo receiptval)
+    local base
+    base=$(build_base "$repo")
+    export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
+    build_head "$repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    local head
+    head=$(git -C "$repo" rev-parse HEAD)
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+    local zeros=0000000000000000000000000000000000000000
+    make_receipt "$WORK/rv-valid.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-source.json" "$zeros" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-basesha.json" "$head" "$zeros" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-same.json" "$head" "$base" fixture-impl \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-weaker.json" "$head" "$base" fixture-junior \
+        fixture-impl 2026-11-05 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-stale.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-04 approve-exception '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-verdict.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve '["sample.go:BorderlineFn"]'
+    make_receipt "$WORK/rv-unbound.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["other.go:Elsewhere"]'
+    make_receipt "$WORK/rv-refactor.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 require-refactor '["sample.go:BorderlineFn"]'
+    printf '%s\n' "{\"schema\": \"go-complexity-review-receipt/1\", \"source_commit\": \"$head\", \"base_commit\": \"$base\", \"reviewer_model\": \"fixture-senior\", \"review_date\": \"2026-11-05\", \"verdict\": \"approve-exception\", \"functions\": [\"sample.go:BorderlineFn\"]}" >"$WORK/rv-noimpl.json"
+
+    local case name substring receipt_file
+    for case in "wrong-source-sha|source_commit mismatch|$WORK/rv-source.json" \
+                "wrong-base-sha|base_commit mismatch|$WORK/rv-basesha.json" \
+                "same-model|equals implementer_model|$WORK/rv-same.json" \
+                "weaker-reviewer|not stronger than|$WORK/rv-weaker.json" \
+                "stale-date|stale receipt|$WORK/rv-stale.json" \
+                "unknown-verdict|unknown verdict|$WORK/rv-verdict.json" \
+                "missing-implementer|implementer_model missing|$WORK/rv-noimpl.json"; do
+        name=${case%%|*}
+        local rest=${case#*|}
+        substring=${rest%%|*}
+        receipt_file=${rest#*|}
+        run_analyzer "$repo" "$base" "$WORK/rv-$name.json" --receipt "$receipt_file"
+        if [ "$RC" -eq 1 ] && grep -q "$substring" "$WORK/out.txt"; then
+            printf 'PASS [receipt-validation] %s\n' "$name"
+        else
+            printf 'FAIL [receipt-validation] %s: rc=%s want-substring=%q out=%s\n' \
+                "$name" "$RC" "$substring" "$(head -c 300 "$WORK/out.txt")"
+            scenario_failed=$((scenario_failed + 1))
+        fi
+    done
+
+    run_analyzer "$repo" "$base" "$WORK/rv-valid-run.json" --receipt "$WORK/rv-valid.json"
+    python3 - "$RC" "$WORK/rv-valid-run.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [receipt-validation] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+receipt = report.get("receipt") or {}
+entry = {e["function"]: e for e in report["changed_functions"]}.get("BorderlineFn", {})
+check("valid-receipt-passes-band",
+      rc == 0 and entry.get("receipt") is True and receipt.get("status") == "accepted"
+      and receipt.get("reviewer_model") == "fixture-senior"
+      and receipt.get("verdict") == "approve-exception",
+      f"rc={rc} entry={entry} receipt={receipt}")
+check("same-day-review-not-stale",
+      report["run"].get("head_commit_date") == "2026-11-05"
+      and receipt.get("review_date") == "2026-11-05",
+      str(receipt))
+sys.exit(1 if failures else 0)
+PY
+    record receipt-validation-valid $([ $? -eq 0 ] && echo pass || echo fail)
+
+    run_analyzer "$repo" "$base" "$WORK/rv-unbound-run.json" --receipt "$WORK/rv-unbound.json"
+    python3 - "$RC" "$WORK/rv-unbound-run.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+entry = {e["function"]: e for e in report["changed_functions"]}.get("BorderlineFn", {})
+condition = (rc == 1 and "NEEDS REVIEW RECEIPT BorderlineFn" in out
+             and "does not bind sample.go:BorderlineFn" in out
+             and entry.get("receipt") is False
+             and entry.get("receipt_reason")
+             == "receipt does not bind sample.go:BorderlineFn")
+print(("PASS" if condition else "FAIL")
+      + f" [receipt-validation] unbound-function: rc={rc} entry={entry}")
+sys.exit(0 if condition else 1)
+PY
+    record receipt-validation-unbound $([ $? -eq 0 ] && echo pass || echo fail)
+
+    run_analyzer "$repo" "$base" "$WORK/rv-refactor-run.json" --receipt "$WORK/rv-refactor.json"
+    python3 - "$RC" "$WORK/rv-refactor-run.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+entry = {e["function"]: e for e in report["changed_functions"]}.get("BorderlineFn", {})
+receipt = report.get("receipt") or {}
+condition = (rc == 1 and "require-refactor" in out
+             and "NEEDS REVIEW RECEIPT BorderlineFn" in out
+             and entry.get("receipt") is False
+             and receipt.get("status") == "valid_not_approving")
+print(("PASS" if condition else "FAIL")
+      + f" [receipt-validation] require-refactor-not-approval: rc={rc} "
+        f"entry={entry} receipt={receipt}")
+sys.exit(0 if condition else 1)
+PY
+    record receipt-validation-refactor $([ $? -eq 0 ] && echo pass || echo fail)
+
+    if [ "$scenario_failed" -ne 0 ]; then
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' receipt-validation
+    else
+        printf 'scenario %-18s OK\n\n' receipt-validation
+    fi
+    scenario_failed=0
+}
+
+# ---------------------------------------------------------------------------
+scenario_duplicate_over_15() {
+    # QG-C01-02 free-duplicate loophole: a content-identical copy of a >15
+    # base function, with the original still at head, must be measured as
+    # added content and block; a valid receipt only feeds the exception
+    # ledger and never unblocks it.
+    export GIT_AUTHOR_DATE="2026-11-01T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-01T09:00:00+00:00"
+    local repo
+    repo=$(new_repo dup)
+    local base
+    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
+    export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
+           GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
+    EXTRA_FILES="dup.go:go_fn_debt_duplicate_head.go.tmpl" \
+        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_debt_base.go.tmpl
+    local head
+    head=$(git -C "$repo" rev-parse HEAD)
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+    run_analyzer "$repo" "$base" "$WORK/dup.json"
+    python3 - "$RC" "$WORK/dup.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+entries = report["changed_functions"]
+by_name = {e["function"]: e for e in entries}
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [duplicate] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+duplicate = by_name.get("HeavyDuplicate", {})
+debt_list = report["untouched_debt"].get("functions_gt15", [])
+check("exit-1", rc == 1, f"rc={rc}")
+check("blocked-line-named", "BLOCKED HeavyDuplicate" in out, out[:300])
+check("measured-as-added-under-thresholds",
+      duplicate.get("kind") == "added" and duplicate.get("new_cyclomatic") == 18
+      and duplicate.get("classification") == "blocks"
+      and duplicate.get("duplicate_of") == "sample.go:HeavyOriginal",
+      str(duplicate))
+check("duplicate-not-in-moved-debt",
+      all(item.get("kind") == "untouched" for item in debt_list)
+      and any(item["function"] == "HeavyOriginal" for item in debt_list)
+      and all(item["function"] != "HeavyDuplicate" for item in debt_list),
+      json.dumps(debt_list))
+sys.exit(1 if failures else 0)
+PY
+    record duplicate-over-15 $([ $? -eq 0 ] && echo pass || echo fail)
+
+    make_receipt "$WORK/dup-receipt.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception '["dup.go:HeavyDuplicate"]'
+    run_analyzer "$repo" "$base" "$WORK/dup-receipt-run.json" --receipt "$WORK/dup-receipt.json"
+    python3 - "$RC" "$WORK/dup-receipt-run.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+entry = {e["function"]: e for e in report["changed_functions"]}.get("HeavyDuplicate", {})
+receipt = report.get("receipt") or {}
+condition = (rc == 1 and "BLOCKED HeavyDuplicate" in out
+             and "exception ledger only" in out
+             and entry.get("classification") == "blocks"
+             and entry.get("exception_receipt_recorded") is True
+             and receipt.get("status") == "accepted")
+print(("PASS" if condition else "FAIL")
+      + f" [duplicate] receipt-never-unblocks-over-15: rc={rc} entry={entry} "
+        f"receipt={receipt}")
+sys.exit(0 if condition else 1)
+PY
+    record duplicate-receipt-ledger $([ $? -eq 0 ] && echo pass || echo fail)
+
+    if [ "$scenario_failed" -ne 0 ]; then
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' duplicate-over-15
+    else
+        printf 'scenario %-18s OK\n\n' duplicate-over-15
+    fi
+    scenario_failed=0
+}
+
+# ---------------------------------------------------------------------------
+scenario_moved_debt_carry() {
+    # Carry-on-move policy: a renamed + reformatted >15 function whose base
+    # original is gone is a genuine move — debt carried without
+    # re-measurement, listed in the untouched-debt ledger, never blocking.
+    local repo
+    repo=$(new_repo carry)
+    local base
+    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
+    EXTRA_FILES="moved.go:go_fn_debt_moved_head.go.tmpl" \
+        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl
+    run_analyzer "$repo" "$base" "$WORK/carry.json"
+    python3 - "$RC" "$WORK/carry.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+entries = report["changed_functions"]
+entry = {e["function"]: e for e in entries}.get("HeavyMovedDebt", {})
+debt = report["untouched_debt"]
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [moved-debt] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+carried = {"file": "moved.go", "function": "HeavyMovedDebt",
+           "cyclomatic": 18, "kind": "moved"}
+check("moved-carries-without-blocking", rc == 0, f"rc={rc}")
+check("reformatted-move-still-recognized",
+      entry.get("kind") == "moved" and entry.get("from_file") == "sample.go"
+      and entry.get("from_function") == "HeavyOriginal"
+      and entry.get("classification") == "ok_moved_unchanged"
+      and "duplicate_of" not in entry, str(entry))
+check("carried-debt-in-ledger",
+      entry.get("new_cyclomatic") == 18 and carried in debt.get("functions_gt15", [])
+      and debt.get("cyclomatic_gt15") == 2,
+      json.dumps(debt.get("functions_gt15")))
+sys.exit(1 if failures else 0)
+PY
+    record moved-debt-carry $([ $? -eq 0 ] && echo pass || echo fail)
+
+    if [ "$scenario_failed" -ne 0 ]; then
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' moved-debt-carry
+    else
+        printf 'scenario %-18s OK\n\n' moved-debt-carry
+    fi
+    scenario_failed=0
+}
+
+# ---------------------------------------------------------------------------
+scenario_formatting_only() {
+    # gofmt/blank-line invariance: the canonical body hash is computed over
+    # the AST printed against a synthetic single-line file set, so a
+    # formatting-only edit produces zero changed functions.
+    local repo
+    repo=$(new_repo fmt)
+    write_go "$repo/sample.go" go_fn_fmt_base.go.tmpl
+    commit_all "$repo" base
+    local base
+    base=$(git -C "$repo" rev-parse HEAD)
+    write_go "$repo/sample.go" go_fn_fmt_head.go.tmpl
+    commit_all "$repo" head
+    run_analyzer "$repo" "$base" "$WORK/fmt.json"
+    python3 - "$RC" "$WORK/fmt.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+out = open(out_path).read()
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [formatting] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+debt = report["untouched_debt"]
+check("exit-0", rc == 0, f"rc={rc}")
+check("zero-changed-functions",
+      report["changed_functions"] == [] and "changed function bodies: 0" in out,
+      json.dumps(report["changed_functions"]))
+check("both-bodies-untouched",
+      debt.get("untouched_functions") == 2
+      and debt.get("cyclomatic_gt15") == 0 and debt.get("cyclomatic_11_to_15") == 0,
+      json.dumps(debt))
+sys.exit(1 if failures else 0)
+PY
+    record formatting-only $([ $? -eq 0 ] && echo pass || echo fail)
+
+    # Regression: a head change touching no Go files at all must exit 0
+    # with an empty changed set and a complete report envelope, not crash
+    # on the helper's empty batch output.
+    local quiet_repo
+    quiet_repo=$(new_repo fmtquiet)
+    write_go "$quiet_repo/sample.go" go_fn_fmt_base.go.tmpl
+    commit_all "$quiet_repo" base
+    local quiet_base
+    quiet_base=$(git -C "$quiet_repo" rev-parse HEAD)
+    printf 'documentation-only change\n' >"$quiet_repo/NOTE.md"
+    commit_all "$quiet_repo" note
+    run_analyzer "$quiet_repo" "$quiet_base" "$WORK/fmt-empty.json"
+    python3 - "$RC" "$WORK/fmt-empty.json" "$WORK/out.txt" <<'PY'
+import json
+import sys
+
+rc, report_path, out_path = sys.argv[1:4]
+rc = int(rc)
+report = json.load(open(report_path))
+condition = (rc == 0 and report["changed_functions"] == []
+             and report["run"]["measured_head_files"] == []
+             and report["analyzer"]["go_version"])
+print(("PASS" if condition else "FAIL")
+      + f" [formatting] zero-go-file-change-clean: rc={rc} "
+        f"run={report['run']['measured_head_files']}")
+sys.exit(0 if condition else 1)
+PY
+    record formatting-only-no-go-files $([ $? -eq 0 ] && echo pass || echo fail)
+
+    if [ "$scenario_failed" -ne 0 ]; then
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' formatting-only
+    else
+        printf 'scenario %-18s OK\n\n' formatting-only
+    fi
+    scenario_failed=0
+}
+
 scenario_clean_pass
 scenario_block_over_15
 scenario_receipt_band
+scenario_receipt_validation
+scenario_duplicate_over_15
+scenario_moved_debt_carry
+scenario_formatting_only
 scenario_determinism
 scenario_moved_modified
 

@@ -7,21 +7,30 @@ added/changed body against the complexity thresholds of
 standards/maintainability.md, recognizes moved/renamed functions with
 unchanged content, and summarizes untouched legacy debt separately.
 
+Threshold decisions (QG-C01-02): a content-identical copy of a function
+whose base original still exists at head is a DUPLICATE, measured as
+added/changed content under the full thresholds; only a move whose original
+is gone carries pre-existing debt (listed in the untouched-debt ledger,
+never blocking). The 11-15 band passes only with a source-bound
+stronger-model review receipt (see scripts/quality/complexity/go/README.md
+for the schema); receipts never unblock >15 bodies for new/changed code.
+
 Python 3.9+ standard library plus the Go toolchain (used only to parse and
 measure; the product is never built). This script measures and reports; gate
-wiring (Makefile/quality.py integration) and receipt policy enforcement are
-separate children (QG-C01-02/-03).
+wiring (Makefile/quality.py integration) is child QG-C01-03.
 
 Usage:
   go_complexity.py --base <git-ref> [--report PATH|-] [--receipt PATH] [--root DIR]
 
 Exit codes: 0 = all changed bodies within policy; 1 = gate failure (a changed
-body >15, or 11-15 without an accepted receipt); 2 = operational error
-(missing go toolchain, git failure, head file that cannot be parsed).
+body >15, an 11-15 body without an accepted receipt, or a rejected receipt);
+2 = operational error (missing go toolchain, git failure, head file that
+cannot be parsed).
 """
 from __future__ import annotations
 
 import argparse
+import datetime
 import hashlib
 import json
 import os
@@ -32,7 +41,7 @@ import sys
 import tarfile
 import tempfile
 
-VERSION = "1.0.0"
+VERSION = "1.1.0"
 HELPER = Path(__file__).resolve().parent / "go_funcscan.go"
 HELPER_VERSION_FIELD = "helper_source_sha256"
 
@@ -41,6 +50,21 @@ HELPER_VERSION_FIELD = "helper_source_sha256"
 CYCLOMATIC_OK_MAX = 10
 CYCLOMATIC_REVIEW_MAX = 15
 DEBT_LIST_LIMIT = 50
+
+# Review receipts (schema in README.md) bind the stronger-model verdict to
+# the exact analyzed diff. Verdict "approve-exception" approves 11-15 bodies
+# and feeds the recorded-exception ledger for >15 bodies (which still block);
+# "require-refactor" is a structurally valid verdict that approves nothing.
+RECEIPT_SCHEMA = "go-complexity-review-receipt/1"
+RECEIPT_APPROVING_VERDICT = "approve-exception"
+RECEIPT_VERDICTS = (RECEIPT_APPROVING_VERDICT, "require-refactor")
+# Model strength ordering, strongest first. The reviewer named on a receipt
+# must rank strictly above the implementer. The default lists the known
+# coordination model only; deployments widen it via GO_COMPLEXITY_MODEL_ORDER
+# (comma-separated, strongest first) — a model absent from the ordering can
+# neither implement nor review, because relative capability is unproven.
+DEFAULT_MODEL_ORDER = ("yabanin/glm-5.3",)
+HEX_DIGITS = frozenset("0123456789abcdef")
 
 # Docs shipped verbatim in every report so a number is never detached from
 # the rules that produced it.
@@ -61,10 +85,17 @@ COGNITIVE_RULES = (
 MOVED_MATCHING = (
     "function identity = sha256 over canonical AST print of receiver + "
     "signature-without-name + body (go/printer against a synthetic "
-    "single-line file set): formatting- and comment-independent; a head "
-    "function whose hash matches any base function (repo-wide at base) is "
-    "moved/renamed, not re-measured as new content; a receiver change is a "
-    "content change"
+    "single-line file set): formatting- and comment-independent (including "
+    "blank lines: every position maps to line 1); a head function whose "
+    "hash matches any base function (repo-wide at base) is moved/renamed, "
+    "not re-measured as new content; a receiver or body change is a content "
+    "change. Duplicate rule (QG-C01-02): if the matched base original still "
+    "exists at head with identical content, the head copy is a duplicate and "
+    "is measured as added/changed content under the full thresholds. Move "
+    "policy: a move whose original is gone carries pre-existing debt without "
+    "re-measurement but is listed in the untouched-debt ledger (kind "
+    "'moved', never blocking); at most one head function may claim a given "
+    "base original as its move origin"
 )
 
 
@@ -169,6 +200,9 @@ def scan_functions(paths, cwd: Path, relative_to: Path) -> dict:
         scan = json.loads(completed.stdout)
     except json.JSONDecodeError as error:
         raise AnalyzerError(f"go_funcscan emitted invalid JSON: {error}") from error
+    # Older helper builds may marshal an empty batch as null; a zero-file
+    # diff must yield a clean empty report, never a crash.
+    scan["files"] = scan.get("files") or []
     for entry in scan["files"]:
         entry["path"] = Path(entry["path"]).relative_to(relative_to).as_posix()
     return scan
@@ -188,21 +222,31 @@ def index_base(scan: dict) -> tuple:
     return by_name, by_hash, failures
 
 
-def match_kind(head, by_name, by_hash, consumed):
+def match_kind(head, by_name, by_hash, consumed, head_index):
     """Resolve how a head function relates to the base tree.
 
-    Returns (kind, base_record): unchanged functions return "untouched" and
-    carry no report entry; a moved function consumes one base candidate so
-    two head copies cannot both claim the same origin.
+    Returns (kind, base_record, note): unchanged functions return
+    "untouched" and carry no report entry; a moved function consumes one
+    base candidate so two head copies cannot both claim the same origin.
+    A hash match whose base original still exists at head with identical
+    content is a free duplicate: it is measured as added/changed content
+    under the full thresholds instead of escaping as a move, with the
+    origin named in the note.
     """
     same_place = by_name.get((head["file"], head["name"]))
     if same_place is not None and same_place["body_sha256"] == head["body_sha256"]:
-        return "untouched", same_place
+        return "untouched", same_place, None
     for candidate in by_hash.get(head["body_sha256"], ()):
+        original_at_head = head_index.get((candidate["file"], candidate["name"]))
+        if original_at_head is not None \
+                and original_at_head["body_sha256"] == head["body_sha256"]:
+            return (("changed" if same_place is not None else "added"),
+                    same_place, {"duplicate_of":
+                                 f'{candidate["file"]}:{candidate["name"]}'})
         if id(candidate) not in consumed:
             consumed.add(id(candidate))
-            return "moved", candidate
-    return ("changed" if same_place is not None else "added"), same_place
+            return "moved", candidate, None
+    return ("changed" if same_place is not None else "added"), same_place, None
 
 
 def score_class(cyclomatic) -> str:
@@ -236,7 +280,26 @@ def build_entry(head, kind, base, classification):
     }
 
 
-def analyze(head_scan, by_name, by_hash, receipt_valid):
+def receipt_binding(record) -> str:
+    return f'{record["file"]}:{record["name"]}'
+
+
+def receipt_decision(receipt, record):
+    """Decide whether the validated receipt approves this 11-15 body.
+
+    Returns (approved, reason). A receipt that exists but does not approve
+    carries a precise reason surfaced in the summary and the report.
+    """
+    if receipt is None:
+        return False, None
+    if receipt.get("verdict") != RECEIPT_APPROVING_VERDICT:
+        return False, f"receipt verdict is {receipt.get('verdict')!r}, not an approval"
+    if receipt_binding(record) not in receipt.get("functions", ()):
+        return False, f"receipt does not bind {receipt_binding(record)}"
+    return True, None
+
+
+def analyze(head_scan, by_name, by_hash, receipt):
     """Diff head functions against the base index.
 
     Returns (entries, untouched). Untouched functions stay out of the report
@@ -244,6 +307,7 @@ def analyze(head_scan, by_name, by_hash, receipt_valid):
     """
     entries, untouched = [], []
     consumed = set()
+    head_index = {}
     for entry in head_scan["files"]:
         if not entry.get("parse_ok"):
             raise AnalyzerError(
@@ -251,18 +315,34 @@ def analyze(head_scan, by_name, by_hash, receipt_valid):
                 f"{entry['path']}: {entry.get('error', 'parse error')}")
         for head in entry["functions"]:
             record = dict(head, file=entry["path"])
-            kind, base = match_kind(record, by_name, by_hash, consumed)
+            head_index[(record["file"], record["name"])] = record
+    for entry in head_scan["files"]:
+        for head in entry["functions"]:
+            record = dict(head, file=entry["path"])
+            kind, base, note = match_kind(record, by_name, by_hash, consumed,
+                                          head_index)
             if kind == "untouched":
                 untouched.append(record)
                 continue
             classification = score_class(head["cyclomatic"])
             item = build_entry(record, kind, base, classification)
             if classification == "needs_review":
-                item["receipt"] = receipt_valid
+                approved, reason = receipt_decision(receipt, record)
+                item["receipt"] = approved
+                if reason:
+                    item["receipt_reason"] = reason
+            if receipt is not None and classification == "blocks" \
+                    and receipt.get("verdict") == RECEIPT_APPROVING_VERDICT \
+                    and receipt_binding(record) in receipt.get("functions", ()):
+                # Receipts never unblock >15; this records the reviewed
+                # exception in the ledger only (maintainability.md).
+                item["exception_receipt_recorded"] = True
             if kind == "moved":
                 item["from_file"] = base["file"]
                 item["from_function"] = base["name"]
                 item["classification"] = "ok_moved_unchanged"
+            if note is not None:
+                item.update(note)
             entries.append(item)
     return entries, untouched
 
@@ -302,22 +382,122 @@ def debt_summary(untouched, moved_entries):
     }
 
 
-def load_receipt(path):
-    """Minimal placeholder validation only (QG-C01-02 owns the policy:
-    reviewer capability, verdict and source binding are NOT checked here)."""
+def model_strength_order() -> list:
+    raw = os.environ.get("GO_COMPLEXITY_MODEL_ORDER", "")
+    if not raw:
+        return list(DEFAULT_MODEL_ORDER)
+    return [tier.strip() for tier in raw.split(",") if tier.strip()]
+
+
+def require_string(document, key):
+    value = document.get(key)
+    if not isinstance(value, str) or not value.strip():
+        return None, f"{key} missing or empty"
+    return value, None
+
+
+def require_commit(document, key, expected, role):
+    value, error = require_string(document, key)
+    if error:
+        return None, error
+    if len(value) != 40 or any(char not in HEX_DIGITS for char in value.lower()):
+        return None, f"{key} {value!r} is not a full 40-hex commit SHA"
+    if value.lower() != expected:
+        return None, (f"{key} mismatch: receipt binds {role} {value}, "
+                      f"analyzed {expected}")
+    return value, None
+
+
+def require_review_date(document, key):
+    value, error = require_string(document, key)
+    if error:
+        return None, error
+    try:
+        return datetime.date.fromisoformat(value), None
+    except ValueError:
+        return None, f"{key} {value!r} is not an ISO YYYY-MM-DD date"
+
+
+def receipt_field_errors(document, head_sha, base_sha, head_date, order):
+    """All policy checks for one receipt document; first error wins."""
+    if document.get("schema") != RECEIPT_SCHEMA:
+        return (f"unsupported schema {document.get('schema')!r}; "
+                f"expected {RECEIPT_SCHEMA!r}")
+    for key in ("implementer_model", "reviewer_model"):
+        _, error = require_string(document, key)
+        if error:
+            return error
+    if document.get("verdict") not in RECEIPT_VERDICTS:
+        return f"unknown verdict {document.get('verdict')!r}; expected one of {RECEIPT_VERDICTS}"
+    _, error = require_commit(document, "source_commit", head_sha,
+                              "the analyzed head commit")
+    if error:
+        return error
+    _, error = require_commit(document, "base_commit", base_sha,
+                              "the analyzed base commit")
+    if error:
+        return error
+    review_date, error = require_review_date(document, "review_date")
+    if error:
+        return error
+    if review_date < head_date:
+        return (f"stale receipt: review_date {review_date.isoformat()} "
+                f"precedes source commit date {head_date.isoformat()}")
+    return model_order_error(document, order)
+
+
+def model_order_error(document, order):
+    implementer = document["implementer_model"]
+    reviewer = document["reviewer_model"]
+    if reviewer == implementer:
+        return f"reviewer_model equals implementer_model ({reviewer}); self-review is not accepted"
+    if reviewer not in order:
+        return f"reviewer_model {reviewer!r} is not in the model strength ordering"
+    if implementer not in order:
+        return f"implementer_model {implementer!r} is not in the model strength ordering"
+    if order.index(reviewer) >= order.index(implementer):
+        return (f"reviewer_model {reviewer!r} is not stronger than "
+                f"implementer_model {implementer!r}")
+    return None
+
+
+def receipt_functions_error(document):
+    functions = document.get("functions")
+    if not isinstance(functions, list) or not functions:
+        return "functions must be a non-empty list of 'file.go:Function' bindings"
+    for item in functions:
+        if not isinstance(item, str) or item.count(":") != 1:
+            return f"functions entry {item!r} is not a 'file.go:Function' binding"
+        path, name = item.split(":")
+        if not path.endswith(".go") or not name:
+            return f"functions entry {item!r} is not a 'file.go:Function' binding"
+    return None
+
+
+def validate_receipt(path, head_sha, base_sha, head_date, order):
+    """Load and fully validate a review receipt (schema in README.md).
+
+    Returns (document, error): (None, None) when no receipt was requested;
+    (None, reason) for any rejected receipt — the reason is precise enough
+    to name the violated binding. Policy: the reviewer must be a strictly
+    stronger model than the implementer, the verdict must be a known one,
+    and source/base commits and review date must bind the analyzed diff.
+    """
     if not path:
-        return False
+        return None, None
     try:
         document = json.loads(Path(path).read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError):
-        return False
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as error:
+        return None, f"cannot read receipt {path}: {error}"
     if not isinstance(document, dict):
-        return False
-    strings_ok = all(isinstance(document.get(key), str) and document[key]
-                     for key in ("reviewer_model", "verdict", "base_sha"))
-    functions = document.get("functions")
-    return strings_ok and isinstance(functions, list) and all(
-        isinstance(item, str) and item for item in functions)
+        return None, "receipt is not a JSON object"
+    error = receipt_field_errors(document, head_sha, base_sha, head_date, order)
+    if error:
+        return None, error
+    error = receipt_functions_error(document)
+    if error:
+        return None, error
+    return document, None
 
 
 def source_digest(root: Path, files) -> str:
@@ -339,31 +519,54 @@ def failing(entries):
 def render_summary(entries, debt, blocked, unreceipted) -> str:
     lines = [f"changed function bodies: {len(entries)}"]
     for item in entries:
+        duplicate = f" duplicate_of={item['duplicate_of']}" if "duplicate_of" in item else ""
         lines.append(
             f"  {item['kind']:>6} {item['function']}: cyclomatic "
             f"{item['old_cyclomatic']} -> {item['new_cyclomatic']} "
-            f"[{item['classification']}] ({item['file']})")
+            f"[{item['classification']}] ({item['file']}){duplicate}")
     lines.append(f"untouched legacy debt: {debt['cyclomatic_gt15']} >15, "
                  f"{debt['cyclomatic_11_to_15']} in 11-15 "
                  f"({debt['untouched_functions']} unchanged functions scanned)")
     for item in blocked:
+        ledger = ("; receipt recorded for the exception ledger only"
+                  if item.get("exception_receipt_recorded") else "")
         lines.append(f"BLOCKED {item['function']} ({item['file']}): cyclomatic "
-                     f"{item['new_cyclomatic']} > {CYCLOMATIC_REVIEW_MAX}")
+                     f"{item['new_cyclomatic']} > {CYCLOMATIC_REVIEW_MAX}"
+                     f"{ledger}")
     for item in unreceipted:
+        detail = f" ({item['receipt_reason']})" if item.get("receipt_reason") else ""
         lines.append(f"NEEDS REVIEW RECEIPT {item['function']} ({item['file']}): "
                      f"cyclomatic {item['new_cyclomatic']} in "
-                     f"{CYCLOMATIC_OK_MAX + 1}-{CYCLOMATIC_REVIEW_MAX}")
+                     f"{CYCLOMATIC_OK_MAX + 1}-{CYCLOMATIC_REVIEW_MAX}{detail}")
     return "\n".join(lines)
 
 
-def build_report(analyzer, run, entries, debt, base_failures):
+def receipt_section(path, receipt, error):
+    """Deterministic echo of the receipt state for the report."""
+    if not path:
+        return None
+    if error:
+        return {"path": path, "status": "rejected", "reason": error}
+    status = ("accepted" if receipt.get("verdict") == RECEIPT_APPROVING_VERDICT
+              else "valid_not_approving")
+    return {"path": path, "status": status, "schema": receipt["schema"],
+            "source_commit": receipt["source_commit"],
+            "base_commit": receipt["base_commit"],
+            "implementer_model": receipt["implementer_model"],
+            "reviewer_model": receipt["reviewer_model"],
+            "verdict": receipt["verdict"], "review_date": receipt["review_date"],
+            "functions": sorted(receipt["functions"])}
+
+
+def build_report(analyzer, run, entries, debt, base_failures, receipt):
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "analyzer": analyzer,
         "run": {
             "requested_base": run["requested_base"],
             "base_sha": run["base_sha"],
             "head_sha": run["head_sha"],
+            "head_commit_date": run["head_commit_date"],
             "dirty_working_tree": run["dirty"],
             "measured_head_files": run["head_files"],
             "measured_source_sha256": run["source_digest"],
@@ -371,12 +574,13 @@ def build_report(analyzer, run, entries, debt, base_failures):
             "deterministic": "no wall-clock fields; identical inputs and "
                              "toolchain produce identical bytes",
         },
+        "receipt": receipt,
         "changed_functions": entries,
         "untouched_debt": debt,
     }
 
 
-def analyzer_meta(scan) -> dict:
+def analyzer_meta(scan, order) -> dict:
     return {
         "name": "go-complexity-differential",
         "version": VERSION,
@@ -386,9 +590,17 @@ def analyzer_meta(scan) -> dict:
         "cyclomatic_rules": CYCLOMATIC_RULES,
         "cognitive_rules": COGNITIVE_RULES,
         "moved_detection": MOVED_MATCHING,
-        "receipt_validation": "minimal placeholder: existing JSON object with "
-                              "reviewer_model/verdict/base_sha strings and a "
-                              "functions list; policy binding is QG-C01-02",
+        "model_strength_order": order,
+        "receipt_validation": "full (QG-C01-02): schema "
+                              f"{RECEIPT_SCHEMA}; binds source_commit and "
+                              "base_commit (full SHAs) to the analyzed diff, "
+                              "functions as file:Name bindings, an "
+                              "implementer_model with a strictly stronger "
+                              "reviewer_model per the configured strength "
+                              "ordering, a known verdict and a review_date "
+                              "not predating the source commit; invalid "
+                              "receipts are rejected with exit 1 and never "
+                              "unblock >15 bodies",
     }
 
 
@@ -400,10 +612,20 @@ def parse_args(argv):
     parser.add_argument("--report", default="-",
                         help="JSON report path, or '-' for stdout")
     parser.add_argument("--receipt",
-                        help="stronger-model review receipt (QG-C01-02 policy; "
-                             "here only existence and minimal shape)")
+                        help="stronger-model review receipt JSON (schema: "
+                             "scripts/quality/complexity/go/README.md); "
+                             "rejected receipts fail the run with exit 1")
     parser.add_argument("--root", help="repository root (default: discover)")
     return parser.parse_args(argv)
+
+
+def commit_date(root: Path, commit: str) -> datetime.date:
+    raw = run_git(root, "show", "-s", "--format=%cI", commit).decode().strip()
+    try:
+        return datetime.date.fromisoformat(raw[:10])
+    except ValueError as error:
+        raise AnalyzerError(
+            f"cannot determine commit date of {commit}: {raw!r}") from error
 
 
 def main(argv=None) -> int:
@@ -411,8 +633,11 @@ def main(argv=None) -> int:
     try:
         root = repo_root(args.root)
         base_sha = resolve_base(root, args.base)
+        head_sha = run_git(root, "rev-parse", "HEAD").decode().strip()
+        receipt, receipt_error = validate_receipt(
+            args.receipt, head_sha, base_sha, commit_date(root, head_sha),
+            model_strength_order())
         head_files = changed_go_files(root, base_sha)
-        receipt_valid = load_receipt(args.receipt)
         with tempfile.TemporaryDirectory(prefix="go-complexity-base-") as tmp:
             tree = Path(tmp) / "base"
             tree.mkdir()
@@ -421,18 +646,21 @@ def main(argv=None) -> int:
             base_scan = scan_functions(base_paths, tree, tree)
         head_scan = scan_functions([root / path for path in head_files], root, root)
         by_name, by_hash, base_failures = index_base(base_scan)
-        entries, untouched = analyze(head_scan, by_name, by_hash, receipt_valid)
+        entries, untouched = analyze(head_scan, by_name, by_hash, receipt)
         moved = [item for item in entries if item["kind"] == "moved"]
         debt = debt_summary(untouched, moved)
-        analyzer = analyzer_meta(head_scan)
+        analyzer = analyzer_meta(head_scan, model_strength_order())
         run = {
             "requested_base": args.base, "base_sha": base_sha,
-            "head_sha": run_git(root, "rev-parse", "HEAD").decode().strip(),
+            "head_sha": head_sha,
+            "head_commit_date": commit_date(root, head_sha).isoformat(),
             "dirty": bool(run_git(root, "status", "--porcelain", "-z")),
             "head_files": head_files,
             "source_digest": source_digest(root, head_files),
         }
-        report = build_report(analyzer, run, entries, debt, base_failures)
+        report = build_report(analyzer, run, entries, debt, base_failures,
+                              receipt_section(args.receipt, receipt,
+                                              receipt_error))
     except AnalyzerError as error:
         print(f"go_complexity error: {error}", file=sys.stderr)
         return 2
@@ -451,10 +679,14 @@ def main(argv=None) -> int:
               f"{CYCLOMATIC_REVIEW_MAX}; refactor or a recorded bounded "
               f"exception is required", file=sys.stderr)
         return 1
+    if receipt_error:
+        print(f"gate: receipt rejected: {receipt_error}", file=sys.stderr)
+        return 1
     if unreceipted:
         print(f"gate: {len(unreceipted)} changed function(s) in "
               f"{CYCLOMATIC_OK_MAX + 1}-{CYCLOMATIC_REVIEW_MAX} lack a review "
-              f"receipt (pass --receipt; validation policy lands in QG-C01-02)",
+              f"receipt (pass --receipt; schema in "
+              f"scripts/quality/complexity/go/README.md)",
               file=sys.stderr)
         return 1
     return 0
