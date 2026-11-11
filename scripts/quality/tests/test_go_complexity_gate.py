@@ -68,7 +68,8 @@ class MakefileRecipeTests(unittest.TestCase):
     def test_profile_target_exposes_gate(self):
         line = next((l for l in self.makefile.splitlines()
                      if l.startswith("quality-fast ")), "")
-        self.assertIn("quality-go-complexity:", line)
+        words = {w.rstrip(":") for w in line.split()}
+        self.assertIn("quality-go-complexity", words)
 
 
 if __name__ == "__main__":

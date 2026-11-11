@@ -45,7 +45,7 @@ PROFILES = {
     "eval": ["routing", "guards"],
     "integration": ["integration"],
     "int-modules": ["int-modules"],
-    "full": ["self", "go-complexity", "static", "security", "tests", "routing", "guards",
+    "full": ["self", "go-complexity", "ts-complexity", "static", "security", "tests", "routing", "guards",
              "dashboard", "site", "design", "node-sdk", "python-sdk", "bridge",
              "go-sdk", "docs", "nested-go", "int-modules",
              "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
@@ -182,7 +182,14 @@ def classify(paths):
         elif path in ("Makefile", ".golangci.yml") or path.startswith(("scripts/quality/", ".opencode/skills/go-")):
             add(PROFILES["full"], path)
         elif path.startswith("web/dashboard/"):
-            add(["dashboard", "design"], path)
+            gates = ["dashboard", "design"]
+            # Mirrors scripts/quality/complexity/ts/collect.mjs measured
+            # extensions; manifests carry no function bodies.
+            if path.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+                # QG-C02: changed TS/JS function bodies must pass the
+                # complexity differential gate.
+                gates.insert(0, "ts-complexity")
+            add(gates, path)
         elif path.startswith("web/site/"):
             add(["site"], path)
         elif path.startswith("e2e/") or path in ("playwright.config.ts", "scripts/quality/browser.sh", "scripts/quality/browser-build.sh", "scripts/build-fingerprint.sh"):

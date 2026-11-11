@@ -16,8 +16,9 @@ import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { analyzerRepoRoot, loadTypescript } from "./typescript.mjs";
+import { loadTypescript } from "./typescript.mjs";
 import { isMeasuredFile, parseAndCollect } from "./collect.mjs";
 import { classifyComplexity } from "./metric.mjs";
 
@@ -632,7 +633,10 @@ function analyze(ts, parser, options) {
 }
 
 function analyzerRepoRootSafe(options) {
-  return options.repo || analyzerRepoRoot();
+  // The analyzed repository defaults to the checkout holding this script
+  // (throwaway fixture repos embed a copy); TS_COMPLEXITY_REPO_ROOT steers
+  // only the pinned parser in typescript.mjs, never the analyzed tree.
+  return options.repo || fileURLToPath(new URL("../../../..", import.meta.url));
 }
 
 function main() {

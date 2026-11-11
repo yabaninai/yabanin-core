@@ -1,7 +1,5 @@
-// Fixture head state (rename scenario): legacyHeavy renamed to
-// legacyHeavyRenamed with a reformatted-only body (indentation noise and
-// comments; identical body AST). Status must be moved with delta 0 — the
-// 25-point debt is carried, not re-flagged as new code.
+// Fixture head state (rename): legacyHeavy renamed legacyHeavyRenamed,
+// reformat-only (identical AST); status moved, delta 0, debt carried.
 export function legacyHeavyRenamed(steps: number): number {
       let total = 0;
   if (steps > 1)

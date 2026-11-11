@@ -1,7 +1,5 @@
-// Fixture head state: changedStraightforward still scores 8 with an edited
-// body; withNestedClosure is rewritten to contain the `scale` closure
-// (its own measured body, cognitive 4); borderlineDetailed is added at
-// cognitive 12 (review band, no receipt); deletedHelper is gone.
+// Fixture head: changedStraightforward stays 8 (edited body); withNestedClosure
+// gains the scale closure (4); borderlineDetailed added at 12; deletedHelper gone.
 export function changedStraightforward(items: string[]): number {
   let score = 0;
   if (items.length > 0) score += 1;

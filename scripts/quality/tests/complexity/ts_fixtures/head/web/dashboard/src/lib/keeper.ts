@@ -1,7 +1,5 @@
-// Fixture head state: added file pinning class-body extraction. Getter
-// `value` (cognitive 1, one if), setter `value` (cognitive 3: if + else-if
-// link + else) and method `bump` (cognitive 3: for + nested if at nesting 1)
-// are each measured as their own body under the class scope.
+// Fixture head state: added file pinning class bodies — getter value (1),
+// setter value (3) and method bump (3), each measured as its own body.
 export class ScoreKeeper {
   private current = 0;
 

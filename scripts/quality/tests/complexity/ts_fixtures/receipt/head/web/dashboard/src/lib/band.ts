@@ -1,7 +1,5 @@
 // Fixture head state (receipt scenario): new file. borderlineTwelve scores
-// cognitive 12 — inside the 11-15 review band and nothing else. Without a
-// receipt the run exits 1 demanding a review receipt; a valid
-// stronger-model receipt clears exactly this band.
+// cognitive 12 — review band only; a valid stronger-model receipt clears it.
 export function borderlineTwelve(rows: string[]): number {
   let hits = 0;
   if (rows.length > 1) hits += 1;

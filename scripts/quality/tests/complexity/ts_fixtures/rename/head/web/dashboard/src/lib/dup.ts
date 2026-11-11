@@ -1,8 +1,5 @@
-// Fixture head state (rename scenario): heavyOriginal is unchanged (the
-// survivor pairs with its base twin and stays untouched debt) and heavyCopy
-// adds a byte-identical body under a new name. Because the original still
-// exists, the copy is a duplicate: status added, duplicate_of heavyOriginal,
-// and it blocks (16 > 15).
+// Fixture head state (rename): heavyOriginal survives untouched; heavyCopy
+// is a byte-identical duplicate — added, duplicate_of set, blocks (16 > 15).
 export function heavyOriginal(rows: string[]): number {
   let total = 0;
   if (rows.length > 1) total += 1;

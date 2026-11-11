@@ -1,6 +1,5 @@
-// Fixture (receipt scenario): identical at base and head. quietHelper
-// (cognitive 2) stays untouched debt so the only changed function in this
-// scenario is the review-band addition in lib/band.ts.
+// Fixture (receipt scenario): identical at base and head; quietHelper (2)
+// stays untouched debt so only lib/band.ts changes at head.
 export function quietHelper(values: number[]): number {
   let total = 0;
   if (values.length > 1) total += 1;
