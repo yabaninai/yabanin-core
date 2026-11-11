@@ -11,7 +11,7 @@ permissions:
 
 jobs:
   quality:
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 120
     steps:
       - uses: actions/checkout@v7
@@ -84,7 +84,7 @@ jobs:
   sovereignty-weekly:
     name: Sovereignty suite (weekly)
     if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 6 * * 1'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 15
     steps:
       - name: Checkout

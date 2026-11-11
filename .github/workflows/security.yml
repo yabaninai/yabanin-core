@@ -12,7 +12,7 @@ env:
 jobs:
   govulncheck:
     name: Go Vulnerability Check
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     permissions:
       contents: read
       issues: write

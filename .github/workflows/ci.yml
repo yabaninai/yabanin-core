@@ -17,7 +17,7 @@ env:
 jobs:
   ci:
     name: CI
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     env:
       CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
     steps:
@@ -69,7 +69,7 @@ jobs:
   # gateway compiles at load time), no database, default runner.
   policies:
     name: Policy declarations (G1)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -94,7 +94,7 @@ jobs:
 
   lint:
     name: Lint
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout repository
         uses: actions/checkout@v7
@@ -139,7 +139,7 @@ jobs:
 
   helm:
     name: Helm validation
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -165,7 +165,7 @@ jobs:
 
   docs-site:
     name: Docs site build (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: web/site
@@ -186,7 +186,7 @@ jobs:
 
   docs-lang:
     name: Docs language gate
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -196,7 +196,7 @@ jobs:
 
   dashboard:
     name: Dashboard build (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: web/dashboard
@@ -216,7 +216,7 @@ jobs:
 
   python-sdk:
     name: Python SDK tests (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: sdks/python
@@ -237,7 +237,7 @@ jobs:
 
   node-sdk:
     name: Node SDK tests (I5)
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     defaults:
       run:
         working-directory: sdks/node
@@ -262,7 +262,7 @@ jobs:
   quality-changed:
     name: Quality (changed gates)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 90
     steps:
       - name: Checkout repository
@@ -327,7 +327,7 @@ jobs:
   integration:
     name: Integration tests (blocking)
     if: github.event_name == 'pull_request'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 60
     # Strict env parsing — a malformed numeric env value fails the
     # blocking gate instead of falling back to a default.
@@ -366,7 +366,7 @@ jobs:
   integration-nightly:
     name: Integration tests (nightly)
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
-    runs-on: ubuntu-latest
+    runs-on: [self-hosted, core-quality]
     timeout-minutes: 30
     services:
       postgres:
