@@ -87,10 +87,13 @@ the gateway through `responsesTestGateway`
 `ResponsesNativeProviders` (zero occurrences in
 `pkg/gateway/responses_codex_real_test.go`), so the real binary exercised the
 **translated** Responses→chat path against a mock upstream. Version binding:
-E1 scenarios are pinned 0.167.0
-(`pkg/gateway/responses_codex_real_test.go:201`) with the recorded evidence
-base "2026-11-03, codex-cli 0.166.0; re-verified 2026-11-09 on 0.167.0"
-(`pkg/gateway/responses_codex_real_test.go:191`); the E2 wire capture is
+only the three harder scenarios (tools loop, unsupported tool call, client
+cancel) enforce the 0.167.0 pin via `requirePinnedCodex`
+(`pkg/gateway/responses_codex_real_test.go:207`; pin `:201`); the base
+`TestResponses_CodexCLI_RealE2E` (`:63`) runs any available codex binary
+(`codexBinary`, `:67`), so its 0.167.0 binding rests on the recorded
+evidence base "2026-11-03, codex-cli 0.166.0; re-verified 2026-11-09 on
+0.167.0" (`pkg/gateway/responses_codex_real_test.go:191`); the E2 wire capture is
 0.166.0 (`pkg/gateway/testdata/compat/real/manifest.json:48-61`). Doc rows still cite
 0.166.0 as latest (`docs/compatibility.md:31`, `docs/clients/sdk-versions.md:220`)
 — see §6.
@@ -101,8 +104,8 @@ base "2026-11-03, codex-cli 0.166.0; re-verified 2026-11-09 on 0.167.0"
 | Multi-turn tool loop on the stateless full-history resend (`store=false`, `previous_response_id=null` every turn) | supported | E1 `pkg/gateway/responses_codex_real_test.go:444`; wire shape E2 `manifest.json:54` (`store=false`, `prompt_cache_key`, encrypted-reasoning include) | IP-CODING | `go test ./pkg/gateway -run TestResponses_CodexCLI_RealE2E_ToolsLoop`; assert tool-call IDs preserved end-to-end and no duplicate paid execution |
 | Unsupported tool call fed back verbatim (`unsupported call: <name>`), never a fake success | supported | E1 `pkg/gateway/responses_codex_real_test.go:673` | IP-CODING | `go test ./pkg/gateway -run TestResponses_CodexCLI_RealE2E_UnsupportedToolCall`; assert the CLI run completes with the limitation reported |
 | Mid-stream client cancel (SIGINT): honest CLI death, exactly one terminal gateway event, relay torn down | supported | E1 `pkg/gateway/responses_codex_real_test.go:760` | IP-CODING | `go test ./pkg/gateway -run TestResponses_CodexCLI_RealE2E_ClientCancel`; ledger shows no false success and no charge for the interrupted stream |
-| `previous_response_id` refused with 400 (stateless surface, both paths) | supported (refusal) | E1 real session-id refusal recorded `pkg/gateway/responses_codex_real_test.go:187-190`; refusing path `pkg/gateway/responses_endpoint.go:25`; E3 `pkg/gateway/compat_test.go:34` | IP-CODING | send a request with `previous_response_id` through the pinned binary and directly; both must return 400 with zero upstream calls |
-| Dropped fields announced in `X-Yabanin-Unsupported` (e.g. `reasoning.effort` downgrade) | supported | E1 disclosed on the wire `pkg/gateway/responses_codex_real_test.go:187-190`; header set on the translated branch `pkg/gateway/responses_endpoint.go:38-40`; claim `docs/clients/codex.md:62-64` | IP-CODING | capture the response headers during the ToolsLoop run; every dropped field appears in the header, none silently |
+| `previous_response_id` refused with 400 (stateless surface, both paths) | supported (refusal) | E1 real session-id refusal asserted with a minted id `pkg/gateway/responses_codex_real_test.go:643`, recorded `:187-190`; refusing path `pkg/gateway/responses_endpoint.go:25`; E3 `pkg/gateway/compat_test.go:34` | IP-CODING | send a request with `previous_response_id` through the pinned binary and directly; both must return 400 with zero upstream calls |
+| Dropped fields announced in `X-Yabanin-Unsupported` (e.g. `reasoning.effort` downgrade) | supported | E1 header asserted on the real wire `pkg/gateway/responses_codex_real_test.go:578`, recorded `:187-190`; header set on the translated branch `pkg/gateway/responses_endpoint.go:38-40`; claim `docs/clients/codex.md:62-64` | IP-CODING | capture the response headers during the ToolsLoop run; every dropped field appears in the header, none silently |
 | `prompt_cache_key` session UUID → session affinity | supported | E1 loop `pkg/gateway/responses_codex_real_test.go:444`; wire shape E2 `pkg/gateway/testdata/compat/real/manifest.json:54`; mapping `pkg/gateway/responses_endpoint.go:46-47`; claim `docs/clients/codex.md:72-77` | IP-CODING | multi-turn run: all turns of one session land on the same affinity key in the durable request rows |
 | Bearer auth via `env_key`/helper (no key material in config) | supported | E1 (the e2e renders `config.toml` with `env_key`); render `pkg/clientconfig/codex.go:49`; invariant `pkg/clientconfig/clientconfig.go:5`; goldens `pkg/clientconfig/render_test.go:12` | IP-PLAN-AUTH | `yb client-config --client codex`; assert output contains no key value; inspect the e2e-workdir config for key material |
 | Paid (non-mock) upstream | unverified | no evidence either way; limitation recorded `docs/compatibility.md:31`, `docs/clients/codex.md:6-9` | IP-CODING | live provider run, separately labeled, with recipient-side cost reconciliation |
@@ -118,7 +121,7 @@ translation (`:29`).
 
 | Feature | Status | Evidence | Profile | Acceptance check |
 | --- | --- | --- | --- | --- |
-| Unchanged body forwarding, non-stream and stream (`/v1/responses` upstream) | supported (fixture-shaped, unverified against real client) | E3 `pkg/gateway/responses_endpoint_test.go:217`, `:294`, `:333`; upstream calls `pkg/gateway/responses_native.go:104`, `:167` | IP-CODING | first qualification run: pinned codex binary through a gateway configured with `ResponsesNativeProviders`; independent wire capture must show byte-identical forwarding |
+| Unchanged body forwarding, non-stream and stream (`/v1/responses` upstream) | supported (fixture-shaped, unverified against real client) | E3 `pkg/gateway/responses_native_test.go:17` (JSON and SSE relay), `:126` (byte-identical stream relay); upstream calls `pkg/gateway/responses_native.go:104`, `:167` | IP-CODING | first qualification run: pinned codex binary through a gateway configured with `ResponsesNativeProviders`; independent wire capture must show byte-identical forwarding |
 | General policy enforcement before upstream (masking/label policy) | supported (fixture-shaped) | E4 `pkg/gateway/responses_native.go:49` | IP-CODING | policy-on run with a synthetic secret canary; canary must not reach the recipient |
 | Stream-break settlement: `response.failed` appended, `request.failed`, no charge | supported (fixture-shaped) | E4 `pkg/gateway/responses_native.go:212`, `:228-232`, `:238-240` | IP-CODING | kill the upstream mid-stream; durable ledger records one failed request and zero charge |
 | Real codex-cli on the native branch | unverified | zero E1/E2 evidence: `responsesTestGateway` never sets `ResponsesNativeProviders` (see 4.1 preamble); E2 capture 0.166.0 was taken on the translated path | IP-CODING | the qualification run above; until recorded, no native-fidelity claim may be made |
