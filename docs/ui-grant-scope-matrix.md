@@ -14,8 +14,9 @@ in the same cell or row are abbreviated on repeat (for example
 every abbreviation resolves to exactly one file under `services/admin/handlers/`,
 `pkg/adminauth/`, `pkg/adminstore/`, `pkg/trcli/`, `pkg/gateway/` or
 `web/dashboard/src/`. The machine-readable mirror `ui-grant-scope-matrix.json`
-carries the same facts with full paths and was validated against HEAD by a
-citation checker before commit.
+carries the same facts with full paths; its citations were mechanically
+re-resolved against HEAD before commit (the checker itself is kept outside
+this repository).
 
 **Derivation.** Grant and scope facts come from the admin server's mount and
 middleware chain (`services/admin/handlers/router.go` and the per-domain mount
@@ -43,7 +44,7 @@ authoritative and the disagreement is listed under [Warts](#warts).
 
 Every dashboard route rides the protected chain (session re-validation
 `services/admin/handlers/router.go:747`, CSRF `:748`) before its specific
-grant. The root CRUD group adds `MustBeRoot` (`router.go:770-771`) plus
+grant. The root CRUD group adds `MustBeRoot` (`router.go:770`) plus
 `OrgScopeMiddleware` for org-scoped mutations (`router.go:777`).
 
 ### Org scopes
@@ -76,7 +77,7 @@ the `NAV_SECTIONS` entry for the route.
 | `orgs` | rootOnly `App.tsx:207` | root-session | cross-org | `GET/POST /api/organizations`, `GET/PUT/DELETE /api/organizations/{id}` `router_orgs.go:41-45` |
 | `keys` | anyOrg `keys.manage\|agent_keys.manage` `App.tsx:155` | org-permission `keys.manage` (`router_keys.go:16`); `agent_keys.manage` (`:25`); root-session for agent profiles (`:47-51`) | org-bound (profiles orgless-root) | `/api/api-keys*` `router_keys.go:17-23`; `/api/agent-keys*`, budgets, delegations `:26-40`; `/api/agent-profiles*` `:47-51` |
 | `agents` | anyOrg `keys.manage\|agent_keys.manage` `App.tsx:158` | any-admin-session for config render; key lookups per `keys.manage` | orgless | `GET /api/client-config/{agent}` `router_console.go:41` |
-| `budgets` | anyOrg `budgets.manage\|agent_keys.manage\|analytics.read` `App.tsx:162` | mixed by section: team budgets `budgets.manage` `router_billing.go:35`; agent budgets `agent_keys.manage` `router_keys.go:25`; wallet credits gate `credit_handlers.go:372`; org caps budgets.manage in-handler (`caps_handlers.go:55`, 404 `:70`, 403 `:73`); grace/output-cap `orgBudgetAccess` `org_settings_handlers.go:93-97`; reservations-mode root-only 403 `:86`; topup/low-balance root-only `router_billing.go:72`,`:75`; spend-alert root-only `:58-59` | org-bound (root-only sections) | team budgets `router_billing.go:36-39`; agent budgets `router_keys.go:32-34`; org caps `caps_handlers.go:49-50`; grace/output-cap/reservations `org_settings_handlers.go:65-68` |
+| `budgets` | anyOrg `budgets.manage\|agent_keys.manage\|analytics.read` `App.tsx:162` | mixed by section: team budgets `budgets.manage` `router_billing.go:35`; agent budgets `agent_keys.manage` `router_keys.go:25`; wallet credits gate `credit_handlers.go:372`; org caps budgets.manage in-handler (`caps_handlers.go:55`, 404 `:70`, 403 `:74`); grace/output-cap `orgBudgetAccess` `org_settings_handlers.go:93-97`; reservations-mode root-only 403 `:86`; topup/low-balance root-only `router_billing.go:72`,`:75`; spend-alert root-only `:58-59` | org-bound (root-only sections) | team budgets `router_billing.go:36-39`; agent budgets `router_keys.go:32-34`; org caps `caps_handlers.go:49-50`; grace/output-cap/reservations `org_settings_handlers.go:65-68` |
 | `models` | rootOnly `App.tsx:185` | root-session | orgless | `/api/models*`, `/api/model-aliases*` `router_models.go:13-20` |
 | `rules` | rootOnly `App.tsx:186` | root-session | orgless | `/api/rules*`, `POST /api/rules/preview` `router_models.go:25-31` |
 | `routing-map` | anyOrg `routing.manage` `App.tsx:189` | in-handler `requireOrgRead` with `routing.manage` (foreign org or missing permission → 404 `services/admin/handlers/routing_map.go:39`); `analytics.read` for provider health | org-bound | `GET /api/routing/map` `router_models.go:51`; `GET /api/providers/health` `:57` |
@@ -98,8 +99,8 @@ the `NAV_SECTIONS` entry for the route.
 | `model-access` | rootOnly `App.tsx:166` | root-session | orgless (per-key/team targets) | `/api/whitelist/api-keys/*`, `/api/whitelist/teams/*` `router_keys.go:54-59`; `GET /api/teams` `router_orgs.go:48` |
 | `members` | anyOrg `members.manage` `App.tsx:167` | org-permission `members.manage` (`router_orgs.go:15`); SCIM tokens same gate (`router_scim.go:47`) | org-bound | members/invites `router_orgs.go:16-25`; SCIM tokens `router_scim.go:48-50`; developer CRUD only when the portal store is wired `router_orgs.go:26-30` |
 | `admin-users` | rootOnly `App.tsx:212` | root-session | orgless | `/api/admin-users*` `router_orgs.go:55-59` |
-| `org-settings` | rootOnly `App.tsx:216` | root-session for the settings tabs (cache-settings `router_orgs.go:62`; routing `:66`; policy-packs/residency `:69-72`; region `router_ops.go:30-31`; MCP servers `router_mcp.go:16-20`, per-agent grants `:47-50`, MC-1 server credential `:54-56` (503 when the credential store is unwired); A2A `:41-45`; pricing `router_billing.go:62-67`); org-permission `keys.manage` for BYOK provider credentials (`org_credentials.go:266`); `org.update` for original-retention (`router_orgs.go:32`) | mixed: root-only org-scoped settings; BYOK org-bound | settings tabs `router_orgs.go:62-72`; region `router_ops.go:30-31`; provider credentials `org_credentials.go:268-273`; MCP servers/A2A `router_mcp.go:16-20` |
-| `mcp-credentials` | rootOnly `App.tsx:219` | unavailable for the registry read (route deliberately not registered, MC-4; JSON 404 `router.go:753`); deployment-dependent for the gateway flows (agent-key auth, MC-3) | unavailable / deployment-dependent | `GET/DELETE /api/organizations/{id}/mcp/user-credentials` (unmounted, `web/dashboard/src/api/mcpCredentials.ts`); `POST /api/mcp/credentials/{server}` `pkg/gateway/gateway.go:2011`; `POST /api/mcp/auth/{server}/begin` `:2012` |
+| `org-settings` | rootOnly `App.tsx:216` | root-session for the settings tabs (cache-settings `router_orgs.go:62`; routing `:66`; policy-packs `:70-72`; residency `:73-74`; region `router_ops.go:30-31`; MCP server list/update `router_mcp.go:17`,`:19` — this page calls no grant or credential routes, MC-1 belongs to `mcp-credentials`; A2A list/update `:42`,`:44`; pricing `router_billing.go:62-67`); org-permission `keys.manage` for BYOK provider credentials (`org_credentials.go:266`); `org.update` for original-retention (`router_orgs.go:32`) | mixed: root-only org-scoped settings; BYOK org-bound | settings tabs `router_orgs.go:62-74`; region `router_ops.go:30-31`; provider credentials `org_credentials.go:268-273`; MCP server list/update `router_mcp.go:17`,`:19`; A2A list/update `router_mcp.go:42`,`:44` |
+| `mcp-credentials` | rootOnly `App.tsx:219` | root-session for the mounted admin surfaces the page drives — MC-1 server credentials `router_mcp.go:54-56` (callers `McpCredentialsPage.tsx:307`,`:345`,`:362`; 503 when the credential store is unwired) plus the server-registry and grant reads it rides (`:17`, `:47`); unavailable for the MC-4 user-credentials registry (route deliberately not registered; JSON 404 `router.go:753`); deployment-dependent for the gateway flows (agent-key auth, MC-3) | mixed: mounted admin calls org-bound (root-only); MC-4 registry unavailable; gateway flows deployment-dependent | MC-1 `GET/PUT/DELETE /api/organizations/{id}/mcp/servers/{name}/credential` `router_mcp.go:54-56` (callers `McpCredentialsPage.tsx:307`,`:345`,`:362`); `GET/DELETE /api/organizations/{id}/mcp/user-credentials` (unmounted, `web/dashboard/src/api/mcpCredentials.ts`); `POST /api/mcp/credentials/{server}` `pkg/gateway/gateway.go:2011`; `POST /api/mcp/auth/{server}/begin` `:2012` |
 | `rates` | anySession `App.tsx:222` | any-admin-session for catalog (`currencies_handlers.go:319`); root-session for diff/promote (`requireRootForRates` `:147`, 403 `:151`) | orgless | `GET /api/rates/catalog` `currencies_handlers.go:115`; `POST /api/rates/diff`, `/api/rates/promote` `:116-117` |
 | `onboarding` | not in nav (`App.tsx:69`) | org-role reader or above for the flow state (`router_console.go:51-52` group); step endpoints use their own gates | org-bound | `GET/POST /api/me/onboarding` `router_console.go:51-52`; key step `router_keys.go:18`; credential step `org_credentials.go:269` |
 
@@ -113,15 +114,18 @@ server stays the arbiter behind every linked surface.
 
 ## CLI/config-only capabilities
 
-Endpoint families with **no dashboard caller** at this commit. The
-`/internal` trio authenticates with the `X-Admin-Key` service key
-(`YABANIN_ADMIN_API_KEY` in run configuration); the group is unmounted when the
-key is unset (`internal_api.go:24-28`).
+Capabilities driven only from the CLI or config at this commit — no dashboard
+screen exercises them. Most member endpoint families also have **no dashboard
+caller**; where an endpoint is shared with a dashboard surface (the
+`cli-pricing-sync` pair), the row says so explicitly. The `/internal` trio
+authenticates with the `X-Admin-Key` service key (`YABANIN_ADMIN_API_KEY` in
+run configuration); the group is unmounted when the key is unset
+(`internal_api.go:24-28`).
 
 | Group | Grant | Scope | Endpoints (citations) |
 |---|---|---|---|
 | `cli-service-api` | internal-service-key | org-bound | `GET /internal/api-keys` `internal_api.go:29` (consumer `pkg/trcli/keys.go:33`; mandatory `org_id` prevents cross-org listing); `GET /internal/analytics/savings` `:30` (`pkg/trcli/spend.go:23`); `GET /internal/analytics/cost` `:31` (automation; no `yb` consumer yet) |
-| `cli-pricing-sync` | root-session (intended) — credential wart | orgless | `GET /api/models` (`pkg/trcli/pricing_sync.go:179`); `POST /api/pricing/import?mode=apply` (`:201`, server mount `router_billing.go:64`) |
+| `cli-pricing-sync` | root-session (intended) — credential wart | orgless | Capability is CLI-only (`yb pricing sync`): `GET /api/models` (`pkg/trcli/pricing_sync.go:179`); `POST /api/pricing/import?mode=apply` (`:201`, server mount `router_billing.go:64`). The endpoints are not dashboard-orphans — `GET /api/models` also serves the `models` page (`router_models.go:13`) and the `/api/pricing` CRUD family serves the org-settings pricing tab (`router_billing.go:62-67`) — but no dashboard screen drives the sync, and the import itself has no dashboard caller |
 | `cache-ops` | root-session | orgless | flush/analytics/warm `router_ops.go:18-20`; experiments `:23-25` |
 | `regions-catalog` | root-session | orgless | `GET /api/regions` `router_ops.go:29` (per-org region endpoints are bound to `org-settings`) |
 | `verticals` | root-session (wired unit) | org-bound | enable/list/disable `router_ops.go:36-38` |
@@ -135,7 +139,7 @@ key is unset (`internal_api.go:24-28`).
 | `root-payload-grants` | root-session inline | orgless | `POST /api/root/payload-grants` `router_console.go:33` |
 | `requests-archive-exports` | org-permission `requests.read` | org-bound | `GET .../requests/export`, `.../requests/archive-search` `router_analytics.go:44-45` (registered, no dashboard caller) |
 | `feedback-data-plane` | api-key | org-bound (caller's org) | `POST /v1/feedback` `router_ops.go:85` (mounted only when the collector is wired) |
-| `scim-protocol` | scim-bearer | org-bound | `/scim/v2` Users, Groups, resource types, schemas, config — 15 endpoints (`router_scim.go:19`); token lifecycle is the `members` route |
+| `scim-protocol` | scim-bearer | org-bound | `/scim/v2` ServiceProviderConfig, Schemas, ResourceTypes, Users×6, Groups×5 — 14 endpoints (`r.Route` at `router_scim.go:20`; no `/Me` or `/Bulk` routes); token lifecycle is the `members` route |
 | `developer-portal` | portal session (opt-in `SetPortal` config) | org-bound | portal pages + `portalAuthed /api/me`, `/api/me/keys*` `router_portal.go:15-27` — separate portal UI, not the dashboard |
 
 ---
@@ -147,7 +151,7 @@ exists — the test that already pins the behavior.
 
 1. **Root-only aggregates.** `GET /api/analytics/savings` without the root flag
    → 403 `forbidden` at `pkg/adminauth/auth.go:471` via the root group chain
-   (`router.go:770-771`, `router.go:783`). Covers `overview`, `cost`, `cache`,
+   (`router.go:770`, `router.go:783`). Covers `overview`, `cost`, `cache`,
    `classifier`, `compare`.
 2. **Org permission.** `GET /api/organizations/{id}/requests` as a member whose
    role lacks `requests.read` → 403 `insufficient permission for this
@@ -188,7 +192,9 @@ exists — the test that already pins the behavior.
    on 404 — `ui_actions_inventory_test.go:848`); JSON 404 via `router.go:753`.
    The gateway flows (`gateway.go:2011`, `:2012`) exist only on deployments
    exposing the gateway plane. The admin-side MC-1 server credential IS mounted
-   and belongs to `org-settings` (`router_mcp.go:54-56`).
+   (`router_mcp.go:54-56`) and its dashboard caller is the `mcp-credentials`
+   screen itself (`McpCredentialsPage.tsx:307`, `:345`, `:362`); org-settings
+   calls only the server list/update endpoints (`router_mcp.go:17`, `:19`).
 3. **`yb pricing sync` credential.** The command sends the `X-Admin-Key`
    service key against `GET /api/models` and `POST /api/pricing/import`
    (`pricing_sync.go:179`, `:201`), but only `/internal` accepts that header
@@ -207,8 +213,9 @@ exists — the test that already pins the behavior.
 
 ## Counts
 
-- 36 routes total; 34 with bound operations; 2 launcher/unavailable
-  (`guardrails`, `mcp-credentials`).
-- 17 CLI/config-only groups covering 63 endpoints (the config-gated developer
+- 36 routes total; 35 with bound operations; 1 launcher (`guardrails`);
+  `mcp-credentials` is mixed — mounted root-only admin calls (MC-1) plus the
+  unmounted MC-4 registry and the deployment-dependent gateway flows.
+- 17 CLI/config-only groups covering 62 endpoints (the config-gated developer
   portal contributes 10 of them in its own UI).
 - 6 negative controls; 5 documented warts.

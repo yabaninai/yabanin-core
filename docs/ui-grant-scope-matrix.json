@@ -24,7 +24,7 @@
   },
   "session_chain": {
     "protected": "Session re-validation (services/admin/handlers/router.go:747) + CSRF (services/admin/handlers/router.go:748); every dashboard route below rides this chain before its specific grant.",
-    "root-group": "Single root CRUD group: adminauth.MustBeRoot (services/admin/handlers/router.go:770-771) + OrgScopeMiddleware for org-scoped mutations (services/admin/handlers/router.go:777)."
+    "root-group": "Single root CRUD group: adminauth.MustBeRoot (services/admin/handlers/router.go:770) + OrgScopeMiddleware for org-scoped mutations (services/admin/handlers/router.go:777)."
   },
   "routes": [
     {
@@ -144,7 +144,7 @@
       "route": "budgets",
       "nav_gate": { "kind": "anyOrg", "permissions": ["budgets.manage", "agent_keys.manage", "analytics.read"], "cite": "web/dashboard/src/App.tsx:162" },
       "page": "web/dashboard/src/pages/BudgetsPage.tsx",
-      "server_grant": "mixed by section: team budgets budgets.manage (services/admin/handlers/router_billing.go:35); agent budgets agent_keys.manage (services/admin/handlers/router_keys.go:25); wallet reads credits gate (services/admin/handlers/credit_handlers.go:372); org caps budgets.manage in-handler (services/admin/handlers/caps_handlers.go:55, 404 :70, 403 :73); grace/output-cap orgBudgetAccess (services/admin/handlers/org_settings_handlers.go:93-97); reservations-mode root-only 403 (services/admin/handlers/org_settings_handlers.go:86); topup/low-balance root-only (services/admin/handlers/router_billing.go:72,75); spend-alert root-only (services/admin/handlers/router_billing.go:58-59)",
+      "server_grant": "mixed by section: team budgets budgets.manage (services/admin/handlers/router_billing.go:35); agent budgets agent_keys.manage (services/admin/handlers/router_keys.go:25); wallet reads credits gate (services/admin/handlers/credit_handlers.go:372); org caps budgets.manage in-handler (services/admin/handlers/caps_handlers.go:55, 404 :70, 403 :74); grace/output-cap orgBudgetAccess (services/admin/handlers/org_settings_handlers.go:93-97); reservations-mode root-only 403 (services/admin/handlers/org_settings_handlers.go:86); topup/low-balance root-only (services/admin/handlers/router_billing.go:72,75); spend-alert root-only (services/admin/handlers/router_billing.go:58-59)",
       "org_scope": "org-bound (root-only sections)",
       "bound_operations": [
         { "op": "GET/PUT/DELETE /api/teams/{id}/budget, GET /api/organizations/{id}/team-budgets", "cite": "services/admin/handlers/router_billing.go:36-39" },
@@ -376,27 +376,28 @@
       "route": "org-settings",
       "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:216" },
       "page": "web/dashboard/src/pages/OrgSettingsPage.tsx",
-      "server_grant": "root-session for the settings tabs (cache-settings services/admin/handlers/router_orgs.go:62; routing :66; policy-packs/residency :69-72; region services/admin/handlers/router_ops.go:30-31; MCP servers services/admin/handlers/router_mcp.go:16-20, per-agent grants :47-50, MC-1 server credential :54-56 (503 when the credential store is unwired); A2A :41-45; pricing services/admin/handlers/router_billing.go:62-67); org-permission keys.manage for BYOK provider credentials (services/admin/handlers/org_credentials.go:266); org-permission org.update for original-retention (services/admin/handlers/router_orgs.go:32)",
+      "server_grant": "root-session for the settings tabs (cache-settings services/admin/handlers/router_orgs.go:62; routing :66; policy-packs :70-72; residency :73-74; region services/admin/handlers/router_ops.go:30-31; MCP server list/update services/admin/handlers/router_mcp.go:17,:19 — this page calls no grant or credential routes, MC-1 belongs to the mcp-credentials route; A2A list/update :42,:44; pricing services/admin/handlers/router_billing.go:62-67); org-permission keys.manage for BYOK provider credentials (services/admin/handlers/org_credentials.go:266); org-permission org.update for original-retention (services/admin/handlers/router_orgs.go:32)",
       "org_scope": "mixed: root-only org-scoped settings; BYOK org-bound",
       "bound_operations": [
-        { "op": "GET/PATCH /api/organizations/{id}/cache-settings, routing, policy-packs, residency", "cite": "services/admin/handlers/router_orgs.go:62-72" },
+        { "op": "GET/PATCH /api/organizations/{id}/cache-settings, routing, policy-packs, residency", "cite": "services/admin/handlers/router_orgs.go:62-74" },
         { "op": "GET/PUT /api/organizations/{id}/region", "cite": "services/admin/handlers/router_ops.go:30-31" },
         { "op": "GET/PUT/DELETE /api/orgs/{id}/provider-credentials*", "cite": "services/admin/handlers/org_credentials.go:268-273" },
-        { "op": "GET/POST/PUT/DELETE /api/organizations/{id}/mcp/servers*, a2a/agents*", "cite": "services/admin/handlers/router_mcp.go:16-20" }
+        { "op": "GET /api/organizations/{id}/mcp/servers, PATCH .../mcp/servers/{name} (list + enable toggle); GET .../a2a/agents, PATCH .../a2a/agents/{name} (list + toggle)", "cite": "services/admin/handlers/router_mcp.go:17, :19, :42, :44" }
       ]
     },
     {
       "route": "mcp-credentials",
       "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:219" },
       "page": "web/dashboard/src/pages/McpCredentialsPage.tsx",
-      "server_grant": "unavailable for the registry read (route deliberately not registered as an MC-4 contract hole; the UI renders an explicit unavailable state on JSON 404 via services/admin/handlers/router.go:753); deployment-dependent for the gateway credential flows (agent-key authenticated, MC-3 per-user lazy authorization)",
-      "org_scope": "unavailable / deployment-dependent",
+      "server_grant": "root-session for the mounted admin surfaces the page drives — MC-1 server credentials (services/admin/handlers/router_mcp.go:54-56; callers web/dashboard/src/pages/McpCredentialsPage.tsx:307/:345/:362; 503 when the credential store is unwired) plus the server-registry and grant reads it rides (services/admin/handlers/router_mcp.go:17, :47); unavailable for the MC-4 user-credentials registry (route deliberately not registered; the UI renders an explicit unavailable state on JSON 404 via services/admin/handlers/router.go:753); deployment-dependent for the gateway credential flows (agent-key authenticated, MC-3 per-user lazy authorization)",
+      "org_scope": "mixed: mounted admin calls org-bound (root-only); MC-4 registry unavailable; gateway flows deployment-dependent",
       "bound_operations": [
+        { "op": "GET/PUT/DELETE /api/organizations/{id}/mcp/servers/{name}/credential (MC-1, mounted; callers McpCredentialsPage.tsx:307/:345/:362)", "cite": "services/admin/handlers/router_mcp.go:54-56" },
         { "op": "GET/DELETE /api/organizations/{id}/mcp/user-credentials (unmounted)", "cite": "web/dashboard/src/api/mcpCredentials.ts" },
         { "op": "POST /api/mcp/credentials/{server} (gateway plane)", "cite": "pkg/gateway/gateway.go:2011" },
         { "op": "POST /api/mcp/auth/{server}/begin (gateway plane)", "cite": "pkg/gateway/gateway.go:2012" }
       ],
-      "notes": "See warts.mcp-credential-endpoints; the admin-side MC-1 server credential (one per server, root-only, org-scoped) IS mounted and belongs to the org-settings route (services/admin/handlers/router_mcp.go:54-56)."
+      "notes": "See warts.mcp-credential-endpoints; the admin-side MC-1 server credential (one per server, root-only, org-scoped) IS mounted (services/admin/handlers/router_mcp.go:54-56) and THIS page is its dashboard caller (web/dashboard/src/pages/McpCredentialsPage.tsx:307/:345/:362); org-settings calls only the server list/update endpoints (services/admin/handlers/router_mcp.go:17/:19)."
     },
     {
       "route": "rates",
@@ -440,7 +441,7 @@
       "auth": "session+CSRF surface; the CLI sends X-Admin-Key which that surface does not accept (see warts.pricing-sync-credential)",
       "grant": "root-session (intended)",
       "org_scope": "orgless",
-      "ui": "none (yb pricing sync)",
+      "ui": "capability is CLI-only (yb pricing sync); the endpoints themselves have dashboard callers for other purposes — GET /api/models serves the models page, the /api/pricing CRUD family serves the org-settings pricing tab — but no dashboard screen drives the sync, and the import itself has no dashboard caller",
       "endpoints": [
         { "op": "GET /api/models (registry read for the catalog map)", "cite": "pkg/trcli/pricing_sync.go:179" },
         { "op": "POST /api/pricing/import?mode=apply", "cite": "pkg/trcli/pricing_sync.go:201", "server_mount": "services/admin/handlers/router_billing.go:64" }
@@ -584,7 +585,7 @@
       "org_scope": "org-bound",
       "ui": "none (token lifecycle is the members route; the protocol itself serves IdP clients)",
       "endpoints": [
-        { "op": "/scim/v2 Users, Groups, ResourceTypes, Schemas, ServiceProviderConfig (15 endpoints)", "cite": "services/admin/handlers/router_scim.go:19" }
+        { "op": "/scim/v2 ServiceProviderConfig, Schemas, ResourceTypes, Users (6), Groups (5) — 14 endpoints; no /Me or /Bulk routes", "cite": "services/admin/handlers/router_scim.go:20" }
       ]
     },
     {
@@ -604,7 +605,7 @@
       "claim": "A non-root session cannot read the root-only aggregates",
       "probe": "GET /api/analytics/savings without the root flag",
       "expected": "403 forbidden",
-      "denial_path": "pkg/adminauth/auth.go:471 via the root group chain (services/admin/handlers/router.go:770-771) under mountAnalyticsRoot (services/admin/handlers/router_analytics.go:57)",
+      "denial_path": "pkg/adminauth/auth.go:471 via the root group chain (services/admin/handlers/router.go:770) under mountAnalyticsRoot (services/admin/handlers/router_analytics.go:57)",
       "routes": ["overview", "cost", "cache", "classifier", "compare"]
     },
     {
@@ -661,8 +662,8 @@
     },
     {
       "id": "mcp-credential-endpoints",
-      "fact": "The mcp-credentials screen targets GET/DELETE /api/organizations/{id}/mcp/user-credentials, which is deliberately not registered (MC-4 contract hole; the UI renders an explicit unavailable state on 404), and the gateway flows POST /api/mcp/credentials/{server}, POST /api/mcp/auth/{server}/begin exist only on deployments exposing the gateway plane.",
-      "cites": ["services/admin/handlers/router.go:753", "services/admin/handlers/ui_actions_inventory_test.go:848", "pkg/gateway/gateway.go:2011", "pkg/gateway/gateway.go:2012", "web/dashboard/src/api/mcpCredentials.ts"]
+      "fact": "The mcp-credentials screen targets GET/DELETE /api/organizations/{id}/mcp/user-credentials, which is deliberately not registered (MC-4 contract hole; the UI renders an explicit unavailable state on 404), and the gateway flows POST /api/mcp/credentials/{server}, POST /api/mcp/auth/{server}/begin exist only on deployments exposing the gateway plane. The admin-side MC-1 server credential IS mounted (router_mcp.go:54-56); its dashboard caller is the mcp-credentials screen, not org-settings (McpCredentialsPage.tsx:307/:345/:362; OrgSettingsPage calls only listMcpServers/updateMcpServer at router_mcp.go:17/:19).",
+      "cites": ["services/admin/handlers/router.go:753", "services/admin/handlers/ui_actions_inventory_test.go:848", "pkg/gateway/gateway.go:2011", "pkg/gateway/gateway.go:2012", "web/dashboard/src/api/mcpCredentials.ts", "services/admin/handlers/router_mcp.go:54-56", "web/dashboard/src/pages/McpCredentialsPage.tsx:307", "web/dashboard/src/pages/McpCredentialsPage.tsx:345", "web/dashboard/src/pages/McpCredentialsPage.tsx:362", "services/admin/handlers/router_mcp.go:17", "services/admin/handlers/router_mcp.go:19"]
     },
     {
       "id": "pricing-sync-credential",
@@ -682,10 +683,10 @@
   ],
   "counts": {
     "routes_total": 36,
-    "routes_with_bound_operations": 34,
-    "routes_launcher_or_unavailable": 2,
+    "routes_with_bound_operations": 35,
+    "routes_launcher_or_unavailable": 1,
     "cli_config_groups": 17,
-    "cli_config_endpoints": 63,
+    "cli_config_endpoints": 62,
     "negative_controls": 6,
     "warts": 5
   }
