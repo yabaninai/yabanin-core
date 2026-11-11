@@ -1,0 +1,692 @@
+{
+  "schema": "yabanin.ui-grant-scope-matrix/1",
+  "generated": "2026-11-10",
+  "base_commit": "243ab5b34d04ba0e83fb10df7b206f88e42629d7",
+  "citation_policy": "Every file:line citation in this matrix and its markdown mirror resolves exactly at the recorded base commit (HEAD of the worktree when generated). Citations point at registrations, guards or denial paths in the server implementation, never at UI labels alone.",
+  "derivation": "Grant and scope facts are derived from the admin server's mount and middleware chain (services/admin/handlers/router.go and the per-domain mount files) plus the guard helpers they invoke. The dashboard nav gates (web/dashboard/src/App.tsx NAV_SECTIONS) are recorded as UI facts and cross-checked against the server chain; where they disagree, the server chain is authoritative and the disagreement is listed under warts.",
+  "grant_vocabulary": {
+    "root-session": "Admin session with the root flag; enforced by adminauth.MustBeRoot (pkg/adminauth/auth.go:466, 403 at pkg/adminauth/auth.go:471).",
+    "org-permission": "Root passes; otherwise the caller's role on the target org must carry the permission (services/admin/handlers/roles_authz.go:138; 400 'org target required' at services/admin/handlers/roles_authz.go:147; 403 'insufficient permission for this organization' at services/admin/handlers/roles_authz.go:152). Permission constants: pkg/adminstore/permissions.go:37-58.",
+    "org-role": "Root passes; otherwise the caller's org role must rank at or above the minimum (services/admin/handlers/roles_authz.go:113; 403 at services/admin/handlers/roles_authz.go:127). Roles: pkg/adminstore/roles.go:24-32.",
+    "global-audit-role": "Root or a root-authorized platform security_auditor global role; org memberships are deliberately not consulted (services/admin/handlers/roles_authz.go:186; 403 at services/admin/handlers/roles_authz.go:204).",
+    "any-admin-session": "Any authenticated admin session; no org or root gate beyond the session + CSRF chain (services/admin/handlers/router.go:747-748).",
+    "internal-service-key": "X-Admin-Key header compared in constant time; only the /internal group accepts it (services/admin/handlers/internal_api.go:28, pkg/adminauth/auth.go:496).",
+    "scim-bearer": "SCIM bearer token issued per org via the members-manage admin surface (services/admin/handlers/router_scim.go:48-50).",
+    "api-key": "Gateway API-key data plane, outside the admin session surface (services/admin/handlers/router_ops.go:85)."
+  },
+  "org_scope_vocabulary": {
+    "org-bound": "The target org is part of the request (path param or org_id query); a foreign org is rejected or hidden.",
+    "orgless": "No org dimension: the resource is platform-global.",
+    "cross-org": "The response aggregates multiple orgs.",
+    "unavailable": "Registered in the route inventory but not mounted at the recorded commit; the protected router answers a JSON 404 (services/admin/handlers/router.go:753).",
+    "deployment-dependent": "Mounted and guarded, but only reachable when a gateway deployment exposes the plane.",
+    "none": "The page performs no API calls (launcher)."
+  },
+  "session_chain": {
+    "protected": "Session re-validation (services/admin/handlers/router.go:747) + CSRF (services/admin/handlers/router.go:748); every dashboard route below rides this chain before its specific grant.",
+    "root-group": "Single root CRUD group: adminauth.MustBeRoot (services/admin/handlers/router.go:770-771) + OrgScopeMiddleware for org-scoped mutations (services/admin/handlers/router.go:777)."
+  },
+  "routes": [
+    {
+      "route": "overview",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:117" },
+      "page": "web/dashboard/src/pages/OverviewPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/analytics/savings", "cite": "services/admin/handlers/router_analytics.go:68" }
+      ],
+      "notes": "Root-only savings aggregate; the screen's per-org breakdown passes an org filter but the gate stays root (mountAnalyticsRoot rides the root group, services/admin/handlers/router.go:783)."
+    },
+    {
+      "route": "cost",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:118" },
+      "page": "web/dashboard/src/pages/CostDashboard.tsx",
+      "server_grant": "root-session",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/analytics/{org_id}/cost", "cite": "services/admin/handlers/router_analytics.go:66" },
+        { "op": "GET /api/analytics/cost/global", "cite": "services/admin/handlers/router_analytics.go:67" }
+      ],
+      "notes": "Hook web/dashboard/src/pages/hooks/useCostReport.ts:33 builds the org cost query."
+    },
+    {
+      "route": "compare",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:138" },
+      "page": "web/dashboard/src/pages/ComparePage.tsx",
+      "server_grant": "root-session (headline reports); org-permission analytics.read for the latency series",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/analytics/shadow", "cite": "services/admin/handlers/router_analytics.go:70" },
+        { "op": "GET /api/analytics/quality", "cite": "services/admin/handlers/router_analytics.go:73" },
+        { "op": "GET /api/analytics/latency (org-scoped, analytics.read)", "cite": "services/admin/handlers/router_analytics.go:24" }
+      ],
+      "notes": "Mixed screen on a root-only nav entry: shadow/quality are root aggregates while latency is the org-scoped endpoint; root satisfies both."
+    },
+    {
+      "route": "credits",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["budgets.manage"], "cite": "web/dashboard/src/App.tsx:121" },
+      "page": "web/dashboard/src/pages/CreditsPage.tsx",
+      "server_grant": "org-permission budgets.manage via RequireOrgPermissionCreditsRead (root passes; non-member 404 at services/admin/handlers/credit_handlers.go:386; member without budgets.manage 403 at services/admin/handlers/credit_handlers.go:390); ledger/budgets/units via currenciesBudgetsRead (non-member 404 services/admin/handlers/currencies_handlers.go:134; member without budgets.manage 403 services/admin/handlers/currencies_handlers.go:138)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/orgs/{id}/credits/balance|transactions", "cite": "services/admin/handlers/router_billing.go:47-48" },
+        { "op": "GET /api/credits/ledger", "cite": "services/admin/handlers/currencies_handlers.go:114" },
+        { "op": "GET /api/budgets, GET /api/units/spend", "cite": "services/admin/handlers/currencies_handlers.go:112-113" }
+      ]
+    },
+    {
+      "route": "classifier",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:145" },
+      "page": "web/dashboard/src/pages/ClassifierPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/analytics/savings", "cite": "services/admin/handlers/router_analytics.go:68" }
+      ],
+      "notes": "The classifier feedback collector data plane is POST /v1/feedback (API-key, services/admin/handlers/router_ops.go:85), listed under cli_config_only."
+    },
+    {
+      "route": "cache",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:144" },
+      "page": "web/dashboard/src/pages/CachePage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/analytics/savings (savings view)", "cite": "services/admin/handlers/router_analytics.go:68" }
+      ],
+      "notes": "The cache management endpoints (flush/warm/experiments) have no dashboard caller; see cli_config_only group cache-ops."
+    },
+    {
+      "route": "feedback",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:147" },
+      "page": "web/dashboard/src/pages/FeedbackPage.tsx",
+      "server_grant": "root-session (owner list/export group mounts only when the feedback lister is wired)",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/feedback", "cite": "services/admin/handlers/router_ops.go:68" },
+        { "op": "GET /api/feedback/export", "cite": "services/admin/handlers/router_ops.go:69" }
+      ]
+    },
+    {
+      "route": "orgs",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:207" },
+      "page": "web/dashboard/src/pages/OrgsPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET/POST /api/organizations, GET/PUT/DELETE /api/organizations/{id}", "cite": "services/admin/handlers/router_orgs.go:41-45" }
+      ]
+    },
+    {
+      "route": "keys",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["keys.manage", "agent_keys.manage"], "cite": "web/dashboard/src/App.tsx:155" },
+      "page": "web/dashboard/src/pages/KeysPage.tsx",
+      "server_grant": "org-permission keys.manage for /api/api-keys* (services/admin/handlers/router_keys.go:16); org-permission agent_keys.manage for /api/agent-keys* (services/admin/handlers/router_keys.go:25); root-session for /api/agent-profiles* (services/admin/handlers/router_keys.go:47-48)",
+      "org_scope": "org-bound (profiles orgless-root)",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/api-keys*", "cite": "services/admin/handlers/router_keys.go:17-23" },
+        { "op": "GET/POST /api/agent-keys*, budgets, delegations", "cite": "services/admin/handlers/router_keys.go:26-40" },
+        { "op": "GET/POST /api/agent-profiles*", "cite": "services/admin/handlers/router_keys.go:47-51" }
+      ]
+    },
+    {
+      "route": "agents",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["keys.manage", "agent_keys.manage"], "cite": "web/dashboard/src/App.tsx:158" },
+      "page": "web/dashboard/src/pages/AgentsPage.tsx",
+      "server_grant": "any-admin-session for the config render (stateless templates; services/admin/handlers/router_console.go:41); key lookups per keys.manage",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET /api/client-config/{agent}", "cite": "services/admin/handlers/router_console.go:41" }
+      ]
+    },
+    {
+      "route": "budgets",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["budgets.manage", "agent_keys.manage", "analytics.read"], "cite": "web/dashboard/src/App.tsx:162" },
+      "page": "web/dashboard/src/pages/BudgetsPage.tsx",
+      "server_grant": "mixed by section: team budgets budgets.manage (services/admin/handlers/router_billing.go:35); agent budgets agent_keys.manage (services/admin/handlers/router_keys.go:25); wallet reads credits gate (services/admin/handlers/credit_handlers.go:372); org caps budgets.manage in-handler (services/admin/handlers/caps_handlers.go:55, 404 :70, 403 :73); grace/output-cap orgBudgetAccess (services/admin/handlers/org_settings_handlers.go:93-97); reservations-mode root-only 403 (services/admin/handlers/org_settings_handlers.go:86); topup/low-balance root-only (services/admin/handlers/router_billing.go:72,75); spend-alert root-only (services/admin/handlers/router_billing.go:58-59)",
+      "org_scope": "org-bound (root-only sections)",
+      "bound_operations": [
+        { "op": "GET/PUT/DELETE /api/teams/{id}/budget, GET /api/organizations/{id}/team-budgets", "cite": "services/admin/handlers/router_billing.go:36-39" },
+        { "op": "GET/PUT/DELETE /api/agent-keys/{id}/budget", "cite": "services/admin/handlers/router_keys.go:32-34" },
+        { "op": "GET/PUT /api/orgs/{id}/caps", "cite": "services/admin/handlers/caps_handlers.go:49-50" },
+        { "op": "GET/PUT /api/orgs/{id}/credits/grace, PUT output-cap, PUT reservations-mode", "cite": "services/admin/handlers/org_settings_handlers.go:65-68" }
+      ]
+    },
+    {
+      "route": "models",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:185" },
+      "page": "web/dashboard/src/pages/ModelsPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/models*, /api/model-aliases*", "cite": "services/admin/handlers/router_models.go:13-20" }
+      ]
+    },
+    {
+      "route": "rules",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:186" },
+      "page": "web/dashboard/src/pages/rules/RulesPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/rules*, POST /api/rules/preview", "cite": "services/admin/handlers/router_models.go:25-31" }
+      ]
+    },
+    {
+      "route": "routing-map",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["routing.manage"], "cite": "web/dashboard/src/App.tsx:189" },
+      "page": "web/dashboard/src/pages/RoutingMapPage.tsx",
+      "server_grant": "in-handler requireOrgRead with routing.manage for the map (root passes; foreign org or member without the permission 404 at services/admin/handlers/routing_map.go:39) and analytics.read for provider health",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/routing/map", "cite": "services/admin/handlers/router_models.go:51" },
+        { "op": "GET /api/providers/health (analytics.read)", "cite": "services/admin/handlers/router_models.go:57" }
+      ]
+    },
+    {
+      "route": "lineage",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["lineage.read"], "cite": "web/dashboard/src/App.tsx:137" },
+      "page": "web/dashboard/src/pages/LineagePage.tsx",
+      "server_grant": "org-permission lineage.read (services/admin/handlers/router_analytics.go:48); verify needs lineage.verify (services/admin/handlers/router_analytics.go:51)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/lineage/{request_id}, GET /api/organizations/{id}/lineage", "cite": "services/admin/handlers/router_analytics.go:49-50" },
+        { "op": "POST /api/lineage/{request_id}/verify", "cite": "services/admin/handlers/router_analytics.go:51" }
+      ]
+    },
+    {
+      "route": "requests-explorer",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["requests.read"], "cite": "web/dashboard/src/App.tsx:127" },
+      "page": "web/dashboard/src/pages/RequestExplorerPage.tsx",
+      "server_grant": "org-permission requests.read",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/organizations/{id}/requests, /requests/stats, /requests/{request_id}", "cite": "services/admin/handlers/router_analytics.go:42-46" }
+      ],
+      "notes": "Registered /requests/export and /requests/archive-search (services/admin/handlers/router_analytics.go:44-45) have no dashboard caller at this commit; see cli_config_only group requests-archive-exports. Payload originals carry a stricter grant handled inside the request store layer."
+    },
+    {
+      "route": "analytics",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["analytics.read"], "cite": "web/dashboard/src/App.tsx:128" },
+      "page": "web/dashboard/src/pages/AnalyticsExplorerPage.tsx",
+      "server_grant": "org-permission analytics.read (group at services/admin/handlers/router_analytics.go:18); the CSV savings button rides the root-only savings endpoint (services/admin/handlers/router_analytics.go:68)",
+      "org_scope": "org-bound (savings export root-only)",
+      "bound_operations": [
+        { "op": "GET /api/analytics/stats, time-series, top-models, error-breakdown, recent-errors, query, label-keys; views CRUD", "cite": "services/admin/handlers/router_analytics.go:19-31" }
+      ]
+    },
+    {
+      "route": "dashboards",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:133" },
+      "page": "web/dashboard/src/pages/DashboardsPage.tsx",
+      "server_grant": "root-session (GET /api/organizations/{id} is root-only at services/admin/handlers/router_orgs.go:43; nav comment records the wart)",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/organizations/{id}", "cite": "services/admin/handlers/router_orgs.go:43" }
+      ]
+    },
+    {
+      "route": "tool-calls",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:135" },
+      "page": "web/dashboard/src/pages/ToolCallsPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "org-bound via {id} path param, root-only gate",
+      "bound_operations": [
+        { "op": "GET /api/organizations/{id}/tool-calls", "cite": "services/admin/handlers/router_analytics.go:60" }
+      ]
+    },
+    {
+      "route": "tasks",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["analytics.read"], "cite": "web/dashboard/src/App.tsx:134" },
+      "page": "web/dashboard/src/pages/TasksPage.tsx",
+      "server_grant": "org-permission analytics.read (group at services/admin/handlers/router_analytics.go:18)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/analytics/tasks", "cite": "services/admin/handlers/router_analytics.go:23" }
+      ],
+      "notes": "Per-group cost/counterfactual/savings report; caller web/dashboard/src/api/analytics.ts:270."
+    },
+    {
+      "route": "tool-policy",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:190" },
+      "page": "web/dashboard/src/pages/ToolPolicyPage.tsx",
+      "server_grant": "root-session (root group + org scope S01)",
+      "org_scope": "org-bound (org-scoped mutations; root operator)",
+      "bound_operations": [
+        { "op": "GET/POST/PATCH/DELETE /api/organizations/{id}/tool-policies*, POST /api/tool-policies alias", "cite": "services/admin/handlers/router_mcp.go:30-37" }
+      ]
+    },
+    {
+      "route": "policy-editor",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["policies.manage"], "cite": "web/dashboard/src/App.tsx:193" },
+      "page": "web/dashboard/src/pages/PolicyEditorPage.tsx",
+      "server_grant": "org-permission policies.manage (RequireOrgPermissionPoliciesManage, services/admin/handlers/policy_pipelines.go:126)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/organizations/{id}/policies*, /policies/validate, /policies/drift", "cite": "services/admin/handlers/policy_pipelines.go:161-170" }
+      ]
+    },
+    {
+      "route": "policy-decisions",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["policies.manage"], "cite": "web/dashboard/src/App.tsx:196" },
+      "page": "web/dashboard/src/pages/PolicyDecisionsPage.tsx",
+      "server_grant": "org-permission policies.manage (same gate as policy pipelines)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/organizations/{id}/policy-decisions", "cite": "services/admin/handlers/policy_decisions.go:67" }
+      ]
+    },
+    {
+      "route": "prompts",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["policies.manage"], "cite": "web/dashboard/src/App.tsx:198" },
+      "page": "web/dashboard/src/pages/prompts/PromptsPage.tsx",
+      "server_grant": "org-permission policies.manage (services/admin/handlers/prompt_studio.go:113)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/organizations/{id}/prompts*, /partials*", "cite": "services/admin/handlers/prompt_studio.go:114-123" }
+      ]
+    },
+    {
+      "route": "label-policy",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["analytics.read"], "cite": "web/dashboard/src/App.tsx:200" },
+      "page": "web/dashboard/src/pages/LabelPolicyPage.tsx",
+      "server_grant": "org-permission analytics.read for read/test (services/admin/handlers/router_analytics.go:32-33); policies.manage for write (services/admin/handlers/router_analytics.go:34-35)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET /api/label-policy, POST /api/label-policy/test", "cite": "services/admin/handlers/router_analytics.go:32-33" },
+        { "op": "PUT/DELETE /api/label-policy", "cite": "services/admin/handlers/router_analytics.go:34-35" }
+      ]
+    },
+    {
+      "route": "guardrails",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["analytics.read"], "cite": "web/dashboard/src/App.tsx:179" },
+      "page": "web/dashboard/src/pages/GuardrailsPage.tsx",
+      "server_grant": "none (launcher; per-card links carry their own gates)",
+      "org_scope": "none",
+      "bound_operations": [],
+      "notes": "The screen fetches nothing; the server stays the arbiter behind every linked surface."
+    },
+    {
+      "route": "guard-packs",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:184" },
+      "page": "web/dashboard/src/pages/GuardPacksPage.tsx",
+      "server_grant": "root-session (guard mount rides the root group; services/admin/handlers/guardpacks.go:117); the activation audit list rides global-audit-role (services/admin/handlers/router_audit.go:19)",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET /api/guard-packs, /status; POST validate/simulate/activate/rollback", "cite": "services/admin/handlers/guardpacks.go:118-123" },
+        { "op": "GET /api/audit-logs (activation journal)", "cite": "services/admin/handlers/router_audit.go:19" }
+      ]
+    },
+    {
+      "route": "audit-log",
+      "nav_gate": { "kind": "anyOrgRole", "roles": ["security_auditor"], "cite": "web/dashboard/src/App.tsx:211" },
+      "page": "web/dashboard/src/pages/AuditLogPage.tsx",
+      "server_grant": "global-audit-role (services/admin/handlers/roles_authz.go:186; 403 'insufficient role for the platform audit' at services/admin/handlers/roles_authz.go:204); the rollback mutations re-execute through each target endpoint's own gate",
+      "org_scope": "cross-org",
+      "bound_operations": [
+        { "op": "GET /api/audit-logs", "cite": "services/admin/handlers/router_audit.go:19" }
+      ]
+    },
+    {
+      "route": "exports",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["budgets.read"], "cite": "web/dashboard/src/App.tsx:163", "wart": "budgets.read is not a server permission; see warts.exports-nav-permission" },
+      "page": "web/dashboard/src/pages/ExportsPage.tsx",
+      "server_grant": "root-session for the bound spend-alert endpoints (services/admin/handlers/router_billing.go:58-59); team budgets budgets.manage (services/admin/handlers/router_billing.go:36-39)",
+      "org_scope": "org-bound (spend-alert root-only)",
+      "bound_operations": [
+        { "op": "GET/PATCH /api/organizations/{id}/spend-alert", "cite": "services/admin/handlers/router_billing.go:58-59" }
+      ],
+      "notes": "Because budgets.read is never served in /api/me, the nav item is effectively root-only in practice."
+    },
+    {
+      "route": "model-access",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:166" },
+      "page": "web/dashboard/src/pages/ModelAccessPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "orgless (per-key/team targets)",
+      "bound_operations": [
+        { "op": "GET/POST/DELETE /api/whitelist/api-keys/*, /api/whitelist/teams/*", "cite": "services/admin/handlers/router_keys.go:54-59" },
+        { "op": "GET /api/teams", "cite": "services/admin/handlers/router_orgs.go:48" }
+      ]
+    },
+    {
+      "route": "members",
+      "nav_gate": { "kind": "anyOrg", "permissions": ["members.manage"], "cite": "web/dashboard/src/App.tsx:167" },
+      "page": "web/dashboard/src/pages/MembersPage.tsx",
+      "server_grant": "org-permission members.manage (services/admin/handlers/router_orgs.go:15); SCIM tokens same gate (services/admin/handlers/router_scim.go:47)",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/organizations/{id}/members*, invites", "cite": "services/admin/handlers/router_orgs.go:16-25" },
+        { "op": "GET/POST/DELETE /api/organizations/{id}/scim/tokens*", "cite": "services/admin/handlers/router_scim.go:48-50" }
+      ],
+      "notes": "Developer management mounts only when the portal store is wired (services/admin/handlers/router_orgs.go:26-30)."
+    },
+    {
+      "route": "admin-users",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:212" },
+      "page": "web/dashboard/src/pages/AdminUsersPage.tsx",
+      "server_grant": "root-session",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET/POST/PUT/DELETE /api/admin-users*", "cite": "services/admin/handlers/router_orgs.go:55-59" }
+      ]
+    },
+    {
+      "route": "org-settings",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:216" },
+      "page": "web/dashboard/src/pages/OrgSettingsPage.tsx",
+      "server_grant": "root-session for the settings tabs (cache-settings services/admin/handlers/router_orgs.go:62; routing :66; policy-packs/residency :69-72; region services/admin/handlers/router_ops.go:30-31; MCP servers services/admin/handlers/router_mcp.go:16-20, per-agent grants :47-50, MC-1 server credential :54-56 (503 when the credential store is unwired); A2A :41-45; pricing services/admin/handlers/router_billing.go:62-67); org-permission keys.manage for BYOK provider credentials (services/admin/handlers/org_credentials.go:266); org-permission org.update for original-retention (services/admin/handlers/router_orgs.go:32)",
+      "org_scope": "mixed: root-only org-scoped settings; BYOK org-bound",
+      "bound_operations": [
+        { "op": "GET/PATCH /api/organizations/{id}/cache-settings, routing, policy-packs, residency", "cite": "services/admin/handlers/router_orgs.go:62-72" },
+        { "op": "GET/PUT /api/organizations/{id}/region", "cite": "services/admin/handlers/router_ops.go:30-31" },
+        { "op": "GET/PUT/DELETE /api/orgs/{id}/provider-credentials*", "cite": "services/admin/handlers/org_credentials.go:268-273" },
+        { "op": "GET/POST/PUT/DELETE /api/organizations/{id}/mcp/servers*, a2a/agents*", "cite": "services/admin/handlers/router_mcp.go:16-20" }
+      ]
+    },
+    {
+      "route": "mcp-credentials",
+      "nav_gate": { "kind": "rootOnly", "cite": "web/dashboard/src/App.tsx:219" },
+      "page": "web/dashboard/src/pages/McpCredentialsPage.tsx",
+      "server_grant": "unavailable for the registry read (route deliberately not registered as an MC-4 contract hole; the UI renders an explicit unavailable state on JSON 404 via services/admin/handlers/router.go:753); deployment-dependent for the gateway credential flows (agent-key authenticated, MC-3 per-user lazy authorization)",
+      "org_scope": "unavailable / deployment-dependent",
+      "bound_operations": [
+        { "op": "GET/DELETE /api/organizations/{id}/mcp/user-credentials (unmounted)", "cite": "web/dashboard/src/api/mcpCredentials.ts" },
+        { "op": "POST /api/mcp/credentials/{server} (gateway plane)", "cite": "pkg/gateway/gateway.go:2011" },
+        { "op": "POST /api/mcp/auth/{server}/begin (gateway plane)", "cite": "pkg/gateway/gateway.go:2012" }
+      ],
+      "notes": "See warts.mcp-credential-endpoints; the admin-side MC-1 server credential (one per server, root-only, org-scoped) IS mounted and belongs to the org-settings route (services/admin/handlers/router_mcp.go:54-56)."
+    },
+    {
+      "route": "rates",
+      "nav_gate": { "kind": "anySession", "cite": "web/dashboard/src/App.tsx:222" },
+      "page": "web/dashboard/src/pages/RatesPage.tsx",
+      "server_grant": "any-admin-session for the catalog read (services/admin/handlers/currencies_handlers.go:319); root-session for diff/promote (requireRootForRates, 403 at services/admin/handlers/currencies_handlers.go:151)",
+      "org_scope": "orgless",
+      "bound_operations": [
+        { "op": "GET /api/rates/catalog", "cite": "services/admin/handlers/currencies_handlers.go:115" },
+        { "op": "POST /api/rates/diff, /api/rates/promote", "cite": "services/admin/handlers/currencies_handlers.go:116-117" }
+      ]
+    },
+    {
+      "route": "onboarding",
+      "nav_gate": { "kind": "not-in-nav", "cite": "web/dashboard/src/App.tsx:69" },
+      "page": "web/dashboard/src/pages/OnboardingPage.tsx",
+      "server_grant": "org-role reader or above (root passes; foreign org 403) for the flow state; the walkthrough's key/credential/policy steps use those endpoints' own gates",
+      "org_scope": "org-bound",
+      "bound_operations": [
+        { "op": "GET/POST /api/me/onboarding", "cite": "services/admin/handlers/router_console.go:51-52" },
+        { "op": "POST /api/api-keys (step)", "cite": "services/admin/handlers/router_keys.go:18" },
+        { "op": "POST /api/orgs/{id}/provider-credentials (step)", "cite": "services/admin/handlers/org_credentials.go:269" }
+      ]
+    }
+  ],
+  "cli_config_only": [
+    {
+      "group": "cli-service-api",
+      "auth": "internal-service-key (config YABANIN_ADMIN_API_KEY; group unmounted when unset: services/admin/handlers/internal_api.go:24-28)",
+      "grant": "internal-service-key",
+      "org_scope": "org-bound",
+      "ui": "none (yb CLI / automation)",
+      "endpoints": [
+        { "op": "GET /internal/api-keys (yb keys list; mandatory org_id prevents cross-org listing)", "cite": "services/admin/handlers/internal_api.go:29", "cli_consumer": "pkg/trcli/keys.go:33" },
+        { "op": "GET /internal/analytics/savings (yb spend)", "cite": "services/admin/handlers/internal_api.go:30", "cli_consumer": "pkg/trcli/spend.go:23" },
+        { "op": "GET /internal/analytics/cost (automation; no yb consumer at this commit)", "cite": "services/admin/handlers/internal_api.go:31" }
+      ]
+    },
+    {
+      "group": "cli-pricing-sync",
+      "auth": "session+CSRF surface; the CLI sends X-Admin-Key which that surface does not accept (see warts.pricing-sync-credential)",
+      "grant": "root-session (intended)",
+      "org_scope": "orgless",
+      "ui": "none (yb pricing sync)",
+      "endpoints": [
+        { "op": "GET /api/models (registry read for the catalog map)", "cite": "pkg/trcli/pricing_sync.go:179" },
+        { "op": "POST /api/pricing/import?mode=apply", "cite": "pkg/trcli/pricing_sync.go:201", "server_mount": "services/admin/handlers/router_billing.go:64" }
+      ]
+    },
+    {
+      "group": "cache-ops",
+      "auth": "session+CSRF then root group",
+      "grant": "root-session",
+      "org_scope": "orgless",
+      "ui": "none",
+      "endpoints": [
+        { "op": "POST /api/cache/flush, GET /api/cache/analytics, POST /api/cache/warm", "cite": "services/admin/handlers/router_ops.go:18-20" },
+        { "op": "GET/POST /api/cache/experiments, GET results", "cite": "services/admin/handlers/router_ops.go:23-25" }
+      ]
+    },
+    {
+      "group": "regions-catalog",
+      "auth": "session+CSRF then root group",
+      "grant": "root-session",
+      "org_scope": "orgless",
+      "ui": "none (the per-org region endpoints are bound to the org-settings route)",
+      "endpoints": [
+        { "op": "GET /api/regions", "cite": "services/admin/handlers/router_ops.go:29" }
+      ]
+    },
+    {
+      "group": "verticals",
+      "auth": "session+CSRF then root group (wired unit)",
+      "grant": "root-session",
+      "org_scope": "org-bound",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET/POST/DELETE /api/organizations/{orgID}/verticals*", "cite": "services/admin/handlers/router_ops.go:36-38" }
+      ]
+    },
+    {
+      "group": "templates",
+      "auth": "session+CSRF then root group (wired unit)",
+      "grant": "root-session",
+      "org_scope": "org-bound / orgless mix (marketplace is global)",
+      "ui": "none",
+      "endpoints": [
+        { "op": "POST export, GET marketplace, PUT subscribe", "cite": "services/admin/handlers/router_ops.go:43-45" }
+      ]
+    },
+    {
+      "group": "retrain-status",
+      "auth": "session+CSRF then root group (wired unit)",
+      "grant": "root-session",
+      "org_scope": "orgless",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET /api/retrain/status", "cite": "services/admin/handlers/router_ops.go:74" }
+      ]
+    },
+    {
+      "group": "inventory",
+      "auth": "session+CSRF then root group; routes are dark (never registered) when the unit is unwired",
+      "grant": "root-session",
+      "org_scope": "org-bound",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET /api/organizations/{id}/inventory, POST import/mcp, POST import/models", "cite": "services/admin/handlers/router_inventory.go:52-54" }
+      ]
+    },
+    {
+      "group": "fleet-registry",
+      "auth": "session+CSRF then root group",
+      "grant": "root-session",
+      "org_scope": "org-bound",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET /api/organizations/{org_id}/fleet/installations[, /{deployment_id}]", "cite": "services/admin/handlers/fleet_handlers.go:232-233" }
+      ]
+    },
+    {
+      "group": "entitlement-diagnostics",
+      "auth": "session+CSRF then root group",
+      "grant": "root-session",
+      "org_scope": "orgless",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET /api/entitlement/diagnostics", "cite": "services/admin/handlers/entitlement_diagnostics_handlers.go:101" }
+      ]
+    },
+    {
+      "group": "sovereign-marketplace",
+      "auth": "session+CSRF then root group (wired unit)",
+      "grant": "root-session",
+      "org_scope": "orgless (policy rows are per org)",
+      "ui": "none",
+      "endpoints": [
+        { "op": "GET/PUT /api/sovereign/models*, GET/PUT /api/sovereign/policy/{org_id}", "cite": "services/admin/handlers/router_models.go:38-41" }
+      ]
+    },
+    {
+      "group": "resale-pricing",
+      "auth": "session+CSRF then root group (wired unit)",
+      "grant": "root-session",
+      "org_scope": "org-bound (list is cross-org)",
+      "ui": "none",
+      "endpoints": [
+        { "op": "PUT/GET /api/orgs/{id}/resale-pricing; GET/DELETE /api/reseller-pricing*", "cite": "services/admin/handlers/router_billing.go:78-82" }
+      ]
+    },
+    {
+      "group": "root-payload-grants",
+      "auth": "session+CSRF then MustBeRoot inline",
+      "grant": "root-session",
+      "org_scope": "orgless",
+      "ui": "none",
+      "endpoints": [
+        { "op": "POST /api/root/payload-grants", "cite": "services/admin/handlers/router_console.go:33" }
+      ]
+    },
+    {
+      "group": "requests-archive-exports",
+      "auth": "session+CSRF then org permission",
+      "grant": "org-permission requests.read",
+      "org_scope": "org-bound",
+      "ui": "none (registered explorer endpoints without a dashboard caller at this commit)",
+      "endpoints": [
+        { "op": "GET /api/organizations/{id}/requests/export, /requests/archive-search", "cite": "services/admin/handlers/router_analytics.go:44-45" }
+      ]
+    },
+    {
+      "group": "feedback-data-plane",
+      "auth": "gateway API key (not the admin session)",
+      "grant": "api-key",
+      "org_scope": "org-bound (resolves the caller's org)",
+      "ui": "none (data plane; the owner list is the feedback route)",
+      "endpoints": [
+        { "op": "POST /v1/feedback (mounted only when the collector is wired)", "cite": "services/admin/handlers/router_ops.go:85" }
+      ]
+    },
+    {
+      "group": "scim-protocol",
+      "auth": "per-org SCIM bearer token",
+      "grant": "scim-bearer",
+      "org_scope": "org-bound",
+      "ui": "none (token lifecycle is the members route; the protocol itself serves IdP clients)",
+      "endpoints": [
+        { "op": "/scim/v2 Users, Groups, ResourceTypes, Schemas, ServiceProviderConfig (15 endpoints)", "cite": "services/admin/handlers/router_scim.go:19" }
+      ]
+    },
+    {
+      "group": "developer-portal",
+      "auth": "opt-in portal config (SetPortal); portal session + portal CSRF",
+      "grant": "portal-session (developer identity)",
+      "org_scope": "org-bound",
+      "ui": "separate portal pages, not the dashboard",
+      "endpoints": [
+        { "op": "portal login/callback/home/keys pages; portalAuthed /api/me, /api/me/keys*", "cite": "services/admin/handlers/router_portal.go:15-27" }
+      ]
+    }
+  ],
+  "negative_controls": [
+    {
+      "id": "nc-root-aggregate",
+      "claim": "A non-root session cannot read the root-only aggregates",
+      "probe": "GET /api/analytics/savings without the root flag",
+      "expected": "403 forbidden",
+      "denial_path": "pkg/adminauth/auth.go:471 via the root group chain (services/admin/handlers/router.go:770-771) under mountAnalyticsRoot (services/admin/handlers/router_analytics.go:57)",
+      "routes": ["overview", "cost", "cache", "classifier", "compare"]
+    },
+    {
+      "id": "nc-org-permission",
+      "claim": "A member whose role lacks requests.read cannot read the explorer",
+      "probe": "GET /api/organizations/{id}/requests as org member without requests.read",
+      "expected": "403 insufficient permission for this organization (400 when no org target resolves)",
+      "denial_path": "services/admin/handlers/roles_authz.go:152 (and :147 for the missing target)",
+      "pinned_by": "services/admin/handlers/authz_test.go:67 (route x role x org matrix)",
+      "routes": ["requests-explorer"]
+    },
+    {
+      "id": "nc-global-audit",
+      "claim": "Org-granted security_auditor membership never admits the global journal",
+      "probe": "GET /api/audit-logs as an org security_auditor member (same or foreign org)",
+      "expected": "403 insufficient role for the platform audit",
+      "denial_path": "services/admin/handlers/roles_authz.go:204 (memberships are deliberately not consulted by the RequireGlobalAuditRead gate, services/admin/handlers/roles_authz.go:186)",
+      "pinned_by": "services/admin/handlers/audit_gate_auth01_test.go:50, services/admin/handlers/audit_gate_auth01_test.go:63, services/admin/handlers/audit_gate_auth01_test.go:100",
+      "routes": ["audit-log", "guard-packs"]
+    },
+    {
+      "id": "nc-hidden-routing-map",
+      "claim": "A foreign org (or a member without routing.manage) cannot distinguish the routing map of another org",
+      "probe": "GET /api/routing/map?org_id={foreign} without membership/permission",
+      "expected": "404 not found (membership-blind existence hiding, not 403)",
+      "denial_path": "services/admin/handlers/routing_map.go:39 (requireOrgRead, services/admin/handlers/routing_map.go:29)",
+      "pinned_by": "services/admin/handlers/routing_map_test.go:104 (rights matrix)",
+      "routes": ["routing-map"]
+    },
+    {
+      "id": "nc-credits-wallet",
+      "claim": "Wallet reads stay org-scoped: no membership hides the org, membership without budgets.manage is refused",
+      "probe": "GET /api/orgs/{id}/credits/balance as non-member, then as member without budgets.manage",
+      "expected": "404 not found; then 403 insufficient permission for this organization",
+      "denial_path": "services/admin/handlers/credit_handlers.go:386 (404) and :390 (403) inside RequireOrgPermissionCreditsRead (services/admin/handlers/credit_handlers.go:372)",
+      "pinned_by": "services/admin/handlers/credits_org_view_test.go",
+      "routes": ["credits", "budgets"]
+    },
+    {
+      "id": "nc-rates-mutation",
+      "claim": "Rates catalog mutations are root-only and require a well-formed root session",
+      "probe": "POST /api/rates/promote as a non-root session",
+      "expected": "403 root session is required for the rates catalog",
+      "denial_path": "services/admin/handlers/currencies_handlers.go:151 (requireRootForRates at services/admin/handlers/currencies_handlers.go:147; promote mounted at services/admin/handlers/currencies_handlers.go:117)",
+      "pinned_by": "services/admin/handlers/currencies_handlers_test.go:534 (root happy path) and :713 (sibling diff op fails closed)",
+      "routes": ["rates"]
+    }
+  ],
+  "warts": [
+    {
+      "id": "exports-nav-permission",
+      "fact": "The exports nav gate references budgets.read, which no server permission defines; /api/me never serves it, so the entry is hidden for every non-root admin and the bound spend-alert endpoints are root-only anyway.",
+      "cites": ["web/dashboard/src/App.tsx:163", "web/dashboard/src/App.navGates.test.ts:43", "pkg/adminstore/permissions.go:37-58"]
+    },
+    {
+      "id": "mcp-credential-endpoints",
+      "fact": "The mcp-credentials screen targets GET/DELETE /api/organizations/{id}/mcp/user-credentials, which is deliberately not registered (MC-4 contract hole; the UI renders an explicit unavailable state on 404), and the gateway flows POST /api/mcp/credentials/{server}, POST /api/mcp/auth/{server}/begin exist only on deployments exposing the gateway plane.",
+      "cites": ["services/admin/handlers/router.go:753", "services/admin/handlers/ui_actions_inventory_test.go:848", "pkg/gateway/gateway.go:2011", "pkg/gateway/gateway.go:2012", "web/dashboard/src/api/mcpCredentials.ts"]
+    },
+    {
+      "id": "pricing-sync-credential",
+      "fact": "yb pricing sync sends the X-Admin-Key service key against GET /api/models and POST /api/pricing/import, but only the /internal group accepts that header; the session surface answers 401. The command needs a server-side resolution (internal mirrors or documented session use).",
+      "cites": ["pkg/trcli/pricing_sync.go:179", "pkg/trcli/pricing_sync.go:201", "services/admin/handlers/internal_api.go:28", "services/admin/handlers/router.go:747"]
+    },
+    {
+      "id": "requests-export-no-caller",
+      "fact": "GET /api/organizations/{id}/requests/export and /requests/archive-search are registered and requests.read-gated but no dashboard module calls them at this commit.",
+      "cites": ["services/admin/handlers/router_analytics.go:44-45"]
+    },
+    {
+      "id": "guard-packs-cross-gate-read",
+      "fact": "The guard-packs screen also lists the audit journal (root group plus global-audit-role); a platform security_auditor without root can see the journal through this screen but not the guard-pack endpoints themselves.",
+      "cites": ["web/dashboard/src/pages/GuardPacksPage.tsx:11", "services/admin/handlers/router_audit.go:19", "services/admin/handlers/guardpacks.go:118-123"]
+    }
+  ],
+  "counts": {
+    "routes_total": 36,
+    "routes_with_bound_operations": 34,
+    "routes_launcher_or_unavailable": 2,
+    "cli_config_groups": 17,
+    "cli_config_endpoints": 63,
+    "negative_controls": 6,
+    "warts": 5
+  }
+}
