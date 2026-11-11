@@ -421,7 +421,9 @@ func TestTimeout_ClientCancelLatchesWriter(t *testing.T) {
 	if err := <-late; !errors.Is(err, http.ErrHandlerTimeout) {
 		t.Fatalf("late Write after client cancel must be rejected with ErrHandlerTimeout, got %v", err)
 	}
-	<-late // WriteHeader attempt observed (no error channel)
+	if err := <-late; err != nil { // WriteHeader arrival signal; nil by contract
+		t.Errorf("WriteHeader signal must be nil, got %v", err)
+	}
 	<-served
 
 	if rec.Body.Len() != 0 {
