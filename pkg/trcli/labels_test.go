@@ -14,6 +14,10 @@ import (
 )
 
 func TestLabelsShowFormats(t *testing.T) {
+	// Goldens carry fixture labels only; scrub the CI detectors so a
+	// runner's GITHUB_*/GITLAB_* environment cannot prepend ci.* labels.
+	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("GITLAB_CI", "")
 	dir := t.TempDir()
 	cases := []string{"header", "json", "env", "github", "gitlab"}
 	for _, format := range cases {
@@ -92,6 +96,10 @@ func TestLabelsExplainServerPolicy(t *testing.T) {
 }
 
 func TestLabelsShowMissingRequiredExitCode(t *testing.T) {
+	// On a CI runner the extracted context can derive `issue` from the PR
+	// title, which would satisfy require:[issue] and skip the exit-3 path.
+	t.Setenv("GITHUB_ACTIONS", "")
+	t.Setenv("GITLAB_CI", "")
 	dir := t.TempDir()
 	profile := filepath.Join(dir, "p.yml")
 	body := "version: 1\nrequire: [issue]\non_missing: fail\n"

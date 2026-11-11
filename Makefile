@@ -101,11 +101,11 @@ GO_BIN := $(shell go env GOPATH)/bin
 MODULE_GO_VERSION := $(shell awk '/^go /{print "go" $$2; exit}' go.mod)
 GOLANGCI_BIN := $(GO_BIN)/golangci-lint
 GOVULNCHECK_BIN := $(GO_BIN)/govulncheck
-GOLANGCI_VERSION := v2.14.0
+GOLANGCI_VERSION := v2.15.0
 GOVULNCHECK_VERSION := v1.6.0
 
 install-analysis-tools: ## Install pinned golangci-lint and govulncheck
-	@if ! $(GOLANGCI_BIN) version 2>/dev/null | grep -q "2.14.0"; then \
+	@if ! $(GOLANGCI_BIN) version 2>/dev/null | grep -q "2.15.0"; then \
 		echo "Installing golangci-lint $(GOLANGCI_VERSION)..."; \
 		go install github.com/golangci/golangci-lint/v2/cmd/golangci-lint@$(GOLANGCI_VERSION); \
 	fi

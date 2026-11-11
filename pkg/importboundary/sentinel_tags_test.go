@@ -211,7 +211,9 @@ func writeScratchFile(t *testing.T, path, content string) {
 // a regression pin, and it is the same instrument that decides whether a
 // dependency used only under build tags stays required (depcheck platform
 // scope, scripts/quality/depcheck.py) — so tagged-only dependency creep
-// cannot land silently next to the tag matrix.
+// cannot land silently next to the tag matrix. A scratch-module negative
+// control pins the drift contract itself: unused require ⇒ rc!=0 with the
+// diff on stdout.
 func TestGoModTidyDiffRider(t *testing.T) {
 	root := findModuleRoot(t)
 	goTool, err := exec.LookPath("go")
@@ -222,15 +224,43 @@ func TestGoModTidyDiffRider(t *testing.T) {
 	defer cancel()
 	cmd := exec.CommandContext(ctx, goTool, "mod", "tidy", "-diff") //nolint:gosec // G204: goTool resolves via LookPath and the arguments are literals; test-only rider
 	cmd.Dir = root
-	var out bytes.Buffer
-	cmd.Stdout = &out
-	cmd.Stderr = &out
+	// Only stdout carries the drift diff; stderr holds cold-cache
+	// "go: downloading" chatter that must not fail a tidy tree.
+	var diff, chatter bytes.Buffer
+	cmd.Stdout = &diff
+	cmd.Stderr = &chatter
 	if err := cmd.Run(); err != nil {
-		t.Fatalf("importboundary: go mod tidy -diff reported drift or failed (rc=%v):\n%s", err, out.String())
+		t.Fatalf("importboundary: go mod tidy -diff reported drift or failed (rc=%v):\n%s\n%s", err, diff.String(), chatter.String())
 	}
-	if drift := out.String(); drift != "" {
+	if drift := diff.String(); drift != "" {
 		t.Fatalf("importboundary: go mod tidy -diff output must be empty on a tidy tree:\n%s", drift)
 	}
+
+	// Negative control: deliberate drift — an unused require resolved by a
+	// local replace, so the probe is fully offline — must exit non-zero with
+	// the diff on stdout, the same channel the positive arm pins as empty.
+	t.Run("scratch drift surfaces on stdout", func(t *testing.T) {
+		dir := t.TempDir()
+		writeScratchFile(t, filepath.Join(dir, "go.mod"),
+			"module example.com/tidy-drift-scratch\n\ngo 1.27\n\nrequire example.com/unused v0.0.0\n\nreplace example.com/unused => ./unused\n")
+		writeScratchFile(t, filepath.Join(dir, "unused", "go.mod"),
+			"module example.com/unused\n\ngo 1.27\n")
+		writeScratchFile(t, filepath.Join(dir, "unused", "unused.go"), "package unused\n")
+		writeScratchFile(t, filepath.Join(dir, "main.go"), "package scratch\n")
+
+		cmd := exec.CommandContext(ctx, goTool, "mod", "tidy", "-diff")
+		cmd.Dir = dir
+		cmd.Env = append(os.Environ(), "GOFLAGS=", "GOPROXY=off", "GOWORK=off")
+		var drift, chatter bytes.Buffer
+		cmd.Stdout = &drift
+		cmd.Stderr = &chatter
+		if err := cmd.Run(); err == nil {
+			t.Fatalf("importboundary: drifted scratch passed tidy -diff (rc=0); negative control is broken")
+		}
+		if !strings.Contains(drift.String(), "require example.com/unused") {
+			t.Fatalf("importboundary: drift diff must remove the unused require on stdout:\n%s\n%s", drift.String(), chatter.String())
+		}
+	})
 }
 
 // goListDepsTagged is goListDeps (sentinel_test.go) with a build-tag
