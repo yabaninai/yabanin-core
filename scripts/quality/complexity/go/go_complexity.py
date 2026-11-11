@@ -11,8 +11,8 @@ Threshold decisions (QG-C01-02): a content-identical copy of a function
 whose base original still exists at head is a DUPLICATE, measured as
 added/changed content under the full thresholds; only a move whose original
 is gone carries pre-existing debt (listed in the untouched-debt ledger,
-never blocking). Since QG-C01-03 duplicate resolution covers the whole head
-tree: the surviving original may live in a changed or an untouched file.
+never blocking). Duplicate resolution covers the whole head tree: the
+surviving original may live in a changed or an untouched file.
 The 11-15 band passes only with a source-bound stronger-model review
 receipt (see scripts/quality/complexity/go/README.md for the schema);
 receipts never unblock >15 bodies for new/changed code.
@@ -20,7 +20,7 @@ receipts never unblock >15 bodies for new/changed code.
 Python 3.9+ standard library plus the Go toolchain (used only to parse and
 measure; the product is never built). Wired as the product `go-complexity`
 changed gate (Makefile `_quality-go-complexity`, selected by
-scripts/quality/quality.py) since QG-C01-03.
+scripts/quality/quality.py.
 
 Usage:
   go_complexity.py --base <git-ref> [--report PATH|-] [--receipt PATH] [--root DIR]
@@ -316,7 +316,7 @@ def receipt_decision(receipt, record):
 def head_tree_index(tree_scan: dict) -> dict:
     """Index every parseable function in the whole head tree.
 
-    Duplicate resolution (whole-tree since QG-C01-03) must see originals
+    Whole-tree duplicate resolution must see originals
     living in unchanged head files too: a copy whose original survives
     anywhere at head is measured as added/changed content, not escaped as
     a move. Files outside the changed set are never measured, so parse

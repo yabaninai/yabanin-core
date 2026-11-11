@@ -66,8 +66,6 @@ class MakefileRecipeTests(unittest.TestCase):
         self.assertIn("--receipt", block)
 
     def test_profile_target_exposes_gate(self):
-        # The gate joins the quality-<profile> dispatch line, so
-        # `make quality-go-complexity` runs it through quality.py directly.
         line = next((l for l in self.makefile.splitlines()
                      if l.startswith("quality-fast ")), "")
         self.assertIn("quality-go-complexity:", line)

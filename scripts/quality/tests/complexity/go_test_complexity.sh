@@ -993,8 +993,6 @@ scenario_gate_wiring() {
         gate_case band-valid-receipt-passes "$band2_repo" "$band2_base" yes \
         '"status": "accepted"'
 
-    # Binding the routing: quality.py must select the gate for .go diffs
-    # (root and nested) and never for docs-only diffs.
     python3 - "$ROOT" <<'PY'
 import importlib.util
 from pathlib import Path

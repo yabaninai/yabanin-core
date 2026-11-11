@@ -242,11 +242,8 @@ _quality-static:
 	bash scripts/lint_helm.sh
 
 # Changed-Go complexity gate (QG-C01): differential analyzer over the task
-# base (QUALITY_BASE, exported by quality-changed; HEAD for working-tree-only
-# diffs). Fails when changed function bodies exceed cyclomatic 15, or sit in
-# 11-15 without a valid stronger-model review receipt (GO_COMPLEXITY_RECEIPT
-# points at the receipt JSON; schema in scripts/quality/complexity/go/README.md).
-# Untouched legacy debt is reported in the ledger and never fails the gate.
+# base (QUALITY_BASE, default HEAD) with review receipts via
+# GO_COMPLEXITY_RECEIPT; policy: scripts/quality/complexity/go/README.md.
 _quality-go-complexity:
 	python3 scripts/quality/complexity/go/go_complexity.py \
 		--base "$${QUALITY_BASE:-HEAD}" --report - \
