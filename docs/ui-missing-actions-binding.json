@@ -7,7 +7,68 @@
   "doc": "docs/ui-grant-scope-matrix.md",
   "base_commit": "243ab5b34d04ba0e83fb10df7b206f88e42629d7"
  },
- "method": "Rows are derived from the accepted ui-grant-scope-matrix warts (5), its unavailable org-scope rows and its 17 CLI/config-only groups (62 endpoints), plus the 4 unavailable records in ui-capability-matrix. Every file:line citation in this file was resolved mechanically from the source at the recorded base commit. Client-absence claims were re-verified with case-insensitive searches (grep -ri) over web/dashboard/src (excluding *.test.*) so differently-cased spellings cannot split an enumeration; negative checks are encoded in this JSON and re-run by the checker.",
+ "method": "Rows are derived from the accepted ui-grant-scope-matrix warts (5), its unavailable org-scope rows and its 17 CLI/config-only groups (62 endpoints), plus the 4 unavailable records in ui-capability-matrix; MA-60..62 (SCIM token admin) and MA-73..75 (policy-packs) come from the task-brief verification set, not the matrix inputs. Every file:line citation in this file was resolved mechanically from the source at the recorded base commit. Client-absence claims were re-verified with case-insensitive searches (grep -ri) over web/dashboard/src (excluding *.test.*) so differently-cased spellings cannot split an enumeration; negative checks are encoded in this JSON and re-run by the checker.",
+ "scope_limit": {
+  "statement": "The binding set is exactly the source-matrix and task-brief inputs named in method. Independent review found 22 further live admin handlers with no dashboard caller that are absent from those inputs and from this enumeration; they are out of scope here and recorded as a follow-up gap for the owner (no binding work done for them in this document).",
+  "out_of_matrix_handler_count": 22,
+  "out_of_matrix_families": [
+   {
+    "family": "org-scoped analytics aggregates (stats, top-models, time-series, error-breakdown)",
+    "handlers": 4,
+    "routes": "services/admin/handlers/router_analytics.go:19-22"
+   },
+   {
+    "family": "cross-org top-orgs aggregate",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_audit.go:26"
+   },
+   {
+    "family": "routing actual/snapshot views",
+    "handlers": 2,
+    "routes": "services/admin/handlers/router_models.go:55-56"
+   },
+   {
+    "family": "self password change",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_console.go:26"
+   },
+   {
+    "family": "agent-key delegate + delegations",
+    "handlers": 4,
+    "routes": "services/admin/handlers/router_keys.go:29,38-40"
+   },
+   {
+    "family": "model bump-version",
+    "handlers": 1,
+    "routes": "services/admin/handlers/router_models.go:34"
+   },
+   {
+    "family": "canary-rollouts",
+    "handlers": 6,
+    "routes": "services/admin/handlers/canary_rollouts.go:114-119"
+   },
+   {
+    "family": "security-inbox reads + operator patch",
+    "handlers": 3,
+    "routes": "services/admin/handlers/security_inbox_handlers.go:551-554"
+   }
+  ]
+ },
+ "base_reproduction": {
+  "note": "Base-reproduction logs for the recorded pre-existing GO-2026-6859 gate failures, verified present in scratch and copied into this worktree's gitignored artifacts/quality/cui-00-03-base-repro/; hashes only, raw logs stay out of Git.",
+  "artifacts": [
+   {
+    "path": "artifacts/quality/cui-00-03-base-repro/base-security.log",
+    "sha256": "c1fa5d1d384c221bc49d18c95ae8b1db10a4e035d85fb50dd342bd5c3c008404",
+    "signature": "go mod verify clean; govulncheck disposition scan BLOCKED (analyze-security Error 3) on GO-2026-6859 REACHABLE findings; GO-2026-6909 NOT_AFFECTED; SAML disposition expires 2026-12-09"
+   },
+   {
+    "path": "artifacts/quality/cui-00-03-base-repro/base-deps.log",
+    "sha256": "cf580c6b43bf48ea67392ae9253c55a6419223aec4b3f15c13c4795405007a8e",
+    "signature": "dependency audit: 7 govulncheck module failures (reachable GO-2026-6859); trivy high/critical 0"
+   }
+  ]
+ },
  "verdict_rule": "bound-in-full: the operator can drive the action from the dashboard at HEAD — handler, route registration, OpenAPI entry, dashboard API client and accepted evidence all have citations. residual-only: at least one of those links has no citation; the residual field names the missing link(s). Deliberate non-dashboard surfaces (IdP protocol, agent data plane, opt-in portal UI, gateway plane) are recorded as residual with the design disposition named, not as missing implementation.",
  "counts": {
   "total": 75,
@@ -1193,7 +1254,7 @@
       "absent": true,
       "negative": {
        "scope": "web/dashboard/src",
-       "needle": "/policy-templates"
+       "needle": "/templates"
       }
      },
      "page_caller": null,
@@ -1236,7 +1297,7 @@
       "absent": true,
       "negative": {
        "scope": "web/dashboard/src",
-       "needle": "/policy-templates"
+       "needle": "/templates"
       }
      },
      "page_caller": null,
@@ -1279,7 +1340,7 @@
       "absent": true,
       "negative": {
        "scope": "web/dashboard/src",
-       "needle": "/policy-templates"
+       "needle": "/templates"
       }
      },
      "page_caller": null,

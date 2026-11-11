@@ -4,6 +4,19 @@ Task: **CUI-00-03** (coordination plan plans/CORE.md) · base commit `34eb9783af
 
 This file binds every operator action the accepted grant-scope matrix marks missing or partial on the dashboard to the full existing chain — handler function, route registration, OpenAPI entry, dashboard API client and accepted evidence — or records the residual where a chain link genuinely does not exist. It is documentation only: no endpoint, UI element or permission is invented, and no implementation claim is made.
 
+**Method.** Rows derive from the accepted `ui-grant-scope-matrix` inputs — its 5 warts, its unavailable org-scope rows and its 17 CLI/config-only groups — plus the 4 unavailable records in `ui-capability-matrix`; MA-60..62 (SCIM token admin) and MA-73..75 (policy-packs) come from the task-brief verification set, not the matrix inputs.
+
+**Scope limit (review follow-up).** The binding set is exactly the inputs above. Independent review found 22 further live admin handlers with no dashboard caller that are absent from those inputs and from this enumeration; they are out of scope here and recorded as a follow-up gap for the owner (no binding work done for them in this document):
+
+- org-scoped analytics aggregates ×4 — `services/admin/handlers/router_analytics.go:19-22` (stats, top-models, time-series, error-breakdown)
+- cross-org top-orgs aggregate ×1 — `services/admin/handlers/router_audit.go:26`
+- routing actual/snapshot views ×2 — `services/admin/handlers/router_models.go:55-56`
+- self password change ×1 — `services/admin/handlers/router_console.go:26`
+- agent-key delegate + delegations ×4 — `services/admin/handlers/router_keys.go:29,38-40`
+- model bump-version ×1 — `services/admin/handlers/router_models.go:34`
+- canary-rollouts ×6 — `services/admin/handlers/canary_rollouts.go:114-119`
+- security-inbox reads + operator patch ×3 — `services/admin/handlers/security_inbox_handlers.go:551-554`
+
 **Verdict rule.** *bound-in-full*: handler, route, OpenAPI entry, dashboard client and accepted evidence all have citations at HEAD — the operator can drive the action from the dashboard today. *residual-only*: at least one link is absent; the residual names it. Deliberate non-dashboard surfaces (IdP protocol, agent data plane, opt-in portal UI, gateway plane) are recorded as residual with the design disposition named, not as missing implementation.
 
 **Counts.** 75 actions enumerated — **7 bound-in-full**, **68 residual-only**.
@@ -148,9 +161,9 @@ This file binds every operator action the accepted grant-scope matrix marks miss
 
 | ID | Action | Handler | Route | OpenAPI | Dashboard client | Evidence | Verdict |
 |---|---|---|---|---|---|---|---|
-| MA-25 | Operator exports the org policy as a template | `services/admin/handlers/policy_template_handlers.go:24` | `services/admin/handlers/router_ops.go:43` | absent | absent (neg: `web/dashboard/src` :: `/policy-templates`) | `services/admin/handlers/policy_template_handlers_test.go:28`;`services/admin/handlers/testdata/routes_admin.golden:193` | residual-only |
-| MA-26 | Operator lists marketplace policy templates | `services/admin/handlers/policy_template_handlers.go:60` | `services/admin/handlers/router_ops.go:44` | absent | absent (neg: `web/dashboard/src` :: `/policy-templates`) | `services/admin/handlers/policy_template_handlers_test.go:56`;`services/admin/handlers/testdata/routes_admin.golden:255` | residual-only |
-| MA-27 | Operator subscribes the org to a template | `services/admin/handlers/policy_template_handlers.go:74` | `services/admin/handlers/router_ops.go:45` | absent | absent (neg: `web/dashboard/src` :: `/policy-templates`) | `services/admin/handlers/policy_template_handlers_test.go:70`;`services/admin/handlers/testdata/routes_admin.golden:194` | residual-only |
+| MA-25 | Operator exports the org policy as a template | `services/admin/handlers/policy_template_handlers.go:24` | `services/admin/handlers/router_ops.go:43` | absent | absent (neg: `web/dashboard/src` :: `/templates`) | `services/admin/handlers/policy_template_handlers_test.go:28`;`services/admin/handlers/testdata/routes_admin.golden:193` | residual-only |
+| MA-26 | Operator lists marketplace policy templates | `services/admin/handlers/policy_template_handlers.go:60` | `services/admin/handlers/router_ops.go:44` | absent | absent (neg: `web/dashboard/src` :: `/templates`) | `services/admin/handlers/policy_template_handlers_test.go:56`;`services/admin/handlers/testdata/routes_admin.golden:255` | residual-only |
+| MA-27 | Operator subscribes the org to a template | `services/admin/handlers/policy_template_handlers.go:74` | `services/admin/handlers/router_ops.go:45` | absent | absent (neg: `web/dashboard/src` :: `/templates`) | `services/admin/handlers/policy_template_handlers_test.go:70`;`services/admin/handlers/testdata/routes_admin.golden:194` | residual-only |
 
 - **MA-25** — residual: no dashboard client and no OpenAPI snapshot entry.
 - **MA-26** — residual: no dashboard client and no OpenAPI snapshot entry.
@@ -335,4 +348,11 @@ This file binds every operator action the accepted grant-scope matrix marks miss
 ## Citation verification
 
 All file:line citations in this document and its JSON mirror were resolved mechanically from the source at the recorded base commit and re-verified line-by-line (file exists, line in range, expected content at the line, negative checks re-run). Per the convention established for `ui-grant-scope-matrix.md`, the checker itself is kept outside this repository.
+
+## Evidence durability
+
+The base-reproduction logs behind the recorded pre-existing GO-2026-6859 gate failures were verified present in scratch and copied into this worktree's gitignored `artifacts/quality/cui-00-03-base-repro/` (hashes recorded here; raw logs stay out of Git):
+
+- `base-security.log` — sha256 `c1fa5d1d384c221bc49d18c95ae8b1db10a4e035d85fb50dd342bd5c3c008404` — `go mod verify` clean; govulncheck disposition scan BLOCKED (`analyze-security` Error 3) on GO-2026-6859 REACHABLE findings; GO-2026-6909 NOT_AFFECTED; SAML disposition expires 2026-12-09.
+- `base-deps.log` — sha256 `cf580c6b43bf48ea67392ae9253c55a6419223aec4b3f15c13c4795405007a8e` — dependency audit: 7 govulncheck module failures (reachable GO-2026-6859); trivy high/critical 0.
 
