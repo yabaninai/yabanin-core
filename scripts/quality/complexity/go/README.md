@@ -109,12 +109,21 @@ or body change does not.
   still exists at head with identical content is a free duplicate — it is
   measured as `added` (or `changed` when it replaced an existing slot)
   under the full thresholds, with `duplicate_of` naming the surviving
-  original. Copying a >15 function under a new name can therefore never
-  escape into non-blocking debt.
+  original. Duplicate resolution is scoped to the changed head files the
+  analyzer measures: a >15 copy whose original also lives in a changed
+  file is always measured under the full thresholds; a copy whose
+  original resides in an unchanged file is not resolvable as a duplicate
+  and classifies as `moved`, landing in the `untouched_debt` ledger —
+  non-blocking (`exit 0`), the debt still reported and visible.
 - **Body changed during a move:** classified as regular content
   (`added`/`changed`) and fully measured.
 - **Formatting-only edits:** produce no changed-function entries; they must
   not suppress existing findings either (debt summaries still run).
+
+Known limitation: whole-tree duplicate detection — resolving duplicate
+originals that live in unchanged head files — is deferred to the
+gate-wiring follow-up (QG-C01-03); today such copies remain in the
+untouched-debt ledger as visible, non-blocking moved debt.
 
 ## Report schema (`go-complexity-diff/2`)
 
