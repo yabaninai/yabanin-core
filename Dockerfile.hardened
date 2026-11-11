@@ -4,17 +4,17 @@
 # runtime via subcommand (gateway / admin / loggerd / mcp / migrate / dev /
 # license), so there is no SERVICE build arg.
 
-# Pin the official golang:1.27.3-alpine multi-arch manifest used by Dockerfile.
-FROM golang:1.27.3-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
+# Pin the official golang:1.27.4-alpine multi-arch manifest used by Dockerfile.
+FROM golang:1.27.4-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
 
 # Exact-version package pins: the apk repository index is a mutable input, so
 # bare package names would let OS package bytes float between builds. Versions
-# below were resolved inside this pinned builder image (alpine 3.24.3, base
+# below were resolved inside this pinned builder image (alpine 3.24.4, base
 # already ships ca-certificates at the same version). If the mirror drops a
 # pinned version the build fails loudly instead of drifting.
 RUN apk add --no-cache \
         ca-certificates=20261020-r0 \
-        git=2.54.0-r0
+        git=2.54.1-r0
 
 WORKDIR /src
 

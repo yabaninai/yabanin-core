@@ -6,7 +6,7 @@ Commands run from the repository root unless a different directory is shown.
 
 ## Prerequisites
 
-- Go matching the root `go.mod` directive (currently **1.27.3**). Check with
+- Go matching the root `go.mod` directive (currently **1.27.4**). Check with
   `go version`; a generic Go 1.27 installation may be older than required.
 - Git and make for source builds; dependency downloads need network access.
 - Docker Engine/Desktop and Compose v2 for the quickstart and container-based

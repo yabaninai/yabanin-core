@@ -1,13 +1,11 @@
 # Go multi-stage Dockerfile for yabanin services
 
 # The tag component documents the toolchain; the digest is the actual pin.
-# golang:1.27.3-alpine carries the standard-library security fixes from
-# Go 1.27.3 (GO-2026-6809 / CVE-2026-111943: distrust of compromised
-# intermediate certificates in crypto/x509, reachable via the loggerd S3
-# export path; the root go.mod declares go 1.27.3, so the builder must be
-# 1.27.3 or newer).
-ARG GO_VERSION=1.27.3
-FROM golang:${GO_VERSION}-alpine@sha256:fa3d596898d9f126af7c01d14ee7597bab3f39cccf392ef36b69fe77cd681f18 AS builder
+# 1.27.4 carries stdlib fixes for GO-2026-6809 (crypto/x509 distrust,
+# CVE-2026-111943) and GO-2026-6859 (net/http, CVE-2026-97054), both
+# reachable via gateway/loggerd; go.mod declares go 1.27.4.
+ARG GO_VERSION=1.27.4
+FROM golang:${GO_VERSION}-alpine@sha256:0a5f7fe796599ff487605987432e7619ae45beeb2fba4c2ce0b907879932aebf AS builder
 
 # Release rebuilds override this with a frozen mirror containing the original
 # signed indices and every resolved APK, retained with a checksum manifest.
@@ -18,7 +16,7 @@ ARG APK_MIRROR=https://dl-cdn.alpinelinux.org/alpine
 
 # Exact-version package pins: the apk repository index is a mutable input, so
 # bare package names would let OS package bytes float between builds. Versions
-# below were resolved inside this pinned builder image (alpine 3.24.3, base
+# below were resolved inside this pinned builder image (alpine 3.24.4, base
 # already ships ca-certificates at the same version). If the mirror drops a
 # pinned version the build fails loudly instead of drifting.
 RUN apk add --no-cache \
@@ -26,7 +24,7 @@ RUN apk add --no-cache \
         --repository "${APK_MIRROR}/v3.24/main" \
         --repository "${APK_MIRROR}/v3.24/community" \
         ca-certificates=20261020-r0 \
-        git=2.54.0-r0
+        git=2.54.1-r0
 
 WORKDIR /app
 
