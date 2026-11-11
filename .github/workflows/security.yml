@@ -20,10 +20,13 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: ${{ env.GO_VERSION }}
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
       - name: Prepare security tools and databases
         run: make install-analysis-tools security-tools-install security-db-update
 

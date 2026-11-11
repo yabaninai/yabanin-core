@@ -21,11 +21,13 @@ jobs:
           # comparisons possible when the run is reused as evidence.
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: '1.27.x'
-          cache: true
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Set up Node
         uses: actions/setup-node@v7
@@ -92,11 +94,13 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Set up Go
-        uses: actions/setup-go@v7
-        with:
-          go-version: '1.27.x'
-          cache: true
+      - name: Set up Go (runner-local)
+        run: |
+          test -x /usr/local/go/bin/go
+          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
+            { echo 'unexpected runner Go version' >&2; exit 1; }
+          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
+          echo "$HOME/go/bin" >> "$GITHUB_PATH"
 
       - name: Run sovereignty suite (-tags sovereignty)
         run: go test -race -count=1 -tags sovereignty ./tests/sovereignty/...
