@@ -27,7 +27,7 @@ record; derived read-side metrics `retried_requests`, `fallback_requests`.
 | Stage | Where (file:line) | Fact |
 | --- | --- | --- |
 | Event fields | `eventBase.FirstTokenMs` / `.AttemptCount` / `.RetryCount` (pkg/gateway/events.go:237, :235, :236) | scalars per request; semantics documented on the wire struct (pkg/eventpublisher/publisher.go:150-153 TTFT, :155-158 fallback-chain hops, :159-162 intra-model retries) |
-| Producers (totals only) | chat pipeline: failure pkg/gateway/chat.go:1083-1084, success :1588-1589, policy-denied :1712-1713; stream pipeline: pkg/gateway/stream.go:698-699, :907-908, :1392-1393, :1503-1504 | `AttemptCount: len(attempts)`, `RetryCount: totalRetries`; `totalRetries` declared at pkg/gateway/chat.go:807 and accumulated per attempt (`totalRetries += attemptNum - 1`, pkg/gateway/chat.go:944); the `attempts` slice comes from the fallback executor (`executeFallback`, pkg/gateway/gateway_policy.go:300) |
+| Producers (totals only) | chat pipeline: failure pkg/gateway/chat.go:1083-1084, success :1588-1589, policy-denied :1712-1713; stream pipeline: pkg/gateway/stream.go:698-699, :907-908, :1392-1393, :1503-1504 | `AttemptCount: len(attempts)`, `RetryCount: totalRetries`; `totalRetries` declared at pkg/gateway/chat.go:809 and accumulated per attempt (`totalRetries += attemptNum - 1`, pkg/gateway/chat.go:944); the `attempts` slice comes from the fallback executor (`executeFallback`, pkg/gateway/gateway_policy.go:300) |
 | Wire | Redis field map `attempt_count` / `retry_count` (pkg/eventpublisher/redis_publisher.go:250-251) | plain stringified integers |
 | Persistence | bound in the full projection via `nullableInt64` (services/loggerd/consumer/event_mapper.go:589-591; helper :755 — absent **or zero** binds SQL NULL); columns `first_token_ms` (migrations/0001_init.up.sql:1733), `attempt_count integer DEFAULT 1` (:1734), `retry_count integer DEFAULT 0` (:1735) | nullable scalars; the DDL defaults never fire for full rows because the projection always binds explicitly (NULL or value) — they fire only for the reduced projections below |
 | Reduced projections | shadow mirror `shadowRequestLogRow` (services/loggerd/consumer/event_mapper.go:612) and budget-blocked `budgetRequestLogRow` (:656) omit all three keys | these rows carry **no attempt observability**: the omitted columns fall back to the DDL defaults (`attempt_count` 1, `retry_count` 0, `first_token_ms` NULL) |
@@ -60,7 +60,7 @@ JSON array on the event (OP-8), persisted one row per decision into
 | Policy events | `appendPolicyEvents` / `policyEventFrom` (pkg/gateway/gateway_policy.go:1320, :1356); stamped on the event at pkg/gateway/chat.go:1305, :1356, :1592, :1716 and the stream pipeline's `streamPolicyJSON()` at pkg/gateway/stream.go:701, :910, :1395, :1508; generic namespace `ruleNamespacePolicy` (pkg/gateway/gateway_policy.go:1018) | JSON array of decision objects carried as `eventBase.Policy` (pkg/gateway/events.go:251) |
 | Wire→row | parsed by `parsePolicyDecision` (services/loggerd/consumer/policy_decisions.go:149) into `policyDecisionWire` (:121); content evidence is stripped on the wire struct (`Evidence string json:"-"`, :105) | findings never persist content evidence, only vocabulary |
 | Persistence | `insertPolicyDecision` (services/loggerd/consumer/policy_decisions.go:403) inside the **same delivery transaction** as the request log (call sites services/loggerd/consumer/stream.go:643, :733, :843, :1066); table `policy_decisions` with mode/verdict CHECKs (migrations/0001_init.up.sql:1444) and `FORCE ROW LEVEL SECURITY` (:1462); hot window 90 days (`PolicyDecisionsRetentionDays`, services/loggerd/consumer/policy_decisions.go:442) | columns: `org_id`, `request_id`, `policy_id`, `policy_version`, `mode` (shadow/enforce), `verdict`, `findings jsonb`, `duration_ms` |
-| Read views | decision log: `ListPolicyDecisions` (pkg/adminstore/policydecisions.go:95) → `GET /api/organizations/{id}/policy-decisions` (mount services/admin/handlers/policy_decisions.go:67, handler :345; mount point services/admin/handlers/router.go:713). Routing side: `routing_decision` column (migrations/0001_init.up.sql:1730) exposed in request detail (field pkg/adminstore/request_detail.go:161, scanned :264) and usable **only as a filter** in the list (`RuleID`, pkg/adminstore/request_list.go:151) | the request detail struct has no policy field — the decision log is a separate, separately permissioned surface (field-matrix.md §(d) item 4) |
+| Read views | decision log: `ListPolicyDecisions` (pkg/adminstore/policydecisions.go:95) → `GET /api/organizations/{id}/policy-decisions` (mount services/admin/handlers/policy_decisions.go:67, handler :364; mount point services/admin/handlers/router.go:713). Routing side: `routing_decision` column (migrations/0001_init.up.sql:1730) exposed in request detail (field pkg/adminstore/request_detail.go:161, scanned :264) and usable **only as a filter** in the list (`RuleID`, pkg/adminstore/request_list.go:151) | the request detail struct has no policy field — the decision log is a separate, separately permissioned surface (field-matrix.md §(d) item 4) |
 
 ## (d) Region family
 
@@ -136,17 +136,26 @@ Each control states the exhaustive search that established the absence.
    `inference_region` / `model_origin_country` / `log_storage_region` /
    `provider_entity_jurisdiction` exist only on `lineage_outbox`
    (migrations/0001_init.up.sql:822) and `request_lineage` (:1659), and a
-   search of `pkg/adminstore`/`services/admin` for those names matches only
-   `lineage.go` and tests. Request detail, request list and analytics never
-   select them; the lineage routes (§d) are the only surface.
+   search of `pkg/adminstore`/`services/admin` for those names
+   (`grep -rn 'inference_region\|model_origin_country\|log_storage_region\|provider_entity_jurisdiction'`)
+   matches only test fixtures that seed `request_lineage`
+   (pkg/adminstore/cruds_int_test.go:416-419,
+   pkg/adminstore/sqlcontract_requests_int_test.go:113-114); the production
+   lineage queries select `raw_attestation` and never name the columns
+   (pkg/adminstore/lineage.go:19, :56, :83). Request detail, request list
+   and analytics never select them; the lineage routes (§d) are the only
+   surface.
 4. **NC4 — percentiles are never served from rollups.**
    `grep -ni 'percentile\|_p50\|_p95' migrations/0001_init.up.sql` returns
    nothing: no rollup (or any) table stores a percentile. The rollup metric
    map (pkg/adminstore/analytics_query_sql.go:208) contains no percentile
    keys, so any query asking for one fails the `analyticsSource` additive
-   test (:243) and runs raw; `percentile_cont` appears only in the raw-path
-   files (analytics_query_sql.go, provider_health.go, request_list.go,
-   request_stats.go).
+   test (:243) and runs raw; `percentile_cont` (case-insensitive — two of
+   the five spell it `PERCENTILE_CONT`) appears in exactly five non-test Go
+   files, every one a raw-path query over `request_logs`:
+   analytics_query_sql.go, provider_health.go, request_list.go,
+   request_stats.go and pkg/feedback/views.go:108-109 (the
+   `beta_latency_daily` view, `FROM public.request_logs`).
 5. **NC5 — shadow and budget rows carry no attempt observability.** The
    shadow projection (services/loggerd/consumer/event_mapper.go:612) and the
    budget-blocked projection (:656) omit `first_token_ms`, `attempt_count`
