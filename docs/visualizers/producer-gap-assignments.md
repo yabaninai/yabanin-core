@@ -57,10 +57,10 @@ appear here only as consumers.
 | --- | --- | --- | --- | --- |
 | G1 | Full traffic-flow aggregation (client/agent → requested → chosen → provider) with provider attribution and covered/unknown counts | V02, V06, V09, V13, V16 | Partial: analytics query engine dims (no provider dim); provider health groups `(provider, model_used)` only | Binding addendum → planned CV-04a/CV-04b (§3.1) |
 | G2 | Per-attempt records (ids, ordinals, timings, outcomes, per-attempt provider) | V03, V04, V10, V14, V18 | **No producer; new contract leaf required** — summary scalars only | Binding addendum → planned CV-03a/CV-03b (§3.2) |
-| G3 | Latency/cost distribution: histogram, sketch or bounded paired samples | V07, V08, V17 | Partial: percentile aggregates only (p50/p90/p95/p99 family); per-request rows bounded 25/page | **New child assignment** `V07-P` (§4.1) |
+| G3 | Latency/cost distribution: histogram, sketch or bounded paired samples | V07, V08, V17 | Partial: percentile aggregates only (p50/p90/p95/p99 family); per-request rows bounded 50/page | **New child assignment** `V07-P` (§4.1) |
 | G4 | Region/destination provenance per recorded request (observed vs configured vs unknown) | V12 | Partial: endpoint dim in analytics; rich region fields only on separately permissioned lineage routes | **New child assignment** `V12-P` (§4.2) |
 | G5 | Policy steps joined to the request journey (link, permission alignment, retention mismatch) | V03, V11 | Partial: policy-decision log exists with steps + request_id filter; not part of request detail; 90-day purge | **New child assignment** `V11-P` (§4.3) |
-| G6 | Tool execution outcome, timing and parentage beyond per-request occurrences | V05, V15, V18 | Partial: per-request invocations in request detail (no outcome/duration/span); 30d cross-request aggregates | **New child assignment** `V05-P` (§4.4) |
+| G6 | Tool execution outcome, timing and parentage beyond per-request occurrences | V05, V15, V18 | Partial: per-request invocations in request detail (no outcome/duration/span); default-30d cross-request aggregates | **New child assignment** `V05-P` (§4.4) |
 | G7 | Hot-row retention coverage signal for a queried window (under-reporting honesty) | V06, V10, V13, V17; matrix V-10/V-11 | **No producer; new contract leaf required** — pricing coverage only; retention config not surfaced per query | **New child assignment** `V06-P` (§4.5) |
 | G8 | Receiver delivery outcomes and an admin read for WORM lineage export | matrix V-17 (exports page) | Partial: spend-alert settings only, `last_alert_at` as the sole delivery signal; WORM export is trcli-only | **New child assignment** `EXP-P` (§4.6; id pending owner allocation) |
 
@@ -166,9 +166,10 @@ the VISUALIZERS contract work section requires.
   (services/admin/handlers/router_analytics.go:24;
   pkg/adminstore/request_stats.go:210-219); list stats average + p95 only
   (web/dashboard/src/api/requests.ts:59-67); per-request `duration_ms`
-  samples bounded 25/page through the request explorer
-  (services/admin/handlers/request_list.go:305) with latency/cost range
-  filters (min/max at :255-256). "Never synthesize a distribution from
+  samples bounded 50/page (default; max 100) through the request explorer
+  (services/admin/handlers/request_list.go:305 with latency/cost range
+  filters, min/max at :255-256; page bounds
+  pkg/adminstore/pagination.go:5-7). "Never synthesize a distribution from
   percentiles" is the frozen V07 boundary; rollups never serve percentiles
   (`field-provenance.md` NC4).
 - **Assignment:** specify the reviewed distribution read — server-side
@@ -239,7 +240,7 @@ the VISUALIZERS contract work section requires.
 - **Consumers:** V03 (journey decision cards), V11 (recorded policy
   explanation graph). Today: `GET /api/organizations/{id}/policy-decisions`
   serves decision rows with the CORE-TRACE-05 envelope — steps with order,
-  action and version (services/admin/handlers/policy_decisions.go:144-149),
+  action and version (services/admin/handlers/policy_decisions.go:138-149),
   two-way filters incl. `request_id` and `step`, `entity=decisions|requests`
   (route mount services/admin/handlers/policy_decisions.go:65-67); request
   detail has **no** policy field and never selects `policy_decisions`
@@ -247,7 +248,7 @@ the VISUALIZERS contract work section requires.
   `policies.manage` (services/admin/handlers/policy_decisions.go:66) while
   the journey view gates on `requests.read` — a member can see a request but
   not its recorded explanation; the 90-day hot purge
-  (services/loggerd/consumer/policy_decisions.go:443) can make old requests
+  (services/loggerd/consumer/policy_decisions.go:442) can make old requests
   legitimately explanation-less.
 - **Assignment:** specify the join contract — a request-detail reference
   (ids only) plus a documented cross-surface link, or an embedded summary —
@@ -276,11 +277,12 @@ the VISUALIZERS contract work section requires.
   (dependency neighborhood), V18 (icicle spans). Today: request detail serves
   per-request occurrences `seq`/`call_id`/`tool_name`/`arguments`
   (pkg/adminstore/request_detail.go:20-26, :176, :321-333) from
-  `tool_call_invocations` (migrations/0001_init.up.sql:2057-2064) whose only
-  timing is `created_at`; the cross-request surface is the fixed-30-day
+  `tool_call_invocations` (migrations/0001_init.up.sql:2057-2066) whose only
+  timing is `created_at`; the cross-request surface is the default-30-day
   aggregate report `GET /api/organizations/{id}/tool-calls` (route
   services/admin/handlers/router_analytics.go:60;
-  handler services/admin/handlers/request_list.go:395; wire
+  handler services/admin/handlers/request_list.go:395 — default 30 days,
+  `days` query-param override at :400-403; wire
   web/dashboard/src/api/requests.ts:89-110) over `tool_calls`
   (migrations/0001_init.up.sql:2087-2096) which adds `task_id`/`model_used`.
   No outcome/status or duration column exists anywhere; no request-list
@@ -299,8 +301,8 @@ the VISUALIZERS contract work section requires.
   - IDENTITY: `(request_id, seq, call_id)` occurrence identity; two
     identically named tools stay separate by id (frozen oracle).
   - COVERAGE: originals-retention off ⇒ "none recorded" is a positive fact
-    for that org, rendered as such; 30-day aggregate window stays fixed
-    until this leaf or CV-06 changes it.
+    for that org, rendered as such; the aggregate window stays default-30-day
+    with its existing `days` override until this leaf or CV-06 changes it.
   - MISSING-STATE: proposal without execution never renders as an execution;
     orphan results and unknown outcomes are named states.
 - **Oracle (frozen from the view spec):** no execution is created for a
@@ -336,7 +338,7 @@ the VISUALIZERS contract work section requires.
   - COVERAGE: cheap enough to join every analytics response (no per-query
     table scan — watermark or min on an indexed column, decided here);
     policy_decisions' independent 90-day window must be coverable too
-    (services/loggerd/consumer/policy_decisions.go:443).
+    (services/loggerd/consumer/policy_decisions.go:442).
   - MISSING-STATE: "no rows retained in window" is distinct from "no traffic
     in window"; a missing bucket never becomes zero (frozen V06 oracle).
 - **Oracle:** an org with a known deletion boundary shows exact
@@ -390,9 +392,12 @@ the VISUALIZERS contract work section requires.
 
 ## 5. Residual — deliberately unassigned, with reasons
 
-1. **V19/V20 producers (runtime signals, forecasts):** owned by Enterprise
-   leaves RG-C01/RG-C02/RG-C03 (E11-P01..P03) per the catalog's data
-   boundary; Core drafts would duplicate authorized Enterprise scope.
+1. **V19/V20 producers (runtime signals, forecasts):** already owned by Core
+   planned leaves RG-C01/RG-C02/RG-C03 (`plans/CORE.md` leaf table);
+   `plans/ENTERPRISE.md` records the E11-P01..P03 authorization as
+   "Authorized Apache Core: RG-C01/02/03", so these are Core-owned producers
+   consumed by Enterprise — drafting them here would duplicate planned Core
+   leaves.
 2. **Resale per-request cost (`resale_cost_usd`):** not persisted in
    `request_logs` and has no admin read view (`field-provenance.md` NC2);
    it is a wallet/ledger fact ("resale is a wallet fact, not an analytics
@@ -422,12 +427,21 @@ the base).
    a repo-relative path (containing `/` and a file extension) immediately
    followed by `:N` or `:N-M`, optionally with comma-separated continuation
    specs in the same parenthetical; a bare `:N`/`:N-M` binds to the most
-   recent preceding full citation's path. Each anchor was checked: the file
-   exists, every cited line/range falls inside the file, and the load-bearing
-   anchors were additionally grep-verified to contain the named symbol/route
-   string at authoring time.
-   Result: **68 citation instances, 57 distinct (file,line-range) anchors,
-   0 bad.**
+   recent preceding full citation's path. Counting rule: a full citation
+   counts as one instance, and each additional `:N`/`:N-M` continuation spec
+   in the same parenthetical counts as one further instance. Each anchor was
+   checked: the file exists, every cited line/range falls inside the file,
+   and the load-bearing anchors were additionally grep-verified to contain
+   the named symbol/route string at authoring time. The CV-00-04 independent
+   review re-derived the inventory with a fresh parse of this grammar,
+   re-checked every anchor (including all anchors corrected by the review
+   fixes) and re-verified the load-bearing symbol/route strings against the
+   frozen base.
+   Result: **62 citation instances (51 full citations + 11 continuation
+   specs), 59 distinct (file,line-range) anchors, 0 bad.** Three anchors are
+   intentionally cited twice (the analytics pricing-coverage fields, the
+   policy-decisions hot-retention constant, the effective-retention read);
+   all other anchors are unique.
 2. Endpoint-name discipline: every route string in this document
    (`/api/analytics/query`, `/api/analytics/latency`,
    `/api/lineage/{request_id}`, `/api/organizations/{id}/lineage`,
