@@ -1,0 +1,56 @@
+version: '2'
+run:
+  timeout: 5m
+  relative-path-mode: gomod
+linters:
+  default: none
+  enable: [errorlint, depguard, forbidigo, exhaustive, gocritic]
+  settings:
+    gocritic:
+      disable-all: true
+      enabled-checks: [appendAssign, badCall, dupBranchBody, exitAfterDefer]
+    errorlint:
+      errorf: true
+      asserts: true
+      comparison: true
+    depguard:
+      rules:
+        public-core:
+          list-mode: lax
+          files: ['$all']
+          deny:
+            - pkg: github.com/yabaninai/yabanin-enterprise
+              desc: Core cannot depend on Enterprise; expose a public Core contract instead.
+        domain-storage:
+          list-mode: lax
+          files: ['**/pkg/agentloop/*.go', '**/pkg/apiformat/*.go']
+          deny:
+            - pkg: database/sql
+              desc: Keep domain contracts independent of SQL adapters.
+            - pkg: github.com/jackc/pgx
+              desc: Keep domain contracts independent of SQL adapters.
+            - pkg: github.com/lib/pq
+              desc: Keep domain contracts independent of SQL adapters.
+    forbidigo:
+      analyze-types: true
+      forbid:
+        - pattern: '^os\.Exit$'
+          pkg: '^os$'
+          msg: Return an error; process exit belongs in command entrypoints.
+        - pattern: '^log\.(Fatal|Fatalf|Fatalln|Logger\.Fatal|Logger\.Fatalf|Logger\.Fatalln)$'
+          pkg: '^log$'
+          msg: Return an error; process exit belongs in command entrypoints.
+    exhaustive:
+      check: [switch]
+      only-types: ['^github\.com/reireirei/yabanin/pkg/agentloop\.OperationState$']
+      default-signifies-exhaustive: false
+  exclusions:
+    generated: strict
+    presets: []
+    rules:
+      - path: '(^cmd/|^tools/|_test\.go$)'
+        linters: [forbidigo]
+issues:
+  max-issues-per-linter: 0
+  max-same-issues: 0
+  uniq-by-line: false

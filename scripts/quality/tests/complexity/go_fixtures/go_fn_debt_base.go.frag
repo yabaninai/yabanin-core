@@ -1,8 +1,5 @@
-// Fixture base: HeavyOriginal, cyclomatic 18 = 1 + 17 ifs (hand-counted
-// oracle). Used twice at head in different scenarios: kept verbatim while a
-// copy appears under a new name (duplicate must be measured as added), or
-// removed while a renamed/reformatted copy appears elsewhere (a genuine
-// move that carries its debt into the ledger).
+// Fixture base: HeavyOriginal cyclomatic 18 = 1 + 17 ifs (hand-counted
+// oracle); reused by the duplicate and moved-debt scenarios.
 func HeavyOriginal(x int) int {
 	n := 0
 	if x > 1 {

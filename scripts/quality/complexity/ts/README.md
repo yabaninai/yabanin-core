@@ -19,6 +19,19 @@ node scripts/quality/complexity/ts/analyze.mjs \
   [--json-out FILE] [--repo PATH] [--quiet]
 ```
 
+Through the quality framework (what CI and `make quality-changed` run):
+
+```bash
+make _quality-ts-complexity                    # base defaults to HEAD
+QUALITY_BASE="$TASK_BASE" make _quality-ts-complexity
+```
+
+The gate recipe analyzes `web/dashboard/` (the default scope) and forwards
+an optional receipt through the `TS_COMPLEXITY_RECEIPT` environment
+variable (path to the receipt JSON; keep receipts outside the tracked
+source tree — `artifacts/` is ignored). The gate never writes files into
+the working tree.
+
 - `--base` — base ref; resolved to a commit, then `git merge-base <commit>
   HEAD` (same semantics as `scripts/quality/quality.py`). Without `--base`,
   the diff is the working tree against `HEAD`.
@@ -35,9 +48,11 @@ node scripts/quality/complexity/ts/analyze.mjs \
   enforced (the inequality is always required).
 - `--debt-out` — write the full untouched-debt ledger (schema
   `ts-complexity-debt/1`, see *Debt ledger*) to this file. Never blocks.
-- `--repo` — target repository (default: the checkout holding this script;
-  `TS_COMPLEXITY_REPO_ROOT` overrides that default, used by the fixture
-  runner for analyzer copies in temp directories).
+- `--repo` — target repository (default: the checkout holding this script —
+  never environment-steered, so a gate copy always measures its own tree).
+  `TS_COMPLEXITY_REPO_ROOT` instead pins where the parser's TypeScript
+  checkout is looked up (used by the fixture runner for analyzer copies in
+  temp directories).
 
 JSON goes to stdout (deterministic: no timestamps, sorted entries); the human
 summary, `BLOCK ...`, `RECEIPT INVALID ...` and `NEEDS REVIEW RECEIPT ...`
@@ -222,8 +237,10 @@ records debt; it never blocks, and unlike the report it carries a
 
 ## Fixtures
 
-`scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds three
-throwaway git repositories from `ts_fixtures/` and asserts 40 checks:
+`scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds throwaway
+git repositories from `ts_fixtures/` (base/head, receipt and rename
+scenarios, plus gate-wiring repos embedding an analyzer copy) and asserts
+54 checks (42 controls + 12 mutants):
 
 - the main repo (base/head) pins the changed-function control classes
   C1–C13: changed/added/moved/deleted bodies, nested-closure attribution,
@@ -256,7 +273,20 @@ throwaway git repositories from `ts_fixtures/` and asserts 40 checks:
   duplicate path via a single exact-string replacement (target uniqueness
   asserted, crashed mutants rejected), and the battery passes only when the
   target control fails on that mutant — a disabled path cannot keep the
-  battery green.
+  battery green;
+- gate-wiring controls (QG-C02-03) commit an analyzer copy at the base of
+  each gate repo and drive the recipe extracted live from the product
+  `Makefile` through `make`: an over-15 change without a receipt fails
+  (W1–W2), a same-model receipt over 15 still fails (W3), the review band
+  without a receipt fails (W4), a receipt bound to a different head commit
+  is rejected (W5), a valid receipt passes via `TS_COMPLEXITY_RECEIPT`
+  (W6), untouched debt passes with a changed ok body (W7), and a docs-only
+  diff measures zero bodies (W8); routing checks (W9–W14) verify
+  `quality.py` selects the gate for measured extensions under
+  `web/dashboard/`, keeps it with the dashboard lane, excludes manifests
+  and out-of-scope trees, includes it in the full profile, and never
+  selects it for docs-only diffs. `test_ts_complexity_gate.py` binds the
+  same invariants as a self-gate unit test.
 
 Fixture coupling: C13 pins `files_changed_in_scope === 7` for the main repo;
 the rename and receipt scenarios deliberately live in separate fixture

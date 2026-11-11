@@ -24,7 +24,7 @@ import commands as command_registry
 PROFILES = {
     "self": ["self"],
     "fast": ["self", "fast"],
-    "static": ["self", "static"],
+    "static": ["self", "static", "go-policy"],
     "security": ["self", "static", "security", "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
     "security-code": ["self", "static", "security", "secrets", "commit-secrets", "deps", "licenses", "policy"],
     "security-runtime": ["self", "tests", "int-modules", "integration"],
@@ -45,7 +45,7 @@ PROFILES = {
     "eval": ["routing", "guards"],
     "integration": ["integration"],
     "int-modules": ["int-modules"],
-    "full": ["self", "go-complexity", "static", "security", "tests", "routing", "guards",
+    "full": ["self", "go-complexity", "ts-complexity", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards",
              "dashboard", "site", "design", "node-sdk", "python-sdk", "bridge",
              "go-sdk", "docs", "nested-go", "int-modules",
              "secrets", "deps", "licenses", "policy", "package", "alerts", "dr"],
@@ -64,9 +64,9 @@ RELEASE_PLAN_DATA = {RELEASE_PLAN_DIR + "PLAN-DATA.md"}
 # suites, image builds, disposable PG drills). Docker Desktop runs the daemon
 # in a CPU-limited VM; overlapping them starves time-sensitive tests into
 # flakes (observed 2026-10-06: slowlog/timing failures under jobs=4). They
-HEAVY_GATES = {"static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity"}
+HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity"}
 LIGHT_GATES = LEAVES - HEAVY_GATES
-DOCKER_GATES = {"tests", "int-modules", "integration", "package", "dr", "image-scan"}
+DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan"}
 # NEXT-14b: ordering constraints for the parallel scheduler. The browser gate
 # serves the production builds produced by dashboard/site; those builds wipe
 # their output directories mid-run (Makefile re-stamps the fingerprint after
@@ -128,6 +128,18 @@ def snapshot(root):
 
 
 def classify(paths):
+    reasons = classify_product_paths(paths)
+    for path in paths:
+        if path.endswith('.go') or Path(path).name in ('go.mod', 'go.sum'):
+            gates = ['go-policy', 'critical-go']
+            if path.endswith('.go'):
+                gates.append('go-complexity')
+            for gate in gates:
+                reasons.setdefault(gate, []).append(path)
+    return reasons
+
+
+def classify_product_paths(paths):
     reasons = {"self": ["verify the quality infrastructure"]}
 
     def add(gates, path):
@@ -182,7 +194,14 @@ def classify(paths):
         elif path in ("Makefile", ".golangci.yml") or path.startswith(("scripts/quality/", ".opencode/skills/go-")):
             add(PROFILES["full"], path)
         elif path.startswith("web/dashboard/"):
-            add(["dashboard", "design"], path)
+            gates = ["dashboard", "design"]
+            # Mirrors scripts/quality/complexity/ts/collect.mjs measured
+            # extensions; manifests carry no function bodies.
+            if path.endswith((".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs")):
+                # QG-C02: changed TS/JS function bodies must pass the
+                # complexity differential gate.
+                gates.insert(0, "ts-complexity")
+            add(gates, path)
         elif path.startswith("web/site/"):
             add(["site"], path)
         elif path.startswith("e2e/") or path in ("playwright.config.ts", "scripts/quality/browser.sh", "scripts/quality/browser-build.sh", "scripts/build-fingerprint.sh"):

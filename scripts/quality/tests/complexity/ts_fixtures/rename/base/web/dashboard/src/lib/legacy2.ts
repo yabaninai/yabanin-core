@@ -1,7 +1,5 @@
-// Fixture base state (rename scenario): legacyHeavy scores cognitive 25
-// (25 flat ifs). At head it is renamed to legacyHeavyRenamed with a
-// reformatted-only body — the identical fingerprint must carry the debt as a
-// moved body, never as a new blocking function.
+// Fixture base state (rename): legacyHeavy scores 25 (25 flat ifs); head
+// renames it reformat-only, so the debt must carry as moved, never block.
 export function legacyHeavy(steps: number): number {
   let total = 0;
   if (steps > 1) total += 1;

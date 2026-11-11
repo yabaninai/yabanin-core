@@ -33,7 +33,7 @@ trap 'rm -rf "$WORK"' EXIT
 # receipt validation; the production default ordering lives in the script.
 export GO_COMPLEXITY_MODEL_ORDER="fixture-senior,fixture-impl,fixture-junior"
 
-BASE_BLOCKS="go_fn_legacy.go.tmpl go_fn_simple_base.go.tmpl go_fn_heavy_base.go.tmpl go_fn_movable_base.go.tmpl go_fn_removed_base.go.tmpl"
+BASE_BLOCKS="go_fn_legacy.go.frag go_fn_simple_base.go.frag go_fn_heavy_base.go.frag go_fn_movable_base.go.frag go_fn_removed_base.go.frag"
 RC=""
 total_failed=0
 scenario_failed=0
@@ -138,8 +138,8 @@ scenario_clean_pass() {
     repo=$(new_repo clean)
     local base
     base=$(build_base "$repo")
-    EXTRA_FILES="moved.go:go_fn_moved_identical.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_ok_head.go.tmpl
+    EXTRA_FILES="moved.go:go_fn_moved_identical.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_heavy_ok_head.go.frag
     run_analyzer "$repo" "$base" "$WORK/clean.json"
     python3 - "$base" "$RC" "$WORK/clean.json" "$WORK/out.txt" <<'PY'
 import json
@@ -208,8 +208,8 @@ scenario_block_over_15() {
     repo=$(new_repo block)
     local base
     base=$(build_base "$repo")
-    EXTRA_FILES="moved.go:go_fn_moved_identical.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_head.go.tmpl
+    EXTRA_FILES="moved.go:go_fn_moved_identical.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_heavy_head.go.frag
     run_analyzer "$repo" "$base" "$WORK/block.json"
     python3 - "$base" "$RC" "$WORK/block.json" "$WORK/out.txt" <<'PY'
 import json
@@ -263,7 +263,7 @@ scenario_receipt_band() {
     repo=$(new_repo receipt)
     local base
     base=$(build_base "$repo")
-    build_head "$repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    build_head "$repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
     local head
     head=$(git -C "$repo" rev-parse HEAD)
 
@@ -342,7 +342,7 @@ PY
     boundary_repo=$(new_repo boundary)
     local boundary_base
     boundary_base=$(build_base "$boundary_repo")
-    build_head "$boundary_repo" go_fn_legacy.go.tmpl go_fn_borderline_ok_head.go.tmpl
+    build_head "$boundary_repo" go_fn_legacy.go.frag go_fn_borderline_ok_head.go.frag
     run_analyzer "$boundary_repo" "$boundary_base" "$WORK/boundary.json"
     python3 - "$RC" "$WORK/boundary.json" "$WORK/out.txt" <<'PY'
 import json
@@ -377,8 +377,8 @@ scenario_determinism() {
     repo=$(new_repo determinism)
     local base
     base=$(build_base "$repo")
-    EXTRA_FILES="moved.go:go_fn_moved_identical.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_head.go.tmpl
+    EXTRA_FILES="moved.go:go_fn_moved_identical.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_heavy_head.go.frag
     run_analyzer "$repo" "$base" "$WORK/det1.json"
     run_analyzer "$repo" "$base" "$WORK/det2.json"
     if cmp -s "$WORK/det1.json" "$WORK/det2.json"; then
@@ -397,8 +397,8 @@ scenario_moved_modified() {
     repo=$(new_repo movedmod)
     local base
     base=$(build_base "$repo")
-    EXTRA_FILES="moved.go:go_fn_moved_modified.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl
+    EXTRA_FILES="moved.go:go_fn_moved_modified.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag
     run_analyzer "$repo" "$base" "$WORK/movedmod.json"
     python3 - "$RC" "$WORK/movedmod.json" "$WORK/out.txt" <<'PY'
 import json
@@ -444,7 +444,7 @@ scenario_receipt_validation() {
     base=$(build_base "$repo")
     export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
            GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
-    build_head "$repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    build_head "$repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
     local head
     head=$(git -C "$repo" rev-parse HEAD)
     unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
@@ -589,11 +589,11 @@ scenario_duplicate_over_15() {
     local repo
     repo=$(new_repo dup)
     local base
-    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
+    base=$(BASE_EXTRA="go_fn_debt_base.go.frag" build_base "$repo")
     export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
            GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
-    EXTRA_FILES="dup.go:go_fn_debt_duplicate_head.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_debt_base.go.tmpl
+    EXTRA_FILES="dup.go:go_fn_debt_duplicate_head.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_debt_base.go.frag
     local head
     head=$(git -C "$repo" rev-parse HEAD)
     unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
@@ -679,9 +679,9 @@ scenario_moved_debt_carry() {
     local repo
     repo=$(new_repo carry)
     local base
-    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
-    EXTRA_FILES="moved.go:go_fn_debt_moved_head.go.tmpl" \
-        build_head "$repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl
+    base=$(BASE_EXTRA="go_fn_debt_base.go.frag" build_base "$repo")
+    EXTRA_FILES="moved.go:go_fn_debt_moved_head.go.frag" \
+        build_head "$repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag
     run_analyzer "$repo" "$base" "$WORK/carry.json"
     python3 - "$RC" "$WORK/carry.json" "$WORK/out.txt" <<'PY'
 import json
@@ -735,11 +735,11 @@ scenario_formatting_only() {
     # formatting-only edit produces zero changed functions.
     local repo
     repo=$(new_repo fmt)
-    write_go "$repo/sample.go" go_fn_fmt_base.go.tmpl
+    write_go "$repo/sample.go" go_fn_fmt_base.go.frag
     commit_all "$repo" base
     local base
     base=$(git -C "$repo" rev-parse HEAD)
-    write_go "$repo/sample.go" go_fn_fmt_head.go.tmpl
+    write_go "$repo/sample.go" go_fn_fmt_head.go.frag
     commit_all "$repo" head
     run_analyzer "$repo" "$base" "$WORK/fmt.json"
     python3 - "$RC" "$WORK/fmt.json" "$WORK/out.txt" <<'PY'
@@ -778,7 +778,7 @@ PY
     # on the helper's empty batch output.
     local quiet_repo
     quiet_repo=$(new_repo fmtquiet)
-    write_go "$quiet_repo/sample.go" go_fn_fmt_base.go.tmpl
+    write_go "$quiet_repo/sample.go" go_fn_fmt_base.go.frag
     commit_all "$quiet_repo" base
     local quiet_base
     quiet_base=$(git -C "$quiet_repo" rev-parse HEAD)
@@ -823,11 +823,11 @@ scenario_treewide_duplicate() {
     local repo
     repo=$(new_repo treedup)
     local base
-    base=$(BASE_EXTRA="go_fn_debt_base.go.tmpl" build_base "$repo")
+    base=$(BASE_EXTRA="go_fn_debt_base.go.frag" build_base "$repo")
     # Head rewrites sample.go byte-identical (git reports no change for it)
     # and adds the duplicate in a brand-new file.
-    EXTRA_FILES="treedup.go:go_fn_debt_duplicate_head.go.tmpl" \
-        build_head "$repo" $BASE_BLOCKS go_fn_debt_base.go.tmpl
+    EXTRA_FILES="treedup.go:go_fn_debt_duplicate_head.go.frag" \
+        build_head "$repo" $BASE_BLOCKS go_fn_debt_base.go.frag
     run_analyzer "$repo" "$base" "$WORK/treedup.json"
     python3 - "$RC" "$WORK/treedup.json" "$WORK/out.txt" <<'PY'
 import json
@@ -921,19 +921,19 @@ scenario_gate_wiring() {
     heavy_base=$(build_base "$heavy_repo")
     export GIT_AUTHOR_DATE="2026-11-05T09:00:00+00:00" \
            GIT_COMMITTER_DATE="2026-11-05T09:00:00+00:00"
-    build_head "$heavy_repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_head.go.tmpl
+    build_head "$heavy_repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_heavy_head.go.frag
     heavy_head=$(git -C "$heavy_repo" rev-parse HEAD)
 
     local band_repo band_base band_head
     band_repo=$(gate_repo gateband)
     band_base=$(build_base "$band_repo")
-    build_head "$band_repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    build_head "$band_repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
     band_head=$(git -C "$band_repo" rev-parse HEAD)
 
     local debt_repo debt_base
     debt_repo=$(gate_repo gatedebt)
     debt_base=$(build_base "$debt_repo")
-    build_head "$debt_repo" go_fn_legacy.go.tmpl go_fn_simple_head.go.tmpl go_fn_heavy_ok_head.go.tmpl
+    build_head "$debt_repo" go_fn_legacy.go.frag go_fn_simple_head.go.frag go_fn_heavy_ok_head.go.frag
 
     local quiet_repo quiet_base
     quiet_repo=$(gate_repo gatedocs)
@@ -984,7 +984,7 @@ scenario_gate_wiring() {
     local band2_repo band2_base band2_head
     band2_repo=$(gate_repo gateband2)
     band2_base=$(build_base "$band2_repo")
-    build_head "$band2_repo" go_fn_legacy.go.tmpl go_fn_borderline_head.go.tmpl
+    build_head "$band2_repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
     band2_head=$(git -C "$band2_repo" rev-parse HEAD)
     unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
     make_receipt "$WORK/gate-valid.json" "$band2_head" "$band2_base" fixture-senior \

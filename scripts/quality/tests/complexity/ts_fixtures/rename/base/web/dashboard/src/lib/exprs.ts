@@ -1,8 +1,5 @@
-// Fixture base state (rename scenario): a plain exported function and a
-// default-exported function with identical low-complexity bodies. At head
-// both are renamed across syntactic forms (function declaration -> const
-// function expression, default export -> renamed arrow re-exported as
-// default); identical bodies must be recognized as moves, not additions.
+// Fixture base state (rename): plain export + default export with identical
+// low-complexity bodies; both are renamed across syntactic forms at head.
 export function exprTarget(rows: string[]): number {
   let total = 0;
   if (rows.length > 2) total += 1;

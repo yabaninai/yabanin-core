@@ -288,6 +288,7 @@ def build_entry(head, kind, base, classification):
         "new_cyclomatic": head["cyclomatic"],
         "old_cognitive": metric(base, "cognitive"),
         "new_cognitive": head["cognitive"],
+        "cognitive_review_required": kind != "moved" and (head["cognitive"] or 0) > 15,
         "cyclomatic_delta": None if head["cyclomatic"] is None or not base
         else head["cyclomatic"] - (base["cyclomatic"] or 0),
         "classification": classification,

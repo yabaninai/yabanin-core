@@ -1,13 +1,5 @@
-// Fixture head state: added file pinning individual metric paths.
-// routePlan pins switch counting: 4 case clauses (+1 x (1+1) each, nesting 1
-// inside the switch) plus an if nested in a clause (+1 x 2) = cognitive 10;
-// the default clause scores nothing.
-// guardedParse pins catch counting: if in try (+1), catch clause (+1), if in
-// catch body at nesting 1 (+2) = cognitive 4.
-// fetchScore pins async function bodies (await itself adds nothing):
-// if + else-if + else + trailing if = cognitive 4.
-// asyncLabel pins async arrow bodies: for-of (+1) and if at nesting 1 (+2)
-// = cognitive 3.
+// Fixture head state: added file pinning metric paths — routePlan 10
+// (switch clauses + nested if), guardedParse 4 (catch), fetchScore 4, asyncLabel 3.
 export function routePlan(code: string, size: number): string {
   let plan = "none";
   switch (code) {

@@ -1,8 +1,5 @@
-// Fixture head state (rename scenario): exprTarget becomes a const function
-// expression named exprTargetMoved; defaultTarget becomes the arrow
-// renamedDefault, still exported as default. Both bodies are identical to
-// base — each must be recognized as a move (fingerprint match), never as
-// added code, even though the syntactic form changed.
+// Fixture head state (rename): exprTarget -> const function expression;
+// defaultTarget -> renamed default-exported arrow; identical bodies stay moves.
 export const exprTargetMoved = function (rows: string[]): number {
   let total = 0;
   if (rows.length > 2) total += 1;

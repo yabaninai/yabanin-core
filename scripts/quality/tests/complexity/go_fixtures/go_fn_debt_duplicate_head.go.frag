@@ -1,8 +1,5 @@
-// Fixture head: HeavyDuplicate is a content-identical copy of the base
-// HeavyOriginal (18 ifs, cyclomatic 18) while the original still exists at
-// head in sample.go. The free-duplicate loophole must NOT apply: this is
-// measured as added content under the full thresholds and blocks (>15),
-// with duplicate_of naming the surviving original.
+// Fixture head: HeavyDuplicate copies HeavyOriginal (cyclomatic 18) while
+// the original survives: measured added, blocks, duplicate_of set.
 func HeavyDuplicate(x int) int {
 	n := 0
 	if x > 1 {

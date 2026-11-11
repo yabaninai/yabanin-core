@@ -95,8 +95,21 @@ jobs:
 
       - name: Security scan (govulncheck)
         run: |
-          make install-analysis-tools security-tools-install security-db-update
+          make install-analysis-tools install-critical-tools security-tools-install security-db-update
           make analyze-security
+
+      - name: Check changed Go policy and critical behavior after push
+        if: github.event_name == 'push'
+        env:
+          QUALITY_BASE: ${{ github.event.before }}
+        run: make analyze-go-policy analyze-critical-go _quality-go-complexity
+
+      - name: Retain post-push Go gate evidence
+        if: always() && github.event_name == 'push'
+        uses: actions/upload-artifact@v7
+        with:
+          name: post-push-go-quality
+          path: artifacts/quality/
 
   helm:
     name: Helm validation
@@ -264,7 +277,7 @@ jobs:
           npm ci --prefix sdks/node --no-audit --no-fund
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
-          make install-analysis-tools security-tools-install security-db-update
+          make install-analysis-tools install-critical-tools security-tools-install security-db-update
 
       # NEXT-14: QUALITY_JOBS=2 overlaps one light gate with the serialized
       # heavy Go lane on the 2-vCPU hosted runner; heavy and Docker gates stay

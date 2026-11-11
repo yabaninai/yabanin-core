@@ -159,7 +159,7 @@ baseline debt tracking is QG-C02 scope.
 ## Fixtures
 
 `scripts/quality/tests/complexity/go_test_complexity.sh` builds throwaway
-git repositories from `go_fixtures/*.go.tmpl` and asserts, with hand-counted
+git repositories from `go_fixtures/*.go.frag` and asserts, with hand-counted
 oracle values independent of the analyzer's own computation:
 
 - clean pass, >15 blocking, receipt band and boundary 10, determinism
@@ -188,5 +188,5 @@ and never for docs-only diffs. `test_go_complexity_gate.py` binds the same
 invariants as a self-gate unit test.
 
 The fixture templates intentionally contain high-complexity bodies; they
-are test inputs, not shipped logic, and are `.go.tmpl` so the module never
+are test inputs, not shipped logic, and are `.go.frag` so the module never
 compiles them at rest.

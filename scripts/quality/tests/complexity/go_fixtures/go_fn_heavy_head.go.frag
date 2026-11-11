@@ -1,7 +1,5 @@
-// Fixture head: HeavyChanged grown to cyclomatic 18. Hand-counted oracle:
-// 1 + for(1) + if/elseif(2) + case clauses incl default(5) + if(1) + &&(1)
-// + plain ifs(7) = 18. Must classify "blocks" and fail the gate naming
-// HeavyChanged.
+// Fixture head: HeavyChanged at cyclomatic 18 (hand-counted: for+elseif+
+// 5 case clauses+&&+plain ifs); must block naming HeavyChanged.
 func HeavyChanged(v []int) int {
 	n := 0
 	for _, x := range v {
