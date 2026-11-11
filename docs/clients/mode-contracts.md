@@ -65,7 +65,7 @@ Codex's ChatGPT-OAuth login is explicitly not a gateway auth path
 - Capability flags: personal keys mint with `can_mint_sessions=false` and
   `can_read_usage=false` — the insert does not set them
   (`pkg/adminstore/developers.go:192`) and the columns default false
-  (`migrations/0001_init.up.sql:393`). Only an org admin holding
+  (`migrations/0001_init.up.sql:393-394`). Only an org admin holding
   `keys.manage` can flip the flags afterwards via the CAS surface
   (`services/admin/handlers/api_key_labels.go:95`; grant row
   `docs/ui-grant-scope-matrix.md:78`).
@@ -177,7 +177,7 @@ entitlement that gates the run.
 - Delegation effects are confined: workspace paths are realpath-confined to
   the launch root, else `workspace_escape`
   (`services/subscription-bridge/src/server.ts:121`); concurrency is capped
-  at WRITE=1/ANALYZE=2 (`services/subscription-bridge/src/server.ts:7`,
+  at WRITE=1/ANALYZE=2 (`services/subscription-bridge/src/server.ts:7-8`,
   admission `:126`); body and output limits per
   `docs/clients/modes-audit.md` §5.
 - The subscription's own entitlement is the gating right: provider quota and
@@ -221,19 +221,19 @@ are issuance (admin, not portal), the managed capability flags, and optional
 ### 4.1 Credential kinds and ownership
 
 - `yb_` org key created via `POST /api/api-keys` under `keys.manage`
-  (`services/admin/handlers/router_keys.go:17`; store insert
+  (gate `services/admin/handlers/router_keys.go:16`, POST `:18`; store insert
   `pkg/adminstore/keys.go:17`; grant row `docs/ui-grant-scope-matrix.md:78`).
 - `can_mint_sessions` / `can_read_usage` start false (column defaults,
-  `migrations/0001_init.up.sql:393`) and are set only through the
+  `migrations/0001_init.up.sql:393-394`) and are set only through the
   admin CAS surface (`services/admin/handlers/api_key_labels.go:95`).
 - Optional `ybs_` session children (`pkg/auth/sessionkeys.go:10`): minted by
   the parent over `/v1/yabanin/session-keys` (`pkg/gateway/gateway.go:1980`),
-  TTL 60–43200 s default 7200 (`pkg/gateway/sessionkeys_api.go:24`), capped
+  TTL 60–43200 s default 7200 (`pkg/gateway/sessionkeys_api.go:24-28`), capped
   at the parent's expiry (AUTH-03, `pkg/gateway/sessionkeys_api.go:139`),
   mint rate 60/min per parent (`pkg/gateway/sessionkeys_api.go:189`).
 - Machine-client secret handling is the operator's: the LiteLLM migration
   refuses to copy `api_key`/`master_key` values into its reports
-  (`pkg/trcli/litellm_migrate.go:229`); CI commands take the parent from
+  (`pkg/clientconfig/litellm_migrate.go:229`); CI commands take the parent from
   `YABANIN_CI_KEY`/env (`pkg/trcli/ci.go:22`, resolution `:225`).
 
 ### 4.2 Injection points
@@ -269,11 +269,14 @@ are issuance (admin, not portal), the managed capability flags, and optional
 
 - Gateway server side: **verified** — documented deployment paths (localhost
   quickstart, offline Docker bundle, air-gapped Kubernetes/Helm —
-  `docs/deployment-options.md:10`), quickstart smoke driving the seeded key
+  `docs/deployment-options.md:10-12`), quickstart smoke driving the seeded key
   through `/v1/models` and chat (`docs/quickstart.md:181`, `:200`), and
   test-pinned auth/session behavior (resolver cache/revocation
   `pkg/auth/resolver_test.go:178`, `pkg/auth/resolver_revocation_test.go`;
   session budget/expiry `pkg/gateway/sessionkeys_api_test.go:268`, `:332`).
+  Of these, only the auth/session/resolver claims are pinned by tests in this
+  repository; the deployment citations are documented procedure — quickstart.md
+  prescribes its smoke steps, but no executed run of them is recorded here.
 - Client-side org-key workflows (CI mint/finish, LiteLLM apply):
   unit/integration tested only; no CI workflow covers them (NC1,
   `docs/clients/ownership-map.md` §6). LiteLLM apply is reviewed-report
