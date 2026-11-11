@@ -1,10 +1,10 @@
 module github.com/reireirei/yabanin
 
-go 1.27.3
+go 1.27.4
 
-// GO-2026-6809: crypto/x509 (go1.27.2) distrust fix, reachable through
-// loggerd S3 export TLS verification. Patch-release toolchain pin; GOTOOLCHAIN=auto
-// fetches it. Rollback: delete this line (returns to the 1.27.2 toolchain).
+// GO-2026-6809 (crypto/x509 distrust via loggerd S3 export) and
+// GO-2026-6859 / CVE-2026-97054 (net/http) are fixed in 1.27.4;
+// GOTOOLCHAIN=auto fetches this patch release.
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.8

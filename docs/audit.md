@@ -13,7 +13,7 @@ is not wired into the CLI; starting an embedder does not enable it.
 
 ## Quickstart: a synthetic report
 
-Install the Go version from the root `go.mod` (currently 1.27.3). From the
+Install the Go version from the root `go.mod` (currently 1.27.4). From the
 repository root, build the **operator CLI**, which contains `audit`:
 
 ```bash
