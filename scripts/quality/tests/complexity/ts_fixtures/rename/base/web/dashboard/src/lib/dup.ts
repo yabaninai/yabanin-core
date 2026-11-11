@@ -1,7 +1,5 @@
-// Fixture base state (rename scenario): heavyOriginal scores cognitive 16
-// (16 flat ifs). At head the file additionally contains heavyCopy with a
-// byte-identical body — the duplicate must be measured as added code and
-// block, while the surviving original stays untouched debt.
+// Fixture base state (rename): heavyOriginal scores 16 (16 flat ifs); head
+// adds a byte-identical heavyCopy that must be measured added and block.
 export function heavyOriginal(rows: string[]): number {
   let total = 0;
   if (rows.length > 1) total += 1;

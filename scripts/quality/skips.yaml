@@ -15,7 +15,7 @@
 #   expires: empty = permanent; YYYY-MM-DD = temporary exception
 
 schema: 1
-updated: 2026-11-03
+updated: 2026-11-11
 
 skips:
   - test: pkg/costsim.TestRegenerateSampleHTML
@@ -120,4 +120,49 @@ skips:
     refs: card N13-P04-T06 lane imp-n05p05t06 (lease row artifacts/imp/leases.md, commit d97bdfb1); armed-run evidence and transcript bound in artifacts/internal-delivery-program/imp-t06live-2026-11-05.md; one-time execution policy per card acceptance (real-message budget <=5, TEST-labeled)
     owner: yabanin
     proof: the deterministic carry runs in every pass and pins the same code paths - TestN13P04T06_MockSink_* (wire contract: request shape, retry_after handling, exactly-one HTTP attempt, token-redacting error paths, wrong-chat rejection, malformed-chat pre-flight) and TestN13P04T06_GoldenBuilder_FormatPins (byte-exact alertmanager v0.27.0 telegram.default.message golden, html/template escaping per notify.TmplHTML, sorted-pairs order, no re-execution of posted annotation values); the armed drill reuses the same telegramSinkClient and the same golden builder the deterministic suites pin
+    expires: ""
+
+  - test: pkg/gateway.TestChatCompletions_OpenCodeCLI_RealE2E
+    condition: opencode CLI binary absent (YABANIN_OPENCODE_BIN unset, ~/.opencode/bin/opencode missing, not on PATH) or -short mode; loud t.Skipf by the test's own guard
+    reason: real-editor-loop e2e requires the real opencode binary as an explicit prerequisite (test header: "binary absence is an explicit prerequisite, never a green mask"); checkout CI runners install no opencode/codex CLI, so the gate skips there by design while owner stands with the binary run the full CLI -> /v1/chat/completions -> mock-upstream loop
+    class: ENVIRONMENT (real-CLI prerequisite absent on checkout runners by design, not lost coverage)
+    refs: flagged as unexplained by CI run 43008645785 manifest 20261111T110430Z-90832bb3 (PR #63) and CI run 43008585765 manifest 20261111T110400Z-d3f67445 on task/ci-hardening (PR #68); same five pkg/gateway RealE2E skips in both
+    owner: yabanin
+    proof: the chat-completions SSE relay contract these e2es drive runs in every pass via the pkg/gateway deterministic suite (gateway_test.go SSE/relay tests); the CLI integration itself is the documented owner-stand confirmation (docs/clients/opencode.md); arming is explicit - install the opencode CLI or set YABANIN_OPENCODE_BIN and run go test ./pkg/gateway/ -run TestChatCompletions_OpenCodeCLI_RealE2E
+    expires: ""
+
+  - test: pkg/gateway.TestResponses_CodexCLI_RealE2E
+    condition: codex CLI binary absent (YABANIN_CODEX_BIN unset, ~/.local/bin/codex missing, not on PATH) or -short mode; loud t.Skipf by the test's own guard
+    reason: real codex-cli e2e requires the real binary (R046 client confirmation); checkout CI runners install no opencode/codex CLI, so the gate skips there by design while owner stands re-verify recorded versions (0.162.1, 0.163.0, 0.166.0 per docs/clients/codex.md)
+    class: ENVIRONMENT (real-CLI prerequisite absent on checkout runners by design, not lost coverage)
+    refs: flagged as unexplained by CI run 43008645785 manifest 20261111T110430Z-90832bb3 (PR #63) and CI run 43008585765 manifest 20261111T110400Z-d3f67445 on task/ci-hardening (PR #68); same five pkg/gateway RealE2E skips in both
+    owner: yabanin
+    proof: TestResponses_CodexCLI_MockE2E and TestResponses_CodexCLI_MockE2E_ReasoningResendAndUsage drive the identical client loop (models probe, streamed tool turns, stateless full-history resend) with a mock codex CLI in every pass; docs/clients/codex.md records the real-binary re-verification cadence and the compatibility matrix
+    expires: ""
+
+  - test: pkg/gateway.TestResponses_CodexCLI_RealE2E_ToolsLoop
+    condition: codex CLI binary absent or -short mode (same guard as TestResponses_CodexCLI_RealE2E)
+    reason: tools-loop leg of the real codex-cli e2e (tool round-trips over the responses wire); same real-binary prerequisite, absent on checkout runners by design
+    class: ENVIRONMENT (real-CLI prerequisite absent on checkout runners by design, not lost coverage)
+    refs: flagged as unexplained by CI run 43008645785 manifest 20261111T110430Z-90832bb3 (PR #63) and CI run 43008585765 manifest 20261111T110400Z-d3f67445 on task/ci-hardening (PR #68); same five pkg/gateway RealE2E skips in both
+    owner: yabanin
+    proof: the tool-calling turn loop is pinned deterministically by TestResponses_CodexCLI_MockE2E (the mock CLI drives one tool-calling turn plus the stateless resend turn) and the gateway-side tool-policy suites; real-binary re-verification recorded in docs/clients/codex.md (0.166.0 tools loop, 2026-11-03)
+    expires: ""
+
+  - test: pkg/gateway.TestResponses_CodexCLI_RealE2E_UnsupportedToolCall
+    condition: codex CLI binary absent or -short mode (same guard as TestResponses_CodexCLI_RealE2E)
+    reason: unsupported-tool-call capability leg of the real codex-cli e2e; same real-binary prerequisite, absent on checkout runners by design
+    class: ENVIRONMENT (real-CLI prerequisite absent on checkout runners by design, not lost coverage)
+    refs: flagged as unexplained by CI run 43008645785 manifest 20261111T110430Z-90832bb3 (PR #63) and CI run 43008585765 manifest 20261111T110400Z-d3f67445 on task/ci-hardening (PR #68); same five pkg/gateway RealE2E skips in both
+    owner: yabanin
+    proof: the D1+D2 dropped-field surface (X-Yabanin-Unsupported announcement, continuation-id refusal) is asserted on every path by the mock-CLI suite (TestResponses_CodexCLI_MockE2E header: "the mock doubles as the regression for the ratified D1+D2 surface"); real-binary re-verification recorded in docs/clients/codex.md (0.166.0 capability errors, 2026-11-03)
+    expires: ""
+
+  - test: pkg/gateway.TestResponses_CodexCLI_RealE2E_ClientCancel
+    condition: codex CLI binary absent or -short mode (same guard as TestResponses_CodexCLI_RealE2E)
+    reason: mid-stream client-cancel leg of the real codex-cli e2e; same real-binary prerequisite, absent on checkout runners by design
+    class: ENVIRONMENT (real-CLI prerequisite absent on checkout runners by design, not lost coverage)
+    refs: flagged as unexplained by CI run 43008645785 manifest 20261111T110430Z-90832bb3 (PR #63) and CI run 43008585765 manifest 20261111T110400Z-d3f67445 on task/ci-hardening (PR #68); same five pkg/gateway RealE2E skips in both
+    owner: yabanin
+    proof: gateway-side cancellation semantics are covered by the deterministic responses/relay suites in pkg/gateway (every pass); the real mid-stream cancel was re-verified on an owner stand and recorded in docs/clients/codex.md (0.166.0, 2026-11-03)
     expires: ""

@@ -1,6 +1,5 @@
-// Fixture head state: new file. MegaList is an arrow-function component with
-// cognitive complexity exactly 16 (16 flat ifs) — the run must exit 1 and
-// name MegaList as the blocking offender.
+// Fixture head state: new file. MegaList is an arrow component at
+// cognitive exactly 16 (16 flat ifs); the run must exit 1 naming it.
 export const MegaList = (rows: string[]): string => {
   let cls = "base";
   if (rows.length > 1) cls += " a";

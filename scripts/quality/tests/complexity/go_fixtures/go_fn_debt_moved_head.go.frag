@@ -1,9 +1,5 @@
-// Fixture head: HeavyOriginal's base original was REMOVED from sample.go
-// and its body reappears here renamed and reformatted (blank lines,
-// one-line ifs, odd spaces — gofmt-equivalent content). Formatting must not
-// break the canonical body hash: this is a genuine move that carries its
-// pre-existing cyclomatic 18 debt into the untouched-debt ledger (kind
-// "moved") and never blocks.
+// Fixture head: the base HeavyOriginal was removed and reappears here
+// renamed and reformatted — a genuine move carrying its cyclomatic-18 debt.
 func HeavyMovedDebt(x int) int {
 	n := 0
 

@@ -1,6 +1,5 @@
-// Fixture head state: same stableReformat body as base, reformatted only
-// (whitespace, line breaks, added comments). It must be measured at head
-// (cognitive 2, untouched-debt bucket) yet produce no changed entry.
+// Fixture head state: stableReformat reformatted only (whitespace, line
+// breaks, comments): measured (2) yet never a changed entry.
 export function stableReformat(values: number[]): number {
   // indentation and comments differ from base on purpose
       let total = 0;

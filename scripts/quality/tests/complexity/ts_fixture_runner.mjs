@@ -14,13 +14,17 @@
 //     (a byte-identical copy of a surviving original is measured and
 //     blocks), C15 (the --debt-out ledger lists untouched and moved debt
 //     untruncated), C16 (function-expression/default-export renames stay
-//     moves) and C17 (an unreadable changed file exits 2 naming the file).
+//     moves) and C17 (an unreadable changed file exits 2 naming the file);
+//   * the wiring repos (W1-W14) drive the live _quality-ts-complexity
+//     recipe extracted from the product Makefile through make, with a
+//     committed analyzer copy and the parser pin kept on the real
+//     checkout via TS_COMPLEXITY_REPO_ROOT.
 //
 // Each guarded control is re-checked against a deliberately mutated copy of
 // the analyzer (single exact-string replacement, target uniqueness
 // asserted) so every guarded control is proven to fail on its intended
-// assertion. Exit 0 only if all 40 checks pass on the real analyzer and all
-// 12 mutants are detected.
+// assertion. Exit 0 only if all 54 rows pass (42 analyzer and wiring
+// controls, 12 detected mutants).
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
@@ -39,23 +43,34 @@ const MODEL_ORDER = ["--model-order", "impl-lite,impl-strong"];
 const RECEIPT_SCHEMA = "ts-complexity-review-receipt/1";
 
 function runGit(repo, ...args) {
-  execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  try {
+    execFileSync("git", ["-C", repo, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+  } catch (error) {
+    throw new Error(`git -C ${repo} ${args.join(" ")} failed: ${error.stderr?.toString() ?? error.message}`);
+  }
+}
+
+function initRepo(target) {
+  runGit(target, "init", "-q");
+  runGit(target, "config", "user.email", "fixtures@local.test");
+  runGit(target, "config", "user.name", "fixture runner");
+  runGit(target, "config", "commit.gpgsign", "false");
 }
 
 function buildFixtureRepo(target, scenario) {
   const root = join(FIXTURES, scenario);
   cpSync(join(root, "base"), target, { recursive: true });
-  runGit(target, "init", "-q");
-  runGit(target, "config", "user.email", "fixtures@local.test");
-  runGit(target, "config", "user.name", "fixture runner");
-  runGit(target, "config", "commit.gpgsign", "false");
-  runGit(target, "add", "-A");
-  runGit(target, "commit", "-qm", "fixture base");
+  initRepo(target);
+  commitAll(target, "fixture base");
   cpSync(join(root, "head"), target, { recursive: true });
-  runGit(target, "add", "-A");
-  runGit(target, "commit", "-qm", "fixture head");
+  commitAll(target, "fixture head");
   const sha = (ref) => execFileSync("git", ["-C", target, "rev-parse", ref]).toString("utf8").trim();
   return { repo: target, base: sha("HEAD~1"), head: sha("HEAD") };
+}
+
+function commitAll(repo, message) {
+  runGit(repo, "add", "-A");
+  runGit(repo, "commit", "-qm", message);
 }
 
 function runAnalyzer(analyzerDir, scenario, extraArgs = []) {
@@ -443,6 +458,142 @@ function writeReceipt(receiptDir, name, scenario, overrides) {
   return path;
 }
 
+// QG-C02-03 gate wiring: the live _quality-ts-complexity recipe is pulled
+// from the product Makefile and driven through make in fixture repos that
+// carry a committed copy of the analyzer package (committed at base so the
+// copy never enters the measured diff). TS_COMPLEXITY_REPO_ROOT keeps the
+// pinned parser on the real checkout while the analyzed tree stays the
+// fixture repo.
+
+function extractGateRecipe() {
+  const lines = readFileSync(join(PRODUCT_ROOT, "Makefile"), "utf8").split("\n");
+  const start = lines.findIndex((line) => line === "_quality-ts-complexity:");
+  if (start === -1) return "";
+  const block = [];
+  for (let index = start; index < lines.length && lines[index] !== ""; index += 1) block.push(lines[index]);
+  return `${block.join("\n")}\n`;
+}
+
+const GATE_RECIPE = extractGateRecipe();
+
+function buildGateRepo(work, name, baseScenario, headScenario, copies, writes) {
+  const repo = join(work, `${name}-repo`);
+  cpSync(join(FIXTURES, baseScenario, "base"), repo, { recursive: true });
+  mkdirSync(join(repo, "scripts/quality/complexity"), { recursive: true });
+  cpSync(ANALYZER_DIR, join(repo, "scripts/quality/complexity", "ts"), { recursive: true });
+  writeFileSync(join(repo, "gate.mk"), GATE_RECIPE);
+  initRepo(repo);
+  commitAll(repo, "gate base");
+  if (headScenario !== null) cpSync(join(FIXTURES, headScenario, "head"), repo, { recursive: true });
+  for (const [source, destination] of copies) cpSync(source, join(repo, destination));
+  for (const [path, text] of writes) writeFileSync(join(repo, path), text);
+  commitAll(repo, "gate head");
+  const sha = (ref) => execFileSync("git", ["-C", repo, "rev-parse", ref]).toString("utf8").trim();
+  return { repo, base: sha("HEAD~1"), head: sha("HEAD") };
+}
+
+function runGate(scenario, receiptPath) {
+  const env = { ...process.env, QUALITY_BASE: scenario.base, TS_COMPLEXITY_REPO_ROOT: PRODUCT_ROOT };
+  if (receiptPath) env.TS_COMPLEXITY_RECEIPT = receiptPath;
+  const result = spawnSync(
+    "make", ["-C", scenario.repo, "-f", "gate.mk", "_quality-ts-complexity"],
+    { encoding: "utf8", maxBuffer: 64 * 1024 * 1024, env },
+  );
+  const out = `${result.stdout ?? ""}${result.stderr ?? ""}${result.error ? result.error.message : ""}`;
+  return { code: result.status, out };
+}
+
+function runWiringScenario(rows, work) {
+  let failures = 0;
+  const gateCase = (id, label, run, wantZero, fragments, forbidden = []) => {
+    let ok = wantZero ? run.code === 0 : run.code !== 0;
+    for (const fragment of fragments) if (!run.out.includes(fragment)) ok = false;
+    for (const fragment of forbidden) if (run.out.includes(fragment)) ok = false;
+    failures += record(rows, id, label, ok);
+  };
+
+  const recipeOk = GATE_RECIPE.includes("analyze.mjs") && GATE_RECIPE.includes("--base");
+  failures += record(rows, "W1", "gate recipe extracted from product Makefile", recipeOk);
+  if (!recipeOk) {
+    failures += record(rows, "W2-W14", "wiring controls skipped (no recipe)", false);
+    return failures;
+  }
+
+  const quiet = join(FIXTURES, "receipt", "base", "web/dashboard/src/lib/quiet.ts");
+  const blockRepo = buildGateRepo(work, "gateblock", "", "", [], []);
+  const bandRepo = buildGateRepo(work, "gateband", "receipt", "receipt", [], []);
+  const debtRepo = buildGateRepo(work, "gatedebt", "", null, [[quiet, "web/dashboard/src/lib/quiet.ts"]], []);
+  const docsRepo = buildGateRepo(work, "gatedocs", "receipt", null, [], [["NOTE.md", "documentation-only change\n"]]);
+
+  const receiptDir = join(work, "gate-receipts");
+  mkdirSync(receiptDir, { recursive: true });
+  const sameModel = writeReceipt(receiptDir, "gate-same-model.json", blockRepo, {
+    fields: {
+      reviewer_model: "impl-lite",
+      functions: ["web/dashboard/src/pages/MegaList.tsx:MegaList",
+                  "web/dashboard/src/App.tsx:borderlineDetailed"],
+    },
+  });
+  const tampered = writeReceipt(receiptDir, "gate-tampered.json", bandRepo, { fields: { source_commit: "USE_BASE" } });
+  const valid = writeReceipt(receiptDir, "gate-valid.json", bandRepo, {});
+
+  gateCase("W2", "over-15 change through make blocks without receipt", runGate(blockRepo), false,
+    [`BLOCK ${BLOCKING_LINE}`]);
+  gateCase("W3", "same-model receipt over >15 change still blocks", runGate(blockRepo, sameModel), false,
+    [`BLOCK ${BLOCKING_LINE}`, "equals implementer_model"]);
+  gateCase("W4", "review band without receipt fails through make", runGate(bandRepo), false,
+    [`NEEDS REVIEW RECEIPT ${BAND_FILE}: borderlineTwelve (cognitive complexity 12 in 11-15)`]);
+  gateCase("W5", "receipt bound to another commit is rejected", runGate(bandRepo, tampered), false,
+    ["does not match analyzed head"]);
+  gateCase("W6", "valid receipt passes via TS_COMPLEXITY_RECEIPT", runGate(bandRepo, valid), true,
+    ["review band 11-15: 1"], ["BLOCK ", "NEEDS REVIEW", "RECEIPT INVALID"]);
+  gateCase("W7", "untouched debt passes with changed ok body", runGate(debtRepo), true,
+    ["untouched debt: 1 functions above 10 (0 review, 1 block)", "changed functions: 1 (1 added, 0 changed, 0 moved)"]);
+  gateCase("W8", "docs-only diff measures zero bodies", runGate(docsRepo), true,
+    ["changed functions: 0 (0 added, 0 changed, 0 moved)"]);
+  return failures;
+}
+
+const ROUTING_CHECKS = String.raw`
+import importlib.util
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(sys.argv[1]) / "scripts/quality"))
+spec = importlib.util.spec_from_file_location("quality", Path(sys.argv[1]) / "scripts/quality/quality.py")
+quality = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(quality)
+checks = [
+    ("ts-diff-selects-gate", "ts-complexity" in quality.classify(["web/dashboard/src/lib/format.ts"])),
+    ("dashboard-gate-kept", "dashboard" in quality.classify(["web/dashboard/src/lib/format.ts"])),
+    ("manifests-exclude-gate",
+     "ts-complexity" not in quality.classify(["web/dashboard/package.json", "web/dashboard/package-lock.json"])),
+    ("out-of-scope-trees-exclude-gate",
+     "ts-complexity" not in quality.classify(["web/site/src/app.js", "e2e/home.spec.ts"])),
+    ("full-profile-contains-gate", "ts-complexity" in quality.expand(["full"])),
+    ("docs-diff-excludes-gate", "ts-complexity" not in quality.classify(["README.md"])),
+]
+for name, ok in checks:
+    print(("PASS" if ok else "FAIL") + " " + name)
+sys.exit(0 if all(ok for _, ok in checks) else 1)
+`;
+
+function runRoutingScenario(rows) {
+  const result = spawnSync("python3", ["-c", ROUTING_CHECKS, PRODUCT_ROOT], { encoding: "utf8" });
+  const lines = `${result.stdout ?? ""}`.trim().split("\n").filter((line) => line);
+  let failures = 0;
+  let index = 9;
+  if (!lines.length) {
+    return record(rows, "W9-W14", `routing checks produced no output (${result.stderr ?? result.error?.message})`, false);
+  }
+  for (const line of lines) {
+    const ok = line.startsWith("PASS ");
+    failures += record(rows, `W${index}`, `routing ${line.slice(5) || "unknown"}`, ok);
+    index += 1;
+  }
+  return failures;
+}
+
 function main() {
   const work = mkdtempSync(join(tmpdir(), "ts-complexity-fixtures-"));
   let failures = 0;
@@ -501,6 +652,9 @@ function main() {
       const outcome = evaluateControl(control, renameReport, renameRun);
       failures += record(rows, control.id, control.label, outcome.ok);
     }
+
+    failures += runWiringScenario(rows, work);
+    failures += runRoutingScenario(rows);
 
     const mutations = [
       ...BASE_MUTATIONS,

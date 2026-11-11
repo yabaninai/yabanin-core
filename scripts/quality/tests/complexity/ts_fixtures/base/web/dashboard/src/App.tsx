@@ -1,6 +1,5 @@
-// Fixture base state: three changed-function scenarios live here.
-// changedStraightforward scores cognitive 8 at base; deletedHelper is removed
-// at head; withNestedClosure (cognitive 2) gains a nested closure at head.
+// Fixture base state: changedStraightforward (8) is edited at head;
+// deletedHelper is removed at head; withNestedClosure (2) gains a closure.
 export function changedStraightforward(items: string[]): number {
   let score = 0;
   if (items.length > 0) score += 1;

@@ -1,6 +1,5 @@
-// Fixture head (reverse control): the same HeavyChanged name refactored to
-// cyclomatic 8 = 1 + 7 ifs. Paired with the 17-fixture this proves the
-// block assertion binds to the measured body, not to the function name.
+// Fixture head (reverse control): HeavyChanged refactored to cyclomatic 8
+// = 1 + 7 ifs; proves blocking binds to the body, not the name.
 func HeavyChanged(x int) int {
 	n := 0
 	if x > 10 {
