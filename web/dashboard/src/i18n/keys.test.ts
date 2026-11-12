@@ -47,6 +47,7 @@ const DYNAMIC_ALLOWLIST: Record<string, string> = {
   'pages/OrgSettingsPage.tsx': 'settings tab labels from the TAB_LABEL_KEYS map',
   'pages/RequestExplorerPage.tsx': 'evidence tier keys from the EXPLORER_EVIDENCE_KEYS map',
   'pages/TasksPage.tsx': 'tasks.group_${groupBy} keys built from the runtime groupBy value',
+  'components/astra/RoutingGraph.tsx': 'warning-code / node-kind / edge-kind / lane-band label keys from the WARN_KEY / NODE_KIND_KEY / EDGE_KIND_KEY / BAND_KEY lookup maps over the server\'s closed code and kind vocabularies (CV-01)',
 }
 
 type Ctx = { kind: 'top' } | { kind: 'tplExpr'; depth: number }
