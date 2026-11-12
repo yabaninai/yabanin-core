@@ -42,6 +42,9 @@ func evalSource(t *testing.T, source string, env pipeline.ConditionEnv) (bool, e
 	return prog.Evaluate(context.Background(), env)
 }
 
+// TestLuaConditionBooleanContract exercises contract semantics with the
+// production defaults: the deterministic step budget (not a wall-clock
+// number) bounds each evaluation, so results hold under -race and load.
 func TestLuaConditionBooleanContract(t *testing.T) {
 	env := testEnv()
 	tests := []struct {
@@ -161,10 +164,11 @@ func TestLuaSandboxEscapeAttempts(t *testing.T) {
 	}
 }
 
-// TestLuaBudgetBounded asserts the DoS guarantee: pathological scripts return
-// within the wall-clock budget plus scheduling slack.
+// TestLuaBudgetBounded asserts the DoS guarantee: pathological scripts abort
+// with a budget error well before the elapsed-time sanity bound. Steps are
+// pinned so the abort is fast and deterministic even under -race + load.
 func TestLuaBudgetBounded(t *testing.T) {
-	e := New(WithEvalTimeout(2 * time.Millisecond))
+	e := New(WithEvalTimeout(2*time.Millisecond), WithMaxSteps(100_000))
 	attacks := []string{
 		`while true do end return false`,
 		`function f() return f() end return f()`,
@@ -190,16 +194,59 @@ func TestLuaBudgetBounded(t *testing.T) {
 			t.Errorf("attack %q: unbounded response: %s", source, elapsed)
 		}
 	}
+
+	// Production defaults (1M steps, race-scaled ceiling) must also bound a
+	// runaway; whichever budget binds first depends on machine speed.
+	defProg, err := New().Compile(`while true do end return false`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	_, err = defProg.Evaluate(context.Background(), testEnv())
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "budget exceeded") {
+		t.Fatalf("default engine runaway: want budget abort, got: %v", err)
+	}
+	if elapsed > 10*time.Second {
+		t.Fatalf("default engine runaway: unbounded response: %s", elapsed)
+	}
+}
+
+// TestLuaStepBudgetIsDeterministic is the negative control for the budget
+// mechanism: with a wall ceiling far beyond the test horizon only the step
+// budget can stop a runaway, so the abort is deterministic on every machine
+// and under any load. If step enforcement regresses, the loop completes and
+// returns true instead of erroring — this cannot pass vacuously.
+func TestLuaStepBudgetIsDeterministic(t *testing.T) {
+	e := New(WithEvalTimeout(time.Minute), WithMaxSteps(50_000))
+	prog, err := e.Compile(`local n = 0 for i = 1, 1000000000 do n = n + 1 end return n > 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rep := 0; rep < 3; rep++ {
+		start := time.Now()
+		got, err := prog.Evaluate(context.Background(), testEnv())
+		elapsed := time.Since(start)
+		if err == nil || got {
+			t.Fatalf("rep %d: runaway completed (got=%v err=%v): step budget must abort", rep, got, err)
+		}
+		if !strings.Contains(err.Error(), "budget exceeded") || !strings.Contains(err.Error(), "steps") {
+			t.Fatalf("rep %d: want deterministic step-budget abort, got: %v", rep, err)
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("rep %d: step-budget abort too slow: %s", rep, elapsed)
+		}
+	}
 }
 
 // TestLuaConcatBombDocumentsTransientAllocation documents the KNOWN GAP for
-// the owner decision: the deadline bounds wall-clock (and therefore peak
-// allocation at wall-clock x copy-rate), but `..` cannot be size-guarded
-// without a gopher-lua fork. Here the doubling loop aborts on budget; a
-// bounded 24-doubling variant (16 MB) legitimately passes both the budget
-// and the (absent) size guard, demonstrating that only the deadline caps it.
+// the owner decision: the `..` concat operator has no VM hook, so a bounded
+// 24-doubling loop (16 MB) legitimately completes — only the budgets cap it.
+// Completion is deterministic: ~100 dispatches sit far below the step budget
+// and the race-scaled 250ms ceiling is a generous backstop, not the
+// assertion (previously a raw 250ms wall deadline tripped under -race load).
 func TestLuaConcatBombDocumentsTransientAllocation(t *testing.T) {
-	e := New(WithEvalTimeout(250 * time.Millisecond)) // generous: documents alloc-rate gap, not budget
+	e := New(WithEvalTimeout(250 * time.Millisecond)) // documents alloc-rate gap, not budget
 	prog, err := e.Compile(`local s = 'a' for _ = 1, 24 do s = s .. s end return #s == 16777216`)
 	if err != nil {
 		t.Fatalf("bounded doubling should pass: %v", err)
