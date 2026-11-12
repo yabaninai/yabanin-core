@@ -419,6 +419,24 @@ func (cs *CacheService) Lookup(ctx context.Context, orgID, modelTier string, pro
 	return result.Data, nil
 }
 
+// lookupMiss is the single terminal-miss exit for the lookup pipeline: it
+// records the miss metrics under the route identity and returns the
+// documented (nil, nil) miss contract — a miss is a normal outcome, never a
+// sentinel error. Centralized so every terminal miss records the same
+// metric pair in the same order.
+func lookupMiss(ri RouteIdentity) (*CacheHit, error) {
+	RecordMiss()
+	go RecordGlobalMiss(ri.OrgID, ri.Model)
+	return noHit, nil
+}
+
+// noHit is the typed-nil CacheHit half of the lookup miss contract: every
+// cache miss returns (nil, nil) — a miss is a normal outcome and a sentinel
+// error would change the wrapper signatures — so the misses below return
+// (noHit, nil). Named on purpose: the pair reads as the documented miss
+// contract instead of an accidental double nil.
+var noHit *CacheHit
+
 // LookupWithResult checks Redis exact cache first, then pgvector exact and
 // semantic search. The lookup runs under the given route identity: an entry
 // is only served when its stored provenance matches the identity (org, route
@@ -451,73 +469,74 @@ func (cs *CacheService) LookupWithResult(ctx context.Context, ri RouteIdentity, 
 	}
 	ri = regimeRI
 
-	// P4.14: Check A/B experiment assignments — control arm skips cache entirely.
-	if cs.expStore != nil {
-		experiments, err := cs.expStore.ListExperiments(ctx, ri.OrgID, true)
-		if err == nil && len(experiments) > 0 {
-			for _, exp := range experiments {
-				assignment, assignErr := cs.expStore.AssignAssignment(ctx, exp.ID, ri.OrgID)
-				if assignErr == nil {
-					if assignment.Variant == exp.ControlVariant {
-						RecordABArm("control", exp.ID)
-						cs.log.Debug("a/b control arm — skip cache", "exp_id", exp.ID, "org_id", ri.OrgID)
-						// Skip all cache lookups for control arm.
-						return nil, nil //nolint:nilnil // sentinel ErrMiss would change signature contract
-					}
-					RecordABArm("treatment", exp.ID)
-				}
-			}
-		}
+	// P4.14: a control-arm A/B assignment skips every cache layer.
+	if cs.abControlSkip(ctx, ri) {
+		return noHit, nil // sentinel ErrMiss would change signature contract
 	}
 
-	// 1. Exact Redis lookup (fast path).
 	start := time.Now()
 	hash := ComputePromptHash(promptJSON)
 	key := MakeKey(ri.OrgID, ri.Model, hash)
 
-	// N03-P05-T04: inside the partition cooldown the exact layer is
-	// presumed down — skip its round-trip (which would burn the Redis
-	// timeout on every lookup) and go straight to the bounded fallback
-	// below. The backend is re-probed when the cooldown expires.
-	partitioned := cs.redisDown()
-	data := []byte(nil)
-	if !partitioned {
-		var err error
-		data, err = cs.exact.Get(ctx, ri.OrgID, ri.Model, hash)
-		if err == nil && len(data) > 0 {
-			// RT-05: verify the entry's provenance against the current route.
-			// Legacy raw payloads, foreign orgs, other route models or
-			// generation parameters are misses — never served.
-			prov, unsealed, ok := OpenEntry(data)
-			if ok && prov.Matches(ri) {
-				cs.log.Debug("cache hit (redis exact)", "org_id", ri.OrgID, "model_used", prov.ModelUsed)
-				RecordHit("exact")
-				RecordLatency("exact", time.Since(start).Seconds())
-				go RecordGlobalHit(ri.OrgID, ri.Model, "exact", 0)
-				return &CacheHit{Data: unsealed, SourceType: "exact", Similarity: 1.0, ModelUsed: prov.ModelUsed}, nil
-			}
-			cs.log.Debug("stale exact entry ignored (provenance mismatch)", "org_id", ri.OrgID, "model", ri.Model)
-		} else if redisUnavailable(ctx, err) {
-			// N03-P05-T04: a non-miss error with a live caller means the
-			// backend or the network to it is partitioned — including the
-			// store's own dial/read timeouts. Classify once, arm the
-			// cooldown and coalesce what follows instead of letting every
-			// lookup degrade into an independent upstream call.
-			cs.markRedisDown()
-			partitioned = true
-			cs.log.Warn("redis exact layer unavailable — partition mode engaged", "error", err)
-		}
+	hit, terminal, err := cs.lookupExact(ctx, key, ri, hash, start)
+	if hit != nil || err != nil || terminal {
+		// A verified exact hit, the partition guard's terminal coalescing
+		// miss (nil, nil) or the pg store's error — the lookup's only
+		// error return — all end the lookup here.
+		return hit, err
 	}
 
+	// Semantic lookup (only if enabled for this org).
+	if !pol.Semantic {
+		return lookupMiss(ri) // documented: semantic disabled is a cache miss, not an error
+	}
+	return cs.lookupSemantic(ctx, key, ri, hash, promptJSON, start)
+}
+
+// abControlSkip reports whether the A/B experiment layer (P4.14) assigns
+// this lookup to a control arm: the control arm skips every cache layer —
+// a miss by design. Treatment arms are counted and proceed normally.
+func (cs *CacheService) abControlSkip(ctx context.Context, ri RouteIdentity) bool {
+	if cs.expStore == nil {
+		return false
+	}
+	experiments, err := cs.expStore.ListExperiments(ctx, ri.OrgID, true)
+	if err != nil || len(experiments) == 0 {
+		return false
+	}
+	for _, exp := range experiments {
+		assignment, assignErr := cs.expStore.AssignAssignment(ctx, exp.ID, ri.OrgID)
+		if assignErr != nil {
+			continue
+		}
+		if assignment.Variant == exp.ControlVariant {
+			RecordABArm("control", exp.ID)
+			cs.log.Debug("a/b control arm — skip cache", "exp_id", exp.ID, "org_id", ri.OrgID)
+			return true
+		}
+		RecordABArm("treatment", exp.ID)
+	}
+	return false
+}
+
+// lookupExact runs the exact layers under the Redis partition guard
+// (N03-P05-T04): the Redis probe — or, while partitioned, the coalescing
+// flight — first, then the optional pgvector exact gate while the guard
+// allows proceeding. It returns the first verified hit; terminal=true marks
+// the guard's bounded coalescing miss (nil hit, nil error: the lookup must
+// not fall through to the semantic stage); err is the pg store's failure,
+// the lookup's only error.
+func (cs *CacheService) lookupExact(ctx context.Context, key string, ri RouteIdentity, hash string, start time.Time) (hit *CacheHit, terminal bool, err error) {
+	hit, partitioned := cs.lookupExactRedis(ctx, ri, hash)
 	if partitioned {
 		RecordRedisPartition()
 		cs.log.Debug("redis partition: coalescing lookup",
 			"org_id", ri.OrgID, "model", ri.Model, "hash", hash[:8])
-		hit, proceed := cs.partitionLookup(ctx, key, ri)
+		phit, proceed := cs.partitionLookup(ctx, key, ri)
 		switch {
-		case hit != nil:
+		case phit != nil:
 			RecordLatency("exact", time.Since(start).Seconds())
-			return hit, nil
+			return phit, false, nil
 		case proceed && ctx.Err() == nil:
 			// Leadership mandate (creator or lease) or bounded fail-open:
 			// continue into the remaining layers exactly as before the
@@ -529,59 +548,103 @@ func (cs *CacheService) LookupWithResult(ctx context.Context, ri RouteIdentity, 
 			// caller's context ended: a miss, never an error.
 			RecordMiss()
 			go RecordGlobalMiss(ri.OrgID, ri.Model)
-			return nil, nil //nolint:nilnil // documented miss contract
+			return nil, true, nil
 		}
 	}
+	if hit != nil {
+		RecordHit("exact")
+		RecordLatency("exact", time.Since(start).Seconds())
+		go RecordGlobalHit(ri.OrgID, ri.Model, "exact", 0)
+		return hit, false, nil
+	}
+	pgHit, pgErr := cs.lookupExactPG(ctx, key, ri, hash, start)
+	return pgHit, false, pgErr
+}
 
-	// 2. pgvector exact lookup (disabled by default: Redis is the exact
-	// layer, and the pg lookup only helps after Redis data loss, at the
-	// cost of a Postgres round-trip on every miss).
-	if cs.pgExactEnabled {
-		entry, err := cs.store.GetExact(ctx, ri.OrgID, ri.Model, hash, ri.Version)
-		if err != nil {
-			return nil, err
-		}
-		if entry != nil {
-			// RT-05: verify provenance before serving; a mismatch is a miss.
-			prov, unsealed, ok := OpenEntry(entry.Response)
-			if !ok || !prov.Matches(ri) {
-				cs.log.Debug("stale pg exact entry ignored (provenance mismatch)", "org_id", ri.OrgID, "model", ri.Model)
-			} else {
-				cs.log.Debug("cache hit (pg exact)", "org_id", ri.OrgID)
-				// Best-effort Redis warm-up under the same route identity:
-				// the entry's provenance was just verified against it.
-				if sealed, sealErr := SealEntry(unsealed, ri); sealErr == nil {
-					// N03-P05-T04: partition waiters coalesced on this key
-					// are served the payload immediately, without waiting
-					// for the (possibly partitioned) Redis write.
-					cs.partition.publish(key, sealed)
-					go func() {
-						if err := cs.exact.Put(ctx, ri.OrgID, ri.Model, hash, sealed); err != nil {
-							cs.log.Warn("redis warm-up write failed", "error", err)
-						}
-					}()
-				}
-				RecordHit("exact")
-				RecordLatency("exact", time.Since(start).Seconds())
-				go RecordGlobalHit(ri.OrgID, ri.Model, "exact", 0)
-				return &CacheHit{Data: unsealed, SourceType: "pg_exact", Similarity: 1.0, ModelUsed: prov.ModelUsed}, nil
+// lookupExactRedis probes the Redis exact layer once and returns its
+// verified hit (nil on plain miss or stale entry). partitioned reports that
+// the layer is down — inside the cooldown, or freshly classified below — so
+// the caller must skip further probes and coalesce through the partition
+// flight instead of letting every lookup degrade into an independent
+// upstream call (N03-P05-T04).
+func (cs *CacheService) lookupExactRedis(ctx context.Context, ri RouteIdentity, hash string) (hit *CacheHit, partitioned bool) {
+	if cs.redisDown() {
+		return nil, true
+	}
+	data, err := cs.exact.Get(ctx, ri.OrgID, ri.Model, hash)
+	if err == nil && len(data) > 0 {
+		return cs.exactEntryHit(data, ri), false
+	}
+	if redisUnavailable(ctx, err) {
+		// A non-miss error with a live caller means the backend or the
+		// network to it is partitioned — including the store's own
+		// dial/read timeouts. Classify once, arm the cooldown.
+		cs.markRedisDown()
+		cs.log.Warn("redis exact layer unavailable — partition mode engaged", "error", err)
+		return nil, true
+	}
+	return nil, false
+}
+
+// exactEntryHit verifies a sealed exact-layer payload against the current
+// route (RT-05) and returns the hit it proves, or nil when the payload is a
+// legacy raw body or foreign to this identity — never served, logged as a
+// stale miss.
+func (cs *CacheService) exactEntryHit(data []byte, ri RouteIdentity) *CacheHit {
+	prov, unsealed, ok := OpenEntry(data)
+	if !ok || !prov.Matches(ri) {
+		cs.log.Debug("stale exact entry ignored (provenance mismatch)", "org_id", ri.OrgID, "model", ri.Model)
+		return nil
+	}
+	cs.log.Debug("cache hit (redis exact)", "org_id", ri.OrgID, "model_used", prov.ModelUsed)
+	return &CacheHit{Data: unsealed, SourceType: "exact", Similarity: 1.0, ModelUsed: prov.ModelUsed}
+}
+
+// lookupExactPG consults the optional pgvector exact gate (disabled by
+// default: Redis is the exact layer, and the pg lookup only helps after
+// Redis data loss, at the cost of a Postgres round-trip on every miss). A
+// store error propagates as the lookup's only error; a provenance mismatch
+// is a logged miss (RT-05). A verified hit warms Redis under the same route
+// identity — publishing to partition waiters before the (possibly
+// partitioned) Redis write (N03-P05-T04).
+func (cs *CacheService) lookupExactPG(ctx context.Context, key string, ri RouteIdentity, hash string, start time.Time) (*CacheHit, error) {
+	if !cs.pgExactEnabled {
+		return noHit, nil // gate disabled: fall through to the semantic stage
+	}
+	entry, err := cs.store.GetExact(ctx, ri.OrgID, ri.Model, hash, ri.Version)
+	if err != nil {
+		return nil, err
+	}
+	if entry == nil {
+		return noHit, nil // not found: fall through to the semantic stage
+	}
+	prov, unsealed, ok := OpenEntry(entry.Response)
+	if !ok || !prov.Matches(ri) {
+		cs.log.Debug("stale pg exact entry ignored (provenance mismatch)", "org_id", ri.OrgID, "model", ri.Model)
+		return noHit, nil // provenance mismatch: fall through to the semantic stage
+	}
+	cs.log.Debug("cache hit (pg exact)", "org_id", ri.OrgID)
+	// Best-effort Redis warm-up under the same route identity: the entry's
+	// provenance was just verified against it.
+	if sealed, sealErr := SealEntry(unsealed, ri); sealErr == nil {
+		cs.partition.publish(key, sealed)
+		go func() {
+			if err := cs.exact.Put(ctx, ri.OrgID, ri.Model, hash, sealed); err != nil {
+				cs.log.Warn("redis warm-up write failed", "error", err)
 			}
-		}
+		}()
 	}
+	RecordHit("exact")
+	RecordLatency("exact", time.Since(start).Seconds())
+	go RecordGlobalHit(ri.OrgID, ri.Model, "exact", 0)
+	return &CacheHit{Data: unsealed, SourceType: "pg_exact", Similarity: 1.0, ModelUsed: prov.ModelUsed}, nil
+}
 
-	// 3. Semantic lookup (only if enabled for this org).
-	if !pol.Semantic {
-		RecordMiss()
-		go RecordGlobalMiss(ri.OrgID, ri.Model)
-		return nil, nil //nolint:nilnil // documented: semantic disabled is a cache miss, not an error
-	}
-
-	// P4.15 + N03-P05: EmbedCache deduplicates SEQUENTIAL embedding repeats
-	// via in-memory LRU; embedFlights additionally deduplicates CONCURRENT
-	// identical misses (per-hash singleflight on a detached load context)
-	// and bounds the total concurrent upstream embedding calls — beyond the
-	// limit the lookup degrades to a cache miss without an upstream call.
-	//
+// lookupSemantic runs the semantic stage: embed the (normalized) prompt,
+// ANN-search, then admit the hit only under the RT-05 provenance,
+// N03-P04-T02/T03 space and N03-P04-T05 decisive-content checks — every
+// mismatch degrades to a self-healing miss (nil, nil), never an error.
+func (cs *CacheService) lookupSemantic(ctx context.Context, key string, ri RouteIdentity, hash string, promptJSON []byte, start time.Time) (*CacheHit, error) {
 	// N03-P04-T03: the embedding input and the space identity carry the
 	// per-input multilingual/domain qualifier tag derived from this
 	// prompt's content (same derivation as the writer — see
@@ -594,35 +657,18 @@ func (cs *CacheService) LookupWithResult(ctx context.Context, ri RouteIdentity, 
 	qualTag := embedderInputTag(cs.embedder, qualifierSourceText(promptJSON))
 	embedInput := qualifiedEmbedInput(string(promptJSON), qualTag)
 	lookupEmbedVer := embeddings.QualifiedSpaceVersion(cs.embedVer, qualTag)
-	var vec []float32
-	embedded := false
-	if cs.embedCache != nil {
-		if v, ok := cs.embedCache.Get(hash); ok && len(v) > 0 {
-			cs.log.Debug("embedding cached (in-memory)", "org_id", ri.OrgID, "hash", hash[:8])
-			vec, embedded = v, true
-		}
-	}
+
+	vec, embedded := cs.lookupEmbedding(ctx, ri, hash, embedInput)
 	if !embedded {
-		v, embErr := cs.embedFlight.do(ctx, hash, func(loadCtx context.Context) ([]float32, error) {
-			return cs.embedder.Embed(loadCtx, embedInput)
-		})
-		if cs.embedLookupError(embErr) {
-			RecordMiss()
-			go RecordGlobalMiss(ri.OrgID, ri.Model)
-			return nil, nil //nolint:nilnil // follows existing LookupWithResult contract
-		}
-		if len(v) > 0 && cs.embedCache != nil {
-			cs.embedCache.Set(hash, v)
-		}
-		vec = v
+		// embedding degraded (embedder failure, flight limit or cancellation):
+		// follows the existing LookupWithResult contract — a miss, not an error
+		return lookupMiss(ri)
 	}
 
 	result, err := cs.semantic.Lookup(ctx, ri.OrgID, ri.Model, ri.Version, vec)
 	if err != nil || result == nil {
-		RecordMiss()
-		go RecordGlobalMiss(ri.OrgID, ri.Model)
-		//nolint:nilerr // cache miss is (nil,nil) by contract: a lookup failure degrades to a miss
-		return nil, nil //nolint:nilnil // documented miss contract
+		// a lookup failure degrades to a miss: cache miss is (nil, nil) by contract
+		return lookupMiss(ri)
 	}
 
 	// RT-05: a semantic hit is only served when its stored provenance still
@@ -631,59 +677,25 @@ func (cs *CacheService) LookupWithResult(ctx context.Context, ri RouteIdentity, 
 	prov, unsealed, ok := OpenEntry(result.Entry.Response)
 	if !ok || !prov.Matches(ri) {
 		cs.log.Debug("stale semantic entry ignored (provenance mismatch)", "org_id", ri.OrgID, "model", ri.Model)
-		RecordMiss()
-		go RecordGlobalMiss(ri.OrgID, ri.Model)
-		return nil, nil //nolint:nilnil // unverifiable provenance degrades to a miss
+		return lookupMiss(ri) // unverifiable provenance degrades to a miss
 	}
 
-	// N03-P04-T02 (+ N03-P04-T03): a semantic hit is only served when the
-	// entry's stamped embedding-space and threshold-admission versions
-	// match this service's current configuration; since T03 the space
-	// version includes the per-input qualifier tag (lookupEmbedVer). Cosine
-	// similarity between vectors from different spaces (embedder model or
-	// query prefix changed, or the prompt's multilingual/domain qualifier
-	// differs) is meaningless and produced false hits — "a similar question
-	// gets someone else's answer". Such entries degrade to a miss (never an
-	// error) and refill under the current versions; exact layers are
-	// hash-keyed and intentionally not subject to this check.
-	// A service with NO versions configured (zero-value struct, test-only
-	// construction today; production always goes through NewCacheService)
-	// cannot know its space and acts as a legacy reader: the check is
-	// skipped, mirroring the entry-side legacy compatibility in SpaceMatch.
-	if (cs.embedVer != "" || cs.thresholdVer != "") && !prov.SpaceMatch(lookupEmbedVer, cs.thresholdVer) {
+	if !cs.semanticSpaceCurrent(prov, lookupEmbedVer) {
 		cs.log.Debug("stale semantic entry ignored (embedding/threshold version mismatch)",
 			"org_id", ri.OrgID, "model", ri.Model,
 			"entry_embed_ver", prov.EmbedVer, "current_embed_ver", lookupEmbedVer,
 			"entry_threshold_ver", prov.ThresholdVer, "current_threshold_ver", cs.thresholdVer)
-		RecordMiss()
-		go RecordGlobalMiss(ri.OrgID, ri.Model)
-		return nil, nil //nolint:nilnil // incompatible vector space or admission epoch degrades to a miss
+		return lookupMiss(ri) // incompatible vector space or admission epoch degrades to a miss
 	}
 
-	// N03-P04-T05: decisive-content admission guard. Near-duplicate prompts
-	// that differ only in a date, a number, an entity or an access level
-	// score above the similarity threshold on real embedders — T04 measured
-	// 10/14 such false hits on the holdout ("a similar question gets
-	// someone else's answer"). The writer stamps a one-way fingerprint of
-	// the entry prompt's decisive content into the provenance
-	// (DecisiveContentStamp over the same normalized bytes); when it
-	// disagrees with THIS prompt's stamp, the entry answers a different
-	// question and degrades to a self-healing miss. Strict equality with
-	// the empty string, mirroring SpaceMatch: a versioning service never
-	// serves unstamped (legacy) entries, a version-blind service skips the
-	// check, and the exact layers are hash-keyed and never consult it.
-	if cs.embedVer != "" || cs.thresholdVer != "" {
-		decVer, decFP := DecisiveContentStamp(promptJSON)
-		if !prov.DecisiveMatch(decVer, decFP) {
-			cs.log.Debug("stale semantic entry ignored (decisive-content mismatch)",
-				"org_id", ri.OrgID, "model", ri.Model,
-				"entry_decisive_ver", prov.DecisiveVer,
-				"current_decisive_ver", decVer,
-				"similarity", result.Similarity)
-			RecordMiss()
-			go RecordGlobalMiss(ri.OrgID, ri.Model)
-			return nil, nil //nolint:nilnil // different decisive content degrades to a miss
-		}
+	decVer, decisive := cs.semanticDecisiveCurrent(prov, promptJSON)
+	if !decisive {
+		cs.log.Debug("stale semantic entry ignored (decisive-content mismatch)",
+			"org_id", ri.OrgID, "model", ri.Model,
+			"entry_decisive_ver", prov.DecisiveVer,
+			"current_decisive_ver", decVer,
+			"similarity", result.Similarity)
+		return lookupMiss(ri) // different decisive content degrades to a miss
 	}
 
 	cs.log.Debug("cache hit (semantic)", "org_id", ri.OrgID, "similarity", result.Similarity)
@@ -701,6 +713,76 @@ func (cs *CacheService) LookupWithResult(ctx context.Context, ri RouteIdentity, 
 	RecordSimilarity(result.Similarity)
 	go RecordGlobalHit(ri.OrgID, ri.Model, "semantic", int(result.Similarity*1000))
 	return &CacheHit{Data: unsealed, SourceType: "semantic", Similarity: result.Similarity, ModelUsed: prov.ModelUsed}, nil
+}
+
+// lookupEmbedding produces the query embedding for the semantic stage.
+// P4.15 + N03-P05: the in-memory EmbedCache LRU deduplicates SEQUENTIAL
+// embedding repeats; embedFlights additionally deduplicates CONCURRENT
+// identical misses (per-hash singleflight on a detached load context) and
+// bounds the total concurrent upstream embedding calls — beyond the limit
+// the lookup degrades to a cache miss without an upstream call.
+// ok=false means the stage degraded (embedder failure, flight limit or
+// cancellation) and the caller must take a plain miss.
+func (cs *CacheService) lookupEmbedding(ctx context.Context, ri RouteIdentity, hash, embedInput string) (vec []float32, ok bool) {
+	if cs.embedCache != nil {
+		if v, ok := cs.embedCache.Get(hash); ok && len(v) > 0 {
+			cs.log.Debug("embedding cached (in-memory)", "org_id", ri.OrgID, "hash", hash[:8])
+			return v, true
+		}
+	}
+	v, embErr := cs.embedFlight.do(ctx, hash, func(loadCtx context.Context) ([]float32, error) {
+		return cs.embedder.Embed(loadCtx, embedInput)
+	})
+	if cs.embedLookupError(embErr) {
+		return nil, false
+	}
+	if len(v) > 0 && cs.embedCache != nil {
+		cs.embedCache.Set(hash, v)
+	}
+	return v, true
+}
+
+// semanticSpaceCurrent enforces N03-P04-T02 (+T03): a semantic hit is only
+// served when the entry's stamped embedding-space and threshold-admission
+// versions match this service's current configuration; since T03 the space
+// version includes the per-input qualifier tag (lookupEmbedVer). Cosine
+// similarity between vectors from different spaces (embedder model or query
+// prefix changed, or the prompt's multilingual/domain qualifier differs) is
+// meaningless and produced false hits — "a similar question gets someone
+// else's answer". Such entries degrade to a miss (never an error) and
+// refill under the current versions; exact layers are hash-keyed and
+// intentionally not subject to this check. A service with NO versions
+// configured (zero-value struct, test-only construction today; production
+// always goes through NewCacheService) cannot know its space and acts as a
+// legacy reader: the check is skipped, mirroring the entry-side legacy
+// compatibility in SpaceMatch.
+func (cs *CacheService) semanticSpaceCurrent(prov Provenance, lookupEmbedVer string) bool {
+	if cs.embedVer == "" && cs.thresholdVer == "" {
+		return true
+	}
+	return prov.SpaceMatch(lookupEmbedVer, cs.thresholdVer)
+}
+
+// semanticDecisiveCurrent enforces the N03-P04-T05 decisive-content
+// admission guard: near-duplicate prompts that differ only in a date, a
+// number, an entity or an access level score above the similarity threshold
+// on real embedders — T04 measured 10/14 such false hits on the holdout
+// ("a similar question gets someone else's answer"). The writer stamps a
+// one-way fingerprint of the entry prompt's decisive content into the
+// provenance (DecisiveContentStamp over the same normalized bytes); when it
+// disagrees with THIS prompt's stamp, the entry answers a different
+// question and degrades to a self-healing miss. Strict equality with the
+// empty string, mirroring SpaceMatch: a versioning service never serves
+// unstamped (legacy) entries, a version-blind service (zero-value struct,
+// test-only construction today) skips the check, and the exact layers are
+// hash-keyed and never consult it. It returns the current stamp version for
+// logging.
+func (cs *CacheService) semanticDecisiveCurrent(prov Provenance, promptJSON []byte) (string, bool) {
+	if cs.embedVer == "" && cs.thresholdVer == "" {
+		return "", true
+	}
+	decVer, decFP := DecisiveContentStamp(promptJSON)
+	return decVer, prov.DecisiveMatch(decVer, decFP)
 }
 
 // embedLookupError reports whether err ends the embedding stage of a lookup
