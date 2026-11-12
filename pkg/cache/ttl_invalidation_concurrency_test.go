@@ -339,6 +339,14 @@ func TestPolicyCache_EvictGuardWhileFlightPending(t *testing.T) {
 	}()
 	waitForFlight(t, pc, "org-x")
 
+	// The 1ms ttl has served its purpose (the gen-1 entry expired before
+	// the guarded flight registered). Freeze expiry for the convergence
+	// phase: the entry published by the post-eviction reload must stay
+	// fresh, so scheduler jitter between a publish and the waiting
+	// reader's re-check cannot masquerade as expiry and force spurious
+	// extra reloads (CI flake, seen once on a loaded self-hosted runner).
+	pc.ttl = time.Minute
+
 	// Churn evicts org-x: the LRU cap is 1, so publishing org-y removes
 	// org-x's entry AND its generation guard while the flight is pending.
 	require.NotNil(t, pc.Get(context.Background(), "org-y", func(context.Context, string) (*OrgPolicy, error) {
