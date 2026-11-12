@@ -13,6 +13,7 @@ package run
 //
 
 import (
+	"context"
 	"encoding/json"
 	"log/slog"
 	"net"
@@ -121,7 +122,7 @@ func TestLoggerdDrain_ReadinessBeforeStop(t *testing.T) {
 	drainDone := make(chan struct{})
 	go func() {
 		defer close(drainDone)
-		drainLoggerdHTTP(gate, srv, 5*time.Second, loggerdTestLogger())
+		drainLoggerdHTTP(context.Background(), gate, srv, 5*time.Second, loggerdTestLogger())
 	}()
 
 	// Not-ready is observable while the listener still accepts: readiness
@@ -162,7 +163,7 @@ func TestLoggerdDrain_ZeroDelaySkipsWindow(t *testing.T) {
 	go func() { _ = srv.Serve(l) }()
 
 	start := time.Now()
-	drainLoggerdHTTP(gate, srv, time.Second, loggerdTestLogger())
+	drainLoggerdHTTP(context.Background(), gate, srv, time.Second, loggerdTestLogger())
 	elapsed := time.Since(start)
 
 	assert.True(t, gate.Draining())
@@ -210,7 +211,7 @@ func TestLoggerdDrain_BoundedByShutdownBudget(t *testing.T) {
 	}
 
 	start := time.Now()
-	drainLoggerdHTTP(gate, srv, 200*time.Millisecond, loggerdTestLogger())
+	drainLoggerdHTTP(context.Background(), gate, srv, 200*time.Millisecond, loggerdTestLogger())
 	elapsed := time.Since(start)
 
 	assert.True(t, gate.Draining())
