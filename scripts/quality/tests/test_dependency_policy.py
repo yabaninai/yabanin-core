@@ -59,14 +59,25 @@ class DependencyPolicyTests(unittest.TestCase):
                 self.policy.write_text(content)
                 self.assertEqual(self.scan()[0], "error")
 
-    def test_public_policy_contains_only_scoped_license_exceptions(self):
+    def test_exceptions_registry_license_entries_are_scoped(self):
         policy = yaml.safe_load(self.policy.read_text())
         self.assertEqual(policy["schema"], 1)
-        self.assertEqual(len(policy["exceptions"]), 3)
-        for entry in policy["exceptions"]:
-            self.assertEqual(entry["scanner"], "license_check")
+        entries = policy["exceptions"]
+        # The registry is shared by scanner-tagged consumers; only the
+        # license_check entries form the public license policy.
+        license_entries = [entry for entry in entries
+                           if entry.get("scanner") == "license_check"]
+        self.assertEqual(len(license_entries), 3)
+        for entry in license_entries:
             for key in ("id", "path", "scope", "version", "reason", "owner", "expires"):
                 self.assertTrue(entry[key], key)
+        # Every entry must name its scanner: untagged entries are silently
+        # honored by the secret scanner (secret_scan.py).
+        for entry in entries:
+            self.assertIn(entry.get("scanner"),
+                          ("license_check", "secret_scan", "dep_audit"))
+            for key in ("id", "path", "reason", "owner", "expires"):
+                self.assertTrue(entry.get(key), key)
 
 
 if __name__ == "__main__":
