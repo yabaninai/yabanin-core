@@ -19,12 +19,12 @@ import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { loadTypescript } from "./typescript.mjs";
-import { isMeasuredFile, parseAndCollect } from "./collect.mjs";
+import { isMeasuredFile, MEASURED_EXTENSIONS, parseAndCollect } from "./collect.mjs";
 import { classifyComplexity } from "./metric.mjs";
 
 const ANALYZER = {
   name: "ts-complexity-diff",
-  version: "1.1.0",
+  version: "1.2.0",
   metric: "cognitive-complexity/sonar-style",
   rules: "scripts/quality/complexity/ts/README.md#metric-rules",
 };
@@ -33,7 +33,22 @@ const REVIEW_LIMIT = 15;
 const BLOCK_LIMIT = 15;
 const DEFAULT_SCOPE = "web/dashboard/";
 const DEBT_SCHEMA = "ts-complexity-debt/1";
-const RECEIPT_SCHEMA = "ts-complexity-review-receipt/1";
+const RECEIPT_SCHEMA = "ts-complexity-review-receipt/2";
+// Schema 2 binds each review approval to the exact function body hash the
+// gate measures (body_sha256 from collect.mjs) and to the decision-relevant
+// gate configuration, so a receipt cannot survive a body edit or a
+// threshold change under the same function name. The material is canonical
+// JSON (sorted keys, no whitespace), mirroring the Go gate's schema 2.
+export function gateConfigDigest() {
+  const material = JSON.stringify({
+    body_identity: "body_sha256@ts-printer-body-comments-removed-whitespace-collapsed",
+    cognitive_block_over: BLOCK_LIMIT,
+    cognitive_ok_max: OK_LIMIT,
+    cognitive_review_max: REVIEW_LIMIT,
+    schema: RECEIPT_SCHEMA,
+  });
+  return createHash("sha256").update(material).digest("hex");
+}
 const RECEIPT_VERDICTS = ["approve", "reject", "require_refactoring"];
 // 30 days mirrors the maximum bounded-exception expiry in
 // standards/maintainability.md; 24h tolerates reviewer/client clock skew.
@@ -136,7 +151,7 @@ function entryBase(file, record) {
     kind: record.kind,
     role: record.role,
     line: record.line,
-    fingerprint: record.fingerprint,
+    body_sha256: record.body_sha256,
   };
 }
 
@@ -146,12 +161,14 @@ function classifyEntry(entry, reviewState) {
   return { ...entry, classification, review };
 }
 
-// --- Stronger-model review receipts (schema ts-complexity-review-receipt/1)
+// --- Stronger-model review receipts (schema ts-complexity-review-receipt/2)
 //
 // A receipt is a JSON file binding one independent review to the exact
-// analyzed commits, the review-band functions and both model identities.
-// Every failed check produces its own precise error; one invalid receipt
-// blocks the run exactly like an unreceipted review-band body.
+// analyzed commits, the review-band function bodies (body_sha256 bindings
+// minted from this gate's own measurement), the active gate configuration
+// and both model identities. Every failed check produces its own precise
+// error; one invalid receipt blocks the run exactly like an unreceipted
+// review-band body.
 
 function readReceiptDocument(path) {
   let raw;
@@ -172,19 +189,25 @@ function readReceiptDocument(path) {
 }
 
 function receiptFieldErrors(document) {
-  const stringKeys = ["schema", "source_commit", "base_commit", "implementer_model", "reviewer_model", "verdict", "reviewed_at"];
+  const stringKeys = ["schema", "source_commit", "base_commit", "implementer_model", "reviewer_model", "verdict", "reviewed_at", "gate_config_sha256"];
   const errors = [];
   for (const key of stringKeys) {
     const value = document[key];
     if (typeof value !== "string" || value.trim() === "") errors.push(`receipt is missing ${key}`);
   }
-  if (!Array.isArray(document.functions) || document.functions.length === 0) {
-    errors.push("receipt is missing functions");
+  if (!Array.isArray(document.bindings) || document.bindings.length === 0) {
+    errors.push("receipt is missing bindings");
   }
   if (typeof document.schema === "string" && document.schema !== RECEIPT_SCHEMA) {
     errors.push(`receipt schema '${document.schema}' is not supported (expected ${RECEIPT_SCHEMA})`);
   }
   return errors;
+}
+
+function receiptConfigErrors(document) {
+  const digest = document.gate_config_sha256;
+  if (typeof digest !== "string" || digest === gateConfigDigest()) return [];
+  return [`receipt gate_config_sha256 '${digest}' does not match the active gate configuration; re-review required under the current thresholds`];
 }
 
 function receiptCommitErrors(document, run) {
@@ -235,15 +258,45 @@ function receiptFreshnessErrors(document, nowMs) {
   return [];
 }
 
+// Bindings are strict {function, body_sha256} objects. Structural errors
+// are reported per entry; band coverage and body-hash matching run against
+// the structurally valid subset only (mirroring the Go gate's split of
+// receipt_bindings_error and receipt_decision).
 function receiptBindingErrors(document, band) {
-  const listed = document.functions;
-  if (!Array.isArray(listed) || listed.some((item) => typeof item !== "string" || item.trim() === "")) {
-    return ["receipt functions must be a list of non-empty 'file:name' strings"];
+  const bindings = Array.isArray(document.bindings) ? document.bindings : [];
+  const errors = [];
+  const boundBodies = new Map();
+  bindings.forEach((item, index) => {
+    const keys = item && typeof item === "object" && !Array.isArray(item) ? Object.keys(item) : [];
+    if (keys.length !== 2 || !keys.includes("function") || !keys.includes("body_sha256")) {
+      errors.push(`receipt bindings[${index}] must have exactly function and body_sha256`);
+      return;
+    }
+    const fn = item.function;
+    // Qualified names contain '::', so split on the first colon only: the
+    // path cannot contain one.
+    const separator = typeof fn === "string" ? fn.indexOf(":") : -1;
+    const [path, name] = separator === -1 ? ["", ""] : [fn.slice(0, separator), fn.slice(separator + 1)];
+    if (typeof fn !== "string" || name === "" || !MEASURED_EXTENSIONS.some((ext) => path.endsWith(ext))) {
+      errors.push(`receipt bindings[${index}].function '${fn}' is not a 'file:name' binding for a measured file`);
+      return;
+    }
+    if (typeof item.body_sha256 !== "string" || !/^[0-9a-f]{64}$/.test(item.body_sha256)) {
+      errors.push(`receipt bindings[${index}].body_sha256 for '${fn}' is not a 64-hex digest`);
+      return;
+    }
+    boundBodies.set(fn, item.body_sha256);
+  });
+  for (const entry of band) {
+    const binding = `${entry.file}:${entry.name}`;
+    const bound = boundBodies.get(binding);
+    if (bound === undefined) {
+      errors.push(`receipt does not bind review-band function ${entry.file}: ${entry.name} (expected "${binding}")`);
+    } else if (bound !== entry.body_sha256) {
+      errors.push(`receipt body hash for ${binding} does not match the current function body; re-review required`);
+    }
   }
-  const bound = new Set(listed);
-  return band
-    .filter((entry) => !bound.has(`${entry.file}:${entry.name}`))
-    .map((entry) => `receipt does not bind review-band function ${entry.file}: ${entry.name} (expected "${entry.file}:${entry.name}")`);
+  return errors;
 }
 
 function validateReceipt(path, run, band, modelOrder, nowMs) {
@@ -251,12 +304,14 @@ function validateReceipt(path, run, band, modelOrder, nowMs) {
   if (document) {
     errors.push(...receiptFieldErrors(document));
     errors.push(...receiptCommitErrors(document, run));
+    errors.push(...receiptConfigErrors(document));
     errors.push(...receiptModelErrors(document, modelOrder));
     errors.push(...receiptVerdictErrors(document));
     errors.push(...receiptFreshnessErrors(document, nowMs));
     errors.push(...receiptBindingErrors(document, band));
   }
   const valid = errors.length === 0;
+  const functionOf = (item) => String(item?.function ?? "");
   return {
     path,
     valid,
@@ -268,7 +323,10 @@ function validateReceipt(path, run, band, modelOrder, nowMs) {
     reviewer_model: document?.reviewer_model ?? null,
     verdict: document?.verdict ?? null,
     reviewed_at: document?.reviewed_at ?? null,
-    functions: Array.isArray(document?.functions) ? document.functions : null,
+    gate_config_sha256: document?.gate_config_sha256 ?? null,
+    bindings: Array.isArray(document?.bindings)
+      ? [...document.bindings].sort((a, b) => (functionOf(a) < functionOf(b) ? -1 : functionOf(a) > functionOf(b) ? 1 : 0))
+      : null,
   };
 }
 
@@ -283,9 +341,9 @@ function parseModelOrder(raw) {
 // survivors before anything else is order-independent: a duplicate copy
 // appearing earlier in the file cannot steal the original's identity.
 function claimSurvivors(side) {
-  const newByFingerprint = groupBy(side.newRecs, (record) => record.fingerprint);
+  const newByBodyHash = groupBy(side.newRecs, (record) => record.body_sha256);
   for (const old of side.oldRecs) {
-    const twin = (newByFingerprint.get(old.fingerprint) || []).find((record) => !record.claimed && record.name === old.name);
+    const twin = (newByBodyHash.get(old.body_sha256) || []).find((record) => !record.claimed && record.name === old.name);
     if (twin) {
       twin.claimed = true;
       old.taken = true;
@@ -299,11 +357,11 @@ function claimSurvivors(side) {
 function claimRenames(side, emit) {
   const vanished = groupBy(
     side.oldRecs.filter((old) => !old.taken),
-    (old) => old.fingerprint,
+    (old) => old.body_sha256,
   );
   for (const record of side.newRecs) {
     if (record.claimed) continue;
-    const candidates = vanished.get(record.fingerprint);
+    const candidates = vanished.get(record.body_sha256);
     if (!candidates || candidates.length === 0) continue;
     const twin = candidates.shift();
     twin.taken = true;
@@ -334,19 +392,19 @@ function matchSide(side, emit) {
 
 // Pending bodies are cross-file moves, duplicates or additions. A pending
 // body whose identical base twin vanished from its own file is a move. If
-// no vanished twin remains but the fingerprint exists at base, the body
+// no vanished twin remains but the body hash exists at base, the body
 // duplicates a function whose original still exists (or was already claimed
 // by one move) and is measured as added code — identical copies must not
 // escape measurement.
 function resolvePending(pending, bodyPool, baseTwins, emit) {
   for (const { file, record } of pending) {
-    const movedFrom = bodyPool.get(record.fingerprint)?.shift() || null;
+    const movedFrom = bodyPool.get(record.body_sha256)?.shift() || null;
     const base = entryBase(file, record);
     if (movedFrom) {
       emit.entry({ ...base, status: "moved", moved_from: { file: movedFrom.file, name: movedFrom.name }, duplicate_of: null, old_complexity: movedFrom.complexity, new_complexity: record.complexity, delta: 0 });
       continue;
     }
-    const duplicateOf = baseTwins.get(record.fingerprint) || null;
+    const duplicateOf = baseTwins.get(record.body_sha256) || null;
     emit.entry({ ...base, status: "added", moved_from: null, duplicate_of: duplicateOf, old_complexity: null, new_complexity: record.complexity, delta: null });
   }
 }
@@ -488,13 +546,13 @@ function computeEntries(sides) {
     const stillUnmatched = matchSide(side, emit);
     for (const record of stillUnmatched) pending.push({ file: side.file, record });
     for (const old of side.oldRecs) {
-      if (!baseTwins.has(old.fingerprint)) {
-        baseTwins.set(old.fingerprint, { file: side.file, name: old.name });
+      if (!baseTwins.has(old.body_sha256)) {
+        baseTwins.set(old.body_sha256, { file: side.file, name: old.name });
       }
       if (old.taken) continue;
-      const queue = bodyPool.get(old.fingerprint) || [];
+      const queue = bodyPool.get(old.body_sha256) || [];
       queue.push({ file: side.file, name: old.name, complexity: old.complexity });
-      bodyPool.set(old.fingerprint, queue);
+      bodyPool.set(old.body_sha256, queue);
       vanished += 1;
     }
   }
@@ -654,9 +712,13 @@ function main() {
   process.exit(blocked > 0 ? 1 : 0);
 }
 
-try {
-  main();
-} catch (error) {
-  process.stderr.write(`ts-complexity-diff error: ${error.message}\n`);
-  process.exit(2);
+// Only a direct `node analyze.mjs` invocation runs an analysis; importing
+// the module (fixture runner minting receipts) must stay side-effect free.
+if (process.argv[1] && process.argv[1] === fileURLToPath(import.meta.url)) {
+  try {
+    main();
+  } catch (error) {
+    process.stderr.write(`ts-complexity-diff error: ${error.message}\n`);
+    process.exit(2);
+  }
 }
