@@ -3,12 +3,13 @@
 // Collects every measurable body: function declarations, class
 // methods/constructors/accessors, function expressions, arrow functions
 // (including closures nested inside other bodies) with a stable qualified
-// name, a formatting-independent body fingerprint and its complexity.
+// name, a formatting-independent body identity (body_sha256) and its
+// complexity.
 import { createHash } from "node:crypto";
 
 import { cognitiveComplexity } from "./metric.mjs";
 
-const MEASURED_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
+export const MEASURED_EXTENSIONS = [".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs"];
 
 export function isMeasuredFile(path) {
   return MEASURED_EXTENSIONS.some((ext) => path.endsWith(ext));
@@ -90,7 +91,7 @@ export function parseAndCollect(ts, fileName, text) {
   const functions = [];
   const seen = new Map();
 
-  function fingerprint(body) {
+  function bodySha256(body) {
     const canonical = printer.printNode(ts.EmitHint.Unspecified, body, sf).replace(/\s+/g, " ").trim();
     return createHash("sha256").update(canonical).digest("hex");
   }
@@ -109,7 +110,7 @@ export function parseAndCollect(ts, fileName, text) {
       role: roleOf(own),
       line,
       complexity: cognitiveComplexity(ts, node),
-      fingerprint: fingerprint(node.body),
+      body_sha256: bodySha256(node.body),
     });
     return own;
   }

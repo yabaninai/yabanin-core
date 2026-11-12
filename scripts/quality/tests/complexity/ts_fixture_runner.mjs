@@ -4,12 +4,14 @@
 // states) and runs scripts/quality/complexity/ts/analyze.mjs against them:
 //
 //   * the main fixture repo pins changed-function controls C1-C13 (metric
-//     paths, fingerprint stability under reformat-only edits, rename/move
+//     paths, body-hash stability under reformat-only edits, rename/move
 //     recognition, untouched debt, byte-determinism);
 //   * the receipt fixture repo pins review-band receipt enforcement: C8
-//     (a valid stronger-model receipt clears the 11-15 band) and R1-R11
-//     (every invalid-receipt class is rejected with its precise error, and
-//     a missing receipt blocks with NEEDS REVIEW);
+//     (a valid stronger-model receipt clears the 11-15 band) and R1-R15
+//     (every invalid-receipt class is rejected with its precise error —
+//     including the schema/2 negatives legacy schema/1, stale body hash,
+//     wrong gate-config digest and malformed binding — and a missing
+//     receipt blocks with NEEDS REVIEW);
 //   * the rename fixture repo pins duplicate and rename handling: C14
 //     (a byte-identical copy of a surviving original is measured and
 //     blocks), C15 (the --debt-out ledger lists untouched and moved debt
@@ -20,16 +22,20 @@
 //     committed analyzer copy and the parser pin kept on the real
 //     checkout via TS_COMPLEXITY_REPO_ROOT.
 //
+// Receipts are minted with real body hashes taken from the scenarios' own
+// gate reports and the analyzer's gateConfigDigest(), mirroring the Go
+// suite's report_body_sha256 helper.
+//
 // Each guarded control is re-checked against a deliberately mutated copy of
 // the analyzer (single exact-string replacement, target uniqueness
 // asserted) so every guarded control is proven to fail on its intended
-// assertion. Exit 0 only if all 54 rows pass (42 analyzer and wiring
+// assertion. Exit 0 only if all 58 rows pass (46 analyzer and wiring
 // controls, 12 detected mutants).
 import { execFileSync, spawnSync } from "node:child_process";
 import { chmodSync, cpSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+import { fileURLToPath, pathToFileURL } from "node:url";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 const ANALYZER_DIR = join(HERE, "..", "..", "complexity", "ts");
@@ -40,7 +46,21 @@ const DUPLICATE_LINE = "web/dashboard/src/lib/dup.ts: heavyCopy (cognitive compl
 const BAND_FILE = "web/dashboard/src/lib/band.ts";
 const BAND_BINDING = `${BAND_FILE}:borderlineTwelve`;
 const MODEL_ORDER = ["--model-order", "impl-lite,impl-strong"];
-const RECEIPT_SCHEMA = "ts-complexity-review-receipt/1";
+const RECEIPT_SCHEMA = "ts-complexity-review-receipt/2";
+const LEGACY_RECEIPT_SCHEMA = "ts-complexity-review-receipt/1";
+const HEX64_ZERO = "0".repeat(64);
+
+// Importing the analyzer runs no analysis (analyze.mjs guards direct
+// invocation), so the runner mints receipts with the gate's own digest.
+const { gateConfigDigest } = await import(pathToFileURL(join(ANALYZER_DIR, "analyze.mjs")).href);
+
+// Review-band body hash minted from the receipt scenario's own report so
+// schema/2 receipts bind the exact measured body.
+let bandBodySha256 = "";
+
+function bodyShaOf(report, file, name) {
+  return report.changed_functions.find((entry) => entry.file === file && entry.name === name)?.body_sha256 ?? "";
+}
 
 function runGit(repo, ...args) {
   try {
@@ -128,7 +148,7 @@ const CONTROLS = [
     check: (report) => {
       const debt = report.untouched_debt;
       const top = debt.top[0];
-      // Debt is legacyDeep (block) plus the fingerprint-stable reformat
+      // Debt is legacyDeep (block) plus the body-hash-stable reformat
       // body from C13, which is measured at head but never "changed".
       return Boolean(debt.functions_total === 2 && debt.block === 1 && top
         && top.name === "legacyDeep" && top.complexity === 25
@@ -189,7 +209,7 @@ const CONTROLS = [
     },
   },
   {
-    id: "C13", label: "reformat-only body keeps fingerprint, no changed entry",
+    id: "C13", label: "reformat-only body keeps body hash, no changed entry",
     check: (report) => {
       // reformat.ts must be in the diff (7 changed in-scope files across the
       // fixture set) yet stableReformat yields no changed_functions entry —
@@ -218,11 +238,24 @@ const RECEIPT_CASES = [
   { id: "R3", label: "reviewer equal to implementer is rejected", fragment: "equals implementer_model", fields: { reviewer_model: "impl-lite" } },
   { id: "R4", label: "weaker reviewer than implementer is rejected", fragment: "is not stronger than implementer_model", fields: { implementer_model: "impl-strong", reviewer_model: "impl-lite" } },
   { id: "R5", label: "stale receipt (older than 30 days) is rejected", fragment: "is stale (older than 30 days)", fields: { reviewed_at: "2020-01-01T00:00:00Z" } },
-  { id: "R6", label: "receipt not binding the review-band function is rejected", fragment: "does not bind review-band function", fields: { functions: ["web/dashboard/src/lib/quiet.ts:quietHelper"] } },
+  { id: "R6", label: "receipt not binding the review-band function is rejected", fragment: "does not bind review-band function", fields: { bindings: [{ function: "web/dashboard/src/lib/quiet.ts:quietHelper", body_sha256: "1".repeat(64) }] } },
   { id: "R7", label: "reject verdict does not approve the change", fragment: "does not approve the reviewed change", fields: { verdict: "reject" } },
   { id: "R8", label: "unknown verdict value is rejected", fragment: "is not one of: approve, reject, require_refactoring", fields: { verdict: "maybe" } },
   { id: "R9", label: "malformed receipt JSON is rejected", fragment: "cannot be parsed as JSON", raw: "{" },
   { id: "R10", label: "missing receipt file is rejected", fragment: "receipt file cannot be read", path: "does-not-exist.json" },
+  { id: "R12", label: "legacy schema/1 receipt is rejected", fragment: "is not supported (expected ts-complexity-review-receipt/2)", raw: (scenario) => JSON.stringify({
+    schema: LEGACY_RECEIPT_SCHEMA,
+    source_commit: scenario.head,
+    base_commit: scenario.base,
+    implementer_model: "impl-lite",
+    reviewer_model: "impl-strong",
+    verdict: "approve",
+    reviewed_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
+    functions: [BAND_BINDING],
+  }) },
+  { id: "R13", label: "stale body hash binding is rejected", fragment: "does not match the current function body", fields: { bindings: [{ function: BAND_BINDING, body_sha256: HEX64_ZERO }] } },
+  { id: "R14", label: "wrong gate-config digest is rejected", fragment: "does not match the active gate configuration", fields: { gate_config_sha256: HEX64_ZERO } },
+  { id: "R15", label: "malformed binding object is rejected", fragment: "must have exactly function and body_sha256", fields: { bindings: [{ function: BAND_BINDING }] } },
 ];
 
 function receiptControls(receiptScenario) {
@@ -312,7 +345,7 @@ function renameControls(ledger) {
 const BASE_MUTATIONS = [
   { id: "M1a", file: "analyze.mjs", find: "const OK_LIMIT = 10;", replace: "const OK_LIMIT = 5;", control: "C1" },
   { id: "M1b", file: "analyze.mjs", find: "const BLOCK_LIMIT = 15;", replace: "const BLOCK_LIMIT = 1e9;", control: "C2" },
-  { id: "M3", file: "analyze.mjs", find: "const movedFrom = bodyPool.get(record.fingerprint)?.shift() || null;", replace: "const movedFrom = null;", control: "C3" },
+  { id: "M3", file: "analyze.mjs", find: "const movedFrom = bodyPool.get(record.body_sha256)?.shift() || null;", replace: "const movedFrom = null;", control: "C3" },
   { id: "M4", file: "analyze.mjs", find: "deleted: deletedCount,", replace: "deleted: 0,", control: "C4" },
   { id: "M5", file: "analyze.mjs", find: "untouchedDebt.push({ file, name: record.name, complexity: record.complexity, kind: record.kind });", replace: ";", control: "C5" },
   { id: "M6", file: "collect.mjs", find: "ts.forEachChild(node, (child) => visit(child, childScope));", replace: "if (!kind) ts.forEachChild(node, (child) => visit(child, childScope));", control: "C6" },
@@ -431,10 +464,11 @@ function eaccessSurfaces() {
     && run.stderr.includes("EACCES"));
 }
 
-function writeReceipt(receiptDir, name, scenario, overrides) {
+function writeReceipt(receiptDir, name, scenario, overrides = {}) {
   const path = join(receiptDir, name);
-  if (overrides.raw !== undefined) {
-    writeFileSync(path, overrides.raw);
+  const raw = typeof overrides.raw === "function" ? overrides.raw(scenario) : overrides.raw;
+  if (raw !== undefined) {
+    writeFileSync(path, raw);
     return path;
   }
   const fields = Object.fromEntries(
@@ -451,7 +485,8 @@ function writeReceipt(receiptDir, name, scenario, overrides) {
     reviewer_model: "impl-strong",
     verdict: "approve",
     reviewed_at: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
-    functions: [BAND_BINDING],
+    gate_config_sha256: gateConfigDigest(),
+    bindings: [{ function: BAND_BINDING, body_sha256: bandBodySha256 }],
     ...fields,
   };
   writeFileSync(path, `${JSON.stringify(document, null, 2)}\n`);
@@ -525,17 +560,34 @@ function runWiringScenario(rows, work) {
   const debtRepo = buildGateRepo(work, "gatedebt", "", null, [[quiet, "web/dashboard/src/lib/quiet.ts"]], []);
   const docsRepo = buildGateRepo(work, "gatedocs", "receipt", null, [], [["NOTE.md", "documentation-only change\n"]]);
 
+  // Receipts for the wiring repos bind the exact bodies those repos
+  // measure; hashes are minted from each repo's own scan.
+  const blockScan = parseReport(runAnalyzer(ANALYZER_DIR, blockRepo), "gate block scan");
+  const bandScan = parseReport(runAnalyzer(ANALYZER_DIR, bandRepo), "gate band scan");
+  const megaBody = bodyShaOf(blockScan, "web/dashboard/src/pages/MegaList.tsx", "MegaList");
+  const detailedBody = bodyShaOf(blockScan, "web/dashboard/src/App.tsx", "borderlineDetailed");
+  const gateBandBody = bodyShaOf(bandScan, BAND_FILE, "borderlineTwelve");
+  if (!megaBody || !detailedBody || !gateBandBody) {
+    throw new Error("gate-wiring scans are missing a body hash needed for receipt minting");
+  }
+
   const receiptDir = join(work, "gate-receipts");
   mkdirSync(receiptDir, { recursive: true });
   const sameModel = writeReceipt(receiptDir, "gate-same-model.json", blockRepo, {
     fields: {
       reviewer_model: "impl-lite",
-      functions: ["web/dashboard/src/pages/MegaList.tsx:MegaList",
-                  "web/dashboard/src/App.tsx:borderlineDetailed"],
+      bindings: [
+        { function: "web/dashboard/src/pages/MegaList.tsx:MegaList", body_sha256: megaBody },
+        { function: "web/dashboard/src/App.tsx:borderlineDetailed", body_sha256: detailedBody },
+      ],
     },
   });
-  const tampered = writeReceipt(receiptDir, "gate-tampered.json", bandRepo, { fields: { source_commit: "USE_BASE" } });
-  const valid = writeReceipt(receiptDir, "gate-valid.json", bandRepo, {});
+  const tampered = writeReceipt(receiptDir, "gate-tampered.json", bandRepo, {
+    fields: { source_commit: "USE_BASE", bindings: [{ function: BAND_BINDING, body_sha256: gateBandBody }] },
+  });
+  const valid = writeReceipt(receiptDir, "gate-valid.json", bandRepo, {
+    fields: { bindings: [{ function: BAND_BINDING, body_sha256: gateBandBody }] },
+  });
 
   gateCase("W2", "over-15 change through make blocks without receipt", runGate(blockRepo), false,
     [`BLOCK ${BLOCKING_LINE}`]);
@@ -615,6 +667,16 @@ function main() {
     }
     failures += record(rows, "C7", "two consecutive runs are byte-identical", isDeterministic(first, second));
 
+    // Mint the review-band body hash from the receipt scenario's own
+    // report before any receipt is written, so every receipt binds the
+    // exact body the analyzer measures.
+    const plainRun = runAnalyzer(ANALYZER_DIR, scenarios.receipt);
+    const plainReport = parseReport(plainRun, "no-receipt run");
+    bandBodySha256 = bodyShaOf(plainReport, BAND_FILE, "borderlineTwelve");
+    if (!bandBodySha256) {
+      throw new Error("receipt scenario report carries no body hash for the review-band function");
+    }
+
     const receiptDir = join(work, "receipts");
     mkdirSync(receiptDir, { recursive: true });
     const validPath = writeReceipt(receiptDir, "valid.json", scenarios.receipt, {});
@@ -630,9 +692,8 @@ function main() {
     const validOutcome = evaluateControl(receiptControlsForRun[0], parseReport(validRun, "valid receipt run"), validRun);
     failures += record(rows, "C8", receiptControlsForRun[0].label, validOutcome.ok);
 
-    const plainRun = runAnalyzer(ANALYZER_DIR, scenarios.receipt);
     const r11 = receiptControlsForRun[receiptControlsForRun.length - 1];
-    const plainOutcome = evaluateControl(r11, parseReport(plainRun, "no-receipt run"), plainRun);
+    const plainOutcome = evaluateControl(r11, plainReport, plainRun);
     failures += record(rows, "R11", r11.label, plainOutcome.ok);
 
     for (let index = 0; index < RECEIPT_CASES.length; index += 1) {

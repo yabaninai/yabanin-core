@@ -8,7 +8,10 @@ relocations — a rename never resets debt), and enforces the review band
 measurement core for the frontend complexity gate (QG-C02).
 
 This analyzer is self-contained Node.js (no npm dependencies of its own). It
-parses with the dashboard's pinned TypeScript compiler.
+parses with the dashboard's pinned TypeScript compiler. Importing
+`analyze.mjs` as a module is side-effect free (the fixture runner imports
+`gateConfigDigest()`); an analysis runs only through a direct
+`node analyze.mjs` invocation.
 
 ## Usage
 
@@ -38,7 +41,8 @@ the working tree.
 - `--scope` — repeatable path prefix filter; defaults to `web/dashboard/`.
   Files with extensions `.ts .tsx .js .jsx .mjs .cjs` are measured.
 - `--receipt` — **path to a review receipt JSON file** (breaking change from
-  1.0, which recorded the value verbatim). See *Review receipts*. A provided
+  1.0, which recorded the value verbatim; schema/2 with `gate_config_sha256`
+  and `bindings` required since 1.2). See *Review receipts*. A provided
   receipt is validated in full; an invalid receipt blocks exactly like a
   missing one.
 - `--model-order` — comma-separated model identifiers ordered weakest to
@@ -104,33 +108,52 @@ given), `receipt-invalid` (receipt given but failed validation) or
 carry their base measurement, delta 0 — but they stay visible as carried
 debt in the debt ledger.
 
-## Review receipts (`ts-complexity-review-receipt/1`)
+## Review receipts (`ts-complexity-review-receipt/2`)
 
-A receipt is a JSON object binding one independent review to the exact
-analyzed commits, the review-band functions and both model identities:
+A receipt is the JSON record of one independent stronger-model review,
+bound to the exact analyzed commits, the exact review-band function bodies
+and both model identities — so a receipt cannot survive a body edit, a
+rename-with-rewrite, or a threshold change under the same function name:
 
 ```json
 {
-  "schema": "ts-complexity-review-receipt/1",
+  "schema": "ts-complexity-review-receipt/2",
   "source_commit": "<analyzed head commit>",
   "base_commit": "<analyzed merge base>",
   "implementer_model": "impl-lite",
   "reviewer_model": "impl-strong",
   "verdict": "approve",
   "reviewed_at": "2026-11-10T09:00:00.000Z",
-  "functions": ["web/dashboard/src/lib/band.ts:borderlineTwelve"]
+  "gate_config_sha256": "<64-hex digest of the active gate configuration>",
+  "bindings": [
+    {
+      "function": "web/dashboard/src/lib/band.ts:borderlineTwelve",
+      "body_sha256": "<64-hex body hash from the gate report>"
+    }
+  ]
 }
 ```
+
+`gate_config_sha256` is the SHA-256 over the canonical JSON (sorted keys,
+no whitespace) of the schema id, the three classification thresholds
+(`cognitive_ok_max`, `cognitive_review_max`, `cognitive_block_over`) and
+the body-identity scheme
+(`body_sha256@ts-printer-body-comments-removed-whitespace-collapsed`);
+the analyzer recomputes it on every run and refuses receipts minted under
+a different configuration. `body_sha256` values come from the gate
+report's `changed_functions[]` entries, so receipts are minted from the
+same measurement they approve.
 
 Valid means all of the following; each failed check yields its own precise
 error, listed in `report.receipt.errors` and on stderr as
 `RECEIPT INVALID ...` lines:
 
-- `schema` is exactly `ts-complexity-review-receipt/1`; every field is
-  present and non-empty (`functions` a non-empty list of `file:name`
-  strings).
+- `schema` is exactly `ts-complexity-review-receipt/2` (a legacy
+  `ts-complexity-review-receipt/1` document is rejected); every field is
+  present and non-empty (`bindings` a non-empty list).
 - `source_commit`/`base_commit` equal the analyzed head commit and merge
   base — a receipt for any other change is refused.
+- `gate_config_sha256` equals the digest of the active gate configuration.
 - `reviewer_model` differs from `implementer_model` (always), and with
   `--model-order` both appear in the ordering with the reviewer strictly
   stronger.
@@ -139,21 +162,27 @@ error, listed in `report.receipt.errors` and on stderr as
 - `reviewed_at` parses as ISO-8601, is no more than 30 days old (mirroring
   the bounded-exception expiry in the maintainability standard) and at most
   24h in the future (clock-skew tolerance).
-- every review-band function of the run is bound as exact `file:name` in
-  `functions` (extra entries are allowed).
+- every `bindings` entry is an object with exactly `function` (a
+  `file:name` binding naming a measured file) and `body_sha256` (64-hex);
+  every review-band function of the run is bound as exact `file:name`
+  **and** its `body_sha256` equals the hash of the function body being
+  measured (extra entries are allowed).
 
 One invalid receipt blocks the run (exit 1) with all of its errors; a valid
 receipt is echoed in `report.receipt` with `valid: true`. Regardless of any
-receipt, bodies over 15 always block.
+receipt, bodies over 15 always block — this gate has no receipt-based
+exception path for blocking bodies; over-limit debt is tracked through the
+debt ledger instead.
 
-Relationship to the Go gate (`scripts/quality/complexity/go`): the
-discipline is shared and the placeholder fields `reviewer_model`,
-`verdict` and `functions` mirror the Go schema. Deliberate divergences:
-Go's single `base_sha` becomes `source_commit` + `base_commit` here; this
-schema adds `implementer_model`, `reviewed_at` and `schema`; Go's
-`functions` entries are bare names while this gate binds exact
-`file:name` pairs, because the TS/JS diff can contain same-named functions
-in different files.
+Relationship to the Go gate (`scripts/quality/complexity/go`): both
+receipt schemas are at `/2` with strict `{function, body_sha256}`
+bindings and a `gate_config_sha256` over the thresholds and the
+body-identity scheme. Deliberate divergences: Go's single `base_sha`
+becomes `source_commit` + `base_commit` here; this schema adds
+`implementer_model`, `reviewed_at` and a 30-day freshness window; the
+verdict vocabularies differ (`approve-exception`/`require-refactor` vs
+`approve`/`reject`/`require_refactoring`); and Go approves per function
+binding while this gate validates whole-band coverage in one receipt.
 
 ## Body extraction and identity
 
@@ -163,17 +192,17 @@ variables/properties) and every closure nested inside another body.
 Overloads and body-less declarations are skipped. `role` is a naming
 heuristic (`useX` → hook, `X...` → component), not a semantic claim.
 
-A body fingerprint is the SHA-256 of the function body printed by the
-TypeScript printer with comments removed and whitespace collapsed, so
-formatting-only and comment-only edits keep the fingerprint stable. Matching
-per changed file runs in three survivor-first passes:
+A body hash (`body_sha256`) is the SHA-256 of the function body printed by
+the TypeScript printer with comments removed and whitespace collapsed, so
+formatting-only and comment-only edits keep the hash stable. Matching per
+changed file runs in three survivor-first passes:
 
 1. **Survivors** — a base body that still exists at head under its own
-   qualified name with an identical fingerprint is unchanged; it is never
+   qualified name with an identical body hash is unchanged; it is never
    re-measured and can never back a rename or move. Pairing survivors first
    makes the result independent of file order: a duplicate copy appearing
    earlier in the file cannot steal the original's identity.
-2. **In-file renames** — identical fingerprint, different name (any
+2. **In-file renames** — identical body hash, different name (any
    syntactic form: declaration → function expression, default export →
    renamed arrow). Each vanished original backs at most one rename; later
    identical copies fall through to duplicate handling.
@@ -182,10 +211,10 @@ per changed file runs in three survivor-first passes:
 
 Bodies still unmatched after the three passes are resolved globally:
 
-- an identical fingerprint in the pool of base bodies that vanished from
+- an identical body hash in the pool of base bodies that vanished from
   *other* changed files → `moved` (cross-file), `moved_from` names the
   origin;
-- otherwise, if the fingerprint exists anywhere at base, the body is a
+- otherwise, if the body hash exists anywhere at base, the body is a
   **duplicate**: status `added` with `duplicate_of` naming the original,
   and it is measured as new code — an identical copy of a blocking body
   blocks, and a copy of a function whose original still exists cannot
@@ -197,7 +226,7 @@ Bodies still unmatched after the three passes are resolved globally:
 
 Known limitation: renaming a function *and* editing its body in the same
 change classifies as `added`, losing the old baseline; a rename that also
-renames parameters breaks fingerprint identity the same way.
+renames parameters breaks body-hash identity the same way.
 
 ## Report schema (`ts-complexity-diff/2`)
 
@@ -208,10 +237,11 @@ renames parameters breaks fingerprint identity the same way.
   head source (`source_digest`) and base tree (`base_source_digest`, git
   blob IDs from `ls-tree`).
 - `receipt` — null, or the validated receipt object: `path`, `valid`,
-  `errors[]`, and the echoed document fields. The full validation verdict,
-  not a verbatim echo.
+  `errors[]`, and the echoed document fields (`gate_config_sha256`,
+  `bindings[]` sorted by function). The full validation verdict, not a
+  verbatim echo.
 - `changed_functions[]` — `file, name (qualified with `::`), kind, role,
-  line, fingerprint, status (added/changed/moved), moved_from,
+  line, body_sha256, status (added/changed/moved), moved_from,
   duplicate_of, old/new complexity, delta, classification, review`.
 - `summary` — added/changed/moved/deleted counts, review and blocking,
   plus `review_unreceipted` (band entries with no receipt at all) and
@@ -240,24 +270,29 @@ records debt; it never blocks, and unlike the report it carries a
 `scripts/quality/tests/complexity/ts_fixture_runner.mjs` builds throwaway
 git repositories from `ts_fixtures/` (base/head, receipt and rename
 scenarios, plus gate-wiring repos embedding an analyzer copy) and asserts
-54 checks (42 controls + 12 mutants):
+58 checks (46 controls + 12 mutants):
 
 - the main repo (base/head) pins the changed-function control classes
   C1–C13: changed/added/moved/deleted bodies, nested-closure attribution,
   untouched debt, and pinned metric paths with exact scores — `switch`
   case-clause counting, `catch`-clause counting, class getter/setter/method
-  bodies, async function and async arrow bodies; fingerprint stability
+  bodies, async function and async arrow bodies; body-hash stability
   under a whitespace/comment-only reformat; byte-determinism of two
   consecutive runs (C7);
 - the receipt repo (`ts_fixtures/receipt/`) pins receipt enforcement: C8 —
   a valid stronger-model receipt clears the single review-band function
-  (exit 0, `review: receipt-recorded`); R1–R10 — receipts failing exactly
-  one validation class each (wrong source commit, wrong base commit,
-  reviewer = implementer, weaker reviewer per `--model-order`, stale,
-  unbound function, `reject` verdict, unknown verdict, malformed JSON,
-  missing file) are all rejected with their precise error; R11 — without a
-  receipt the band blocks (exit 1) with a `NEEDS REVIEW RECEIPT` line and
-  `failures` stays complexity-only;
+  (exit 0, `review: receipt-recorded`); R1–R10 and R12–R15 — receipts
+  failing exactly one validation class each (wrong source commit, wrong
+  base commit, reviewer = implementer, weaker reviewer per
+  `--model-order`, stale, unbound function, `reject` verdict, unknown
+  verdict, malformed JSON, missing file, legacy schema/1 document, stale
+  body-hash binding, wrong `gate_config_sha256`, malformed binding object)
+  are all rejected with their precise error; R11 — without a receipt the
+  band blocks (exit 1) with a `NEEDS REVIEW RECEIPT` line and `failures`
+  stays complexity-only. Receipts are minted from the scenarios' own gate
+  reports (real `body_sha256` values) and the analyzer's
+  `gateConfigDigest()`, mirroring the Go suite's `report_body_sha256`
+  helper;
 - the rename repo (`ts_fixtures/rename/`) pins rename/duplicate handling:
   C14 — a byte-identical copy (`heavyCopy`) of a surviving original
   (`heavyOriginal`) is `added` with `duplicate_of` and blocks at 16 > 15;
