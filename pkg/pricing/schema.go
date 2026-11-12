@@ -337,6 +337,18 @@ func (c *refProblemCollector) err() error {
 func ValidateCatalog(c Catalog) error {
 	var pc refProblemCollector
 
+	validateCatalogHeader(&pc, c)
+	seenIdentity := make(map[string]int, len(c.Models))
+	seenAlias := make(map[string]int, len(c.Models))
+	for i := range c.Models {
+		validateModel(&pc, i, &c.Models[i], seenIdentity, seenAlias)
+	}
+	return pc.err()
+}
+
+// validateCatalogHeader checks the snapshot metadata fields in declaration
+// order, before any model finding.
+func validateCatalogHeader(pc *refProblemCollector, c Catalog) {
 	if c.SchemaVersion != RefSchemaVersion {
 		pc.add("schema_version", "must be %d, got %d", RefSchemaVersion, c.SchemaVersion)
 	}
@@ -352,6 +364,15 @@ func ValidateCatalog(c Catalog) error {
 	if c.Supersedes != "" && !isDigestHex(c.Supersedes) {
 		pc.add("supersedes", "must be a 64-hex digest, got %q", c.Supersedes)
 	}
+	validateCatalogDigest(pc, c)
+	if c.ReviewSLADays < 0 {
+		pc.add("review_sla_days", "must not be negative (%d)", c.ReviewSLADays)
+	}
+}
+
+// validateCatalogDigest checks the declared Digest: 64-hex format when
+// present, and content match against the digest of the canonical form.
+func validateCatalogDigest(pc *refProblemCollector, c Catalog) {
 	if c.Digest != "" && !isDigestHex(c.Digest) {
 		pc.add("digest", "must be a 64-hex digest, got %q", c.Digest)
 	}
@@ -363,16 +384,6 @@ func ValidateCatalog(c Catalog) error {
 			pc.add("digest", "does not match content (want %s)", want)
 		}
 	}
-	if c.ReviewSLADays < 0 {
-		pc.add("review_sla_days", "must not be negative (%d)", c.ReviewSLADays)
-	}
-
-	seenIdentity := make(map[string]int, len(c.Models))
-	seenAlias := make(map[string]int, len(c.Models))
-	for i := range c.Models {
-		validateModel(&pc, i, &c.Models[i], seenIdentity, seenAlias)
-	}
-	return pc.err()
 }
 
 // validateModel checks one model entry and registers its identity and
@@ -580,7 +591,23 @@ func rateConflictResolved(r *RefRate, conflicts []RefConflict) bool {
 	return false
 }
 
+// validateRate checks one rate in field order: axis/unit pairing and
+// duplicate-axis registration, then the amount, then the evidence records.
 func validateRate(pc *refProblemCollector, where string, idx int, r *RefRate, seenAxis map[string]int) {
+	validateRateAxisUnit(pc, where, idx, r, seenAxis)
+	if r.Amount != nil {
+		validateFiniteNonNegative(pc, where+".amount", *r.Amount)
+	}
+	seenEvidence := make(map[string]struct{}, len(r.Evidence))
+	for k, ev := range r.Evidence {
+		validateRateEvidence(pc, fmt.Sprintf("%s.evidence[%d]", where, k), ev, seenEvidence)
+	}
+}
+
+// validateRateAxisUnit enforces the closed axis vocabulary, the axis↔unit
+// pairing and one-rate-per-axis; unknown axes still claim their slot so a
+// repeated unknown axis is reported as a duplicate too.
+func validateRateAxisUnit(pc *refProblemCollector, where string, idx int, r *RefRate, seenAxis map[string]int) {
 	unit, known := axisUnits[r.Axis]
 	if !known {
 		pc.add(where+".axis", "unknown axis %q", r.Axis)
@@ -592,32 +619,32 @@ func validateRate(pc *refProblemCollector, where string, idx int, r *RefRate, se
 	} else {
 		seenAxis[r.Axis] = idx
 	}
-	if r.Amount != nil {
-		v := *r.Amount
-		if math.IsNaN(v) || math.IsInf(v, 0) {
-			pc.add(where+".amount", "not a finite number (%v)", v)
-		} else if v < 0 {
-			pc.add(where+".amount", "negative price %v", v)
-		}
+}
+
+// validateFiniteNonNegative rejects NaN and infinities, then negative
+// prices; 0 stays a legitimate explicit free (Amount=nil is the unpriced
+// state and is never passed here).
+func validateFiniteNonNegative(pc *refProblemCollector, path string, v float64) {
+	if math.IsNaN(v) || math.IsInf(v, 0) {
+		pc.add(path, "not a finite number (%v)", v)
+	} else if v < 0 {
+		pc.add(path, "negative price %v", v)
 	}
-	seenEvidence := make(map[string]struct{}, len(r.Evidence))
-	for k, ev := range r.Evidence {
-		epath := fmt.Sprintf("%s.evidence[%d]", where, k)
-		if strings.TrimSpace(ev.Ref) == "" {
-			pc.add(epath+".ref", "evidence ref is required")
-		}
-		if _, dup := seenEvidence[ev.Ref]; dup {
-			pc.add(epath+".ref", "duplicate evidence ref %q", ev.Ref)
-		}
-		seenEvidence[ev.Ref] = struct{}{}
-		if math.IsNaN(ev.Amount) || math.IsInf(ev.Amount, 0) {
-			pc.add(epath+".amount", "not a finite number (%v)", ev.Amount)
-		} else if ev.Amount < 0 {
-			pc.add(epath+".amount", "negative price %v", ev.Amount)
-		}
-		if err := ValidateRefTime(ev.At); err != nil {
-			pc.add(epath+".at", "%v", err)
-		}
+}
+
+// validateRateEvidence checks one evidence record and registers its ref in
+// the rate-local namespace (first occurrence wins).
+func validateRateEvidence(pc *refProblemCollector, epath string, ev RefEvidence, seenEvidence map[string]struct{}) {
+	if strings.TrimSpace(ev.Ref) == "" {
+		pc.add(epath+".ref", "evidence ref is required")
+	}
+	if _, dup := seenEvidence[ev.Ref]; dup {
+		pc.add(epath+".ref", "duplicate evidence ref %q", ev.Ref)
+	}
+	seenEvidence[ev.Ref] = struct{}{}
+	validateFiniteNonNegative(pc, epath+".amount", ev.Amount)
+	if err := ValidateRefTime(ev.At); err != nil {
+		pc.add(epath+".at", "%v", err)
 	}
 }
 
