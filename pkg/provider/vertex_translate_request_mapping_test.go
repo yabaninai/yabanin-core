@@ -6,6 +6,7 @@ package provider
 // hand-derived from the documented adapter mapping, not from the code.
 
 import (
+	"bytes"
 	"encoding/json"
 	"strings"
 	"testing"
@@ -52,12 +53,19 @@ func TestChatToVertexGenerate_GoldenWireBytes(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, "gemini-2.5-flash", model, "model is trimmed")
 	assert.JSONEq(t, wantGoldenPayload, string(got), "payload semantics")
-	assert.Equal(t, wantGoldenPayload, string(got), "byte-level wire emission (field order, no extra keys)")
+	// Byte equality pins the wire emission (field order, no extra keys)
+	// that JSONEq deliberately ignores; plain bytes.Equal because byte
+	// identity, not JSON equivalence, is the contract under test.
+	if !bytes.Equal(got, []byte(wantGoldenPayload)) {
+		t.Errorf("payload bytes = %s, want %s", got, wantGoldenPayload)
+	}
 
 	env, err := (*Vertex)(nil).TranslateRequest([]byte(goldenBody))
 	require.NoError(t, err)
 	wantEnvelope := `{"model":"gemini-2.5-flash","gemini":` + wantGoldenPayload + `}`
-	assert.Equal(t, wantEnvelope, string(env), "envelope wraps the same payload bytes")
+	if !bytes.Equal(env, []byte(wantEnvelope)) {
+		t.Errorf("envelope bytes = %s, want %s", env, wantEnvelope)
+	}
 }
 
 func TestChatToVertexGenerate_MinimalPayloadHasOnlyContents(t *testing.T) {
@@ -66,8 +74,10 @@ func TestChatToVertexGenerate_MinimalPayloadHasOnlyContents(t *testing.T) {
 	got, model, err := chatToVertexGenerate([]byte(`{"model":"m","messages":[{"role":"user","content":"hi"}]}`))
 	require.NoError(t, err)
 	assert.Equal(t, "m", model)
-	assert.Equal(t, `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, string(got),
-		"no system/tools/generationConfig keys may be emitted when unset")
+	wantMinimal := `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`
+	if !bytes.Equal(got, []byte(wantMinimal)) {
+		t.Errorf("payload bytes = %s, want %s (unset sections must not be emitted)", got, wantMinimal)
+	}
 }
 
 func TestChatToVertexGenerate_EmptySystemMessagesEmitNoInstruction(t *testing.T) {
@@ -80,7 +90,10 @@ func TestChatToVertexGenerate_EmptySystemMessagesEmitNoInstruction(t *testing.T)
 	got, _, err := chatToVertexGenerate([]byte(body))
 	require.NoError(t, err)
 	assert.NotContains(t, string(got), "systemInstruction", "empty system text folds to nothing")
-	assert.Equal(t, `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`, string(got))
+	wantFolded := `{"contents":[{"role":"user","parts":[{"text":"hi"}]}]}`
+	if !bytes.Equal(got, []byte(wantFolded)) {
+		t.Errorf("payload bytes = %s, want %s", got, wantFolded)
+	}
 
 	_, _, err = chatToVertexGenerate([]byte(`{"model":"m","messages":[{"role":"system","content":"only rules"}]}`))
 	require.Error(t, err)

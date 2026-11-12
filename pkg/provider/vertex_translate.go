@@ -233,6 +233,34 @@ func (*Vertex) TranslateRequest(openaiBody []byte) ([]byte, error) {
 	return out, nil
 }
 
+// vertexChatRequest is the decode target for chatToVertexGenerate: the
+// canonical chat request plus the newer OpenAI max_completion_tokens alias.
+type vertexChatRequest struct {
+	apiformat.ChatRequest
+	MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
+}
+
+// decodeVertexChatRequest decodes the OpenAI chat body (coercing a string
+// `stop` into the array the canonical type decodes) and applies the guards
+// that must fire before any mapping: a resolvable model, and rejection of
+// fields with no mapped Gemini equivalent (I51) — reasoning_effort has no
+// thinkingConfig mapping yet, and answering at a default reasoning level
+// would silently betray the requested one.
+func decodeVertexChatRequest(body []byte) (vertexChatRequest, string, error) {
+	var req vertexChatRequest
+	if err := json.Unmarshal(coerceStopToArray(body), &req); err != nil {
+		return vertexChatRequest{}, "", fmt.Errorf("vertex: decode openai request: %w", err)
+	}
+	model := strings.TrimSpace(req.Model)
+	if model == "" {
+		return vertexChatRequest{}, "", errors.New("vertex: request body has no model field; cannot resolve the Gemini model")
+	}
+	if req.ReasoningEffort != "" {
+		return vertexChatRequest{}, "", fmt.Errorf("vertex: reasoning_effort %q is not mapped yet (Gemini thinkingConfig mapping pending); rejecting instead of silently dropping (I51)", req.ReasoningEffort)
+	}
+	return req, model, nil
+}
+
 // chatToVertexGenerate maps an OpenAI chat body to (geminiJSON, model).
 // Supported: system/developer→systemInstruction, user/assistant text
 // (string or text-part arrays), assistant tool_calls → functionCall parts,
@@ -242,121 +270,175 @@ func (*Vertex) TranslateRequest(openaiBody []byte) ([]byte, error) {
 // an OpenAI client expecting a tool call must never receive a text answer
 // that pretends the request succeeded.
 func chatToVertexGenerate(body []byte) ([]byte, string, error) {
-	body = coerceStopToArray(body)
-	var req struct {
-		apiformat.ChatRequest
-		MaxCompletionTokens *int `json:"max_completion_tokens,omitempty"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		return nil, "", fmt.Errorf("vertex: decode openai request: %w", err)
-	}
-	model := strings.TrimSpace(req.Model)
-	if model == "" {
-		return nil, "", errors.New("vertex: request body has no model field; cannot resolve the Gemini model")
-	}
-	// N07-P01-T05 (I51): reasoning_effort is modeled but has no mapped Gemini
-	// equivalent yet (thinkingConfig mapping pending). Reject instead of
-	// silently answering at a default reasoning level.
-	if req.ReasoningEffort != "" {
-		return nil, "", fmt.Errorf("vertex: reasoning_effort %q is not mapped yet (Gemini thinkingConfig mapping pending); rejecting instead of silently dropping (I51)", req.ReasoningEffort)
-	}
-
-	var (
-		out      vertexGenerateRequest
-		system   []vertexReqPart
-		contents []vertexContent
-		// toolNames resolves OpenAI tool_call_id → Gemini function name for
-		// tool result messages (OpenAI addresses results by id, Gemini by
-		// function name).
-		toolNames = map[string]string{}
-		frIdx     = -1 // index of the functionResponse content being merged
-	)
-	for _, msg := range req.Messages {
-		switch msg.Role {
-		case "system", "developer":
-			text, err := vertexTextOf(msg.Content)
-			if err != nil {
-				return nil, "", err
-			}
-			if text != "" {
-				system = append(system, vertexReqPart{Text: text})
-			}
-		case "user":
-			text, err := vertexTextOf(msg.Content)
-			if err != nil {
-				return nil, "", err
-			}
-			if text == "" {
-				return nil, "", errors.New("vertex: user message has no translatable content; rejecting instead of sending an empty Gemini content")
-			}
-			contents = append(contents, vertexContent{Role: "user", Parts: []vertexReqPart{{Text: text}}})
-			frIdx = -1
-		case "assistant":
-			parts := make([]vertexReqPart, 0, 1+len(msg.ToolCalls))
-			if text, err := vertexTextOf(msg.Content); err != nil {
-				return nil, "", err
-			} else if text != "" {
-				parts = append(parts, vertexReqPart{Text: text})
-			}
-			for _, tc := range msg.ToolCalls {
-				if tc.Type != "" && tc.Type != "function" {
-					return nil, "", fmt.Errorf("vertex: unsupported tool call type %q; only function calls are mapped", tc.Type)
-				}
-				if tc.Function.Name == "" {
-					return nil, "", errors.New("vertex: tool call without a function name; cannot map to a Gemini functionCall")
-				}
-				args, err := vertexArgsBytes(tc.Function.Arguments)
-				if err != nil {
-					return nil, "", err
-				}
-				toolNames[tc.ID] = tc.Function.Name
-				parts = append(parts, vertexReqPart{FunctionCall: &vertexFunctionCall{Name: tc.Function.Name, Args: args}})
-			}
-			if len(parts) == 0 {
-				// An assistant message with neither content nor tool calls
-				// carries no semantics to translate; Gemini would reject the
-				// empty content outright.
-				continue
-			}
-			contents = append(contents, vertexContent{Role: "model", Parts: parts})
-			frIdx = -1
-		case "tool":
-			name := msg.Name
-			if name == "" {
-				name = toolNames[msg.ToolCallID]
-			}
-			if name == "" {
-				return nil, "", errors.New("vertex: tool result cannot be resolved to a function name (set message.name or match a prior assistant tool_call id)")
-			}
-			part := vertexReqPart{FunctionResponse: &vertexFunctionResponse{
-				Name:     name,
-				Response: vertexResponseObject(apiformat.ContentText(msg.Content)),
-			}}
-			// Gemini expects the responses to a parallel tool-call turn as
-			// functionResponse parts of ONE user content — merge consecutive
-			// tool messages accordingly.
-			if frIdx >= 0 && frIdx == len(contents)-1 {
-				contents[frIdx].Parts = append(contents[frIdx].Parts, part)
-			} else {
-				contents = append(contents, vertexContent{Role: "user", Parts: []vertexReqPart{part}})
-				frIdx = len(contents) - 1
-			}
-		default:
-			return nil, "", fmt.Errorf("vertex: unsupported message role %q; rejecting instead of silently dropping the message", msg.Role)
-		}
-	}
-	if len(contents) == 0 {
-		return nil, "", errors.New("vertex: request has no user/assistant messages to generate from")
-	}
-	out.Contents = contents
-	if len(system) > 0 {
-		out.SystemInstruction = &vertexContent{Parts: system}
-	}
-
-	if err := vertexMapTools(&out, &req.ChatRequest); err != nil {
+	req, model, err := decodeVertexChatRequest(body)
+	if err != nil {
 		return nil, "", err
 	}
 
+	b := newVertexContentBuilder()
+	for _, msg := range req.Messages {
+		if err := b.addMessage(msg); err != nil {
+			return nil, "", err
+		}
+	}
+	if len(b.contents) == 0 {
+		return nil, "", errors.New("vertex: request has no user/assistant messages to generate from")
+	}
+
+	var out vertexGenerateRequest
+	out.Contents = b.contents
+	if len(b.system) > 0 {
+		out.SystemInstruction = &vertexContent{Parts: b.system}
+	}
+	if err := vertexMapTools(&out, &req.ChatRequest); err != nil {
+		return nil, "", err
+	}
+	gc, err := vertexGenerationConfigOf(&req)
+	if err != nil {
+		return nil, "", err
+	}
+	if gc.configured() {
+		out.GenerationConfig = gc
+	}
+
+	gemini, err := json.Marshal(out)
+	if err != nil {
+		return nil, "", fmt.Errorf("vertex: encode generateContent request: %w", err)
+	}
+	return gemini, model, nil
+}
+
+// vertexContentBuilder accumulates the Gemini contents (plus the
+// systemInstruction part list) across the OpenAI messages of one request.
+type vertexContentBuilder struct {
+	system   []vertexReqPart
+	contents []vertexContent
+	// toolNames resolves OpenAI tool_call_id → Gemini function name for
+	// tool result messages (OpenAI addresses results by id, Gemini by
+	// function name).
+	toolNames map[string]string
+	// frIdx is the index of the content currently collecting
+	// functionResponse parts, or -1 when no merge window is open.
+	frIdx int
+}
+
+func newVertexContentBuilder() vertexContentBuilder {
+	return vertexContentBuilder{toolNames: map[string]string{}, frIdx: -1}
+}
+
+// addMessage routes one chat message by role; unmapped roles reject (I51)
+// rather than silently dropping the message.
+func (b *vertexContentBuilder) addMessage(msg apiformat.ChatMessage) error {
+	switch msg.Role {
+	case "system", "developer":
+		return b.addSystemText(msg.Content)
+	case "user":
+		return b.addUserText(msg.Content)
+	case "assistant":
+		return b.addAssistantMessage(msg)
+	case "tool":
+		return b.addToolResult(msg)
+	default:
+		return fmt.Errorf("vertex: unsupported message role %q; rejecting instead of silently dropping the message", msg.Role)
+	}
+}
+
+func (b *vertexContentBuilder) addSystemText(raw json.RawMessage) error {
+	text, err := vertexTextOf(raw)
+	if err != nil {
+		return err
+	}
+	if text != "" {
+		b.system = append(b.system, vertexReqPart{Text: text})
+	}
+	return nil
+}
+
+func (b *vertexContentBuilder) addUserText(raw json.RawMessage) error {
+	text, err := vertexTextOf(raw)
+	if err != nil {
+		return err
+	}
+	if text == "" {
+		return errors.New("vertex: user message has no translatable content; rejecting instead of sending an empty Gemini content")
+	}
+	b.contents = append(b.contents, vertexContent{Role: "user", Parts: []vertexReqPart{{Text: text}}})
+	b.frIdx = -1
+	return nil
+}
+
+func (b *vertexContentBuilder) addAssistantMessage(msg apiformat.ChatMessage) error {
+	parts := make([]vertexReqPart, 0, 1+len(msg.ToolCalls))
+	if text, err := vertexTextOf(msg.Content); err != nil {
+		return err
+	} else if text != "" {
+		parts = append(parts, vertexReqPart{Text: text})
+	}
+	for _, tc := range msg.ToolCalls {
+		part, err := vertexToolCallPart(tc, b.toolNames)
+		if err != nil {
+			return err
+		}
+		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		// An assistant message with neither content nor tool calls carries
+		// no semantics — Gemini would reject the empty content outright.
+		// Skipping it must NOT close the tool-result merge window.
+		return nil
+	}
+	b.contents = append(b.contents, vertexContent{Role: "model", Parts: parts})
+	b.frIdx = -1
+	return nil
+}
+
+// vertexToolCallPart maps one OpenAI tool_call to a Gemini functionCall
+// part and registers its id→name pair for later tool result resolution.
+func vertexToolCallPart(tc apiformat.ToolCall, toolNames map[string]string) (vertexReqPart, error) {
+	if tc.Type != "" && tc.Type != "function" {
+		return vertexReqPart{}, fmt.Errorf("vertex: unsupported tool call type %q; only function calls are mapped", tc.Type)
+	}
+	if tc.Function.Name == "" {
+		return vertexReqPart{}, errors.New("vertex: tool call without a function name; cannot map to a Gemini functionCall")
+	}
+	args, err := vertexArgsBytes(tc.Function.Arguments)
+	if err != nil {
+		return vertexReqPart{}, err
+	}
+	toolNames[tc.ID] = tc.Function.Name
+	return vertexReqPart{FunctionCall: &vertexFunctionCall{Name: tc.Function.Name, Args: args}}, nil
+}
+
+func (b *vertexContentBuilder) addToolResult(msg apiformat.ChatMessage) error {
+	name := msg.Name
+	if name == "" {
+		name = b.toolNames[msg.ToolCallID]
+	}
+	if name == "" {
+		return errors.New("vertex: tool result cannot be resolved to a function name (set message.name or match a prior assistant tool_call id)")
+	}
+	part := vertexReqPart{FunctionResponse: &vertexFunctionResponse{
+		Name:     name,
+		Response: vertexResponseObject(apiformat.ContentText(msg.Content)),
+	}}
+	// Gemini expects the responses to a parallel tool-call turn as
+	// functionResponse parts of ONE user content — merge consecutive
+	// tool messages accordingly (only a message that appends a content
+	// closes the window; see addAssistantMessage).
+	if b.frIdx >= 0 && b.frIdx == len(b.contents)-1 {
+		b.contents[b.frIdx].Parts = append(b.contents[b.frIdx].Parts, part)
+		return nil
+	}
+	b.contents = append(b.contents, vertexContent{Role: "user", Parts: []vertexReqPart{part}})
+	b.frIdx = len(b.contents) - 1
+	return nil
+}
+
+// vertexGenerationConfigOf maps the sampling/output knobs onto a Gemini
+// generationConfig; an all-zero result means the request set none of them
+// (Gemini defaults apply). max_completion_tokens takes precedence over
+// max_tokens.
+func vertexGenerationConfigOf(req *vertexChatRequest) (*vertexGenerationConfig, error) {
 	gc := &vertexGenerationConfig{}
 	gc.MaxOutputTokens = req.MaxCompletionTokens
 	if gc.MaxOutputTokens == nil {
@@ -367,34 +449,44 @@ func chatToVertexGenerate(body []byte) ([]byte, string, error) {
 	if len(req.Stop) > 0 {
 		gc.StopSequences = req.Stop
 	}
-	if len(req.ResponseFormat) > 0 && string(req.ResponseFormat) != "null" {
-		var rf struct {
-			Type string `json:"type"`
-		}
-		if err := json.Unmarshal(req.ResponseFormat, &rf); err != nil {
-			return nil, "", errors.New("vertex: response_format is not a {type} object")
-		}
-		switch rf.Type {
-		case "", "text":
-			// Default behavior; nothing to set.
-		case "json_object":
-			gc.ResponseMimeType = "application/json"
-		case "json_schema":
-			return nil, "", errors.New("vertex: response_format json_schema is not mapped; rejecting instead of silently ignoring the schema guarantee")
-		default:
-			return nil, "", fmt.Errorf("vertex: unsupported response_format type %q", rf.Type)
-		}
-	}
-	if gc.MaxOutputTokens != nil || gc.Temperature != nil || gc.TopP != nil ||
-		len(gc.StopSequences) > 0 || gc.ResponseMimeType != "" {
-		out.GenerationConfig = gc
-	}
-
-	gemini, err := json.Marshal(out)
+	mime, err := vertexResponseMime(req.ResponseFormat)
 	if err != nil {
-		return nil, "", fmt.Errorf("vertex: encode generateContent request: %w", err)
+		return nil, err
 	}
-	return gemini, model, nil
+	gc.ResponseMimeType = mime
+	return gc, nil
+}
+
+// configured reports whether any generationConfig field would be emitted.
+func (gc *vertexGenerationConfig) configured() bool {
+	return gc.MaxOutputTokens != nil || gc.Temperature != nil || gc.TopP != nil ||
+		len(gc.StopSequences) > 0 || gc.ResponseMimeType != ""
+}
+
+// vertexResponseMime maps response_format onto the Gemini responseMimeType;
+// "" means the default text mode. Unmapped formats reject (I51): a client
+// asking for json_schema or an unknown type must not receive prose it
+// cannot parse.
+func vertexResponseMime(raw json.RawMessage) (string, error) {
+	if len(raw) == 0 || string(raw) == "null" {
+		return "", nil
+	}
+	var rf struct {
+		Type string `json:"type"`
+	}
+	if err := json.Unmarshal(raw, &rf); err != nil {
+		return "", errors.New("vertex: response_format is not a {type} object")
+	}
+	switch rf.Type {
+	case "", "text":
+		return "", nil
+	case "json_object":
+		return "application/json", nil
+	case "json_schema":
+		return "", errors.New("vertex: response_format json_schema is not mapped; rejecting instead of silently ignoring the schema guarantee")
+	default:
+		return "", fmt.Errorf("vertex: unsupported response_format type %q", rf.Type)
+	}
 }
 
 // vertexMapTools maps the OpenAI tools/tool_choice pair onto Gemini
