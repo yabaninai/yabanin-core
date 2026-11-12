@@ -120,6 +120,12 @@ var (
 	ErrReservedUnderflow = errors.New("reservation: scope reserve underflow")
 	// ErrInvalidRequest: malformed grant (empty, unknown scope, duplicates).
 	ErrInvalidRequest = errors.New("reservation: invalid request")
+	// ErrOrphanAcquireTimeout: the orphan-close verdict's bounded pool
+	// round-trip deadline elapsed — typically every pooled connection
+	// pinned by fence-holder transactions. Retryable: rows already closed
+	// stay closed (the per-row exactly-once state machine) and a later
+	// verdict finishes the rest.
+	ErrOrphanAcquireTimeout = errors.New("reservation: orphan close timed out waiting for a pooled connection")
 )
 
 // reservationDB is the store's surface (*pgxpool.Pool in production).
@@ -137,6 +143,10 @@ type ReservationStore struct {
 	db  reservationDB
 	log *slog.Logger
 	cfg ReservationConfig
+	// orphanAcquireTimeout bounds each pool round-trip of the orphan-close
+	// core; 0 → orphanAcquireDefault. Test seam — deployments use the
+	// default.
+	orphanAcquireTimeout time.Duration
 }
 
 // NewReservationStore builds a store with §14 defaults.
@@ -1181,6 +1191,73 @@ func (s *ReservationStore) CloseAbandonedReplica(ctx context.Context, replicaID 
 	return s.closeAbandonedCandidates(ctx, replicaID, "unfenced", orphanWindow(window), nil)
 }
 
+// orphanAcquireDefault bounds each pool round-trip (connection acquire +
+// statement) of the orphan-close core. A fenced verdict pins one pooled
+// connection for its lease holder for the verdict's whole lifetime, so when
+// N=MaxConns verdicts hold every connection an unbounded second acquire
+// deadlocks the pool client-side with zero goroutines reaching Postgres
+// (W40). The deadline turns that starvation into ErrOrphanAcquireTimeout —
+// a retryable refusal, like ErrRecoveryFenceHeld.
+const orphanAcquireDefault = 5 * time.Second
+
+// orphanAcquireBound resolves the verdict's per-round-trip pool deadline.
+func (s *ReservationStore) orphanAcquireBound() time.Duration {
+	if s.orphanAcquireTimeout > 0 {
+		return s.orphanAcquireTimeout
+	}
+	return orphanAcquireDefault
+}
+
+// orphanBoundedErr maps an internal acquire/statement deadline of the
+// orphan-close core to the retryable sentinel. A deadline coming from the
+// caller's own context propagates unchanged: only the verdict's internal
+// bound refuses to wait.
+func orphanBoundedErr(parent context.Context, err error) error {
+	if errors.Is(err, context.DeadlineExceeded) && parent.Err() == nil {
+		return fmt.Errorf("%w: %w", ErrOrphanAcquireTimeout, err)
+	}
+	return err
+}
+
+// orphanCandidate is one scanned allowance row of a declared-lost replica.
+type orphanCandidate struct {
+	id              int64
+	org, scope, key string
+	period          string
+}
+
+// scanOrphanCandidates runs the bounded candidates read: the replica's
+// allowance rows ordered by id, including already-released rows so a
+// re-verdict observes the exactly-once losing sides.
+func (s *ReservationStore) scanOrphanCandidates(ctx context.Context, replicaID string) ([]orphanCandidate, error) {
+	scanCtx, cancelScan := context.WithTimeout(ctx, s.orphanAcquireBound())
+	defer cancelScan()
+	rows, err := s.db.Query(scanCtx, `
+		SELECT id, org_id, scope_kind, scope_key, period
+		FROM budget_allowances
+		WHERE replica_id = $1
+		ORDER BY id`,
+		replicaID)
+	if err != nil {
+		return nil, orphanBoundedErr(ctx, fmt.Errorf("orphan close candidates: %w", err))
+	}
+	var candidates []orphanCandidate
+	for rows.Next() {
+		var c orphanCandidate
+		if err := rows.Scan(&c.id, &c.org, &c.scope, &c.key, &c.period); err != nil {
+			rows.Close()
+			return nil, orphanBoundedErr(ctx, fmt.Errorf("orphan close scan: %w", err))
+		}
+		candidates = append(candidates, c)
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, orphanBoundedErr(ctx, fmt.Errorf("orphan close rows: %w", err))
+	}
+	rows.Close()
+	return candidates, nil
+}
+
 // closeAbandonedCandidates is the shared exactly-once core of both orphan
 // verdicts: scan the replica's allowance rows (candidates include
 // already-released rows so a re-verdict observes the exactly-once losing
@@ -1190,34 +1267,10 @@ func (s *ReservationStore) CloseAbandonedReplica(ctx context.Context, replicaID 
 // under budget_allowance_released_total{reason="crash_orphan"} exactly
 // once per closed row, whichever verdict wins the race.
 func (s *ReservationStore) closeAbandonedCandidates(ctx context.Context, replicaID, closer string, window time.Duration, stop func() error) (AbandonedReplicaSummary, error) {
-	rows, err := s.db.Query(ctx, `
-		SELECT id, org_id, scope_kind, scope_key, period
-		FROM budget_allowances
-		WHERE replica_id = $1
-		ORDER BY id`,
-		replicaID)
+	candidates, err := s.scanOrphanCandidates(ctx, replicaID)
 	if err != nil {
-		return AbandonedReplicaSummary{}, fmt.Errorf("orphan close candidates: %w", err)
+		return AbandonedReplicaSummary{}, err
 	}
-	type orphanCandidate struct {
-		id              int64
-		org, scope, key string
-		period          string
-	}
-	var candidates []orphanCandidate
-	for rows.Next() {
-		var c orphanCandidate
-		if err := rows.Scan(&c.id, &c.org, &c.scope, &c.key, &c.period); err != nil {
-			rows.Close()
-			return AbandonedReplicaSummary{}, fmt.Errorf("orphan close scan: %w", err)
-		}
-		candidates = append(candidates, c)
-	}
-	if err := rows.Err(); err != nil {
-		rows.Close()
-		return AbandonedReplicaSummary{}, fmt.Errorf("orphan close rows: %w", err)
-	}
-	rows.Close()
 
 	var summary AbandonedReplicaSummary
 	for _, c := range candidates {
@@ -1228,7 +1281,7 @@ func (s *ReservationStore) closeAbandonedCandidates(ctx context.Context, replica
 		}
 		state, returned, err := s.closeAbandonedOne(ctx, c.id, c.org, ScopeKind(c.scope), c.key, c.period, window)
 		if err != nil {
-			return summary, err
+			return summary, orphanBoundedErr(ctx, fmt.Errorf("orphan close row %d: %w", c.id, err))
 		}
 		switch state {
 		case orphanClosed:
@@ -1254,26 +1307,23 @@ func (s *ReservationStore) closeAbandonedCandidates(ctx context.Context, replica
 	return summary, nil
 }
 
-// closeAbandonedOne closes a single allowance of the declared-lost replica
-// if it still qualifies: lease lapsed past the safety window, or zero
-// remainder while draining/expired (§7.1.1/§7.1.2 — the same qualification
-// releaseOne applies, so the targeted verdict and the periodic pass can
-// never both move the same money).
-func (s *ReservationStore) closeAbandonedOne(ctx context.Context, id int64, orgID string, scope ScopeKind, key, period string, window time.Duration) (orphanClosureState, int64, error) {
-	tx, err := s.db.Begin(ctx)
-	if err != nil {
-		return 0, 0, fmt.Errorf("orphan close begin tx: %w", err)
-	}
-	defer func() { _ = tx.Rollback(ctx) }()
+// orphanQualification is the locked read's verdict for one candidate row:
+// the closure state to report and the remainder (µUSD) a closing verdict
+// must return to the wallet and decrement from the scope reserve.
+type orphanQualification struct {
+	state     orphanClosureState
+	remainder int64
+}
 
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
-		return 0, 0, fmt.Errorf("orphan close advisory lock: %w", err)
-	}
-
+// qualifyOrphanRow takes the FOR UPDATE read and applies the same
+// qualification releaseOne uses (lease lapsed past the safety window, or
+// zero remainder while draining/expired — §7.1.1/§7.1.2), so the targeted
+// verdict and the periodic pass can never both move the same money.
+func qualifyOrphanRow(ctx context.Context, tx pgx.Tx, id int64, window time.Duration) (orphanQualification, error) {
 	var curStatus string
 	var curGranted, curReturned int64
 	var lapsed bool
-	err = tx.QueryRow(ctx, `
+	err := tx.QueryRow(ctx, `
 		SELECT status, granted_micro_usd, returned_micro_usd,
 		       lease_until < now() - $2::interval
 		FROM budget_allowances WHERE id = $1 FOR UPDATE`,
@@ -1281,19 +1331,19 @@ func (s *ReservationStore) closeAbandonedOne(ctx context.Context, id int64, orgI
 	if errors.Is(err, pgx.ErrNoRows) {
 		// Released (and possibly retention-deleted) between the candidate
 		// query and the lock — a reconciler race this pass lost; terminal.
-		return orphanAlreadyReleased, 0, nil
+		return orphanQualification{state: orphanAlreadyReleased}, nil
 	}
 	if err != nil {
-		return 0, 0, fmt.Errorf("orphan close allowance read: %w", err)
+		return orphanQualification{}, fmt.Errorf("orphan close allowance read: %w", err)
 	}
 	if curStatus == AllowanceReleased {
 		// Another reconciler closed it first — the exactly-once losing side.
-		return orphanAlreadyReleased, 0, nil
+		return orphanQualification{state: orphanAlreadyReleased}, nil
 	}
 
 	settled, err := settledMicro(ctx, tx, id)
 	if err != nil {
-		return 0, 0, err
+		return orphanQualification{}, err
 	}
 	remainder := curGranted - curReturned - settled
 	if remainder < 0 {
@@ -1303,11 +1353,39 @@ func (s *ReservationStore) closeAbandonedOne(ctx context.Context, id int64, orgI
 		// Live-reserve guard (negative criterion): money held under a
 		// young lease is not provably orphaned — the owner may be a paused
 		// incarnation that renews on comeback. Stay frozen.
-		return orphanSkippedLive, 0, nil
+		return orphanQualification{state: orphanSkippedLive}, nil
+	}
+	return orphanQualification{state: orphanClosed, remainder: remainder}, nil
+}
+
+// closeAbandonedOne closes a single allowance of the declared-lost replica
+// if it still qualifies (qualifyOrphanRow applies the §7.1.1/§7.1.2
+// qualification). The row's whole transaction runs under one bounded
+// round-trip (orphanAcquireBound): acquire, advisory lock and statements
+// each refuse to wait forever on an exhausted pool.
+func (s *ReservationStore) closeAbandonedOne(ctx context.Context, id int64, orgID string, scope ScopeKind, key, period string, window time.Duration) (orphanClosureState, int64, error) {
+	txCtx, cancelTx := context.WithTimeout(ctx, s.orphanAcquireBound())
+	defer cancelTx()
+	tx, err := s.db.Begin(txCtx)
+	if err != nil {
+		return 0, 0, fmt.Errorf("orphan close begin tx: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+
+	if _, err := tx.Exec(txCtx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
+		return 0, 0, fmt.Errorf("orphan close advisory lock: %w", err)
 	}
 
-	if remainder > 0 {
-		if err := decrementScopeReserve(ctx, tx, orgID, scope, key, period, remainder); err != nil {
+	q, err := qualifyOrphanRow(txCtx, tx, id, window)
+	if err != nil {
+		return 0, 0, err
+	}
+	if q.state != orphanClosed {
+		return q.state, 0, nil
+	}
+
+	if q.remainder > 0 {
+		if err := decrementScopeReserve(txCtx, tx, orgID, scope, key, period, q.remainder); err != nil {
 			// Same invariant-drift disposition as releaseOne: closing
 			// without the decrement leaves the reserve observable as §7.1.3
 			// divergence (safe direction) instead of wedging crash recovery.
@@ -1316,17 +1394,17 @@ func (s *ReservationStore) closeAbandonedOne(ctx context.Context, id int64, orgI
 		}
 	}
 
-	if _, err := tx.Exec(ctx, `
+	if _, err := tx.Exec(txCtx, `
 		UPDATE budget_allowances
 		SET returned_micro_usd = returned_micro_usd + $2, status = $3, updated_at = now()
 		WHERE id = $1 AND status <> $3`,
-		id, remainder, AllowanceReleased); err != nil {
+		id, q.remainder, AllowanceReleased); err != nil {
 		return 0, 0, fmt.Errorf("orphan close release update: %w", err)
 	}
-	if err := tx.Commit(ctx); err != nil {
+	if err := tx.Commit(txCtx); err != nil {
 		return 0, 0, fmt.Errorf("orphan close commit: %w", err)
 	}
-	return orphanClosed, remainder, nil
+	return orphanClosed, q.remainder, nil
 }
 
 // grantDelta is the pure §5.3 sizing rule:
