@@ -273,7 +273,7 @@ func adminNewStore(ctx context.Context, pool *pgxpool.Pool, enc *encryption.Encr
 // rotation grace, the served license state for entitlement diagnostics, and
 // the store-backed read planes. The returned stop function halts the
 // diagnostics adapter's re-verification loop at shutdown.
-func adminNewHandlers(s *adminStartup, store *adminstore.Store, licensePath string) (*handlers.AdminHandlers, func()) {
+func adminNewHandlers(ctx context.Context, s *adminStartup, store *adminstore.Store, licensePath string) (*handlers.AdminHandlers, func()) {
 	h := handlers.New(store, s.sessionSecret, s.adminDomain, s.cfg.Gateway.TrustedProxies)
 	h.SetReservationsGate(s.cfg.Gateway.Reservations)
 	h.SetSessionSecretGrace(s.previousSessionSecret, s.sessionGraceStarted, s.sessionGrace)
@@ -281,7 +281,11 @@ func adminNewHandlers(s *adminStartup, store *adminstore.Store, licensePath stri
 	h.SetEntitlementDiagnostics(licDiag)
 	h.SetLabelPolicyStore(store)
 	h.SetAnalyticsViewStore(store)
-	return h, func() { licDiag.Close(context.Background()) }
+	// The diagnostics stop runs at AdminServer return alongside the other
+	// shutdown defers. Close discards the context, but the parent ctx is
+	// cancelled during shutdown, so derive a never-cancelled context
+	// instead of a raw Background to keep the inherited-context contract.
+	return h, func() { licDiag.Close(context.WithoutCancel(ctx)) }
 }
 
 // adminWireAccessKeys mounts the optional credential-gated surfaces. Each
@@ -710,7 +714,7 @@ func adminServe(ctx context.Context, srv *http.Server, store *adminstore.Store, 
 	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer shutdownCancel()
 
-	//nolint:contextcheck // shutdown runs after cancellation; a context derived from the cancelled ctx would time out instantly
+	//nolint:contextcheck // shutdown runs after cancel(); a context derived from the cancelled ctx would time out instantly
 	if err := srv.Shutdown(shutdownCtx); err != nil {
 		logger.Error("admin shutdown failed", "error", err)
 	}
@@ -764,8 +768,7 @@ func AdminServer(ctx context.Context) error {
 	defer pool.Close()
 
 	store := adminNewStore(ctx, pool, enc, logger)
-	//nolint:contextcheck // the diagnostics stop closure runs at AdminServer return, after ctx is cancelled at shutdown; Background is deliberate (same as the tracing flush)
-	h, stopEntitlementDiag := adminNewHandlers(s, store, licensePath)
+	h, stopEntitlementDiag := adminNewHandlers(ctx, s, store, licensePath)
 	defer stopEntitlementDiag()
 
 	adminWireAccessKeys(h, s.cfg, logger)
