@@ -222,14 +222,20 @@ const (
 // SSRF re-check → tool allow-list → param guard → upstream JSON-RPC POST →
 // audit. It returns the upstream tool result (MCP CallToolResult JSON) on
 // success, or a *InvokeError on the documented failure paths.
+//
+// The body is a pipeline over the invokeCall stage helpers (authorize →
+// chain ceiling → args guard → SSRF → hook → credential → upstream →
+// result guard); each helper performs its own metrics/audit and returns
+// the span outcome label alongside the error, so every path — including
+// pre-egress denials — is audited and traced exactly once.
 func (p *Proxy) Invoke(ctx context.Context, orgID string, id Identity, req InvokeRequest) (json.RawMessage, error) {
 	start := p.nowFn()
 
-	// MCP-05: one span per tool call. The outcome attribute is set on the way
-	// out (auditDone updates spanOutcome); the span ends when Invoke returns
-	// (defer), so every path — including pre-egress denials — is traced. When
-	// tracing is not initialized the tracer is a no-op (tracing.Tracer), so
-	// this costs nothing in dev / test.
+	// MCP-05: one span per tool call. The outcome attribute is set on the
+	// way out (each stage returns its outcome label); the span ends when
+	// Invoke returns (defer), so every path — including pre-egress denials —
+	// is traced. When tracing is not initialized the tracer is a no-op
+	// (tracing.Tracer), so this costs nothing in dev / test.
 	ctx, span := p.tracer.Start(ctx, "mcp.tools/call",
 		trace.WithAttributes(
 			attribute.String("mcp.server", req.Server),
@@ -243,259 +249,374 @@ func (p *Proxy) Invoke(ctx context.Context, orgID string, id Identity, req Invok
 		span.End()
 	}()
 
-	// 0-2. N05-P02-T04: the four-dimension grant check (subject / server /
-	// action / tool) — consolidated from the former inline steps 0, 1, 1b
-	// and 2. MCP-03: tool-calls are agent-key-only (the identity comes from
-	// the gateway auth middleware; the inbound header is stripped on
-	// ingress, auth.go, so it cannot be client-spoofed). Revoking the
-	// grant stops ALL dependent access here — the credential path below
-	// never runs without it.
-	srv, _, refusal, err := p.authorizeGrant(ctx, orgID, id, req.Server, req.Tool, GrantActionInvoke)
-	if err != nil {
-		spanOutcome = OutcomeUpstreamError // store/DB error, not a documented InvokeError
+	c := &invokeCall{orgID: orgID, id: id, req: req, params: req.Params, start: start}
+	if outcome, err := p.invokeAuthorize(ctx, c); err != nil {
+		spanOutcome = outcome
 		return nil, err
 	}
-	if refusal != nil {
-		spanOutcome = refusal.outcome
-		p.auditDone(ctx, orgID, id, refusal.serverName, req.Tool, req.Params, refusal.outcome, 0, 0, start, refusal.serverURL)
-		return nil, refusal.err
+	if outcome, err := p.invokeChainCheck(ctx, c); err != nil {
+		spanOutcome = outcome
+		return nil, err
+	}
+	if outcome, err := p.invokeGuardArgs(ctx, c); err != nil {
+		spanOutcome = outcome
+		return nil, err
+	}
+	if outcome, err := p.invokeSSRFCheck(ctx, c); err != nil {
+		spanOutcome = outcome
+		return nil, err
+	}
+	if outcome, err := p.invokeHookScan(ctx, c); err != nil {
+		spanOutcome = outcome
+		return nil, err
+	}
+	if outcome, err := p.invokePrepareCredential(ctx, c); err != nil {
+		spanOutcome = outcome
+		return nil, err
 	}
 
-	// 2b. AUTH-02: the agent AND every ancestor in its delegation chain must
-	// hold an enabled grant on this server, and the requested tool must pass
-	// the chain-wide allowance — the parent's scope applies at invoke time
-	// even if the child's stored grant predates a parent narrowing (or was
-	// issued before the grant-time inheritance fix). No chain access is
-	// indistinguishable from "server unavailable" to the caller (not_found) —
-	// an agent cannot enumerate which of its requests are grant-blocked vs.
-	// server-blocked. The per-server and grant ceilings themselves live in
-	// authorizeGrant; this is the chain-wide half.
-	allowance, err := p.store.DelegationChainAllowance(ctx, orgID, id.AgentID)
-	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			spanOutcome = OutcomeNotFound
-			p.auditDone(ctx, orgID, id, srv.Name, req.Tool, req.Params, OutcomeNotFound, 0, 0, start, srv.URL)
-			return nil, &InvokeError{Code: ErrCodeNotFound,
-				Message: fmt.Sprintf("mcp server %q is not available for this org", req.Server)}
-		}
-		spanOutcome = OutcomeUpstreamError // store/DB error, not a documented InvokeError
-		return nil, fmt.Errorf("mcpagg: lookup delegation chain allowance: %w", err)
-	}
-
-	// The tool must also pass the chain-wide allowance; either side empty
-	// means "all of that side".
-	if !allowance.Allows(req.Server, req.Tool) {
-		spanOutcome = OutcomeNotFound
-		p.auditDone(ctx, orgID, id, srv.Name, req.Tool, req.Params, OutcomeNotFound, 0, 0, start, srv.URL)
-		return nil, &InvokeError{Code: ErrCodeNotFound,
-			Message: fmt.Sprintf("tool %q is not allowed on mcp server %q", req.Tool, req.Server)}
-	}
-
-	// 2c. OP-6 toolpolicy guardrails, pre-egress: the server-aware deny
-	// decision plus the org's args rules (JSON-schema / max-size /
-	// deny_regex). Runs BEFORE any network work (the SSRF re-check saves
-	// its DNS work when the call is policy-blocked anyway). A deny surfaces
-	// as mcp_tool_blocked (400); a loader outage follows the org posture
-	// inside the guard (fail-closed ⇒ deny, fail-open ⇒ Degraded, counted
-	// as an error decision, never as an allow).
-	params := req.Params
-	if len(params) == 0 {
-		params = json.RawMessage(`{}`)
-	}
-	if p.guard != nil {
-		rep := p.guard.GuardArgs(ctx, orgID, id.AgentID, srv.Name, req.Tool, params)
-		switch {
-		case rep.Degraded:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "error")
-		case rep.Denied:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "deny")
-			spanOutcome = OutcomeToolBlocked
-			p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeToolBlocked, 0, 0, start, srv.URL)
-			return nil, &InvokeError{Code: ErrCodeToolBlocked, Message: rep.Reason}
-		default:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "allow")
-		}
-	}
-
-	// 3. SSRF guard, second layer (rebind window — docs/mcp-gateway.md R1).
-	// p.testAllowHTTP is the unit-test seam for httptest loopback upstreams
-	// (production never sets it — see Config.testAllowHTTP).
-	if p.testAllowHTTP {
-		// Test seam: skip the guard for httptest loopback upstreams. The full
-		// guard is pinned in validate_test.go; the proxy logic is the subject
-		// of the proxy tests.
-	} else if err := ValidateURLAtInvoke(srv.URL, p.allow, false); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
-		spanOutcome = OutcomeSSRFBlocked
-		p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeSSRFBlocked, 0, 0, start, srv.URL)
-		return nil, &InvokeError{Code: ErrCodeSSRF, Message: err.Error()}
-	}
-
-	// 4. Pre-egress param guard (MCP-06).
-	denyReason := ""
-	if p.hook != nil {
-		// The guard may redact params (they are then what egress AND what the
-		// audit records) or deny the call with a reason.
-		params, denyReason, _ = p.hook.Scan(ctx, params)
-	}
-	if denyReason != "" {
-		spanOutcome = OutcomeDenied
-		p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeDenied, 0, 0, start, srv.URL)
-		return nil, &InvokeError{Code: ErrCodeDenied, Message: denyReason}
-	}
-
-	// 4b. N05-P02-T04: the policy-selected credential mode for this call
-	// (subject, server, tool). "" or "auto" = no constraint (the
-	// connection-config credential mode governs); "service"/"delegated" pin
-	// the layer step 5 must resolve. A selector failure or an unknown mode
-	// value is fail-closed: the call refuses rather than running under the
-	// config mode with the constraint unverified (a broken policy store must
-	// never silently upgrade a delegated pin to the service layer).
-	credMode := ""
-	if p.modePolicy != nil && p.creds != nil {
-		m, err := p.modePolicy.SelectCredentialMode(ctx, orgID, srv.Name, req.Tool, id.AgentID)
-		if err != nil {
-			spanOutcome = OutcomeCredMode
-			return nil, p.refuseCredMode(ctx, orgID, id, srv, req.Tool, params, "-", "error",
-				fmt.Sprintf("credential mode policy is unavailable; refusing the call: %v", err), start)
-		}
-		m, err = normalizeCredMode(m)
-		if err != nil {
-			spanOutcome = OutcomeCredMode
-			return nil, p.refuseCredMode(ctx, orgID, id, srv, req.Tool, params, "-", "error",
-				fmt.Sprintf("credential mode policy returned an invalid mode; refusing the call: %v", err), start)
-		}
-		credMode = m
-	}
-
-	// 5. MC-2 + N05-P02-T04: resolve the outbound credential (per-user
-	// active → server-level enabled). Under a constrained mode the source
-	// must be level-aware and the resolved layer must match the pin — a
-	// mismatch refuses BEFORE egress: a delegated pin never silently runs
-	// on the org's (stronger) service credential and a service pin never
-	// leaks the org credential under a user identity. Miss (no credential)
-	// = the legacy unauthenticated posture; the upstream verdict decides
-	// (mcp_auth_required on 401/403). An infrastructure failure here is
-	// fail-closed: the org plausibly holds a credential and silently
-	// egressing unauthenticated is the exact leak the BYOK resolver policy
-	// refuses.
-	var credHeaders map[string][]string
-	credKind := CredKindNone
-	if p.creds != nil {
-		if credModeConstrained(credMode) {
-			ls, levelAware := p.creds.(LevelAwareCredSource)
-			if !levelAware {
-				spanOutcome = OutcomeCredMode
-				return nil, p.refuseCredMode(ctx, orgID, id, srv, req.Tool, params, credMode, "error",
-					"credential mode policy requires a credential source that reports which layer resolved the credential; refusing the call", start)
-			}
-			headers, kind, level, err := ls.AuthHeadersLevel(ctx, orgID, req.Server, id.AgentID)
-			if err != nil {
-				spanOutcome = OutcomeUpstreamError
-				p.metricCreds(srv.Name, kind, CredOutcomeError)
-				p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeUpstreamError, 0, 0, start, srv.URL)
-				return nil, fmt.Errorf("mcpagg: resolve credential: %w", err)
-			}
-			credHeaders, credKind = headers, kind
-			if credModeViolation(credMode, level) {
-				spanOutcome = OutcomeCredMode
-				return nil, p.refuseCredMode(ctx, orgID, id, srv, req.Tool, params, credMode, "deny",
-					fmt.Sprintf("credential mode policy pins %q for this call; the resolved credential is the %s credential — refusing",
-						credMode, level), start)
-			}
-			p.metricCredMode(srv.Name, credMode, "allow")
-			if credHeaders != nil {
-				p.metricCreds(srv.Name, credKind, CredOutcomeHit)
-			} else {
-				p.metricCreds(srv.Name, CredKindNone, CredOutcomeMiss)
-			}
-		} else {
-			headers, kind, err := p.creds.AuthHeaders(ctx, orgID, req.Server, id.AgentID)
-			if err != nil {
-				spanOutcome = OutcomeUpstreamError
-				p.metricCreds(srv.Name, kind, CredOutcomeError)
-				p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeUpstreamError, 0, 0, start, srv.URL)
-				return nil, fmt.Errorf("mcpagg: resolve credential: %w", err)
-			}
-			credHeaders, credKind = headers, kind
-			if credHeaders != nil {
-				p.metricCreds(srv.Name, credKind, CredOutcomeHit)
-			} else {
-				p.metricCreds(srv.Name, CredKindNone, CredOutcomeMiss)
-			}
-		}
-	}
-
-	// 6. Upstream JSON-RPC tools/call over MCP streamable HTTP. A 401/403
-	// with a credential applied gets exactly ONE force-refresh + retry
-	// (oauth); a terminally rejected credential surfaces as
-	// mcp_auth_required (the lazy-authorization error, MC-3 flows).
-	result, status, callErr := p.callUpstream(ctx, srv, req.Tool, params, id, credHeaders)
-	if callErr != nil && isAuthRejection(status) && p.creds != nil {
-		result, status, callErr = p.retryAfterUnauthorized(ctx, orgID, id, srv, req.Tool, params, credKind, credMode, start)
-	}
+	// 401/403 with a credential applied gets exactly ONE force-refresh +
+	// retry round inside invokeUpstream (oauth); a terminally rejected
+	// credential surfaces as mcp_auth_required (MC-3 flows).
+	result, status, callErr := p.invokeUpstream(ctx, c)
 	latency := p.nowFn().Sub(start).Milliseconds()
 	if callErr != nil {
-		// MC-2: the lazy-authorization error rides its own outcome — it is
-		// not a generic upstream failure (the handler renders
-		// mcp_auth_required with kind + url from it).
-		var authErr *AuthRequiredError
-		if errors.As(callErr, &authErr) {
-			spanOutcome = OutcomeAuthRequired
-			p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeAuthRequired, status, latency, start, srv.URL)
-			return nil, authErr
-		}
-		// N05-P02-T04: a credential-mode refusal surfaced from the retry
-		// round (the refreshed credential violated the pin) — same loud
-		// denial, same OutcomeCredMode audit/span label as the pre-egress
-		// refusal.
-		var cmErr *credModeRefusal
-		if errors.As(callErr, &cmErr) {
-			spanOutcome = OutcomeCredMode
-			p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeCredMode, status, latency, start, srv.URL)
-			return nil, cmErr.InvokeError
-		}
-		outcome := OutcomeUpstreamError
-		code := ErrCodeUpstream
-		var iErr *InvokeError
-		if errors.As(callErr, &iErr) {
-			outcome = iErr.Code
-			code = iErr.Code
-		}
+		var err error
+		spanOutcome, err = p.invokeCallFailure(ctx, c, callErr, status, latency)
+		return nil, err
+	}
+
+	result, outcome, err := p.invokeGuardResult(ctx, c, result, status, latency)
+	if err != nil {
 		spanOutcome = outcome
-		p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, outcome, status, latency, start, srv.URL)
-		if code == ErrCodeTimeout {
-			return nil, &InvokeError{Code: ErrCodeTimeout, Message: callErr.Error()}
-		}
-		return nil, &InvokeError{Code: ErrCodeUpstream, Message: callErr.Error()}
+		return nil, err
 	}
 
-	// 6b. OP-6 result post-check: the org's result rules (secrets /
-	// deny_regex via pkg/guardhooks detectors) over the SERIALIZED
-	// upstream result. deny drops the result (the call already ran — the
-	// agent never sees it); mask returns the redacted result; flag passes
-	// unchanged with the observation counted.
-	if p.guard != nil {
-		rep := p.guard.GuardResult(ctx, orgID, id.AgentID, srv.Name, req.Tool, result)
-		switch rep.Action {
-		case toolpolicy.ResultDeny:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "deny")
-			spanOutcome = OutcomeToolBlocked
-			p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeToolBlocked, status, latency, start, srv.URL)
-			return nil, &InvokeError{Code: ErrCodeToolBlocked, Message: rep.Reason}
-		case toolpolicy.ResultMask:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "mask")
-			result = json.RawMessage(rep.Masked)
-		case toolpolicy.ResultFlag:
-			p.metricToolPolicy(orgID, srv.Name, req.Tool, "flag")
-		default:
-			if rep.Degraded {
-				p.metricToolPolicy(orgID, srv.Name, req.Tool, "error")
-			}
-		}
-	}
-
-	p.auditDone(ctx, orgID, id, srv.Name, req.Tool, params, OutcomeOK, status, latency, start, srv.URL)
+	p.auditDone(ctx, orgID, id, c.srv.Name, req.Tool, c.params, OutcomeOK, status, latency, start, c.srv.URL)
 	return result, nil
+}
+
+// invokeCall carries one tool call's state through the Invoke stage
+// helpers. Invariants: params starts as the raw request params and is
+// defaulted to {} at the args-guard stage (before that the chain audits
+// carry the raw value — auditDone normalizes empty to {} itself); the hook
+// stage REPLACES it with the redacted value, which is then what egresses
+// AND what every later audit records. Credential lookups key on the
+// REQUESTED server name (c.req.Server, the legacy contract); audit and
+// metrics label on the resolved row (c.srv).
+type invokeCall struct {
+	orgID  string
+	id     Identity
+	req    InvokeRequest
+	srv    *Server
+	params json.RawMessage
+	start  time.Time
+
+	credHeaders map[string][]string
+	credKind    string
+	credMode    string
+}
+
+// invokeAuthorize runs the four-dimension grant check (subject / server /
+// action / tool). MCP-03: tool-calls are agent-key-only (the identity comes
+// from the gateway auth middleware; the inbound header is stripped on
+// ingress, auth.go, so it cannot be client-spoofed). Revoking the grant
+// stops ALL dependent access here — the credential stages never run
+// without it. A refusal audits with the refusal's own server coordinates
+// (both empty on the earliest denials, where the server was never
+// resolved); a store error stays a plain wrapped error with no audit.
+func (p *Proxy) invokeAuthorize(ctx context.Context, c *invokeCall) (string, error) {
+	srv, _, refusal, err := p.authorizeGrant(ctx, c.orgID, c.id, c.req.Server, c.req.Tool, GrantActionInvoke)
+	if err != nil {
+		return OutcomeUpstreamError, err // store/DB error, not a documented InvokeError
+	}
+	if refusal != nil {
+		p.auditDone(ctx, c.orgID, c.id, refusal.serverName, c.req.Tool, c.req.Params,
+			refusal.outcome, 0, 0, c.start, refusal.serverURL)
+		return refusal.outcome, refusal.err
+	}
+	c.srv = srv
+	return "", nil
+}
+
+// invokeChainCheck enforces the AUTH-02 chain-wide tool ceiling: the agent
+// AND every ancestor in its delegation chain must hold an enabled grant on
+// this server, and the requested tool must pass the chain-wide allowance —
+// the parent's scope applies at invoke time even if the child's stored
+// grant predates a parent narrowing. No chain access is indistinguishable
+// from "server unavailable" to the caller (not_found) — an agent cannot
+// enumerate which of its requests are grant-blocked vs. server-blocked.
+func (p *Proxy) invokeChainCheck(ctx context.Context, c *invokeCall) (string, error) {
+	allowance, err := p.store.DelegationChainAllowance(ctx, c.orgID, c.id.AgentID)
+	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.req.Params,
+				OutcomeNotFound, 0, 0, c.start, c.srv.URL)
+			return OutcomeNotFound, &InvokeError{Code: ErrCodeNotFound,
+				Message: fmt.Sprintf("mcp server %q is not available for this org", c.req.Server)}
+		}
+		return OutcomeUpstreamError, fmt.Errorf("mcpagg: lookup delegation chain allowance: %w", err)
+	}
+	// Either side of the allowance empty means "all of that side".
+	if !allowance.Allows(c.req.Server, c.req.Tool) {
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.req.Params,
+			OutcomeNotFound, 0, 0, c.start, c.srv.URL)
+		return OutcomeNotFound, &InvokeError{Code: ErrCodeNotFound,
+			Message: fmt.Sprintf("tool %q is not allowed on mcp server %q", c.req.Tool, c.req.Server)}
+	}
+	return "", nil
+}
+
+// invokeGuardArgs runs the OP-6 toolpolicy guardrails, pre-egress: the
+// server-aware deny decision plus the org's args rules (JSON-schema /
+// max-size / deny_regex) over the params (defaulted to {} first). It runs
+// BEFORE any network work — the SSRF re-check then saves its DNS work when
+// the call is policy-blocked anyway. A deny surfaces as mcp_tool_blocked
+// (400); a loader outage follows the org posture inside the guard
+// (fail-closed ⇒ deny, fail-open ⇒ Degraded, counted as an error decision,
+// never as an allow).
+func (p *Proxy) invokeGuardArgs(ctx context.Context, c *invokeCall) (string, error) {
+	if len(c.params) == 0 {
+		c.params = json.RawMessage(`{}`)
+	}
+	if p.guard == nil {
+		return "", nil
+	}
+	rep := p.guard.GuardArgs(ctx, c.orgID, c.id.AgentID, c.srv.Name, c.req.Tool, c.params)
+	switch {
+	case rep.Degraded:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "error")
+	case rep.Denied:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "deny")
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeToolBlocked, 0, 0, c.start, c.srv.URL)
+		return OutcomeToolBlocked, &InvokeError{Code: ErrCodeToolBlocked, Message: rep.Reason}
+	default:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "allow")
+	}
+	return "", nil
+}
+
+// invokeSSRFCheck is the SSRF guard, second layer (rebind window —
+// docs/mcp-gateway.md R1).
+func (p *Proxy) invokeSSRFCheck(ctx context.Context, c *invokeCall) (string, error) {
+	// p.testAllowHTTP is the unit-test seam for httptest loopback upstreams
+	// (production never sets it — see Config.testAllowHTTP). The full guard
+	// is pinned in validate_test.go; the proxy logic is the subject of the
+	// proxy tests.
+	if p.testAllowHTTP {
+		return "", nil
+	}
+	if err := ValidateURLAtInvoke(c.srv.URL, p.allow, false); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeSSRFBlocked, 0, 0, c.start, c.srv.URL)
+		return OutcomeSSRFBlocked, &InvokeError{Code: ErrCodeSSRF, Message: err.Error()}
+	}
+	return "", nil
+}
+
+// invokeHookScan runs the pre-egress param guard (MCP-06). The guard may
+// redact params (they are then what egress AND what the audit records) or
+// deny the call with a reason.
+func (p *Proxy) invokeHookScan(ctx context.Context, c *invokeCall) (string, error) {
+	denyReason := ""
+	if p.hook != nil {
+		c.params, denyReason, _ = p.hook.Scan(ctx, c.params)
+	}
+	if denyReason != "" {
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeDenied, 0, 0, c.start, c.srv.URL)
+		return OutcomeDenied, &InvokeError{Code: ErrCodeDenied, Message: denyReason}
+	}
+	return "", nil
+}
+
+// invokePrepareCredential selects the policy credential mode (N05-P02-T04)
+// and resolves the outbound credential (MC-2). Under a constrained mode the
+// source must be level-aware and the resolved layer must match the pin — a
+// mismatch refuses BEFORE egress: a delegated pin never silently runs on
+// the org's (stronger) service credential and a service pin never leaks
+// the org credential under a user identity. Miss (no credential) = the
+// legacy unauthenticated posture; the upstream verdict decides
+// (mcp_auth_required on 401/403). An infrastructure failure here is
+// fail-closed: the org plausibly holds a credential and silently egressing
+// unauthenticated is the exact leak the BYOK resolver policy refuses.
+func (p *Proxy) invokePrepareCredential(ctx context.Context, c *invokeCall) (string, error) {
+	if outcome, err := p.selectCredMode(ctx, c); err != nil {
+		return outcome, err
+	}
+	if p.creds == nil {
+		return "", nil
+	}
+	var err error
+	if credModeConstrained(c.credMode) {
+		err = p.resolveCredConstrained(ctx, c)
+	} else {
+		err = p.resolveCredPlain(ctx, c)
+	}
+	if err == nil {
+		return "", nil
+	}
+	var refusal *InvokeError
+	if errors.As(err, &refusal) {
+		return OutcomeCredMode, refusal // refuseCredMode already metric'd + audited it
+	}
+	p.metricCreds(c.srv.Name, c.credKind, CredOutcomeError)
+	p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+		OutcomeUpstreamError, 0, 0, c.start, c.srv.URL)
+	return OutcomeUpstreamError, fmt.Errorf("mcpagg: resolve credential: %w", err)
+}
+
+// selectCredMode resolves the policy-selected credential mode for this
+// call (subject, server, tool). "" or "auto" = no constraint (the
+// connection-config credential mode governs); "service"/"delegated" pin
+// the layer the resolver must match. A selector failure or an unknown
+// mode value is fail-closed: the call refuses rather than running under
+// the config mode with the constraint unverified (a broken policy store
+// must never silently upgrade a delegated pin to the service layer).
+func (p *Proxy) selectCredMode(ctx context.Context, c *invokeCall) (string, error) {
+	if p.modePolicy == nil || p.creds == nil {
+		return "", nil
+	}
+	m, err := p.modePolicy.SelectCredentialMode(ctx, c.orgID, c.srv.Name, c.req.Tool, c.id.AgentID)
+	if err != nil {
+		return OutcomeCredMode, p.refuseCredMode(ctx, c.orgID, c.id, c.srv, c.req.Tool, c.params, "-", "error",
+			fmt.Sprintf("credential mode policy is unavailable; refusing the call: %v", err), c.start)
+	}
+	m, err = normalizeCredMode(m)
+	if err != nil {
+		return OutcomeCredMode, p.refuseCredMode(ctx, c.orgID, c.id, c.srv, c.req.Tool, c.params, "-", "error",
+			fmt.Sprintf("credential mode policy returned an invalid mode; refusing the call: %v", err), c.start)
+	}
+	c.credMode = m
+	return "", nil
+}
+
+// resolveCredConstrained resolves under a pinned mode: the source must be
+// level-aware (it refuses fail-closed otherwise — the layer constraint
+// must be verifiable, never assumed) and the resolved layer must match the
+// pin. A refusal returns as *InvokeError (already metric'd and audited by
+// refuseCredMode); a plain error is an infrastructure failure the caller
+// wraps fail-closed.
+func (p *Proxy) resolveCredConstrained(ctx context.Context, c *invokeCall) error {
+	ls, levelAware := p.creds.(LevelAwareCredSource)
+	if !levelAware {
+		return p.refuseCredMode(ctx, c.orgID, c.id, c.srv, c.req.Tool, c.params, c.credMode, "error",
+			"credential mode policy requires a credential source that reports which layer resolved the credential; refusing the call", c.start)
+	}
+	headers, kind, level, err := ls.AuthHeadersLevel(ctx, c.orgID, c.req.Server, c.id.AgentID)
+	c.credHeaders, c.credKind = headers, kind
+	if err != nil {
+		return err
+	}
+	if credModeViolation(c.credMode, level) {
+		return p.refuseCredMode(ctx, c.orgID, c.id, c.srv, c.req.Tool, c.params, c.credMode, "deny",
+			fmt.Sprintf("credential mode policy pins %q for this call; the resolved credential is the %s credential — refusing",
+				c.credMode, level), c.start)
+	}
+	p.metricCredMode(c.srv.Name, c.credMode, "allow")
+	p.countCredResolution(c.srv.Name, c.credKind, c.credHeaders)
+	return nil
+}
+
+// resolveCredPlain is the unconstrained legacy resolution: per-user active
+// → server-level enabled. Errors are infrastructure failures the caller
+// wraps fail-closed.
+func (p *Proxy) resolveCredPlain(ctx context.Context, c *invokeCall) error {
+	headers, kind, err := p.creds.AuthHeaders(ctx, c.orgID, c.req.Server, c.id.AgentID)
+	c.credHeaders, c.credKind = headers, kind
+	if err != nil {
+		return err
+	}
+	p.countCredResolution(c.srv.Name, c.credKind, c.credHeaders)
+	return nil
+}
+
+// countCredResolution counts the hit/miss gateway_mcp_creds_total decision
+// for a resolved credential (miss normalizes the kind label to "-").
+func (p *Proxy) countCredResolution(serverName, kind string, headers map[string][]string) {
+	if headers != nil {
+		p.metricCreds(serverName, kind, CredOutcomeHit)
+	} else {
+		p.metricCreds(serverName, CredKindNone, CredOutcomeMiss)
+	}
+}
+
+// invokeUpstream posts the tools/call and, when the upstream rejected an
+// applied credential (401/403), runs the single force-refresh + retry
+// round.
+func (p *Proxy) invokeUpstream(ctx context.Context, c *invokeCall) (json.RawMessage, int, error) {
+	result, status, callErr := p.callUpstream(ctx, c.srv, c.req.Tool, c.params, c.id, c.credHeaders)
+	if callErr != nil && isAuthRejection(status) && p.creds != nil {
+		return p.retryAfterUnauthorized(ctx, c.orgID, c.id, c.srv, c.req.Tool, c.params,
+			c.credKind, c.credMode, c.start)
+	}
+	return result, status, callErr
+}
+
+// invokeCallFailure translates an upstream/refresh failure into the caller
+// error and its audit/span outcome. The lazy-authorization error (MC-2)
+// rides its own outcome — it is not a generic upstream failure (the
+// handler renders mcp_auth_required with kind + url from it); a
+// credential-mode refusal from the retry round gets the same loud
+// OutcomeCredMode label as the pre-egress refusal; everything else maps
+// through the InvokeError code (the audit outcome carries that code, e.g.
+// "upstream"/"timeout").
+func (p *Proxy) invokeCallFailure(ctx context.Context, c *invokeCall, callErr error, status int, latencyMS int64) (string, error) {
+	var authErr *AuthRequiredError
+	if errors.As(callErr, &authErr) {
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeAuthRequired, status, latencyMS, c.start, c.srv.URL)
+		return OutcomeAuthRequired, authErr
+	}
+	var cmErr *credModeRefusal
+	if errors.As(callErr, &cmErr) {
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeCredMode, status, latencyMS, c.start, c.srv.URL)
+		return OutcomeCredMode, cmErr.InvokeError
+	}
+	outcome := OutcomeUpstreamError
+	code := ErrCodeUpstream
+	var iErr *InvokeError
+	if errors.As(callErr, &iErr) {
+		outcome = iErr.Code
+		code = iErr.Code
+	}
+	p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+		outcome, status, latencyMS, c.start, c.srv.URL)
+	if code == ErrCodeTimeout {
+		return outcome, &InvokeError{Code: ErrCodeTimeout, Message: callErr.Error()}
+	}
+	return outcome, &InvokeError{Code: ErrCodeUpstream, Message: callErr.Error()}
+}
+
+// invokeGuardResult runs the OP-6 result post-check: the org's result
+// rules (secrets / deny_regex via pkg/guardhooks detectors) over the
+// SERIALIZED upstream result. deny drops the result (the call already ran
+// — the agent never sees it); mask returns the redacted result; flag
+// passes it unchanged with the observation counted.
+func (p *Proxy) invokeGuardResult(ctx context.Context, c *invokeCall, result json.RawMessage, status int, latencyMS int64) (json.RawMessage, string, error) {
+	if p.guard == nil {
+		return result, "", nil
+	}
+	rep := p.guard.GuardResult(ctx, c.orgID, c.id.AgentID, c.srv.Name, c.req.Tool, result)
+	switch rep.Action {
+	case toolpolicy.ResultDeny:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "deny")
+		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
+			OutcomeToolBlocked, status, latencyMS, c.start, c.srv.URL)
+		return nil, OutcomeToolBlocked, &InvokeError{Code: ErrCodeToolBlocked, Message: rep.Reason}
+	case toolpolicy.ResultMask:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "mask")
+		result = json.RawMessage(rep.Masked)
+	case toolpolicy.ResultFlag:
+		p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "flag")
+	default:
+		if rep.Degraded {
+			p.metricToolPolicy(c.orgID, c.srv.Name, c.req.Tool, "error")
+		}
+	}
+	return result, "", nil
 }
 
 // isAuthRejection reports whether the upstream status means the credential

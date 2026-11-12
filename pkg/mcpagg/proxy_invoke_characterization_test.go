@@ -51,8 +51,8 @@ func charEchoUpstream(t *testing.T) (*httptest.Server, func() []string) {
 }
 
 // The OP-6 args guard (stage 2c) runs BEFORE the MCP-06 hook scan (stage 4):
-// when both would deny, the caller sees mcp_tool_blocked, not denied. The
-// negative control freezes the hook-only outcome.
+// when both would deny, the caller sees mcp_tool_blocked, not denied. (The
+// hook-only outcome is frozen by TestInvokeChar_HookDenySurfacesWhenNoGuard.)
 func TestInvokeChar_GuardArgsDenyOutranksHookDeny(t *testing.T) {
 	up, sawArgs := charEchoUpstream(t)
 	g := &fakeGuard{args: toolpolicy.ArgsReport{Denied: true, Reason: "policy cap"}}
@@ -76,18 +76,27 @@ func TestInvokeChar_GuardArgsDenyOutranksHookDeny(t *testing.T) {
 	if len(auditEvents) != 1 || auditEvents[0].Outcome != OutcomeToolBlocked {
 		t.Fatalf("audit must record one tool_blocked event: %+v", auditEvents)
 	}
+}
 
-	// Negative control: same hook, no guard → the hook denial surfaces.
+// Negative control for the ordering pin above: the same hook denial, but
+// with no toolpolicy guard installed, surfaces as denied (OutcomeDenied).
+func TestInvokeChar_HookDenySurfacesWhenNoGuard(t *testing.T) {
+	up, sawArgs := charEchoUpstream(t)
+	hook := &staticHook{deny: "secret detected"}
 	var ctlEvents []AuditEvent
-	p2 := NewProxy(storeForUpstreamWithGrant(up.URL, nil, testGrant("ag-1")), testConfig(), loopbackAllow(t), hook,
+	p := NewProxy(storeForUpstreamWithGrant(up.URL, nil, testGrant("ag-1")), testConfig(), loopbackAllow(t), hook,
 		&recordingAudit{events: &ctlEvents})
-	_, err = p2.Invoke(context.Background(), "org-1", Identity{AgentID: "ag-1"},
+	_, err := p.Invoke(context.Background(), "org-1", Identity{AgentID: "ag-1"},
 		InvokeRequest{Server: "knowledge", Tool: "search", Params: json.RawMessage(`{"q":"x"}`)})
+	var iErr *InvokeError
 	if !errors.As(err, &iErr) || iErr.Code != ErrCodeDenied {
 		t.Fatalf("hook-only deny must surface denied, got %v", err)
 	}
 	if len(ctlEvents) != 1 || ctlEvents[0].Outcome != OutcomeDenied {
 		t.Fatalf("control audit must record denied: %+v", ctlEvents)
+	}
+	if got := sawArgs(); len(got) != 0 {
+		t.Fatalf("denied call must not egress, saw %v", got)
 	}
 }
 
