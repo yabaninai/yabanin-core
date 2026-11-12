@@ -54,7 +54,7 @@ func logdBaseEnv(t *testing.T) {
 // Loggerd will bind.
 func logdFreeAddr(t *testing.T) string {
 	t.Helper()
-	l, err := net.Listen("tcp", "127.0.0.1:0")
+	l, err := (&net.ListenConfig{}).Listen(context.Background(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	addr := l.Addr().String()
 	require.NoError(t, l.Close())
@@ -91,12 +91,17 @@ func logdRunUntilCancelled(t *testing.T, extraEnv func()) (addr string, resCh <-
 	go func() { ch <- Loggerd(ctx) }()
 
 	healthURL := "http://" + addr + "/healthz"
+	client := &http.Client{Timeout: 2 * time.Second}
 	require.Eventually(t, func() bool {
-		resp, err := http.Get(healthURL) //nolint:noctx // bounded by the test deadline
+		req, reqErr := http.NewRequestWithContext(context.Background(), http.MethodGet, healthURL, nil)
+		if reqErr != nil {
+			return false
+		}
+		resp, err := client.Do(req)
 		if err != nil {
 			return false
 		}
-		defer resp.Body.Close() //nolint:bodyclose // closed here; the status is the assertion
+		defer resp.Body.Close()
 		return resp.StatusCode == http.StatusOK
 	}, 20*time.Second, 100*time.Millisecond, "loggerd /healthz must answer 200 while running")
 
@@ -121,7 +126,12 @@ func logdAssertBoundedCleanShutdown(t *testing.T, addr string, resCh <-chan erro
 	case <-time.After(20 * time.Second):
 		t.Fatal("Loggerd did not return after parent cancellation")
 	}
-	_, err := http.Get("http://" + addr + "/healthz") //nolint:noctx,bodyclose // the connection error IS the assertion
+	req, reqErr := http.NewRequestWithContext(context.Background(), http.MethodGet, "http://"+addr+"/healthz", nil)
+	require.NoError(t, reqErr)
+	resp, err := (&http.Client{Timeout: 2 * time.Second}).Do(req)
+	if err == nil {
+		_ = resp.Body.Close()
+	}
 	require.Error(t, err, "the health listener must be closed after Loggerd returns")
 }
 
@@ -135,7 +145,7 @@ func TestLoggerd_InvalidLeaderLockTTLRejected(t *testing.T) {
 	err := Loggerd(context.Background())
 
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "invalid duration")
+	require.ErrorContains(t, err, "invalid duration")
 	assert.NotContains(t, err.Error(), "read config file")
 }
 
@@ -148,7 +158,7 @@ func TestLoggerd_UnreachablePostgresFailsClosed(t *testing.T) {
 	err := Loggerd(context.Background())
 
 	require.Error(t, err)
-	assert.ErrorContains(t, err, "connection refused")
+	require.ErrorContains(t, err, "connection refused")
 	assert.NotContains(t, err.Error(), "pg_uri is required",
 		"the URI is configured; the failure must be the dial, not validation")
 }

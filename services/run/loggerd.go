@@ -34,8 +34,87 @@ import (
 // Postgres is REQUIRED for loggerd (request logging is its whole job): missing
 // or unreachable PG returns an error rather than degraded start.
 func Loggerd(parentCtx context.Context) error {
-	// Kubernetes deployments configure via env only; fall back to defaults
-	// when no config file exists and none was requested explicitly.
+	cfg, err := logdLoadConfig()
+	if err != nil {
+		return err
+	}
+
+	ctx, cancel := context.WithCancel(parentCtx)
+	defer cancel()
+
+	logger := logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).With(slog.String("service", "loggerd"))
+
+	// The observability flushes run after the deferred dbPool.Close() (LIFO,
+	// matching the historical defer stack) on their own bounded contexts.
+	otelSink, otelEnabled, obsCleanup := logdObservability(ctx, cfg, logger)
+	if obsCleanup != nil {
+		defer obsCleanup()
+	}
+
+	dbPool, err := logdOpenPool(ctx, cfg, logger)
+	if err != nil {
+		return err
+	}
+	defer dbPool.Close()
+
+	rdb, err := logdDialRedis(ctx, cfg)
+	if err != nil {
+		return err
+	}
+
+	rt, err := logdWireRuntime(ctx, cfg, dbPool, rdb, otelSink, otelEnabled, logger)
+	if err != nil {
+		return err
+	}
+
+	logdStartWorkers(ctx, cfg, rdb, rt, logger)
+	logdStartPurgeLoop(ctx, rt.db, logger)
+	logdStartReplication(ctx, cfg, rt.db, logger)
+
+	server, drain, err := logdServe(cfg, logger)
+	if err != nil {
+		return err
+	}
+
+	// Teardown thunk, deferred as an opaque value: it runs right after the
+	// select below releases Loggerd — BEFORE the deferred pool close and
+	// observability flushes (LIFO), matching the historical inline order.
+	// See logdBuildShutdown for why its contexts are not the runtime ctx.
+	defer logdBuildShutdown(ctx, rt, server, drain, logger)()
+
+	// Loggerd's single blocking point: a signal or parent cancellation
+	// releases it into the deferred shutdown above.
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
+	select {
+	case sig := <-sigCh:
+		logger.Info("received signal, shutting down", "signal", sig.String())
+	case <-ctx.Done():
+	}
+
+	return nil
+}
+
+// logdBuildShutdown returns the shutdown tail as a function value: drain
+// the health/metrics listener (N12-P03-T03: readiness=false → bounded
+// propagation window → close — not-ready is observable by the LB/readiness
+// probes BEFORE the port stops accepting), then stop the consumer (keeping
+// its existing bound). The drain context is derived from the runtime ctx
+// via context.WithoutCancel: by the time this runs that ctx is cancelled/
+// signalled, and drainLoggerdHTTP still needs its full bounded window —
+// deriving a cancellable child would time out instantly, defeating the
+// drain.
+func logdBuildShutdown(ctx context.Context, rt *logdRuntime, server *http.Server, drain *gateway.DrainReadiness, logger *slog.Logger) func() {
+	return func() {
+		drainLoggerdHTTP(ctx, drain, server, loggerdShutdownBudget, logger)
+		rt.consumer.Stop()
+	}
+}
+
+// logdLoadConfig resolves the loggerd config (explicit path, ./config.yaml
+// fallback, env-only defaults) and validates it. Kubernetes deployments
+// configure via env only; the file fallback exists for local runs.
+func logdLoadConfig() (config.All, error) {
 	cfgFile := config.PathFromEnv()
 	if cfgFile == "" {
 		if _, statErr := os.Stat("config.yaml"); statErr == nil {
@@ -46,81 +125,110 @@ func Loggerd(parentCtx context.Context) error {
 	cfg, err := config.Load(cfgFile)
 	if err != nil {
 		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to load config", "error", err)
-		return err
+		return config.All{}, err
 	}
 
 	if err := cfg.Loggerd.Validate(); err != nil {
 		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("invalid loggerd config", "error", err)
-		return err
+		return config.All{}, err
 	}
+	return cfg, nil
+}
 
-	ctx, cancel := context.WithCancel(parentCtx)
-	defer cancel()
-
-	// Initialize tracing if an OTEL endpoint is configured.
+// logdObservability initializes tracing (when an OTEL endpoint is
+// configured) and the OTLP logs sink, returning the sink for consumer
+// wiring plus a combined shutdown flush. The flushes derive detached,
+// bounded contexts (context.WithoutCancel) so they outlive the runtime
+// ctx; with both enabled, the OTel flush runs before the tracing shutdown,
+// matching the historical defer order. nil cleanup = neither enabled.
+func logdObservability(ctx context.Context, cfg config.All, logger *slog.Logger) (sink consumer.OTelLogSink, otelEnabled bool, cleanup func()) {
 	if cfg.Loggerd.TracingEnabled() {
 		if err := tracing.Init(ctx, "loggerd", cfg.Loggerd.OTELTracingEndpoint, cfg.Loggerd.OTELTracingSample); err != nil {
 			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Warn("tracing init failed, continuing without tracing", "error", err)
 		}
-		//nolint:contextcheck // closure runs after ctx is cancelled at shutdown; deriving from the cancelled parent would abort the flush immediately
-		defer func() {
-			shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		cleanup = func() {
+			shutdownCtx, shutdownCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 			defer shutdownCancel()
 			_ = tracing.Shutdown(shutdownCtx)
-		}()
+		}
 	}
-
-	logger := logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).With(slog.String("service", "loggerd"))
 
 	// Disabled entirely unless YABANIN_OTEL_LOGS_ENDPOINT is set — no
 	// exporter, no goroutines, consumer path bit-for-bit unchanged.
-	otelSink, otelEnabled, otelErr := newOTelLogSinkFromEnv(ctx, logger)
+	sink, enabled, otelErr := newOTelLogSinkFromEnv(ctx, logger)
 	if otelErr != nil {
 		logger.Warn("otel logs exporter disabled (configuration error)", "error", otelErr)
-	} else if otelEnabled {
-		//nolint:contextcheck // the sink's lifecycle is independent of the runtime ctx (flush happens after cancellation; the deferred Shutdown carries its own timeout)
-		defer func() {
-			flushCtx, flushCancel := context.WithTimeout(context.Background(), 5*time.Second)
-			defer flushCancel()
-			if err := otelSink.Shutdown(flushCtx); err != nil {
-				logger.Warn("otel logs flush on shutdown failed", "error", err)
-			}
-		}()
+		return nil, false, cleanup
 	}
+	if !enabled {
+		return nil, false, cleanup
+	}
+	return sink, true, logdBuildOtelCleanup(ctx, sink, logger, cleanup)
+}
 
-	var dbPool *pgxpool.Pool
-	if cfg.Loggerd.PGURI != "" {
-		// pgxpool.ParseConfig (not pgx.ParseConfig + manual wrap) so the pool
-		// config carries the createdByParseConfig flag that
-		// pgxpool.NewWithConfig requires in pgx v5.10.
-		pc, parseErr := pgxpool.ParseConfig(cfg.Loggerd.PGURI)
-		if parseErr != nil {
-			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to parse pg_uri", "error", parseErr)
-			return parseErr
+// logdBuildOtelCleanup returns the combined observability shutdown flush:
+// the OTel logs flush first, then the tracing shutdown — the historical
+// defer order. Both derive detached, bounded contexts from the runtime ctx
+// (context.WithoutCancel) because it is already cancelled when they run.
+func logdBuildOtelCleanup(ctx context.Context, sink consumer.OTelLogSink, logger *slog.Logger, tracingShutdown func()) func() {
+	return func() {
+		logdOtelFlush(ctx, sink, logger)
+		if tracingShutdown != nil {
+			tracingShutdown()
 		}
-		if cfg.Gateway.Region != "" {
-			if err := regionrouter.ConfigurePool(pc, cfg.Gateway.Region); err != nil {
-				logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to configure RLS region hook", "error", err)
-				return err
-			}
-			logger.Info("RLS region context configured", "region", cfg.Gateway.Region)
-		}
-		dbPool, err = pgxpool.NewWithConfig(ctx, pc)
-		if err != nil {
-			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to connect to postgres", "error", err)
-			return err
-		}
-		if err := dbPool.Ping(ctx); err != nil {
-			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to ping postgres, DB is required for request logging — aborting", "error", err)
-			dbPool.Close()
-			return err
-		}
-		defer dbPool.Close()
-	} else {
+	}
+}
+
+// logdOtelFlush flushes the OTLP logs sink at shutdown. The flush context
+// is derived from the runtime ctx via context.WithoutCancel — the flush
+// must complete even though that ctx is already cancelled (the same
+// detached-shutdown idiom as historyops/batchstore), bounded to 5s.
+func logdOtelFlush(ctx context.Context, sink consumer.OTelLogSink, logger *slog.Logger) {
+	flushCtx, flushCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	defer flushCancel()
+	if err := sink.Shutdown(flushCtx); err != nil {
+		logger.Warn("otel logs flush on shutdown failed", "error", err)
+	}
+}
+
+// logdOpenPool opens the REQUIRED loggerd Postgres pool: a missing or
+// unreachable PG aborts startup rather than degrading request logging.
+func logdOpenPool(ctx context.Context, cfg config.All, logger *slog.Logger) (*pgxpool.Pool, error) {
+	if cfg.Loggerd.PGURI == "" {
 		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("DB is required but PG_URI is not configured — aborting")
-		return errors.New("loggerd: PG_URI is required")
+		return nil, errors.New("loggerd: PG_URI is required")
 	}
+	// pgxpool.ParseConfig (not pgx.ParseConfig + manual wrap) so the pool
+	// config carries the createdByParseConfig flag that
+	// pgxpool.NewWithConfig requires in pgx v5.10.
+	pc, parseErr := pgxpool.ParseConfig(cfg.Loggerd.PGURI)
+	if parseErr != nil {
+		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to parse pg_uri", "error", parseErr)
+		return nil, parseErr
+	}
+	if cfg.Gateway.Region != "" {
+		if err := regionrouter.ConfigurePool(pc, cfg.Gateway.Region); err != nil {
+			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to configure RLS region hook", "error", err)
+			return nil, err
+		}
+		logger.Info("RLS region context configured", "region", cfg.Gateway.Region)
+	}
+	dbPool, err := pgxpool.NewWithConfig(ctx, pc)
+	if err != nil {
+		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to connect to postgres", "error", err)
+		return nil, err
+	}
+	if err := dbPool.Ping(ctx); err != nil {
+		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to ping postgres, DB is required for request logging — aborting", "error", err)
+		dbPool.Close()
+		return nil, err
+	}
+	return dbPool, nil
+}
 
+// logdDialRedis opens the Redis client loggerd consumes the event stream
+// from; an unreachable Redis aborts startup.
+func logdDialRedis(ctx context.Context, cfg config.All) (*redis.Client, error) {
 	rdb := redis.NewClient(&redis.Options{
 		Addr:         cfg.Loggerd.RedisAddr,
 		ReadTimeout:  3 * time.Second,
@@ -129,38 +237,50 @@ func Loggerd(parentCtx context.Context) error {
 	})
 	if err := rdb.Ping(ctx).Err(); err != nil {
 		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to connect to redis", "error", err)
-		return err
+		return nil, err
 	}
+	return rdb, nil
+}
 
-	streamName := cfg.Loggerd.StreamName
+// logdRuntime is the wired loggerd runtime: the stream consumer with its
+// stores plus the background workers (settlement, budget reconcile, log
+// export) and the pool they all run against.
+type logdRuntime struct {
+	db         *pgxpool.Pool
+	stream     string
+	consumer   *consumer.StreamConsumer
+	settlement *consumer.SettlementWorker
+	reconciler *budget.ReconcileWorker
+	exporter   *loggerd.LogExporter
+}
 
-	// PR1: Wire credits store if DB is available (for reseller billing).
-	var creditStore *credits.Store
-	if dbPool != nil {
-		storeCfg := credits.DefaultConfig()
-		storeCfg.GracePeriodCents = cfg.Gateway.CreditsGraceCents
-		if ttl, err := time.ParseDuration(cfg.Gateway.CreditsCacheTTL); err == nil && ttl > 0 {
-			storeCfg.CacheTTL = ttl
-		}
-		creditStore = credits.NewStoreWithConfig(dbPool, logger.With("component", "loggerd-credits"), storeCfg)
-		logger.Info("loggerd credit store initialized", "grace_cents", storeCfg.GracePeriodCents)
+// logdWireRuntime builds the consumer and its stores in the historical
+// wiring order (credits → original-text retention → OTel sink → agent
+// spend), then the settlement and reconcile workers sharing those stores.
+// PG is required, so dbPool is always non-nil here.
+func logdWireRuntime(ctx context.Context, cfg config.All, dbPool *pgxpool.Pool, rdb *redis.Client, otelSink consumer.OTelLogSink, otelEnabled bool, logger *slog.Logger) (*logdRuntime, error) {
+	// PR1: credits store for reseller billing on the request-log path.
+	storeCfg := credits.DefaultConfig()
+	storeCfg.GracePeriodCents = cfg.Gateway.CreditsGraceCents
+	if ttl, err := time.ParseDuration(cfg.Gateway.CreditsCacheTTL); err == nil && ttl > 0 {
+		storeCfg.CacheTTL = ttl
 	}
+	creditStore := credits.NewStoreWithConfig(dbPool, logger.With("component", "loggerd-credits"), storeCfg)
+	logger.Info("loggerd credit store initialized", "grace_cents", storeCfg.GracePeriodCents)
 
-	consumerInstance := consumer.NewWithCreditStore(consumer.NewRedisOps(rdb), consumer.NewDBOps(dbPool), streamName, logger.With("component", "consumer"), creditStore)
+	consumerInstance := consumer.NewWithCreditStore(consumer.NewRedisOps(rdb), consumer.NewDBOps(dbPool), cfg.Loggerd.StreamName, logger.With("component", "consumer"), creditStore)
 
 	// N02-P06 T03: the org original-text retention source. The consumer
 	// resolves the effective toggle once per message at its delivery
 	// boundary and persists processed text only unless the org explicitly
-	// opted in; lookup failures fail closed to processed-only. A nil DB
-	// pool keeps the fail-closed default (no store, no retention).
-	if dbPool != nil {
-		consumerInstance.SetOriginalRetentionStore(consumer.AdminOriginalRetentionStore{
-			Store: adminstore.New(dbPool, logger.With("component", "adminstore"), nil),
-		})
-		logger.Info("original retention source initialized", "default_processed_only", true)
-	}
+	// opted in; lookup failures fail closed to processed-only.
+	consumerInstance.SetOriginalRetentionStore(consumer.AdminOriginalRetentionStore{
+		Store: adminstore.New(dbPool, logger.With("component", "adminstore"), nil),
+	})
+	logger.Info("original retention source initialized", "default_processed_only", true)
 
-	// endpoint is configured (disabled = feature off, zero overhead).
+	// The sink is wired only when an endpoint is configured (disabled =
+	// feature off, zero overhead).
 	if otelEnabled {
 		consumerInstance.SetOTelSink(otelSink)
 	}
@@ -168,220 +288,272 @@ func Loggerd(parentCtx context.Context) error {
 	// G2 debt fix: wire per-agent spend recording so agent budgets see usage.
 	// AF-06: the same enforcer executes the settlement worker's exact
 	// micro-USD agent-spend side effect (transactional with the job).
-	var agentBudgets *budget.AgentEnforcer
-	if dbPool != nil {
-		agentBudgets = budget.NewAgentEnforcer(dbPool, logger.With("component", "agent-budget"))
-		consumerInstance.SetAgentSpender(agentBudgets)
-	}
+	agentBudgets := budget.NewAgentEnforcer(dbPool, logger.With("component", "agent-budget"))
+	consumerInstance.SetAgentSpender(agentBudgets)
 
-	// a watermark-gated, at-least-once JSONL dump of closed-period
-	// request_logs rows. Enabled by YABANIN_LOG_EXPORT_S3_BUCKET; the
-	// exporter is a separate goroutine on its own ticker and never touches
-	// the consumer hot path.
-	var logExporter *loggerd.LogExporter
-	if expCfg := loggerd.LogExportConfigFromEnv(os.Getenv); expCfg.Enabled() {
-		if expCfg.Schedule != "" && expCfg.Schedule != loggerd.ScheduleHourly && expCfg.Schedule != loggerd.ScheduleDaily {
-			logger.Warn("invalid log export schedule, using hourly", "value", expCfg.Schedule)
+	// nil exporter = export off (YABANIN_LOG_EXPORT_S3_BUCKET unset).
+	var exporter *loggerd.LogExporter
+	var err error
+	if loggerd.LogExportConfigFromEnv(os.Getenv).Enabled() {
+		if exporter, err = logdNewExporter(ctx, dbPool, cfg, logger); err != nil {
+			return nil, err
 		}
-		uploader, upErr := loggerd.NewS3Uploader(ctx, expCfg)
-		if upErr != nil {
-			logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to init log export S3 uploader", "error", upErr)
-			return upErr
-		}
-		logExporter = loggerd.NewLogExporter(dbPool, uploader, expCfg, logger.With("component", "log-export"))
-		logger.Info("log export enabled",
-			"bucket", expCfg.Bucket, "prefix", expCfg.Prefix,
-			"schedule", logExporter.Schedule(), "redact", expCfg.Redact, "endpoint", expCfg.Endpoint)
 	}
 
 	// AF-06: the durable settlement worker executes settlement_jobs intents
 	// (resale wallet deduction, exact agent budget spend) with lease/retry/
 	// idempotency. It coordinates with other replicas via SKIP LOCKED, so it
 	// runs wherever the consumer runs (leader-elected when enabled).
-	var settlementWorker *consumer.SettlementWorker
-	if dbPool != nil {
-		settlementWorker = consumer.NewSettlementWorker(dbPool, creditStore, agentBudgets, logger.With("component", "settlement"))
-	}
+	settlement := consumer.NewSettlementWorker(dbPool, creditStore, agentBudgets, logger.With("component", "settlement"))
 
 	// NEXT-18e (ADR-0001 §7.1): the reservation reconcile worker — bounded
 	// ticker releasing lapsed escrow (expired past the safety window,
 	// draining/expired zero-remainder), checking the §7.1.3/§7.1.4 money
 	// invariants and running the §7.1.5 released-allowance retention. It
 	// runs wherever the settlement worker runs (§5.4: when loggerd stalls,
-	// reconcile conservatively releases nothing), leader-elected when
-	// enabled.
+	// reconcile conservatively releases nothing).
 	reconciler := budget.NewReconcileWorker(dbPool, logger.With("component", "budget-reconcile"), budget.DefaultReconcileConfig())
 
-	// ENT-04 (HA multi-replica): when leader election is on, N loggerd
-	// replicas elect a single active node and only the leader's Start runs;
-	// losing the lock cancels the consumer and another replica takes over.
+	return &logdRuntime{
+		db:         dbPool,
+		stream:     cfg.Loggerd.StreamName,
+		consumer:   consumerInstance,
+		settlement: settlement,
+		reconciler: reconciler,
+		exporter:   exporter,
+	}, nil
+}
+
+// logdNewExporter builds the watermark-gated, at-least-once JSONL dump of
+// closed-period request_logs rows (the exporter is a separate goroutine on
+// its own ticker and never touches the consumer hot path); the caller has
+// already checked that export is enabled.
+func logdNewExporter(ctx context.Context, dbPool *pgxpool.Pool, cfg config.All, logger *slog.Logger) (*loggerd.LogExporter, error) {
+	expCfg := loggerd.LogExportConfigFromEnv(os.Getenv)
+	if expCfg.Schedule != "" && expCfg.Schedule != loggerd.ScheduleHourly && expCfg.Schedule != loggerd.ScheduleDaily {
+		logger.Warn("invalid log export schedule, using hourly", "value", expCfg.Schedule)
+	}
+	uploader, upErr := loggerd.NewS3Uploader(ctx, expCfg)
+	if upErr != nil {
+		logging.New(cfg.Loggerd.LogLevel, cfg.Loggerd.LogFormat).Error("failed to init log export S3 uploader", "error", upErr)
+		return nil, upErr
+	}
+	exporter := loggerd.NewLogExporter(dbPool, uploader, expCfg, logger.With("component", "log-export"))
+	logger.Info("log export enabled",
+		"bucket", expCfg.Bucket, "prefix", expCfg.Prefix,
+		"schedule", exporter.Schedule(), "redact", expCfg.Redact, "endpoint", expCfg.Endpoint)
+	return exporter, nil
+}
+
+// logdStartWorkers starts the background workers under leader election or
+// directly. ENT-04 (HA multi-replica): when leader election is on, N
+// loggerd replicas elect a single active node and only the leader's Start
+// runs; losing the lock cancels the consumer and another replica takes
+// over.
+func logdStartWorkers(ctx context.Context, cfg config.All, rdb *redis.Client, rt *logdRuntime, logger *slog.Logger) {
 	if cfg.Loggerd.LeaderElection {
-		ttl := 30 * time.Second
-		if cfg.Loggerd.LeaderLockTTL != "" {
-			if parsed, err := time.ParseDuration(cfg.Loggerd.LeaderLockTTL); err == nil && parsed > 0 {
-				ttl = parsed
-			} else {
-				logger.Warn("invalid leader_lock_ttl, using 30s default", "value", cfg.Loggerd.LeaderLockTTL)
-			}
+		logdStartElected(ctx, cfg, rdb, rt, logger)
+		return
+	}
+	logdStartDirect(ctx, rt, logger)
+}
+
+// logdStartElected runs consumer and workers only while this replica holds
+// the Redis leader lock.
+func logdStartElected(ctx context.Context, cfg config.All, rdb *redis.Client, rt *logdRuntime, logger *slog.Logger) {
+	ttl := 30 * time.Second
+	if cfg.Loggerd.LeaderLockTTL != "" {
+		if parsed, err := time.ParseDuration(cfg.Loggerd.LeaderLockTTL); err == nil && parsed > 0 {
+			ttl = parsed
+		} else {
+			logger.Warn("invalid leader_lock_ttl, using 30s default", "value", cfg.Loggerd.LeaderLockTTL)
 		}
-		leader := consumer.NewLeader(consumer.NewLeaderRedis(rdb), streamName+":loggerd-leader", "", ttl, logger.With("component", "leader"))
+	}
+	leader := consumer.NewLeader(consumer.NewLeaderRedis(rdb), rt.stream+":loggerd-leader", "", ttl, logger.With("component", "leader"))
+	go func() {
+		if err := leader.Lead(ctx, logdLeadWork(rt, logger)); err != nil {
+			logger.Error("leader loop failed", "error", err)
+		}
+	}()
+	startRollups(ctx, rt.db, logger, leader.IsHeld)
+}
+
+// logdLeadWork is the elected-leader workload: settlement, reconcile and
+// export workers run in their own goroutines (their failures are logged,
+// never fatal to leadership) while the consumer Start blocks for as long
+// as the leadership context lives.
+func logdLeadWork(rt *logdRuntime, logger *slog.Logger) func(context.Context) error {
+	return func(leadCtx context.Context) error {
+		logger.Info("leader: starting stream consumer under elected leadership")
 		go func() {
-			if err := leader.Lead(ctx, func(leadCtx context.Context) error {
-				logger.Info("leader: starting stream consumer under elected leadership")
-				if settlementWorker != nil {
-					go func() {
-						if runErr := settlementWorker.Run(leadCtx); runErr != nil {
-							logger.Error("settlement worker failed", "error", runErr)
-						}
-					}()
-				}
-				go func() {
-					if runErr := reconciler.Run(leadCtx); runErr != nil {
-						logger.Error("budget reconcile worker failed", "error", runErr)
-					}
-				}()
-				if logExporter != nil {
-					go func() {
-						if runErr := logExporter.Run(leadCtx); runErr != nil {
-							logger.Error("log export worker failed", "error", runErr)
-						}
-					}()
-				}
-				return consumerInstance.Start(leadCtx)
-			}); err != nil {
-				logger.Error("leader loop failed", "error", err)
+			if runErr := rt.settlement.Run(leadCtx); runErr != nil {
+				logger.Error("settlement worker failed", "error", runErr)
 			}
 		}()
-		startRollups(ctx, dbPool, logger, leader.IsHeld)
-	} else {
 		go func() {
-			logger.Info("starting stream consumer", "stream", streamName)
-			if err := consumerInstance.Start(ctx); err != nil {
-				logger.Error("consumer failed", "error", err)
+			if runErr := rt.reconciler.Run(leadCtx); runErr != nil {
+				logger.Error("budget reconcile worker failed", "error", runErr)
 			}
 		}()
-		if settlementWorker != nil {
+		if rt.exporter != nil {
 			go func() {
-				logger.Info("starting settlement worker")
-				if err := settlementWorker.Run(ctx); err != nil {
-					logger.Error("settlement worker failed", "error", err)
+				if runErr := rt.exporter.Run(leadCtx); runErr != nil {
+					logger.Error("log export worker failed", "error", runErr)
 				}
 			}()
 		}
-		go func() {
-			logger.Info("starting budget reservation reconcile worker")
-			if err := reconciler.Run(ctx); err != nil {
-				logger.Error("budget reconcile worker failed", "error", err)
-			}
-		}()
-		if logExporter != nil {
-			go func() {
-				logger.Info("starting S3 log export worker",
-					"bucket", logExporter.Bucket(), "schedule", logExporter.Schedule())
-				if err := logExporter.Run(ctx); err != nil {
-					logger.Error("log export worker failed", "error", err)
-				}
-			}()
+		return rt.consumer.Start(leadCtx)
+	}
+}
+
+// logdStartDirect runs consumer and workers on this replica (the
+// historical single-node behavior).
+func logdStartDirect(ctx context.Context, rt *logdRuntime, logger *slog.Logger) {
+	go func() {
+		logger.Info("starting stream consumer", "stream", rt.stream)
+		if err := rt.consumer.Start(ctx); err != nil {
+			logger.Error("consumer failed", "error", err)
 		}
-		startRollups(ctx, dbPool, logger, nil)
-	}
-
-	// PH.2: purge_expired_records — hourly background job that deletes old
-	// request_logs (and, OP-9, the 90d policy decision log). W-LOGG: the
-	// loop selects on ctx.Done() (the old ticker range kept the goroutine —
-	// and its DB handle — alive forever after shutdown) and deletes in
-	// bounded batches so one oversized backlog cannot hold a long
-	// transaction and its bloat window for hours.
-	if days, ok := config.LogRetentionDays(); ok {
-		go func() {
-			logger.Info("purge_expired_records started", "retention_days", days)
-			ticker := time.NewTicker(1 * time.Hour)
-			defer ticker.Stop()
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case <-ticker.C:
-					deleted, err := purgeExpiredRequestLogs(ctx, dbPool, purgeBatchSize, days)
-					if err != nil {
-						logger.Warn("purge_expired_records failed", "error", err, "retention_days", days, "rows_deleted", deleted)
-						continue
-					}
-					logger.Info("purge_expired_records completed", "rows_deleted", deleted, "retention_days", days)
-
-					// OP-9: the decision log keeps its own fixed window
-					// (owner decision, 90d) — it is purged on the same
-					// hourly cycle, not a new worker.
-					purged, err := consumer.PurgeExpiredPolicyDecisions(ctx, dbPool, purgeBatchSize, consumer.PolicyDecisionsRetentionDays)
-					if err != nil {
-						logger.Warn("purge_policy_decisions failed", "error", err, "rows_deleted", purged)
-						continue
-					}
-					if purged > 0 {
-						logger.Info("purge_policy_decisions completed", "rows_deleted", purged, "retention_days", consumer.PolicyDecisionsRetentionDays)
-					}
-				}
-			}
-		}()
-	}
-
-	// PB2.4: nightly replication cron — rollup + ship at midnight UTC.
-	if cfg.Loggerd.ReplicationEndpoint != "" && dbPool != nil {
-		localRegion := cfg.Gateway.Region
-		if localRegion == "" {
-			localRegion = "sg" // fallback for single-region deployments
+	}()
+	go func() {
+		logger.Info("starting settlement worker")
+		if err := rt.settlement.Run(ctx); err != nil {
+			logger.Error("settlement worker failed", "error", err)
 		}
-		shipper := regionrepl.NewShipper(cfg.Loggerd.ReplicationEndpoint, localRegion)
+	}()
+	go func() {
+		logger.Info("starting budget reservation reconcile worker")
+		if err := rt.reconciler.Run(ctx); err != nil {
+			logger.Error("budget reconcile worker failed", "error", err)
+		}
+	}()
+	if rt.exporter != nil {
 		go func() {
-			ticker := time.NewTicker(24 * time.Hour)
-			defer ticker.Stop()
-			logger.Info("nightly replication cron started", "endpoint", cfg.Loggerd.ReplicationEndpoint)
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case t := <-ticker.C:
-					// Rollup the previous day (UTC).
-					day := t.Add(-24 * time.Hour)
-					rows, err := regionrepl.RollupForDay(ctx, dbPool, localRegion, day)
-					if err != nil {
-						logger.Error("rollup failed", "day", day.Format("2006-01-02"), "error", err)
-						continue
-					}
-					if len(rows) == 0 {
-						logger.Debug("no rollup rows for day", "day", day.Format("2006-01-02"))
-						continue
-					}
-					start := time.Now()
-					if err := shipper.Ship(ctx, rows); err != nil {
-						logger.Error("rollup ship failed after retry", "day", day.Format("2006-01-02"), "error", err)
-					} else {
-						logger.Info("rollup shipped", "day", day.Format("2006-01-02"), "rows", len(rows), "duration", time.Since(start).String())
-					}
-				}
+			logger.Info("starting S3 log export worker",
+				"bucket", rt.exporter.Bucket(), "schedule", rt.exporter.Schedule())
+			if err := rt.exporter.Run(ctx); err != nil {
+				logger.Error("log export worker failed", "error", err)
 			}
 		}()
 	}
+	startRollups(ctx, rt.db, logger, nil)
+}
 
+// logdStartPurgeLoop starts the PH.2 purge_expired_records job — hourly
+// background delete of old request_logs — when YABANIN_LOG_RETENTION_DAYS
+// is set. W-LOGG: the loop selects on ctx.Done() (the old ticker range
+// kept the goroutine — and its DB handle — alive forever after shutdown)
+// and deletes in bounded batches so one oversized backlog cannot hold a
+// long transaction and its bloat window for hours.
+func logdStartPurgeLoop(ctx context.Context, db *pgxpool.Pool, logger *slog.Logger) {
+	days, ok := config.LogRetentionDays()
+	if !ok {
+		return
+	}
+	go func() {
+		logger.Info("purge_expired_records started", "retention_days", days)
+		ticker := time.NewTicker(1 * time.Hour)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-ticker.C:
+				logdPurgeTick(ctx, db, logger, days)
+			}
+		}
+	}()
+}
+
+// logdPurgeTick runs one purge cycle: request_logs first, then the OP-9
+// policy decision log on its own fixed window (owner decision, 90d — same
+// hourly cycle, not a new worker). A failure skips the rest of the cycle,
+// never the loop.
+func logdPurgeTick(ctx context.Context, db *pgxpool.Pool, logger *slog.Logger, days int) {
+	deleted, err := purgeExpiredRequestLogs(ctx, db, purgeBatchSize, days)
+	if err != nil {
+		logger.Warn("purge_expired_records failed", "error", err, "retention_days", days, "rows_deleted", deleted)
+		return
+	}
+	logger.Info("purge_expired_records completed", "rows_deleted", deleted, "retention_days", days)
+
+	purged, err := consumer.PurgeExpiredPolicyDecisions(ctx, db, purgeBatchSize, consumer.PolicyDecisionsRetentionDays)
+	if err != nil {
+		logger.Warn("purge_policy_decisions failed", "error", err, "rows_deleted", purged)
+		return
+	}
+	if purged > 0 {
+		logger.Info("purge_policy_decisions completed", "rows_deleted", purged, "retention_days", consumer.PolicyDecisionsRetentionDays)
+	}
+}
+
+// logdStartReplication starts the PB2.4 nightly replication cron — rollup
+// + ship at midnight UTC — when a replication endpoint is configured.
+func logdStartReplication(ctx context.Context, cfg config.All, db *pgxpool.Pool, logger *slog.Logger) {
+	if cfg.Loggerd.ReplicationEndpoint == "" {
+		return
+	}
+	localRegion := cfg.Gateway.Region
+	if localRegion == "" {
+		localRegion = "sg" // fallback for single-region deployments
+	}
+	shipper := regionrepl.NewShipper(cfg.Loggerd.ReplicationEndpoint, localRegion)
+	go func() {
+		ticker := time.NewTicker(24 * time.Hour)
+		defer ticker.Stop()
+		logger.Info("nightly replication cron started", "endpoint", cfg.Loggerd.ReplicationEndpoint)
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case t := <-ticker.C:
+				logdShipDay(ctx, db, shipper, localRegion, logger, t)
+			}
+		}
+	}()
+}
+
+// logdShipDay rolls up the previous UTC day and ships it to the central
+// analytics endpoint; an empty rollup skips the ship.
+func logdShipDay(ctx context.Context, db *pgxpool.Pool, shipper *regionrepl.Shipper, region string, logger *slog.Logger, t time.Time) {
+	day := t.Add(-24 * time.Hour)
+	rows, err := regionrepl.RollupForDay(ctx, db, region, day)
+	if err != nil {
+		logger.Error("rollup failed", "day", day.Format("2006-01-02"), "error", err)
+		return
+	}
+	if len(rows) == 0 {
+		logger.Debug("no rollup rows for day", "day", day.Format("2006-01-02"))
+		return
+	}
+	start := time.Now()
+	if err := shipper.Ship(ctx, rows); err != nil {
+		logger.Error("rollup ship failed after retry", "day", day.Format("2006-01-02"), "error", err)
+		return
+	}
+	logger.Info("rollup shipped", "day", day.Format("2006-01-02"), "rows", len(rows), "duration", time.Since(start).String())
+}
+
+// logdServe builds the readiness gate and the hardened health/metrics
+// listener and starts serving. N12-P03-T03: the readiness gate is wired
+// BEFORE the listener opens; an invalid YABANIN_READINESS_DRAIN_DELAY
+// fails startup (fail-closed knob convention, shared with the gateway).
+func logdServe(cfg config.All, logger *slog.Logger) (*http.Server, *gateway.DrainReadiness, error) {
 	httpAddr := cfg.Loggerd.ListenAddr
 	if httpAddr == "" {
 		httpAddr = ":8085"
 	}
 
-	// N12-P03-T03: readiness gate wired BEFORE the listener opens; an invalid
-	// YABANIN_READINESS_DRAIN_DELAY fails startup (fail-closed knob
-	// convention, shared with the gateway).
 	drain, err := gateway.NewDrainReadiness()
 	if err != nil {
 		logger.Error("invalid readiness drain delay", "error", err)
-		return err
+		return nil, nil, err
 	}
 
-	mux := newLoggerdMux(drain)
-	server, err := newLoggerdHTTPServer(httpAddr, mux)
+	server, err := newLoggerdHTTPServer(httpAddr, newLoggerdMux(drain))
 	if err != nil {
 		logger.Error("invalid HTTP server configuration", "error", err)
-		return err
+		return nil, nil, err
 	}
 
 	go func() {
@@ -390,23 +562,7 @@ func Loggerd(parentCtx context.Context) error {
 			logger.Error("HTTP server failed", "error", err)
 		}
 	}()
-
-	sigCh := make(chan os.Signal, 1)
-	signal.Notify(sigCh, syscall.SIGINT, syscall.SIGTERM)
-	select {
-	case sig := <-sigCh:
-		logger.Info("received signal, shutting down", "signal", sig.String())
-	case <-ctx.Done():
-	}
-
-	// N12-P03-T03: readiness=false → bounded propagation window → close the
-	// listener — not-ready is observable by the LB/readiness probes BEFORE
-	// the port stops accepting. The subsequent consumer stop keeps its
-	// existing bound.
-	//nolint:contextcheck // shutdown runs after ctx cancellation; deriving from the cancelled ctx would time out instantly
-	drainLoggerdHTTP(drain, server, loggerdShutdownBudget, logger)
-	consumerInstance.Stop()
-	return nil
+	return server, drain, nil
 }
 
 // loggerdShutdownBudget bounds the health/metrics listener drain. The
@@ -443,14 +599,16 @@ func loggerdHealthHandler(drain *gateway.DrainReadiness) http.HandlerFunc {
 // drainLoggerdHTTP runs the readiness-first listener drain: flip the gate,
 // hold the bounded propagation window, then close the listener under its
 // budget. Deterministic apart from the real listener close, which is what
-// the sequence exists to bound.
-func drainLoggerdHTTP(drain *gateway.DrainReadiness, server *http.Server, budget time.Duration, logger *slog.Logger) {
+// the sequence exists to bound. The shutdown context is derived from ctx
+// via context.WithoutCancel: the drain runs after that ctx is cancelled,
+// and the close still needs its full budget.
+func drainLoggerdHTTP(ctx context.Context, drain *gateway.DrainReadiness, server *http.Server, budget time.Duration, logger *slog.Logger) {
 	drain.SetDraining()
 	logger.Info("loggerd readiness set to draining", "readiness_propagation_delay", drain.PropagationDelay().String())
 	drain.WaitPropagation()
-	ctx, cancel := context.WithTimeout(context.Background(), budget)
+	shutdownCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), budget)
 	defer cancel()
-	if err := server.Shutdown(ctx); err != nil {
+	if err := server.Shutdown(shutdownCtx); err != nil {
 		logger.Error("HTTP server shutdown error", "error", err)
 	}
 }
