@@ -69,5 +69,67 @@ class CriticalEngineControls(unittest.TestCase):
             critical.fuzz(self.root, 'pkg/auth', [TARGET], '', self.out, time.monotonic() + 30)
 
 
+class ApplicabilityControls(unittest.TestCase):
+    """Per-kind applicability: explicit N/A where infrastructure is absent."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='critical-applicability-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name) / 'source'
+        self.pkg = self.root / 'pkg/auth'
+        self.pkg.mkdir(parents=True)
+        (self.root / 'go.mod').write_text('module example.test/core\n\ngo 1.27.4\n')
+        (self.pkg / 'check.go').write_text(SOURCE)
+        self.out = Path(self.temp.name) / 'evidence'
+        self.out.mkdir()
+        self.gremlins = os.environ.get('GREMLINS_BIN') or shutil.which('gremlins')
+        if not self.gremlins:
+            self.gremlins = str(Path.home() / 'go/bin/gremlins')
+
+    def mode(self, kind, tests, qualified=False, deadline_seconds=90):
+        (self.pkg / 'check_test.go').write_text(tests)
+        target = self.out / kind
+        target.mkdir(exist_ok=True)
+        return critical.run_mode(kind, self.root, 'pkg/auth', [TARGET], '', target,
+                                 time.monotonic() + deadline_seconds, self.gremlins, qualified)
+
+    def test_fuzz_not_applicable_without_targets(self):
+        result = self.mode('fuzz', 'package auth\nimport "testing"\nfunc TestWeak(t *testing.T) { Allowed(1) }\n')
+        self.assertEqual(result['status'], 'not_applicable')
+        self.assertIn('no fuzz targets', result['reason'])
+
+    def test_mutation_not_applicable_when_unqualified(self):
+        result = self.mode('mutation', TESTS, qualified=False)
+        self.assertEqual(result['status'], 'not_applicable')
+        self.assertIn('gremlins-qualified', result['reason'])
+
+    def test_mutation_enforced_when_qualified(self):
+        result = self.mode('mutation', TESTS, qualified=True)
+        self.assertEqual(result[0]['killed'], 2)
+
+    def test_unit_suite_enforced_where_fuzz_absent(self):
+        result = self.mode('unit', 'package auth\nimport "testing"\nfunc TestWeak(t *testing.T) { Allowed(1) }\n')
+        self.assertEqual(result['status'], 'passed')
+
+    def test_failing_unit_suite_blocks_not_applicable_packages(self):
+        broken = 'package auth\nimport "testing"\nfunc TestBroken(t *testing.T) { if Allowed(1) != false { t.Fatal("sabotage") } }\n'
+        with self.assertRaisesRegex(ValueError, 'exited'):
+            self.mode('unit', broken, deadline_seconds=30)
+
+    def test_unit_skipped_when_fuzz_targets_exist(self):
+        result = self.mode('unit', TESTS)
+        self.assertEqual(result['status'], 'not_applicable')
+        self.assertIn('fuzz-target package', result['reason'])
+
+    def test_unit_not_applicable_without_any_tests(self):
+        (self.pkg / 'check_test.go').unlink(missing_ok=True)
+        target = self.out / 'notests'
+        target.mkdir()
+        result = critical.run_mode('unit', self.root, 'pkg/auth', [TARGET], '', target,
+                                   time.monotonic() + 30, self.gremlins, False)
+        self.assertEqual(result['status'], 'not_applicable')
+        self.assertIn('no unit tests', result['reason'])
+
+
 if __name__ == '__main__':
     unittest.main()
