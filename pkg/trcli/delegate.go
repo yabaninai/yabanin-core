@@ -41,166 +41,234 @@ a crashed run leaves done steps on disk and resume replays only the tail.
 This CLI uses the in-process FakeExecutor by design — the same state format
 is what a future executor-backed controller will consume.`,
 	}
-	var workspace string
-	cmd.PersistentFlags().StringVar(&workspace, "workspace", ".", "workspace root (state under .yabanin/delegate/)")
+	env := &delegateEnv{holder: fmt.Sprintf("%s:%d", hostName(), os.Getpid())}
+	// The flag writes straight into env so subcommands read the parsed
+	// value lazily at run time, not a snapshot taken at build time.
+	cmd.PersistentFlags().StringVar(&env.workspace, "workspace", ".", "workspace root (state under .yabanin/delegate/)")
+	cmd.AddCommand(
+		newDelegateRunCmd(env),
+		newDelegateStatusCmd(env),
+		newDelegateResumeCmd(env),
+		newDelegateCancelCmd(env),
+		newDelegateReviewCmd(env),
+		jitCmd(),
+	)
+	return cmd
+}
 
-	holder := fmt.Sprintf("%s:%d", hostName(), os.Getpid())
-	newController := func() (*controller.Controller, error) {
-		store, err := controller.NewStore(workspace + "/.yabanin/delegate")
-		if err != nil {
-			return nil, err
-		}
-		// NEXT-12 (owner decision 2026-09-18): low-risk analyze episodes
-		// (all steps passed, zero writes) may close automatically with
-		// recorded provenance. TP-17 refines the criteria: auto-accept
-		// requires a COMPLETE successful final result — and the hermetic
-		// FakeExecutor honestly reports validation "skipped", so its
-		// episodes stop at awaiting_review for an explicit review decision.
-		// Implement episodes always stop at awaiting_review.
-		return controller.New(store, delegation.NewFakeExecutor("codex"), holder, 30*time.Second).
-			WithAutoAccept(true), nil
+// delegateEnv is the shared runtime behind the delegate subcommands: the
+// --workspace flag target (cobra writes it during flag parsing) and the
+// lease-holder identity used by every controller this CLI creates.
+type delegateEnv struct {
+	workspace string
+	holder    string
+}
+
+func (env *delegateEnv) stateDir() string     { return env.workspace + "/.yabanin/delegate" }
+func (env *delegateEnv) worktreesDir() string { return env.workspace + "/.yabanin/worktrees" }
+
+func (env *delegateEnv) newController() (*controller.Controller, error) {
+	store, err := controller.NewStore(env.stateDir())
+	if err != nil {
+		return nil, err
 	}
+	// NEXT-12 (owner decision 2026-09-18): low-risk analyze episodes (all
+	// steps passed, zero writes) may close automatically with recorded
+	// provenance. TP-17 refines the criteria: auto-accept requires a
+	// COMPLETE successful final result — and the hermetic FakeExecutor
+	// honestly reports validation "skipped", so its episodes stop at
+	// awaiting_review for an explicit review decision. Implement episodes
+	// always stop at awaiting_review.
+	return controller.New(store, delegation.NewFakeExecutor("codex"), env.holder, 30*time.Second).
+		WithAutoAccept(true), nil
+}
 
+func newDelegateRunCmd(env *delegateEnv) *cobra.Command {
 	var implement bool
 	var sourceRepo string
 	run := &cobra.Command{
 		Use:   "run <id> <task>",
 		Short: "Start (or resume) an episode and drive it to completion",
 		Args:  cobra.ExactArgs(2),
-		RunE: func(_ *cobra.Command, args []string) error {
-			ctl, err := newController()
-			if err != nil {
-				return err
-			}
-			taskMode := delegation.ModeAnalyze
-			if implement {
-				taskMode = delegation.ModeImplement
-			}
-			e, err := ctl.Start(args[0], args[1], taskMode, delegation.ProviderAuto)
-			if err != nil {
-				return err
-			}
-			// NEXT-09: with --repo the episode runs in an isolated git
-			// worktree (cross-process locked); the ACTUAL diff is reported
-			// from git, never from executor claims.
-			var ws *controller.Workspace
-			if sourceRepo != "" {
-				mgr, err := controller.NewWorkspaceManager(workspace + "/.yabanin/worktrees")
-				if err != nil {
-					return err
-				}
-				ws, err = mgr.Acquire(args[0], sourceRepo)
-				if err != nil {
-					return err
-				}
-				defer func() { _ = ws.Release() }()
-			}
-			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer cancel()
-			var runErr error
-			e, runErr = ctl.Run(ctx, e)
-			printEpisode(cmd.OutOrStdout(), e)
-			evErr := writeEpisodeEvidence(cmd.OutOrStdout(), ctl, e)
-			if ws != nil {
-				changed, stat, derr := ws.Diff()
-				if derr != nil {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  diff:     unavailable (%v)\n", derr)
-				} else if len(changed) == 0 {
-					_, _ = fmt.Fprintln(cmd.OutOrStdout(), "  diff:     none (no files changed)")
-				} else {
-					_, _ = fmt.Fprintf(cmd.OutOrStdout(), "  diff:     %s\n", strings.Join(changed, ", "))
-					if stat != "" {
-						_, _ = fmt.Fprintln(cmd.OutOrStdout(), "  diffstat:")
-						for _, l := range strings.Split(stat, "\n") {
-							_, _ = fmt.Fprintf(cmd.OutOrStdout(), "    %s\n", l)
-						}
-					}
-				}
-			}
-			// TP-18: an evidence write failure is a CLI error, not a
-			// printed footnote; the execution error (if any) is preserved.
-			if runErr != nil && evErr != nil {
-				return fmt.Errorf("%w; evidence: %w", runErr, evErr)
-			}
-			if evErr != nil {
-				return fmt.Errorf("evidence: %w", evErr)
-			}
-			return runErr
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return env.runEpisode(cmd, args[0], args[1], implement, sourceRepo)
 		},
 	}
 	run.Flags().BoolVar(&implement, "implement", false, "implement mode (analyze is default)")
 	run.Flags().StringVar(&sourceRepo, "repo", "", "source git repo: run the episode in an isolated worktree of it")
+	return run
+}
 
-	status := &cobra.Command{
+// runEpisode starts (or resumes) the episode, drives it to completion and
+// renders episode card, evidence envelope and worktree diff.
+func (env *delegateEnv) runEpisode(cmd *cobra.Command, id, task string, implement bool, sourceRepo string) error {
+	ctl, err := env.newController()
+	if err != nil {
+		return err
+	}
+	taskMode := delegation.ModeAnalyze
+	if implement {
+		taskMode = delegation.ModeImplement
+	}
+	e, err := ctl.Start(id, task, taskMode, delegation.ProviderAuto)
+	if err != nil {
+		return err
+	}
+	// NEXT-09: with --repo the episode runs in an isolated git worktree
+	// (cross-process locked); the ACTUAL diff is reported from git, never
+	// from executor claims.
+	var ws *controller.Workspace
+	if sourceRepo != "" {
+		ws, err = env.acquireWorktree(id, sourceRepo)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = ws.Release() }()
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	e, runErr := ctl.Run(ctx, e)
+	w := cmd.OutOrStdout()
+	printEpisode(w, e)
+	evErr := writeEpisodeEvidence(w, ctl, e)
+	printWorktreeDiff(w, ws, "diff:     ", "none (no files changed)")
+	// TP-18: an evidence write failure is a CLI error, not a printed
+	// footnote; the execution error (if any) is preserved.
+	return combineEpisodeErrors(runErr, evErr)
+}
+
+// acquireWorktree creates (or re-attaches to) the episode's isolated
+// worktree of sourceRepo under the workspace root.
+func (env *delegateEnv) acquireWorktree(id, sourceRepo string) (*controller.Workspace, error) {
+	mgr, err := controller.NewWorkspaceManager(env.worktreesDir())
+	if err != nil {
+		return nil, err
+	}
+	return mgr.Acquire(id, sourceRepo)
+}
+
+// printWorktreeDiff renders the git-reported worktree inventory. label is
+// the exact "diff:" plus alignment spaces (run and review differ by one
+// column); noneNote is the empty-inventory phrasing.
+func printWorktreeDiff(w io.Writer, ws *controller.Workspace, label, noneNote string) {
+	if ws == nil {
+		return
+	}
+	changed, stat, err := ws.Diff()
+	if err != nil {
+		_, _ = fmt.Fprintf(w, "  %sunavailable (%v)\n", label, err)
+		return
+	}
+	if len(changed) == 0 {
+		_, _ = fmt.Fprintf(w, "  %s%s\n", label, noneNote)
+		return
+	}
+	_, _ = fmt.Fprintf(w, "  %s%s\n", label, strings.Join(changed, ", "))
+	if stat != "" {
+		_, _ = fmt.Fprintln(w, "  diffstat:")
+		for _, l := range strings.Split(stat, "\n") {
+			_, _ = fmt.Fprintf(w, "    %s\n", l)
+		}
+	}
+}
+
+// combineEpisodeErrors keeps a run error and an evidence error both
+// visible (TP-18), the execution error first.
+func combineEpisodeErrors(runErr, evErr error) error {
+	switch {
+	case runErr != nil && evErr != nil:
+		return fmt.Errorf("%w; evidence: %w", runErr, evErr)
+	case evErr != nil:
+		return fmt.Errorf("evidence: %w", evErr)
+	default:
+		return runErr
+	}
+}
+
+func newDelegateStatusCmd(env *delegateEnv) *cobra.Command {
+	return &cobra.Command{
 		Use:   "status <id>",
 		Short: "Show one episode's persisted state",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			store, err := controller.NewStore(workspace + "/.yabanin/delegate")
-			if err != nil {
-				return err
-			}
-			e, err := store.Load(args[0])
-			if err != nil {
-				return err
-			}
-			printEpisode(cmd.OutOrStdout(), e)
-			return nil
+			return env.showEpisode(cmd, args[0])
 		},
 	}
+}
 
-	resume := &cobra.Command{
+func (env *delegateEnv) showEpisode(cmd *cobra.Command, id string) error {
+	store, err := controller.NewStore(env.stateDir())
+	if err != nil {
+		return err
+	}
+	e, err := store.Load(id)
+	if err != nil {
+		return err
+	}
+	printEpisode(cmd.OutOrStdout(), e)
+	return nil
+}
+
+func newDelegateResumeCmd(env *delegateEnv) *cobra.Command {
+	return &cobra.Command{
 		Use:   "resume <id>",
 		Short: "Take over a crashed/expired episode and finish it",
 		Args:  cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctl, err := newController()
-			if err != nil {
-				return err
-			}
-			e, err := ctl.Store().Load(args[0])
-			if err != nil {
-				return err
-			}
-			ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
-			defer cancel()
-			e, runErr := ctl.Run(ctx, e)
-			printEpisode(cmd.OutOrStdout(), e)
-			// TP-18: keep both errors when they both happen.
-			if evErr := writeEpisodeEvidence(cmd.OutOrStdout(), ctl, e); evErr != nil {
-				if runErr != nil {
-					return fmt.Errorf("%w; evidence: %w", runErr, evErr)
-				}
-				return fmt.Errorf("evidence: %w", evErr)
-			}
-			return runErr
+			return env.resumeEpisode(cmd, args[0])
 		},
 	}
+}
 
-	cancelCmd := &cobra.Command{
+func (env *delegateEnv) resumeEpisode(cmd *cobra.Command, id string) error {
+	ctl, err := env.newController()
+	if err != nil {
+		return err
+	}
+	e, err := ctl.Store().Load(id)
+	if err != nil {
+		return err
+	}
+	ctx, cancel := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer cancel()
+	e, runErr := ctl.Run(ctx, e)
+	w := cmd.OutOrStdout()
+	printEpisode(w, e)
+	// TP-18: keep both errors when they both happen.
+	return combineEpisodeErrors(runErr, writeEpisodeEvidence(w, ctl, e))
+}
+
+func newDelegateCancelCmd(env *delegateEnv) *cobra.Command {
+	return &cobra.Command{
 		Use:   "cancel <id> [reason]",
 		Short: "Cancel a non-terminal episode",
 		Args:  cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctl, err := newController()
-			if err != nil {
-				return err
-			}
-			e, err := ctl.Store().Load(args[0])
-			if err != nil {
-				return err
-			}
 			reason := "operator cancel"
 			if len(args) > 1 {
 				reason = args[1]
 			}
-			e, err = ctl.Cancel(e, reason)
-			printEpisode(cmd.OutOrStdout(), e)
-			return err
+			return env.cancelEpisode(cmd, args[0], reason)
 		},
 	}
+}
 
-	// NEXT-12: review bundle + approve/reject with actor/hash/time.
+func (env *delegateEnv) cancelEpisode(cmd *cobra.Command, id, reason string) error {
+	ctl, err := env.newController()
+	if err != nil {
+		return err
+	}
+	e, err := ctl.Store().Load(id)
+	if err != nil {
+		return err
+	}
+	e, err = ctl.Cancel(e, reason)
+	printEpisode(cmd.OutOrStdout(), e)
+	return err
+}
+
+// NEXT-12: review bundle + approve/reject with actor/hash/time.
+func newDelegateReviewCmd(env *delegateEnv) *cobra.Command {
 	review := &cobra.Command{
 		Use:   "review <id>",
 		Short: "Show the review bundle, or record approve/reject",
@@ -216,111 +284,120 @@ Approvals record actor, time and the state-file hash; auto-accept is
 deliberately absent (a separate owner decision per NEXT-12).`,
 		Args: cobra.MinimumNArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
-			ctl, err := newController()
-			if err != nil {
-				return err
-			}
-			e, err := ctl.Store().Load(args[0])
-			if err != nil {
-				return err
-			}
-			w := cmd.OutOrStdout()
-			printEpisode(w, e)
-			// Evidence verification status (tamper check).
-			// TP-18: a failed verification (missing binding, unreadable
-			// registry, envelope/state mismatch) must also fail the command;
-			// "none written yet" stays a soft display note. One exception: a
-			// recorded review decision or cancel legitimately evolves the
-			// state AFTER the envelope was written — that is a stale
-			// envelope, not tampering, and is displayed honestly.
-			regPath, rerr := resolveRegistryPath()
-			if rerr != nil {
-				return rerr
-			}
-			ev, verr := ctl.Store().VerifyEvidence(args[0], regPath)
-			legitEvolved := e.Review != nil || e.CancelReason != ""
-			switch {
-			case verr != nil && errors.Is(verr, fs.ErrNotExist):
-				_, _ = fmt.Fprintln(w, "  evidence:  none written yet")
-			case verr != nil && legitEvolved:
-				_, _ = fmt.Fprintln(w, "  evidence:  stale (state evolved after the envelope was written)")
-			case verr != nil:
-				_, _ = fmt.Fprintf(w, "  evidence:  MISMATCH (%v)\n", verr)
-				return fmt.Errorf("evidence verification failed: %w", verr)
-			default:
-				_, _ = fmt.Fprintf(w, "  evidence:  verified (state %s…, outcome %s)\n", ev.StateSHA256[:12], ev.Outcome)
-			}
-			// The actual diff, when a repo is provided.
-			if src, _ := cmd.Flags().GetString("repo"); src != "" {
-				mgr, merr := controller.NewWorkspaceManager(workspace + "/.yabanin/worktrees")
-				if merr != nil {
-					return merr
-				}
-				ws, aerr := mgr.Acquire(args[0], src)
-				if aerr != nil {
-					return aerr
-				}
-				defer func() { _ = ws.Release() }()
-				changed, stat, derr := ws.Diff()
-				if derr != nil {
-					_, _ = fmt.Fprintf(w, "  diff:      unavailable (%v)\n", derr)
-				} else if len(changed) == 0 {
-					_, _ = fmt.Fprintln(w, "  diff:      none")
-				} else {
-					_, _ = fmt.Fprintf(w, "  diff:      %s\n", strings.Join(changed, ", "))
-					if stat != "" {
-						_, _ = fmt.Fprintln(w, "  diffstat:")
-						for _, l := range strings.Split(stat, "\n") {
-							_, _ = fmt.Fprintf(w, "    %s\n", l)
-						}
-					}
-				}
-			}
-			if e.Review != nil {
-				_, _ = fmt.Fprintf(w, "  review:    %s by %s at %s (state %s…)\n",
-					e.Review.Decision, e.Review.Actor, e.Review.At.Format(time.RFC3339), shortHash(e.Review.StateSHA))
-			} else {
-				_, _ = fmt.Fprintln(w, "  review:    not decided — use `review <id> approve|reject --actor <name>`")
-			}
-			return nil
+			return env.showReviewBundle(cmd, args[0])
 		},
 	}
 	review.Flags().String("repo", "", "source repo to render the actual worktree diff")
+	review.AddCommand(newDelegateDecisionCmd(env, "approve"), newDelegateDecisionCmd(env, "reject"))
+	return review
+}
 
-	var actor, note string
-	decision := func(dec string) *cobra.Command {
-		d := &cobra.Command{
-			Use:   dec + " <id>",
-			Short: "record the " + dec + " decision",
-			Args:  cobra.ExactArgs(1),
-			RunE: func(cmd *cobra.Command, args []string) error {
-				decision := map[string]string{"approve": "approved", "reject": "rejected"}[dec]
-				ctl, err := newController()
-				if err != nil {
-					return err
-				}
-				e, err := ctl.Store().Load(args[0])
-				if err != nil {
-					return err
-				}
-				e, err = ctl.Review(e, decision, actor, note)
-				if err != nil {
-					return err
-				}
-				_, _ = fmt.Fprintf(cmd.OutOrStdout(), "review recorded: %s by %s (state %s…) → %s\n",
-					e.Review.Decision, e.Review.Actor, shortHash(e.Review.StateSHA), e.State)
-				return nil
-			},
-		}
-		d.Flags().StringVar(&actor, "actor", "", "reviewer identity (required)")
-		_ = d.MarkFlagRequired("actor")
-		d.Flags().StringVar(&note, "note", "", "free-form decision note")
-		return d
+func (env *delegateEnv) showReviewBundle(cmd *cobra.Command, id string) error {
+	ctl, err := env.newController()
+	if err != nil {
+		return err
 	}
-	review.AddCommand(decision("approve"), decision("reject"))
+	e, err := ctl.Store().Load(id)
+	if err != nil {
+		return err
+	}
+	w := cmd.OutOrStdout()
+	printEpisode(w, e)
+	if err := printEvidenceStatus(w, ctl, id, e.Review != nil || e.CancelReason != ""); err != nil {
+		return err
+	}
+	// The actual diff, when a repo is provided.
+	if src, _ := cmd.Flags().GetString("repo"); src != "" {
+		if err := env.showReviewDiff(w, id, src); err != nil {
+			return err
+		}
+	}
+	printReviewDecision(w, e)
+	return nil
+}
 
-	cmd.AddCommand(run, status, resume, cancelCmd, review, jitCmd())
-	return cmd
+// printEvidenceStatus renders the NEXT-10 tamper check. TP-18: a failed
+// verification (missing binding, unreadable registry, envelope/state
+// mismatch) must also fail the command; "none written yet" stays a soft
+// display note. One exception: a recorded review decision or cancel
+// legitimately evolves the state AFTER the envelope was written — that is
+// a stale envelope, not tampering, and is displayed honestly.
+func printEvidenceStatus(w io.Writer, ctl *controller.Controller, id string, legitEvolved bool) error {
+	regPath, err := resolveRegistryPath()
+	if err != nil {
+		return err
+	}
+	ev, verr := ctl.Store().VerifyEvidence(id, regPath)
+	switch {
+	case verr != nil && errors.Is(verr, fs.ErrNotExist):
+		_, _ = fmt.Fprintln(w, "  evidence:  none written yet")
+	case verr != nil && legitEvolved:
+		_, _ = fmt.Fprintln(w, "  evidence:  stale (state evolved after the envelope was written)")
+	case verr != nil:
+		_, _ = fmt.Fprintf(w, "  evidence:  MISMATCH (%v)\n", verr)
+		return fmt.Errorf("evidence verification failed: %w", verr)
+	default:
+		_, _ = fmt.Fprintf(w, "  evidence:  verified (state %s…, outcome %s)\n", ev.StateSHA256[:12], ev.Outcome)
+	}
+	return nil
+}
+
+func (env *delegateEnv) showReviewDiff(w io.Writer, id, sourceRepo string) error {
+	mgr, err := controller.NewWorkspaceManager(env.worktreesDir())
+	if err != nil {
+		return err
+	}
+	ws, err := mgr.Acquire(id, sourceRepo)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = ws.Release() }()
+	printWorktreeDiff(w, ws, "diff:      ", "none")
+	return nil
+}
+
+func printReviewDecision(w io.Writer, e *controller.Episode) {
+	if e.Review != nil {
+		_, _ = fmt.Fprintf(w, "  review:    %s by %s at %s (state %s…)\n",
+			e.Review.Decision, e.Review.Actor, e.Review.At.Format(time.RFC3339), shortHash(e.Review.StateSHA))
+		return
+	}
+	_, _ = fmt.Fprintln(w, "  review:    not decided — use `review <id> approve|reject --actor <name>`")
+}
+
+func newDelegateDecisionCmd(env *delegateEnv, dec string) *cobra.Command {
+	var actor, note string
+	d := &cobra.Command{
+		Use:   dec + " <id>",
+		Short: "record the " + dec + " decision",
+		Args:  cobra.ExactArgs(1),
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return env.recordDecision(cmd, args[0], dec, actor, note)
+		},
+	}
+	d.Flags().StringVar(&actor, "actor", "", "reviewer identity (required)")
+	_ = d.MarkFlagRequired("actor")
+	d.Flags().StringVar(&note, "note", "", "free-form decision note")
+	return d
+}
+
+func (env *delegateEnv) recordDecision(cmd *cobra.Command, id, dec, actor, note string) error {
+	decision := map[string]string{"approve": "approved", "reject": "rejected"}[dec]
+	ctl, err := env.newController()
+	if err != nil {
+		return err
+	}
+	e, err := ctl.Store().Load(id)
+	if err != nil {
+		return err
+	}
+	e, err = ctl.Review(e, decision, actor, note)
+	if err != nil {
+		return err
+	}
+	_, _ = fmt.Fprintf(cmd.OutOrStdout(), "review recorded: %s by %s (state %s…) → %s\n",
+		e.Review.Decision, e.Review.Actor, shortHash(e.Review.StateSHA), e.State)
+	return nil
 }
 
 // state machine (D7: API/DB-first; trcli is the operator surface, the
