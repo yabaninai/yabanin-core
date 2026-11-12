@@ -4,13 +4,15 @@
 //
 // SANDBOX MODEL (verified against gopher-lua v1.1.2 source):
 //
-//   - gopher-lua has NO debug hooks (README, "Unsupported functions"), so
-//     the planned instruction-count budget via debug.sethook is not
-//     implementable. The real budget primitive is that the VM checks
-//     LState.Context on EVERY instruction (mainLoopWithContext):
-//     Evaluate runs each chunk under a wall-clock deadline
-//     (DefaultEvalTimeout) derived from the caller's context. A runaway
-//     chunk aborts with "evaluation budget exceeded" and unrolls.
+//   - Budgets (deterministic first): gopher-lua has NO debug hooks, but its
+//     context-enabled main loop calls ctx.Done() on EVERY instruction
+//     dispatch, so Evaluate runs each chunk under a step budget
+//     (DefaultMaxSteps VM dispatches) enforced by the VM itself —
+//     machine-independent, immune to GC pauses and runner load — plus a
+//     wall-clock ceiling (DefaultEvalTimeout, scaled on -race builds, see
+//     race_on.go) that backstops single huge operations such as one massive
+//     concat. A runaway chunk aborts with "evaluation budget exceeded" and
+//     unrolls.
 //   - Stdlib is an allowlist: base (pairs/ipairs/type/tonumber/tostring/
 //     select/error/assert/next/rawget/rawequal/rawlen/pcall), string, table,
 //     math. os/io/debug/load/loadstring/dofile/loadfile/require/print/_G/
@@ -64,9 +66,19 @@ const (
 	maxConditionSourceBytes = 16 << 10
 	maxEnvItems             = 4096
 	maxEnvBytes             = 1 << 20
-	// DefaultEvalTimeout is the per-evaluation wall-clock budget; the VM
-	// checks the context on every instruction, so this bounds every script.
+	// DefaultEvalTimeout is the per-evaluation wall-clock CEILING. It only
+	// backstops work between dispatch checks (one huge allocation-heavy
+	// opcode); boundedness itself comes from DefaultMaxSteps. New scales it
+	// by raceWallScale on -race builds (load tolerance, not semantics).
 	DefaultEvalTimeout = 5 * time.Millisecond
+	// DefaultMaxSteps is the deterministic per-evaluation budget of VM
+	// instruction dispatches. It exceeds what a legit condition needs at the
+	// env-size limit (a 4096-item scan costs ~250k dispatches), so the wall
+	// ceiling stays the binding production bound while runaway scripts die
+	// at the same dispatch count on every machine.
+	DefaultMaxSteps = 1_000_000
+	// raceWallScale is applied to wall ceilings on -race builds only.
+	raceWallScale = 10
 	// DefaultMaxStringResult caps string.rep/string.format/table.concat
 	// results (1 MiB).
 	DefaultMaxStringResult = 1 << 20
@@ -82,6 +94,7 @@ const (
 // under Name ("lua") on pipeline.Engine.Scripts.
 type Engine struct {
 	evalTimeout time.Duration
+	maxSteps    int64
 	maxString   int
 
 	pool      sync.Pool // *glua.LState with sealed stdlib
@@ -94,8 +107,19 @@ type Engine struct {
 // Option configures an Engine.
 type Option func(*Engine)
 
-// WithEvalTimeout overrides the per-evaluation wall-clock budget.
+// WithEvalTimeout overrides the per-evaluation wall-clock ceiling; on -race
+// builds New scales it by raceWallScale. The step budget is unaffected.
 func WithEvalTimeout(d time.Duration) Option { return func(e *Engine) { e.evalTimeout = d } }
+
+// WithMaxSteps overrides the deterministic per-evaluation VM dispatch
+// budget; n <= 0 is ignored and the engine keeps its current budget.
+func WithMaxSteps(n int64) Option {
+	return func(e *Engine) {
+		if n > 0 {
+			e.maxSteps = n
+		}
+	}
+}
 
 // WithMaxStringResult overrides the guarded-stdlib result cap.
 func WithMaxStringResult(n int) Option { return func(e *Engine) { e.maxString = n } }
@@ -115,12 +139,16 @@ func WithMaxWorkers(n int) Option {
 func New(opts ...Option) *Engine {
 	e := &Engine{
 		evalTimeout: DefaultEvalTimeout,
+		maxSteps:    DefaultMaxSteps,
 		maxString:   DefaultMaxStringResult,
 		evalSlots:   make(chan struct{}, script.DefaultMaxWorkers),
 		cache:       make(map[[sha256.Size]byte]*glua.FunctionProto),
 	}
 	for _, opt := range opts {
 		opt(e)
+	}
+	if raceEnabled {
+		e.evalTimeout *= raceWallScale
 	}
 	e.pool.New = func() any { return e.newState() }
 	return e
@@ -225,9 +253,9 @@ func (p *program) Evaluate(ctx context.Context, env pipeline.ConditionEnv) (bool
 	resetGlobals(L)
 	setEnv(L, env)
 
-	evalCtx, cancel := context.WithTimeout(ctx, e.evalTimeout)
-	defer cancel()
-	L.SetContext(evalCtx)
+	budget := newBudgetContext(ctx, e.maxSteps, e.evalTimeout)
+	defer budget.stop()
+	L.SetContext(budget)
 	L.Push(L.NewFunctionFromProto(p.proto))
 	err := L.PCall(0, 1, nil)
 	L.RemoveContext()
@@ -235,8 +263,10 @@ func (p *program) Evaluate(ctx context.Context, env pipeline.ConditionEnv) (bool
 		switch {
 		case ctx.Err() != nil:
 			return false, fmt.Errorf("lua: caller context: %w", ctx.Err())
-		case errors.Is(evalCtx.Err(), context.DeadlineExceeded):
-			return false, fmt.Errorf("lua: evaluation budget exceeded (%s): %w", e.evalTimeout, err)
+		case errors.Is(budget.Err(), errStepBudget):
+			return false, fmt.Errorf("lua: evaluation budget exceeded (%d steps): %w", e.maxSteps, err)
+		case errors.Is(budget.Err(), errWallCeiling):
+			return false, fmt.Errorf("lua: evaluation budget exceeded (%s wall): %w", e.evalTimeout, err)
 		default:
 			return false, fmt.Errorf("lua: %w", err)
 		}
