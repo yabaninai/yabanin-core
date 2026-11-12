@@ -115,7 +115,8 @@ func TestExprUnknownNamesFailAtCompile(t *testing.T) {
 }
 
 // TestExprTerminatesByConstruction: even absurd operand expressions finish
-// immediately — there is no loop construct to hang on.
+// immediately — there is no loop construct to hang on. The wall ceiling is
+// the generous backstop, not the assertion.
 func TestExprTerminatesByConstruction(t *testing.T) {
 	start := time.Now()
 	got, err := evalSource(t, `len('a' + 'b' + 'c') == 3 and (1..10000 | len()) == 10000`, testEnv())
@@ -127,6 +128,43 @@ func TestExprTerminatesByConstruction(t *testing.T) {
 	}
 	if time.Since(start) > time.Second {
 		t.Fatalf("bounded ops took %s", time.Since(start))
+	}
+}
+
+// TestExprEvalTimeoutScaledOnRaceBuilds pins the load-tolerance mechanism:
+// the wall ceiling is the engine's only wall-clock bound (no deterministic
+// step hook exists in expr-lang production builds), so -race builds scale it
+// by raceWallScale; production builds keep it unscaled.
+func TestExprEvalTimeoutScaledOnRaceBuilds(t *testing.T) {
+	want := DefaultEvalTimeout
+	if raceEnabled {
+		want *= raceWallScale
+	}
+	if got := New().evalTimeout; got != want {
+		t.Fatalf("New() evalTimeout = %s, want %s (raceEnabled=%v)", got, want, raceEnabled)
+	}
+	wantCustom := 100 * time.Millisecond
+	if raceEnabled {
+		wantCustom *= raceWallScale
+	}
+	if got := New(WithEvalTimeout(100 * time.Millisecond)).evalTimeout; got != wantCustom {
+		t.Fatalf("WithEvalTimeout(100ms): evalTimeout = %s, want %s", got, wantCustom)
+	}
+}
+
+// TestExprRunawayAllocationAbortsUnderProductionDefaults is the negative
+// control for the DoS guarantee with untouched default budgets: an
+// allocation bomb aborts through the VM's tracked memory budget — a
+// deterministic byte counter, not a wall clock — so the abort holds under
+// -race instrumentation and shared-runner load.
+func TestExprRunawayAllocationAbortsUnderProductionDefaults(t *testing.T) {
+	prog, err := New().Compile(`len(1..2000000) > 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = prog.Evaluate(context.Background(), pipeline.ConditionEnv{})
+	if err == nil {
+		t.Fatal("allocation bomb passed the default VM memory budget")
 	}
 }
 

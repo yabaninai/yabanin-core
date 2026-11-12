@@ -34,13 +34,12 @@ func testEnv() pipeline.ConditionEnv {
 
 func evalSource(t *testing.T, source string, env pipeline.ConditionEnv) (bool, error) {
 	t.Helper()
-	// The semantics/error/mutation contract tests must not depend on machine
-	// load: the production-default 25ms wall-clock watchdog can cancel a
-	// legitimate evaluation when the whole module suite runs in parallel.
-	// The watchdog itself is pinned by TestStarlarkWatchdogBounded with an
-	// explicit tight budget, so this helper uses a load-tolerant one.
-	e := New(WithEvalTimeout(2 * time.Second))
-	prog, err := e.Compile(source)
+	// Production defaults: the deterministic step budget (not a wall-clock
+	// number) bounds each evaluation, and the watchdog ceiling is
+	// race-scaled on -race builds (race_on.go), so results hold under -race
+	// and load. The watchdog itself is pinned by TestStarlarkWatchdogBounded
+	// with an explicit tight budget.
+	prog, err := New().Compile(source)
 	if err != nil {
 		return false, err
 	}
@@ -177,6 +176,74 @@ func TestStarlarkWatchdogBounded(t *testing.T) {
 	}
 	if elapsed := time.Since(start); elapsed > 2*time.Second {
 		t.Errorf("unbounded response: %s", elapsed)
+	}
+}
+
+// TestStarlarkStepBudgetIsDeterministic is the negative control for the
+// budget mechanism: with the watchdog far beyond the test horizon only the
+// native step budget can stop a runaway, so the abort is deterministic on
+// every machine and under any load. If step enforcement regresses, the
+// comprehension runs on and this fails on the elapsed sanity bound instead
+// of passing vacuously.
+func TestStarlarkStepBudgetIsDeterministic(t *testing.T) {
+	e := New(WithStepLimit(50_000), WithEvalTimeout(time.Minute))
+	prog, err := e.Compile(`len([x for x in range(1000 * 1000) for y in range(1000)]) > 0`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for rep := 0; rep < 3; rep++ {
+		start := time.Now()
+		got, err := prog.Evaluate(context.Background(), testEnv())
+		elapsed := time.Since(start)
+		if err == nil || got {
+			t.Fatalf("rep %d: runaway completed (got=%v err=%v): step budget must abort", rep, got, err)
+		}
+		if !strings.Contains(err.Error(), "evaluation budget exceeded") || !strings.Contains(err.Error(), "too many steps") {
+			t.Fatalf("rep %d: want deterministic step-budget abort, got: %v", rep, err)
+		}
+		if elapsed > 5*time.Second {
+			t.Fatalf("rep %d: step-budget abort too slow: %s", rep, elapsed)
+		}
+	}
+}
+
+// TestStarlarkBoundedWorkCompletesUnderProductionDefaults is the negative
+// control for the race-scaled watchdog: a comprehension sized near a real
+// condition's ceiling (~80k of the 100k default steps) must complete with
+// production defaults — no error, correct result — under -race and load.
+// The assertion is the result, not a completion deadline.
+func TestStarlarkBoundedWorkCompletesUnderProductionDefaults(t *testing.T) {
+	prog, err := New().Compile(`len([x for x in range(8000)]) == 8000`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := prog.Evaluate(context.Background(), testEnv())
+	if err != nil {
+		t.Fatalf("bounded work must complete under production defaults: %v", err)
+	}
+	if !got {
+		t.Fatal("comprehension result wrong")
+	}
+}
+
+// TestStarlarkEvalTimeoutScaledOnRaceBuilds pins the load-tolerance
+// mechanism: -race builds scale the wall watchdog by raceWallScale (the
+// deterministic step budget stays unscaled); production builds keep it
+// unscaled.
+func TestStarlarkEvalTimeoutScaledOnRaceBuilds(t *testing.T) {
+	want := DefaultEvalTimeout
+	if raceEnabled {
+		want *= raceWallScale
+	}
+	if got := New().evalTimeout; got != want {
+		t.Fatalf("New() evalTimeout = %s, want %s (raceEnabled=%v)", got, want, raceEnabled)
+	}
+	wantCustom := 100 * time.Millisecond
+	if raceEnabled {
+		wantCustom *= raceWallScale
+	}
+	if got := New(WithEvalTimeout(100 * time.Millisecond)).evalTimeout; got != wantCustom {
+		t.Fatalf("WithEvalTimeout(100ms): evalTimeout = %s, want %s", got, wantCustom)
 	}
 }
 
