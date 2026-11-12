@@ -20,7 +20,7 @@ import {
   type WizardApplyOutcome, type WizardDeploymentPreset, type WizardResidencyPreset, type WizardSelection, type WizardSignals,
 } from '../lib/onboarding'
 
-// W-WELCOME: the 3-step welcome flow — (1) connect a provider key (BYOK,
+// The 3-step welcome flow — (1) connect a provider key (BYOK,
 // deep link to the provider-keys tab of organization settings), (2) create a
 // gateway key (deep link to the API-keys screen), (3) point the client at
 // the gateway (copy blocks verbatim from docs/clients/{opencode,claude-code,
@@ -30,7 +30,7 @@ import {
 //  - step completion is DERIVED LIVE (provider-credentials list, api-keys
 //    list, org request stats) — the org flag (api/onboarding.ts) only stores
 //    completed/skipped marks, so a step cannot lie because a stale flag says
-//    so; unknown/loading/error never read as done (OnboardingCard, TP-07);
+//    so; unknown/loading/error never read as done (OnboardingCard);
 //  - when every step confirms true the flow marks the org completed
 //    (POST /api/me/onboarding, best-effort: a 501-only deployment keeps
 //    working, the mark retries on the operator's next visit);

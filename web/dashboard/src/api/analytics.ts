@@ -111,7 +111,7 @@ export interface ShadowModelCompare {
   verdict: 'cheaper' | 'pricier' | 'insufficient_data'
 }
 
-// ADL-08: the task-tag dimension — cost + latency per (task class, primary,
+// The task-tag dimension — cost + latency per (task class, primary,
 // shadow) triple, from the same shadow join grouped by request_logs.task_id
 // (NULL → "(untagged)"). Field names match
 // ShadowTaskClassCompare (pkg/adminstore/shadow_compare.go).

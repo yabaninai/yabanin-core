@@ -1,4 +1,4 @@
-// PostHog CTA events (2026-09-14). Pageviews are handled by the snippet in
+// PostHog CTA events. Pageviews are handled by the snippet in
 // docusaurus.config.ts; this helper is for the handful of explicit,
 // named events on the landing page — nothing else is captured.
 type PostHogLike = { capture: (event: string, props?: Record<string, unknown>) => void }

@@ -3,7 +3,6 @@
 import { EXPR_CMP_OPS, EXPR_LIST_OPS, type ExprIssue } from '../../lib/matchExpr.ts'
 
 /**
- * D-18 (checklist «страница v2» IMP-40 acceptance: «пустое поле не красное»).
  * Validation feedback appears only AFTER the operator typed something — an
  * untouched or emptied field is neutral, never flagged. The submit path
  * re-checks the raw issues, so an empty required expression still cannot be
