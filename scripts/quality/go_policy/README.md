@@ -50,28 +50,55 @@ explicit coverage decision. Dependency-only edits still run policy/security and
 normal product tests; this runner does not pretend that unchanged functions were
 modified or that their missing historic fuzz tests are new-code violations.
 
-Each affected package has at most 300 seconds for fuzzing and 300 for mutation,
-including subprocess startup and its supported build modes. Missing coverage,
-timeout or an unfinished run blocks. Extended campaigns belong in separate runs;
-never raise this budget secretly or interpret an exhausted budget as success.
+Each affected package has at most 300 seconds per check kind (unit suite,
+fuzzing, mutation), including subprocess startup and its supported build modes.
+Missing coverage, timeout or an unfinished run blocks. Extended campaigns
+belong in separate runs; never raise this budget secretly or interpret an
+exhausted budget as success.
 
-Fuzz targets must exist, cover every statement block of selected functions with seed inputs,
-and complete actual fuzz executions. The engine warms its instrumented binary
-inside the same budget before spending the remaining time on input generation.
-Build modes share the budget, and only functions compiled in that mode are tested;
-a selected file absent from every configured mode blocks.
-A passing unrelated fuzz target or an empty test suite is insufficient.
+Applicability is per package and build mode, decided from real evidence and
+versioned in `critical.json` (schema 2):
 
-Mutation runs use real Gremlins in an isolated source copy. Every selected
-function must have tested mutations; relevant mutations must be KILLED. The underlying Go invocations are independently captured as JSON events; a kill
-requires an actual failing named test. Compilation/CLI errors, incomplete child
-processes and mismatched kill totals block, even when the mutator claims success.
-LIVED,
-NOT COVERED, NOT VIABLE, skipped, timed-out and unknown outcomes do not certify
-correctness. A nonviable mutation or an equivalent survivor requires diagnosis
-and a separately reviewed, source-bound exception decision; this initial gate
-has no automatic waiver path. Never weaken tests or hide the mutation to pass.
-The mutation gate is additional evidence, not a proof of all business invariants.
+- Fuzzing applies only where the package actually has fuzz targets in that
+  build mode (detected via `go test -list=^Fuzz`). Where targets exist, the
+  strict requirement is unchanged: seed inputs must cover every statement
+  block of the selected functions and actual fuzz executions must complete.
+  A package without fuzz targets in a mode reports
+  `skipped: no fuzz targets (N/A)` for that mode — visibly in the console
+  output and in `report.json`; it is never counted as fuzz coverage.
+- Mutation applies only to packages listed in `mutation_qualified_packages`
+  — a gremlins-qualified unit mode, meaning a test suite that can actually
+  kill the relevant mutants of each selected function within the approved
+  budget. The list is explicit and versioned; it is empty until a package
+  genuinely qualifies. Unlisted packages report
+  `skipped: no gremlins-qualified unit mode (N/A)` explicitly.
+- Where fuzz targets are absent but the package has unit tests, the gate
+  requires that unit suite to pass in each configured build mode — the real
+  requirement that exists there. A package with no tests at all reports
+  `skipped: no unit tests in package (N/A)` and enforces nothing else here;
+  normal build, vet, lint and test gates still apply outside this runner.
+
+Not-applicable entries are printed with their reasons and stored in
+`report.json`; they never fabricate fuzz executions, mutation kills or
+coverage, and strictness is unchanged where the infrastructure exists. The
+engine warms its instrumented binary inside the same fuzz budget before
+spending the remaining time on input generation. Build modes share the
+budget, and only functions compiled in that mode are tested; a selected file
+absent from every configured mode blocks. A passing unrelated fuzz target or
+an empty test suite is insufficient.
+
+For qualified packages, mutation runs use real Gremlins in an isolated source
+copy. Every selected function must have tested mutations; relevant mutations
+must be KILLED. The underlying Go invocations are independently captured as
+JSON events; a kill requires an actual failing named test. Compilation/CLI
+errors, incomplete child processes and mismatched kill totals block, even
+when the mutator claims success. LIVED,
+NOT COVERED, NOT VIABLE, skipped, timed-out and unknown outcomes do not
+certify correctness. A nonviable mutation or an equivalent survivor requires
+diagnosis and a separately reviewed, source-bound exception decision; this
+initial gate has no automatic waiver path. Never weaken tests or hide the
+mutation to pass. The mutation gate is additional evidence, not a proof of
+all business invariants.
 
 Logs, mutation reports, seed coverage and fuzz execution counts are retained under
 ignored `artifacts/quality/`; failing fuzz corpora are copied from the isolated

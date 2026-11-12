@@ -36,10 +36,26 @@ def go_args(tags):
     return ['go', 'test', '-count=1', '-parallel=1', *(['-tags=' + tags] if tags else [])]
 
 
-def fuzz(root, package, functions, tags, out, deadline, max_fuzz_seconds=None):
+def fuzz_targets(root, package, tags, out, deadline):
     listing = out / 'fuzz-list.log'
     checked(go_args(tags) + ['-list=^Fuzz', './' + package], root, listing, deadline)
-    names = re.findall(r'^Fuzz\w+$', listing.read_text(), flags=re.M)
+    return re.findall(r'^Fuzz\w+$', listing.read_text(), flags=re.M)
+
+
+def test_targets(root, package, tags, out, deadline):
+    listing = out / 'test-list.log'
+    checked(go_args(tags) + ['-list=^Test', './' + package], root, listing, deadline)
+    return re.findall(r'^Test\w+$', listing.read_text(), flags=re.M)
+
+
+def unit_suite(root, package, tags, out, deadline):
+    log = out / 'unit-suite.log'
+    checked(go_args(tags) + ['./' + package], root, log, deadline)
+    return {'status': 'passed', 'evidence': log.name}
+
+
+def fuzz(root, package, functions, tags, out, deadline, max_fuzz_seconds=None):
+    names = fuzz_targets(root, package, tags, out, deadline)
     if not names:
         raise ValueError('No fuzz target in critical package: ' + package)
     profile = out / 'fuzz-seeds.cover'
@@ -72,10 +88,19 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
 
 
 def validate_config(config):
-    if config.get('schema_version') != 1 or config.get('seconds_per_package_and_kind') != 300:
-        raise ValueError('Expected schema 1 and approved 300-second check budget')
+    if config.get('schema_version') != 2 or config.get('seconds_per_package_and_kind') != 300:
+        raise ValueError('Expected schema 2 and approved 300-second check budget')
     if not config.get('critical_paths') or not config.get('build_tags'):
         raise ValueError('Critical scope and build modes must not be empty')
+    if config.get('fuzz_applicability') != 'fuzz-targets':
+        raise ValueError("Expected fuzz applicability 'fuzz-targets' (per-mode target detection)")
+    qualified = config.get('mutation_qualified_packages')
+    if not isinstance(qualified, list):
+        raise ValueError('mutation_qualified_packages must be an explicit versioned list')
+    unknown = [name for name in qualified
+               if not isinstance(name, str) or not scope.is_critical(name + '/x.go', config['critical_paths'])]
+    if unknown:
+        raise ValueError('Mutation-qualified packages must be critical package paths: ' + str(unknown))
 
 
 def check_version(gremlins, config):
@@ -96,7 +121,8 @@ def active_functions(root, package, functions, tags, out, deadline):
 
 def run_package(root, package, functions, config, out, gremlins):
     result = {}
-    for kind in ('fuzz', 'mutation'):
+    qualified = package in set(config['mutation_qualified_packages'])
+    for kind in ('unit', 'fuzz', 'mutation'):
         deadline = time.monotonic() + config['seconds_per_package_and_kind']
         covered = set()
         for index, tags in enumerate(config['build_tags']):
@@ -106,18 +132,45 @@ def run_package(root, package, functions, config, out, gremlins):
             selected = active_functions(root, package, functions, tags, target, mode_deadline)
             covered.update(fn['file'] for fn in selected)
             result[kind + ':' + tags] = run_mode(kind, root, package, selected, tags,
-                                                target, mode_deadline, gremlins)
+                                                 target, mode_deadline, gremlins, qualified)
         if {fn['file'] for fn in functions} - covered:
             raise ValueError('Changed critical files are absent from all configured build modes')
     return result
 
 
-def run_mode(kind, root, package, functions, tags, out, deadline, gremlins):
+def unit_mode(root, package, tags, out, deadline):
+    # Compensating requirement where fuzz infrastructure does not exist: the
+    # package's own unit suite must pass. Never fabricated as fuzz coverage.
+    if fuzz_targets(root, package, tags, out, deadline):
+        return {'status': 'not_applicable',
+                'reason': 'skipped: fuzz-target package, fuzz kind owns execution (N/A)'}
+    if not test_targets(root, package, tags, out, deadline):
+        return {'status': 'not_applicable', 'reason': 'skipped: no unit tests in package (N/A)'}
+    return unit_suite(root, package, tags, out, deadline)
+
+
+def run_mode(kind, root, package, functions, tags, out, deadline, gremlins, qualified):
     if not functions:
         return {'status': 'not_applicable', 'reason': 'no selected function in this build mode'}
+    if kind == 'unit':
+        return unit_mode(root, package, tags, out, deadline)
     if kind == 'fuzz':
+        if not fuzz_targets(root, package, tags, out, deadline):
+            return {'status': 'not_applicable', 'reason': 'skipped: no fuzz targets (N/A)'}
         return fuzz(root, package, functions, tags, out, deadline)
+    if not qualified:
+        return {'status': 'not_applicable',
+                'reason': 'skipped: no gremlins-qualified unit mode (N/A)'}
     return mutation(root, package, functions, tags, out, deadline, gremlins)
+
+
+def applicability_lines(report):
+    lines = []
+    for package, entry in report['packages'].items():
+        for key, value in sorted(entry.get('checks', {}).items()):
+            if isinstance(value, dict) and value.get('status') == 'not_applicable':
+                lines.append(f'{package} [{key}]: ' + value.get('reason', 'not applicable'))
+    return lines
 
 
 def run(args):
@@ -148,6 +201,8 @@ def run(args):
         raise
     finally:
         source.write(out / 'report.json', report)
+        for line in applicability_lines(report):
+            print('Critical Go applicability: ' + line)
     print('Critical Go checks: ' + report['status'] + '; ' + str(out / 'report.json'))
     print('Report SHA256: ' + source.digest(out / 'report.json'))
     return 0

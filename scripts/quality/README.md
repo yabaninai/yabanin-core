@@ -96,6 +96,9 @@ and follow the separate release review process before distributing artifacts.
 
 Install `make install-analysis-tools install-critical-tools`. Changed Go work and
 the full profile include `go-policy` and `critical-go`; see the
-[scope, budgets and negative controls](go_policy/README.md). Preserve the original
+[scope, budgets and negative controls](go_policy/README.md). Critical fuzz and
+mutation requirements apply only where a package actually has that
+infrastructure; missing applicability is reported explicitly, never silently.
+Preserve the original
 task base for local execution and candidate evidence. Untouched analyzer debt is
 reported separately. A missing tool or missing relevant critical coverage blocks.

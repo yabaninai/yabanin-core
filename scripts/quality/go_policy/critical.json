@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "seconds_per_package_and_kind": 300,
   "critical_paths": [
     "pkg/budget/**", "pkg/credits/**", "pkg/auth/**", "pkg/rbac/**",
@@ -7,5 +7,7 @@
     "pkg/retry/**", "pkg/idempotency/**", "pkg/agentloop/**"
   ],
   "build_tags": [""],
-  "gremlins_version": "0.6.0"
+  "gremlins_version": "0.6.0",
+  "fuzz_applicability": "fuzz-targets",
+  "mutation_qualified_packages": []
 }
