@@ -13,10 +13,16 @@ permissions:
   contents: read
   pages: write
   id-token: write
+  actions: read # pre-deploy guard reads this run's artifacts
 
 concurrency:
   group: pages
   cancel-in-progress: true
+
+env:
+  # Single source of truth for the artifact name: upload-pages-artifact
+  # `name`, deploy-pages `artifact_name` and the pre-deploy guard must agree.
+  PAGES_ARTIFACT: github-pages
 
 jobs:
   deploy:
@@ -38,5 +44,12 @@ jobs:
       - uses: actions/upload-pages-artifact@v5
         with:
           path: web/site/build
+          name: ${{ env.PAGES_ARTIFACT }}
+      - name: Verify Pages artifact
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+        run: python3 scripts/ci/pages_artifact_guard.py
       - id: deployment
         uses: actions/deploy-pages@v5
+        with:
+          artifact_name: ${{ env.PAGES_ARTIFACT }}
