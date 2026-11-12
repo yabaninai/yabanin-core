@@ -352,8 +352,17 @@ a:focus-visible, button:focus-visible, summary:focus-visible, input:focus-visibl
   }
 }
 
+/* Routing topology canvas (CV-01): selection highlights ease over 140ms.
+   Purely presentational — opacity/stroke only, no movement, no entry animation. */
+.routing-topo .topo-edge,
+.routing-topo .topo-node {
+  transition: opacity 140ms ease-out, stroke 140ms ease-out;
+}
+
 @media (prefers-reduced-motion: reduce) {
   .motion-safe\:animate-pulse { animation: none; }
+  .routing-topo .topo-edge,
+  .routing-topo .topo-node { transition: none; }
 }
 
 /* Tighter card padding on phones (space stays token-driven). */

@@ -18,6 +18,7 @@ import {
   type RoutingMap, type RoutingMapModel, type RoutingMapRule, type RoutingMapWarning,
   type ProviderHealth, type ProviderHealthModel, type ProviderHealthReport,
 } from '../api/routing'
+import { ApiError } from '../api/transport'
 import { PageHeader } from '../components/astra/PageHeader'
 import { StateNotice } from '../components/astra/StateNotice'
 import { RoutingGraphSection } from '../components/astra/RoutingGraph'
@@ -25,6 +26,7 @@ import { DataTable, type DataTableColumn } from '../components/astra/DataTable'
 import { GlobalScopeBar } from '../components/GlobalScopeBar'
 import { useGlobalScope } from '../hooks/useGlobalScope'
 import { currentHashQuery, relatedListHref } from '../lib/inspectUrl'
+import { missingTargetNames } from '../lib/routingTopology'
 import { formatDateTime } from '../i18n/format'
 
 type LoadState = 'idle' | 'loading' | 'ready' | 'failed'
@@ -71,6 +73,12 @@ export function RoutingMapPage() {
 
   const [map, setMap] = useState<RoutingMap | null>(null)
   const [mapState, setMapState] = useState<LoadState>('idle')
+  // Why the last map load failed (undefined status = network/unknown). The
+  // notice copy branches on it: session/permission, membership-vs-foreign-org
+  // (the API answers 404 for both), or a plain failure.
+  const [mapError, setMapError] = useState<{ status?: number; message: string } | null>(null)
+  // Bumping this re-runs the map effect (the notices' retry action).
+  const [mapTick, setMapTick] = useState(0)
   const [health, setHealth] = useState<ProviderHealthReport | null>(null)
   const [healthState, setHealthState] = useState<LoadState>('idle')
   const mapGen = useRef(0)
@@ -80,6 +88,7 @@ export function RoutingMapPage() {
     if (!org) {
       setMap(null)
       setMapState('idle')
+      setMapError(null)
       return
     }
     const g = ++mapGen.current
@@ -90,14 +99,18 @@ export function RoutingMapPage() {
         if (!live || mapGen.current !== g) return
         setMap(res)
         setMapState('ready')
+        setMapError(null)
       })
-      .catch(() => {
+      .catch((err: unknown) => {
         if (!live || mapGen.current !== g) return
+        // Honest failure: drop the stale map instead of painting old data
+        // as if it were current — the notice says what happened.
         setMap(null)
         setMapState('failed')
+        setMapError(err instanceof ApiError ? { status: err.status, message: err.message } : { message: String(err) })
       })
     return () => { live = false }
-  }, [org])
+  }, [org, mapTick])
 
   useEffect(() => {
     if (!org) {
@@ -141,6 +154,10 @@ export function RoutingMapPage() {
     [health],
   )
 
+  // Configured-but-unregistered targets: the honest input behind the partial
+  // notice (phantoms in the graph, missing rows in the tables).
+  const missingTargets = useMemo(() => (map === null ? [] : missingTargetNames(map)), [map])
+
   return (
     <div className="space-y-6">
       <PageHeader title={t('routingMap.title')} purpose={t('routingMap.purpose')} />
@@ -148,14 +165,16 @@ export function RoutingMapPage() {
       {!org && <StateNotice state="not-loaded" message={t('routingMap.notLoaded')} />}
       {org && (
         <div className="space-y-6">
-          {mapState === 'failed' && <StateNotice state="error" message={t('routingMap.mapFailed')} />}
-          {mapState === 'loading' && <StateNotice state="loading" />}
-          {mapState === 'ready' && map && (
+          <MapStatusBlock mapState={mapState} map={map} mapError={mapError} onRetry={() => setMapTick(n => n + 1)} />
+          {map !== null && (mapState === 'ready' || mapState === 'loading') && (
             <>
+              <MissingTargetsNotice names={missingTargets} />
               <WarningsPanel warnings={map.warnings} />
-              {/* Brief §(e) routing viz: the read-only route map (possible
-                  routes). The tables below carry the same payload — the
-                  graph is the visual alternative, not a second data source. */}
+              {/* CV-01 (V01 rendering child): the configuration-topology
+                  visualizer (alias → rule → model → provider lanes, olive
+                  selected path). The tables below carry the same payload —
+                  the graph is the visual alternative, not a second data
+                  source. */}
               <RoutingGraphSection map={map} />
               <ChainsSection map={map} warningsFor={warningsFor} />
               <AliasesSection map={map} warningsFor={warningsFor} />
@@ -509,4 +528,73 @@ function HealthSection({ health, modelRows }: {
       />
     </section>
   )
+}
+
+/** Copy for a failed map load, branched on the HTTP status the API contract defines. */
+function mapFailCopy(status: number | undefined, t: T): string {
+  if (status === 401 || status === 403) return t('routingMap.mapSessionRequired')
+  if (status === 404) return t('routingMap.mapNoAccess')
+  return t('routingMap.mapFailed')
+}
+
+/**
+ * The failed-map notice: what the API contract actually means by the status
+ * (session/permission; the API answers 404 for a foreign org AND for a
+ * member without routing permission — indistinguishable by design, so the
+ * copy says both), plus the one useful next action: retry.
+ */
+function MapStateNotices({ error, onRetry }: { error: { status?: number; message: string } | null; onRetry: () => void }) {
+  const { t } = useTranslation()
+  return (
+    <StateNotice
+      state="error"
+      message={mapFailCopy(error?.status, t)}
+      action={{ label: t('common.retry'), onClick: onRetry }}
+    />
+  )
+}
+
+/**
+ * The partial input, named: targets that chains/aliases/rules point at but
+ * that have no registry row. The graph shows them as dashed phantoms; this
+ * notice says the same fact in words (code font, not a fake table).
+ */
+function MissingTargetsNotice({ names }: { names: string[] }) {
+  const { t } = useTranslation()
+  if (names.length === 0) return null
+  return (
+    <StateNotice
+      state="partial"
+      message={t('routingMap.mapPartial')}
+      details={
+        <span style={{ fontFamily: 'var(--astra-font-code)' }}>
+          {names.join(' · ')}
+        </span>
+      }
+    />
+  )
+}
+
+/**
+ * Map-scope status notices, extracted so the page body stays flat: failed
+ * copy (status-branched) or the loading/stale distinction — a refresh with
+ * no data yet is "loading", a refresh over still-renderable data is
+ * "stale" and keeps the graph visible below.
+ */
+function MapStatusBlock({ mapState, map, mapError, onRetry }: {
+  mapState: LoadState
+  map: RoutingMap | null
+  mapError: { status?: number; message: string } | null
+  onRetry: () => void
+}) {
+  const { t } = useTranslation()
+  if (mapState === 'failed') {
+    return <MapStateNotices error={mapError} onRetry={onRetry} />
+  }
+  if (mapState === 'loading') {
+    return map === null
+      ? <StateNotice state="loading" />
+      : <StateNotice state="stale" message={t('routingMap.mapStale')} />
+  }
+  return null
 }
