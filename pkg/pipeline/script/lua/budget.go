@@ -35,7 +35,11 @@ type budgetContext struct {
 	ceiling    *time.Timer
 }
 
-func newBudgetContext(parent context.Context, maxSteps int64, ceiling time.Duration) *budgetContext {
+// newBudgetContext returns the same object twice, like context.WithTimeout
+// returns (ctx, cancel): the context.Context form is what the VM (and
+// context-analyzer tooling) sees as derived from parent; the concrete
+// handle carries Err/stop for the caller's epilogue.
+func newBudgetContext(parent context.Context, maxSteps int64, ceiling time.Duration) (context.Context, *budgetContext) {
 	b := &budgetContext{
 		parent:     parent,
 		parentDone: parent.Done(), // stable for standard contexts; nil never fires
@@ -49,7 +53,7 @@ func newBudgetContext(parent context.Context, maxSteps int64, ceiling time.Durat
 	if ceiling > 0 {
 		b.ceiling = time.AfterFunc(ceiling, func() { b.finish(errWallCeiling) })
 	}
-	return b
+	return b, b
 }
 
 // Done counts one VM instruction dispatch. Caller cancellation is checked

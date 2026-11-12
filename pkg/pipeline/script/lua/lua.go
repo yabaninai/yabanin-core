@@ -253,23 +253,14 @@ func (p *program) Evaluate(ctx context.Context, env pipeline.ConditionEnv) (bool
 	resetGlobals(L)
 	setEnv(L, env)
 
-	budget := newBudgetContext(ctx, e.maxSteps, e.evalTimeout)
+	budgetCtx, budget := newBudgetContext(ctx, e.maxSteps, e.evalTimeout)
 	defer budget.stop()
-	L.SetContext(budget)
+	L.SetContext(budgetCtx)
 	L.Push(L.NewFunctionFromProto(p.proto))
 	err := L.PCall(0, 1, nil)
 	L.RemoveContext()
 	if err != nil {
-		switch {
-		case ctx.Err() != nil:
-			return false, fmt.Errorf("lua: caller context: %w", ctx.Err())
-		case errors.Is(budget.Err(), errStepBudget):
-			return false, fmt.Errorf("lua: evaluation budget exceeded (%d steps): %w", e.maxSteps, err)
-		case errors.Is(budget.Err(), errWallCeiling):
-			return false, fmt.Errorf("lua: evaluation budget exceeded (%s wall): %w", e.evalTimeout, err)
-		default:
-			return false, fmt.Errorf("lua: %w", err)
-		}
+		return false, abortError(ctx, budget, err, e)
 	}
 
 	res := L.Get(-1)
@@ -280,6 +271,21 @@ func (p *program) Evaluate(ctx context.Context, env pipeline.ConditionEnv) (bool
 	}
 	clean = true
 	return bool(b), nil
+}
+
+// abortError classifies a failed PCall: caller cancellation keeps the
+// caller's cause; a tripped budget names the limit that fired.
+func abortError(ctx context.Context, b *budgetContext, err error, e *Engine) error {
+	switch {
+	case ctx.Err() != nil:
+		return fmt.Errorf("lua: caller context: %w", ctx.Err())
+	case errors.Is(b.Err(), errStepBudget):
+		return fmt.Errorf("lua: evaluation budget exceeded (%d steps): %w", e.maxSteps, err)
+	case errors.Is(b.Err(), errWallCeiling):
+		return fmt.Errorf("lua: evaluation budget exceeded (%s wall): %w", e.evalTimeout, err)
+	default:
+		return fmt.Errorf("lua: %w", err)
+	}
 }
 
 func checkEnvironmentBudget(env pipeline.ConditionEnv) error {

@@ -79,51 +79,54 @@ func partnerInitVersion(t *testing.T, requested string) (string, string) {
 	return resp.Result.ProtocolVersion, resp.Result.ServerInfo.Name
 }
 
+// partnerVersionRow is one initialize-negotiation oracle: requested in,
+// negotiated protocolVersion out.
+type partnerVersionRow struct {
+	requested string
+	want      string
+}
+
+// partnerMatrixRows derives the negotiation table from the SDK's own sets.
+// Modern protocol revisions removed the initialize handshake (stateless
+// core, reached via server/discover, which this bridge does not expose), so
+// initialize never negotiates them: modern and unknown non-empty requests
+// cap at the SDK's LATEST_LEGACY_PROTOCOL_VERSION. A MISSING version is
+// different: the SDK applies the spec's header-assumption rule (assume
+// 2025-03-26) — an intentional asymmetry versus the native endpoint, whose
+// missing initialize param falls back to its latest.
+func partnerMatrixRows() []partnerVersionRow {
+	rows := make([]partnerVersionRow, 0, len(mcp.ValidProtocolVersions)+4)
+	for _, v := range mcp.LegacyProtocolVersions() {
+		rows = append(rows, partnerVersionRow{requested: v, want: v})
+	}
+	for _, v := range mcp.ValidProtocolVersions {
+		if mcp.IsModernProtocol(v) {
+			rows = append(rows, partnerVersionRow{requested: v, want: mcp.LATEST_LEGACY_PROTOCOL_VERSION})
+		}
+	}
+	for _, v := range []string{"1999-01-01", "2030-01-01", "garbage"} {
+		rows = append(rows, partnerVersionRow{requested: v, want: mcp.LATEST_LEGACY_PROTOCOL_VERSION})
+	}
+	return append(rows, partnerVersionRow{requested: "", want: "2025-03-26"})
+}
+
 // TestPartnerVersionMatrix pins the SDK-side negotiation: every legacy
 // SDK-valid version echoes exactly; modern and unknown non-empty requests
 // cap at the SDK's latest legacy version (explicit, never an echo of the
-// requested value).
+// requested value). The serverInfo identity is asserted on every row.
 func TestPartnerVersionMatrix(t *testing.T) {
 	// The initialize-negotiable ceiling must itself be a known version.
 	if !slices.Contains(mcp.ValidProtocolVersions, mcp.LATEST_LEGACY_PROTOCOL_VERSION) {
 		t.Fatalf("SDK latest legacy %q not a member of its own valid set", mcp.LATEST_LEGACY_PROTOCOL_VERSION)
 	}
-	for _, v := range mcp.LegacyProtocolVersions() {
-		got, name := partnerInitVersion(t, v)
-		if got != v {
-			t.Fatalf("SDK legacy %q negotiated to %q, want exact echo", v, got)
+	for _, row := range partnerMatrixRows() {
+		got, name := partnerInitVersion(t, row.requested)
+		if got != row.want {
+			t.Fatalf("initialize(%q) negotiated to %q, want %q", row.requested, got, row.want)
 		}
 		if name != "yabanin-mcp" {
-			t.Fatalf("serverInfo.name = %q, want yabanin-mcp", name)
+			t.Fatalf("initialize(%q) serverInfo.name = %q, want yabanin-mcp", row.requested, name)
 		}
-	}
-	// Modern protocol revisions removed the initialize handshake, so
-	// initialize never negotiates them: the SDK caps at its latest legacy
-	// version. Clients reach the modern protocol via server/discover,
-	// which this bridge does not expose.
-	for _, v := range mcp.ValidProtocolVersions {
-		if !mcp.IsModernProtocol(v) {
-			continue
-		}
-		got, _ := partnerInitVersion(t, v)
-		if got != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
-			t.Fatalf("modern %q via initialize negotiated to %q, want capped %q", v, got, mcp.LATEST_LEGACY_PROTOCOL_VERSION)
-		}
-	}
-	// Unknown non-empty requests cap at the SDK's latest legacy version —
-	// explicit, never an echo of the unknown value. A MISSING version is
-	// different: the SDK applies the spec's header-assumption rule (no
-	// version identifier available → assume 2025-03-26), an intentional
-	// asymmetry versus the native endpoint, whose missing initialize param
-	// falls back to its latest (pkg/mcpserver negotiateProtocolVersion).
-	for _, requested := range []string{"1999-01-01", "2030-01-01", "garbage"} {
-		got, _ := partnerInitVersion(t, requested)
-		if got != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
-			t.Fatalf("unknown %q negotiated to %q, want explicit SDK latest legacy %q", requested, got, mcp.LATEST_LEGACY_PROTOCOL_VERSION)
-		}
-	}
-	if got, _ := partnerInitVersion(t, ""); got != "2025-03-26" {
-		t.Fatalf("missing version negotiated to %q, want the spec's assumed %q", got, "2025-03-26")
 	}
 }
 
