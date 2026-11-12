@@ -214,6 +214,12 @@ unreadable. Shell-expanded values passed as arguments can be visible in process
 listings. Do not paste keys, database URIs, or private request content into bug
 reports.
 
+Committed history is scanned by pinned Gitleaks via the
+`history/commit-secrets` gate. Reviewed false positives and synthetic test
+fixtures are recorded in `.gitleaks.toml` as exact-value, fully anchored
+allowlist entries with a justification; unanchored, pattern-based, or
+path-wide allowlist entries hide real findings and are not permitted.
+
 Boolean configuration values handled by the shared parser accept `1` or
 `true` (case-insensitive) as true; other non-empty values are false. Strict
 numeric parsing does not make arbitrary boolean spellings valid. Validate

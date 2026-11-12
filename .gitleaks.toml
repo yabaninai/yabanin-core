@@ -1,0 +1,109 @@
+# Gitleaks configuration for Yabanin Core. The scanner runs pinned default
+# rules only (see scripts/security/scanner-lock.json); this file appends
+# reviewed allowlists. Gate: make _quality-commit-secrets /
+# _quality-history-secrets (scripts/security/secret_audit.py).
+#
+# Convention: every entry is anchored (^...$) to exactly one captured value
+# (regexTarget = "secret") and was individually reviewed as a synthetic test
+# fixture or a non-credential identifier. Real issued credentials never equal
+# these constants, so unanchored, pattern-based or path-wide allowlists are
+# forbidden here; add a new exact value with a justification instead.
+
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "This config quotes the key-shaped literals it allowlists"
+paths = ['''(^|/)\.gitleaks\.toml$''']
+
+[[allowlists]]
+description = "Dashboard localStorage namespace keys and an i18n message key: behavior-bearing identifier literals, not credentials (web/dashboard/src/lib)"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^yabanin\.orgScope\.v1$''',
+  '''^yabanin\.globalScope\.v1$''',
+  '''^signals\.latencyP95Jump$''',
+]
+
+[[allowlists]]
+description = "Local KMS/HMAC test keys made of sequential hex, set via t.Setenv in pkg/kms tests; inert by construction"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^(0123456789abcde|0123456789abcdef|0123456789abcdef0123456789abcdef|0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef|fedcba9876543210fedcba9876543210fedcba9876543210fedcba9876543210|00112233445566778899aabbccddeeff)$''',
+]
+
+[[allowlists]]
+description = "Sentinel strings planted by redaction/scrubbing tests that assert these values get masked"
+targetRules = ["generic-api-key", "jwt", "curl-auth-header"]
+regexTarget = "secret"
+regexes = [
+  '''^sk-1234567890$''',
+  '''^hunter2-planted\d{0,4}$''',
+  '''^abc123digest$''',
+  '''^AbcDef0123456789$''',
+  '''^zX9mQp1kLw2v$''',
+  '''^zq-7431-canary$''',
+  '''^n04-live-saml-secret$''',
+  '''^demo-shadow-key$''',
+  '''^eyJhbGciOiJIUzI1NiJ9\.eyJzdWIiOiIxMjM0NX0\.c2VjcmV0c2lnbmF0dXJl$''',
+  '''^eyJhbGciOiJub25lIn0\.eyJzdWIiOiJ1c2VyNDIzfQ\.c2VjcmV0LXNpZ25hdHVyZQ$''',
+]
+
+[[allowlists]]
+description = "Synthetic provider-key fixtures (probe/integration/fixture-marked sk-, yb_live_, pk-, at-/rt- literals) used by boundary and rotation tests and their testdata"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^sk-rotation-probe-0123456789abcdef-SECRET$''',
+  '''^sk-byok-probe-0123456789abcdef-SECRET-TAIL$''',
+  '''^sk-imp90-probe-0123456789abcdef0123456789abcdef$''',
+  '''^sk-internalkey123456$''',
+  '''^sk-1234abcdef123456$''',
+  '''^sk-live-abcdef1234567890$''',
+  '''^sk-abcdefghijklmnop123456$''',
+  '''^sk-abcdefghijklmnop12345678$''',
+  '''^sk-abcdef1234567890abcdef$''',
+  '''^sk-integration-abcdef123456$''',
+  '''^sk-mcpagg-echo-headers-4d8e1f60$''',
+  '''^sk-r067-integration-rotated-0809$''',
+  '''^yb_live_9f8e7d6c5b4a$''',
+  '''^pk-boundary-partner-3f2b9c$''',
+  '''^pk-boundary-partner-aa11bb$''',
+  '''^at-abcdef-1234$''',
+  '''^rt-abcdef-5678$''',
+  '''^abcdefgh12345678$''',
+  '''^fixture-pseudonym-9f8e7d6c$''',
+  '''^fixture-pseudonym-t10$''',
+  '''^ik_live_T10_SECRET$''',
+]
+
+[[allowlists]]
+description = "Idempotency keys, session/invite UUIDs and digest-shaped identifiers: not credentials"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^idem-n09p1t06-joint$''',
+  '''^idem-n09p1t08-retry$''',
+  '''^a1b2c3d4-e5f6-7890-abcd-ef1234567890$''',
+  '''^018c2f3e-9c1a-7c34-9f2e-0d5a1b6c3e4f\.4f0a80c4e1d94e2ba56cd0f71e92aa64$''',
+]
+
+[[allowlists]]
+description = "AWS-shaped test access-key IDs spelled SYNTHETICFIXTURE / YABANINLOCALTEST (datasets/eval corpus, S3 export test)"
+targetRules = ["aws-access-token"]
+regexTarget = "secret"
+regexes = [
+  '''^AKIASYNTHETICFIXTURE$''',
+  '''^AKIAYABANINLOCALTEST$''',
+]
+
+[[allowlists]]
+description = "Documentation examples: the published yag_ key-shape sample in docs/agent-governance.md and prose about secret detectors in docs/mcp-gateway.md"
+targetRules = ["generic-api-key"]
+regexTarget = "secret"
+regexes = [
+  '''^yag_9f2c1a4b7e8d30f6a5c9b2d1e4f7a8c3$''',
+  '''^flag/mask/deny$''',
+]

@@ -1,6 +1,19 @@
-# Reviewed license metadata exceptions. These do not waive vulnerabilities.
+# Reviewed security exceptions. Secret-scan entries allow exact reviewed
+# files only; license entries do not waive vulnerabilities.
 schema: 1
 exceptions:
+  - id: openai-key
+    path: .gitleaks.toml
+    reason: config quotes synthetic sk- fixtures as anchored exact-value allowlist regexes; not credentials
+    owner: yabanin
+    expires: 2027-11-12
+    scanner: secret_scan
+  - id: aws-access-key
+    path: .gitleaks.toml
+    reason: config quotes synthetic AKIA test access-key IDs as anchored exact-value allowlist regexes; not credentials
+    owner: yabanin
+    expires: 2027-11-12
+    scanner: secret_scan
   - id: npm-eval-no-license-metadata
     path: node_modules/eval
     scope: web/site/package-lock.json
