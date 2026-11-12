@@ -91,6 +91,8 @@ waivers to obtain a passing result.
 License metadata exceptions are versioned, scoped and expire. They do not waive
 vulnerabilities or grant release clearance. Preserve complete upstream notices
 and follow the separate release review process before distributing artifacts.
+The exceptions registry is shared across scanners: every entry names its
+scanner, and each gate reads only its own entries.
 
 ## Go policy and critical behavior
 
