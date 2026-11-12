@@ -12,8 +12,9 @@ import { validateKeyLabels, type LabelProblem } from '../../lib/labels'
 import { relatedListHref, currentHashQuery } from '../../lib/inspectUrl'
 import { formatMoneyCell } from '../../lib/columnFormat'
 
-// inspector fields, the "Effective policy" panel (layered org → team → key →
-// renders only when the API provides the fields. The labels editor (AT-13)
+// The key card: inspector fields and the "Effective policy" panel (layered
+// org → team → key → agent) render only when the API provides the fields.
+// The labels editor
 // rides along as drawer content; the raw secret is never shown.
 
 export function KeyDrawer({
@@ -211,7 +212,7 @@ function LimitsSection({ apiKey }: { apiKey: APIKey }) {
   )
 }
 
-// AT-13 labels editor (moved from the inline expanded row into the key card;
+// Labels editor (moved from the inline expanded row into the key card;
 // same DOM contract: chips, Key/Value inputs, Add, validation alert, save).
 export function KeyLabelsBlock({ apiKey, canManage, hint, onSaved }: { apiKey: APIKey; canManage: boolean; hint?: string; onSaved: (next: APIKey) => void }) {
   const { t } = useTranslation()
@@ -259,7 +260,7 @@ export function KeyLabelsBlock({ apiKey, canManage, hint, onSaved }: { apiKey: A
     setKeyValue('')
   }
 
-  // AUX-12: label/mode save is low risk and reversible — no dialog; the
+  // Label/mode save is low risk and reversible — no dialog; the
   // toast's Undo restores the pre-save label set and mode switches.
   const labelSaveAction = useAction({ id: 'keys.labels', risk: 'low', permission: 'keys.manage', reversible: true })
 

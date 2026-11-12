@@ -9,18 +9,17 @@ import {
 import { FormDrawer } from '../../components/astra/FormDrawer'
 import { ALL_OPS, appendClause, buildClause, isListOp, showsError, visibleIssues } from './helpers'
 
-// one FormDrawer holds the constructor, the raw expression text and the
-// AUX-19 server preview, expanded by default. Contract carried over from
-// ASTR-08 / AUX-19:
+// One FormDrawer holds the constructor, the raw expression text and the
+// server preview, expanded by default. Contract:
 //   * the expression language is the gateway's own (pkg/rulesengine) and the
 //     client linter only mirrors it; the server preview stays the single
 //     arbiter of a verdict;
-//   * D-18: validation feedback appears only after the operator typed
+//   * validation feedback appears only after the operator typed
 //     (visibleIssues gate) — an untouched or emptied field is never red;
 //     the submit path re-checks and throws, so an invalid draft still
 //     cannot be saved (inline error, drawer stays open).
 
-// AUX-19: request-side sample fields for the server preview. org_id is NOT
+// Request-side sample fields for the server preview. org_id is NOT
 // among them — the org scope is the admin session's trusted header, so the
 // verdict always describes what the gateway would really do.
 const PREVIEW_SAMPLE_FIELDS = ['model_requested', 'session_id', 'client_ip', 'user_agent'] as const
@@ -35,7 +34,7 @@ export interface RuleFormDrawerProps {
   open: boolean
   /** The rule being edited; null = create. */
   editing: RoutingRule | null
-  /** ADL-04 draft from the quality screen (create mode only). */
+  /** Draft from the quality screen (create mode only). */
   prefill?: RuleDraftPrefill | null
   /** The org the rule belongs to (the committed global scope). */
   orgId: string
@@ -60,14 +59,14 @@ export function RuleFormDrawer({ open, editing, prefill, orgId, models, onClose,
   const [builderField, setBuilderField] = useState<string>('model_requested')
   const [builderOp, setBuilderOp] = useState<string>(' starts_with ')
   const [builderValue, setBuilderValue] = useState('')
-  // AUX-19: the sample for the SERVER-side preview (org scope rides the
+  // The sample for the SERVER-side preview (org scope rides the
   // trusted session header — deliberately not an input here).
   const [previewSample, setPreviewSample] = useState<RulePreviewSample>({ ...EMPTY_SAMPLE })
   const [previewBusy, setPreviewBusy] = useState(false)
   const [previewResult, setPreviewResult] = useState<RulePreviewResponse | null>(null)
   const [previewError, setPreviewError] = useState<{ invalid: boolean; message: string } | null>(null)
 
-  // Fresh form per open: create starts empty (or from the ADL-04 draft),
+  // Fresh form per open: create starts empty (or from the quality-screen draft),
   // edit starts from the loaded row.
   useEffect(() => {
     if (!open) return
@@ -86,12 +85,12 @@ export function RuleFormDrawer({ open, editing, prefill, orgId, models, onClose,
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [open, editing])
 
-  // D-18: the linter always computes; the UI only SHOWS after input.
+  // The linter always computes; the UI only SHOWS after input.
   const linterIssues = useMemo(() => validateMatchExpr(matchExpr, t), [matchExpr, t])
   const shown = visibleIssues(matchExpr, linterIssues)
   const blocking = showsError(matchExpr, linterIssues)
 
-  // AUX-19: a stale verdict is worse than none — any edit to the draft or
+  // A stale verdict is worse than none — any edit to the draft or
   // the sample clears the last server answer.
   const resetPreview = () => { setPreviewResult(null); setPreviewError(null) }
   const edit = (apply: () => void) => {
@@ -102,7 +101,7 @@ export function RuleFormDrawer({ open, editing, prefill, orgId, models, onClose,
 
   const submit = async () => {
     if (!matchExpr.trim()) throw new Error(t('rules.exprRequired'))
-    // Full linter regardless of the D-18 display gate: an invalid draft
+    // Full linter regardless of the display gate: an invalid draft
     // never reaches the API (the server would reject it anyway).
     const all = validateMatchExpr(matchExpr, t)
     if (all.some(i => i.level === 'error')) throw new Error(t('rules.fixErrorsFirst'))
@@ -120,7 +119,7 @@ export function RuleFormDrawer({ open, editing, prefill, orgId, models, onClose,
     onSaved(true)
   }
 
-  // AUX-19: the honest server verdict — the draft + sample go to
+  // The honest server verdict — the draft + sample go to
   // POST /api/rules/preview (the same evaluator snapshot the gateway
   // compiles). The button is NOT gated by the client linter: the server is
   // the only arbiter and a malformed expression comes back as a
@@ -176,7 +175,7 @@ export function RuleFormDrawer({ open, editing, prefill, orgId, models, onClose,
           aria-describedby="rf-expr-help"
           className={`control min-w-0 max-w-full font-mono text-xs ${blocking ? 'border-[color:var(--astra-danger)]' : ''}`}
         />
-        {/* D-18: neutral guidance while the field is empty — no error. */}
+        {/* Neutral guidance while the field is empty — no error. */}
         <div id="rf-expr-help" role="status" className="mt-1">
           {shown.length === 0 ? (
             <p className="text-[11px] text-[color:var(--astra-text-muted)]">{t('rules.builderEmpty')}</p>

@@ -70,7 +70,7 @@ export interface GuardPackErrorView {
   kind: 'notFound' | 'conflict' | 'conflictState' | 'storeFailure' | 'unwired' | 'http'
   /** The server's own error text (verbatim; never rewritten by the UI). */
   serverMessage: string
-  /** The LIVE durable state a 409 conflict envelope carries (AF-09 parity). */
+  /** The LIVE durable state a 409 conflict envelope carries. */
   conflict?: { active_version?: string; previous_version?: string }
 }
 

@@ -1,4 +1,4 @@
-// W-BYOK (card W-BYOK-UI): pure helpers for the Provider keys settings
+// Pure helpers for the Provider keys settings
 // section. Kept side-effect free so the contract logic (mask, PATCH diffing,
 // test-result shaping) is unit-testable without a DOM — the section renders,
 // these decide.
@@ -56,7 +56,7 @@ type CreateParsed =
   | { ok: true; input: CreateProviderCredentialInput }
   | { ok: false; missing: CreateField[] }
 
-/** POST body per the frozen W-BYOK-API contract: {name, provider, base_url, key}. */
+/** POST body per the API contract: {name, provider, base_url, key}. */
 export function buildCreateInput(draft: CredentialDraft): CreateParsed {
   const name = draft.name.trim()
   const provider = draft.provider.trim()
@@ -228,7 +228,7 @@ export type RegistryLoadState =
 
 /**
  * Derives the registry load state: present data wins (a failed refresh keeps
- * the last good slice — AUX-23 refresh semantics), an error without data is
+ * the last good slice), an error without data is
  * the true outage, and everything else (first load in flight, not yet
  * loaded) is the transient loading state — suspended, but never failure copy.
  */
@@ -268,8 +268,8 @@ export interface CatalogCrossCheck {
  * unavailable (outage or still loading) and every state is suspended.
  * `testOk` is the credential's last connection-test verdict — the only
  * usability evidence a BYOK credential carries — applied to the registered
- * rows only: a snapshot-only id stays "discovered" (register it manually,
- * D-3/D-6) no matter how the test went.
+ * rows only: a snapshot-only id stays "discovered" (register it manually)
+ * no matter how the test went.
  */
 export function crossCheckCatalog(o: {
   snapshot: readonly string[] | undefined

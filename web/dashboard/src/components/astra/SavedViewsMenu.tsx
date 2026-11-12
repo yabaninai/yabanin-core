@@ -3,14 +3,14 @@ import { useTranslation } from 'react-i18next'
 import { useAction } from './ActionDialog'
 import { useDisclosureDismiss } from './disclosure'
 
-// AUX-22 — the general «Виды ▾» saved-views menu (the AUX-06 Analytics
-// disclosure, generalized into the shared contract component). One UI, two
+// The general «Виды ▾» saved-views menu (the Analytics disclosure,
+// generalized into the shared contract component). One UI, two
 // storage backends (lib/savedViews.ts):
 //   * Analytics passes its SERVER views (shareable, audited) — the reason
 //     input stays on its dialogs via `collectReason`;
 //   * other data pages pass the localStorage registry operations.
-// Rename runs as a medium-risk AUX-12 dialog (prefilled name input), delete
-// as a high-risk one (type-the-name confirmation) — the AUX-12 dialogs, no
+// Rename runs as a medium-risk dialog (prefilled name input), delete
+// as a high-risk one (type-the-name confirmation) — no
 // legacy browser popups. Escape closes and returns focus to the toggle; a
 // click outside closes (useDisclosureDismiss).
 
@@ -51,7 +51,7 @@ export interface SavedViewsMenuProps {
   saveDisabled?: boolean
   /** Extra controls rendered under the name input (Analytics: shared flag). */
   saveHint?: ReactNode
-  /** AUX-14b: collect an optional operator reason in the AUX-12 dialogs. */
+  /** Collect an optional operator reason in the rename/delete dialogs. */
   collectReason?: boolean
   /** Action-descriptor ids for the rename/delete dialogs. */
   actionIds?: { rename: string; delete: string }
@@ -75,7 +75,7 @@ export function SavedViewsMenu({
   const confirmRename = labels?.rename ?? t('views.rename')
   const confirmDelete = labels?.delete ?? t('views.delete')
 
-  // AUX-12 contract, same risk routing the Analytics page used before the
+  // Same risk routing the Analytics page used before the
   // menu was generalized: rename medium (reversible), delete high.
   const renameAction = useAction({ id: ids.rename, risk: 'medium', reversible: true })
   const deleteAction = useAction({ id: ids.delete, risk: 'high', reversible: false })

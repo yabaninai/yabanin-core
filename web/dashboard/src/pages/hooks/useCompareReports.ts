@@ -9,9 +9,9 @@ import {
 } from '../../api/client'
 import { deriveScreenState, useScopedQuery, type ScreenState } from '../../hooks/useScopedQuery'
 
-// AF-17 domain hook: the Compare screen read (CMP-01) — shadow cost
-// comparison plus the supplementary latency percentiles and quality scores.
-// Contract kept from the pre-refactor load:
+// The Compare screen read — shadow cost comparison plus the supplementary
+// latency percentiles and quality scores. Contract kept from the
+// pre-refactor load:
 //   * the shadow comparison is the screen's backbone — its failure is the
 //     screen error (an aborted fetch stays silence, never an error);
 //   * latency + quality are supplementary: a failure there must not blank
@@ -23,7 +23,7 @@ export interface CompareLoad {
   shadow: ShadowComparison
   latency: LatencyReport | null
   quality: QualityReport | null
-  /** The applied scope+window, frozen at load time (AVR-01). */
+  /** The applied scope+window, frozen at load time. */
   applied: { orgId: string; days: number }
 }
 
@@ -31,7 +31,7 @@ export function useCompareReports(orgId: string, days: number): {
   shadow: ShadowComparison | null
   latency: LatencyReport | null
   quality: QualityReport | null
-  /** The applied scope+window of the shown numbers (AVR-01 applied vs draft). */
+  /** The applied scope+window of the shown numbers (applied, not draft). */
   applied: { orgId: string; days: number } | null
   loading: boolean
   error: string

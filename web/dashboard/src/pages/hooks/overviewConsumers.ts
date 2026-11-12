@@ -53,7 +53,7 @@ export interface ConsumersBoard {
 /** Server `top` per dimension; the merged list is capped to the same top. */
 export const CONSUMER_TOP = 10
 
-/** Bucket labels that mean "no value", never a real entity (AUX-06). */
+/** Bucket labels that mean "no value", never a real entity. */
 export const MUTED_CONSUMER_VALUES = new Set(['(none)', '(other)', '(untagged)'])
 
 function num(v: unknown): number | null {
@@ -120,7 +120,7 @@ export interface ToolBucketRow {
   costUsd: number | null
 }
 
-/** Model rows that are actually tool traffic (D-19), split out per bucket. */
+/** Model rows that are actually tool traffic, split out per bucket. */
 export function toolBucketRows(
   topModels: ReadonlyArray<{ model: string; requests: number; actual_cost_usd: number }> | undefined,
 ): ToolBucketRow[] {

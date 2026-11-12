@@ -2,10 +2,10 @@ import { useCallback } from 'react'
 import { fetchJSON, type PricingMetadata } from '../../api/client'
 import { deriveScreenState, useScopedQuery, type ScreenState } from '../../hooks/useScopedQuery'
 
-// AF-17 domain hook: the Cost screen read (U03 scope + UX-03 window →
-// GET /api/analytics/{org}/cost). AUX-04: both scope fields are real — the
-// endpoint accepts org_id + provider (+ days); the lifecycle (generation,
-// abort, applied-vs-draft, AUX-23 freshness) lives in useScopedQuery.
+// The Cost screen read (org scope + window → GET /api/analytics/{org}/cost).
+// Both scope fields are real — the endpoint accepts org_id + provider
+// (+ days); the lifecycle (generation, abort, applied-vs-draft, freshness)
+// lives in useScopedQuery.
 export interface CostReport {
   total_cost_usd: number
   counterfactual_cost: number
@@ -15,7 +15,7 @@ export interface CostReport {
   avg_cost_per_request: number
   by_model: Array<{ model_name: string; total_cost: number; request_count: number }>
   by_day: Array<{ date: string; total_cost: number; request_count: number }>
-  // A01/AF-07 (additive, may be absent on older backends): coverage_status +
+  // Additive, may be absent on older backends: coverage_status +
   // unpriced_share (null = not measured) + coverage_error — the same contract
   // as the savings report (api/analytics.ts PricingMetadata).
   pricing?: PricingMetadata

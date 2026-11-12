@@ -26,8 +26,8 @@ import {
   type ModelDisplayState, type ModelState, type UnavailableReason,
 } from '../models/helpers'
 
-// W-BYOK (card W-BYOK-UI): the «Provider keys» tab of the organization
-// settings screen. BYOK credentials per the frozen W-BYOK-API contract:
+// The «Provider keys» tab of the organization
+// settings screen. BYOK credentials per the API contract:
 // the list shows the masked key fragment only ("••••1234"); the raw key is
 // typed into a password field, serialized into the POST/PUT body once, and
 // cleared from state the moment the request is sent — it is never kept in
@@ -41,17 +41,17 @@ import {
 //    re-probe exists; the buttons are the only probes and they share the
 //    server's 1/min/org budget, whose throttle surfaces as an honest error);
 //  - a delayed test completion is dropped when the org scope changed or a
-//    newer run for the same credential superseded it (TP-06 async scope);
+//    newer run for the same credential superseded it (async scope);
 //    the same async-scope rules: verified is always false — a snapshot is
 //    NOT a usability mark, nothing is saved, and manual model entry stays
 //    the fallback (refusals render their machine reason honestly);
 //    through the shared modelDisplayState matrix — discovered / configured /
 //    verified / unavailable + reason, derived over the facts only; probes
-//    never mutate state (D-2), an id the registry does not know renders
+//    never mutate state, an id the registry does not know renders
 //    "discovered" with the manual-register hint, and a registry outage
 //    suspends the states instead of reading models as missing;
-//  - deletion runs through the AUX-12 high-risk dialog (type-the-name);
-//  - every mutating action carries the AUX-14b X-Audit-Reason.
+//  - deletion runs through the high-risk dialog (type-the-name);
+//  - every mutating action carries an X-Audit-Reason.
 
 const rowBtnCls =
   'inline-flex min-h-[36px] items-center whitespace-nowrap rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] px-3 text-xs font-medium text-[color:var(--astra-ink)] hover:bg-[color:var(--astra-surface-muted)] disabled:cursor-not-allowed disabled:opacity-50'
@@ -87,7 +87,7 @@ export function ProviderKeysSection({ org }: { org: string }) {
   const [modelStates, setModelStates] = useState<Record<string, CredentialCatalogState>>({})
   const [modelsCred, setModelsCred] = useState<ProviderCredential | null>(null)
   const modelSeq = useRef(0)
-  // (a plain read — no probe, D-4 is untouched by it). The registry is
+  // (a plain read — no probe is fired). The registry is
   // global; the candidate rows are filtered to the credential's provider at
   // render time.
   const registryFetcher = useCallback((signal: AbortSignal) => listAllModels({ signal }), [])
@@ -208,7 +208,7 @@ export function ProviderKeysSection({ org }: { org: string }) {
 
   // async-scope discipline as runTest: a stale completion (org switched or
   // a newer run started) is dropped. The snapshot is display-only here —
-  // this component never writes the models anywhere (D-3 display-only).
+  // this component never writes the models anywhere (display-only).
   const runModels = (cred: ProviderCredential) => {
     setError('')
     const run = ++modelSeq.current
@@ -358,7 +358,7 @@ export function ProviderKeysSection({ org }: { org: string }) {
       {stateLabel(state.state)}
     </span>
   )
-  // Per-row hint text under a badge: the fix, per D-6.
+  // Per-row hint text under a badge: the fix for the state.
   const rowHint = (state: ModelState): string | null => {
     if (state.state === 'discovered') return t('providerKeys.hintRegisterManual')
     if (state.state === 'unavailable' && state.reason) return unavailableHint(state.reason)

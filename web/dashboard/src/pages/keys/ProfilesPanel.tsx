@@ -13,9 +13,9 @@ import { useScopedQuery } from '../../hooks/useScopedQuery'
 import { usePermissions } from '../../hooks/usePermissions'
 import { formatMoneyCell } from '../../lib/columnFormat'
 
-// for yag_ keys. Creation moved into the FormDrawer; the daily cap is entered
+// Profiles for yag_ keys. Creation moved into the FormDrawer; the daily cap is entered
 // in CURRENCY and stored as cents. Profile CRUD stays root-only server-side —
-// the controls disable with the root hint (AUX-13).
+// the controls disable with the root hint.
 
 export function ProfilesPanel({ org, createOpen, onCreateClosed }: {
   org: string
