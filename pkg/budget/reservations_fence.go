@@ -288,6 +288,11 @@ func (l *RecoveryLease) Release(ctx context.Context) error {
 //   - ErrRecoveryFenceExpired: the TTL elapsed before (or during) the
 //     pass — a partial summary may accompany the error, the remaining
 //     rows stay frozen, and the caller must take a fresh lease.
+//   - ErrOrphanAcquireTimeout: the bounded pool round-trip elapsed
+//     (typically every connection pinned by fence holders); the pass is
+//     retryable — a partial summary may accompany the error and a later
+//     verdict finishes the remaining rows through the same per-row
+//     exactly-once state machine.
 func (s *ReservationStore) CloseAbandonedReplicaFenced(ctx context.Context, lease *RecoveryLease, window time.Duration) (AbandonedReplicaSummary, error) {
 	replica, owner := lease.ReplicaID(), lease.Owner()
 	if !lease.Held() {

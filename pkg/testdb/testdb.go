@@ -537,6 +537,29 @@ func PostgresApp(tb testing.TB, region string) *pgxpool.Pool {
 	return pool
 }
 
+// PostgresPool returns a NEW, uncached pool over the shared disposable
+// Postgres stand with fn applied to its parsed config before construction —
+// for tests that need a dedicated pool shape (e.g. MaxConns=2 to reproduce
+// pool exhaustion) without pinning the shared pool's connections. The pool
+// is closed at tb cleanup; fn must not be nil.
+func PostgresPool(tb testing.TB, fn func(*pgxpool.Config)) *pgxpool.Pool {
+	tb.Helper()
+	if fn == nil {
+		require.NoError(tb, errors.New("testdb: PostgresPool needs a non-nil config fn"))
+	}
+	_, uri, err := ensurePostgres(tb) // per-use liveness check, recreate-once on a dead listener
+	require.NoError(tb, err)
+	// pgxpool.ParseConfig (not pgx.ParseConfig + manual wrap) so the config
+	// carries the flag pgxpool.NewWithConfig requires in pgx v5.10.
+	pc, err := pgxpool.ParseConfig(uri)
+	require.NoError(tb, err)
+	fn(pc)
+	pool, err := pgxpool.NewWithConfig(context.Background(), pc)
+	require.NoError(tb, err)
+	tb.Cleanup(pool.Close)
+	return pool
+}
+
 // Shared per-binary Redis stand state (FIX-12 lifecycle parity with the
 // Postgres stand). redisInitErr is sticky only for a failed boot or a failed
 // bounded recreate; a stand that dies after a successful boot is detected

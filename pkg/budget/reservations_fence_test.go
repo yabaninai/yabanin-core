@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -309,4 +310,67 @@ func TestRecoveryLeaseReleaseIgnoresCallerCancel(t *testing.T) {
 	assert.True(t, tx.unlockQueried, "the unlock ran despite the cancelled caller context")
 	assert.True(t, tx.rolledBack)
 	assert.False(t, lease.Held())
+}
+
+// w40BlockingDB fakes an exhausted pool without Postgres: every operation
+// waits for its context to die, exactly like puddle's acquire queue when
+// every connection is pinned by a fence holder (W40).
+type w40BlockingDB struct{}
+
+func (w40BlockingDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (w40BlockingDB) Exec(ctx context.Context, _ string, _ ...any) (pgconn.CommandTag, error) {
+	<-ctx.Done()
+	return pgconn.CommandTag{}, ctx.Err()
+}
+
+func (w40BlockingDB) Query(ctx context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	<-ctx.Done()
+	return nil, ctx.Err()
+}
+
+func (w40BlockingDB) QueryRow(ctx context.Context, _ string, _ ...any) pgx.Row {
+	return stalledUnlockRow{ctx: ctx}
+}
+
+// TestW40OrphanCloseBoundedAcquireSurfacesSentinel: with every pooled
+// connection pinned, the orphan-close verdict must refuse to queue — the
+// internal bound aborts the round-trip and surfaces as the retryable
+// ErrOrphanAcquireTimeout (still carrying the underlying deadline), never
+// as a hang or a fence-class rejection.
+func TestW40OrphanCloseBoundedAcquireSurfacesSentinel(t *testing.T) {
+	t.Parallel()
+	store := NewReservationStoreWithConfig(w40BlockingDB{}, newBudgetTestLogger(), DefaultReservationConfig())
+	store.orphanAcquireTimeout = 60 * time.Millisecond
+
+	start := time.Now()
+	_, err := store.CloseAbandonedReplica(context.Background(), "w40-dead", time.Hour)
+	elapsed := time.Since(start)
+
+	require.ErrorIs(t, err, ErrOrphanAcquireTimeout)
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the underlying deadline stays in the chain")
+	assert.Less(t, elapsed, 5*time.Second, "the bound fails fast instead of hanging")
+	require.NotErrorIs(t, err, ErrRecoveryFenceExpired)
+	require.NotErrorIs(t, err, ErrStaleRecoveryFence)
+}
+
+// TestW40OrphanCloseCallerDeadlineIsNotMisclassified: the mapping's
+// negative control — a deadline coming from the CALLER's own context
+// propagates unchanged; only the verdict's internal bound becomes the
+// retryable busy refusal.
+func TestW40OrphanCloseCallerDeadlineIsNotMisclassified(t *testing.T) {
+	t.Parallel()
+	store := NewReservationStoreWithConfig(w40BlockingDB{}, newBudgetTestLogger(), DefaultReservationConfig())
+	store.orphanAcquireTimeout = time.Hour // effectively unbounded
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Millisecond)
+	defer cancel()
+	_, err := store.CloseAbandonedReplica(ctx, "w40-dead", time.Hour)
+
+	require.ErrorIs(t, err, context.DeadlineExceeded)
+	require.NotErrorIs(t, err, ErrOrphanAcquireTimeout,
+		"the caller's own deadline is the caller's error, not the store's busy refusal")
 }
