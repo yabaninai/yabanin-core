@@ -38,15 +38,75 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// n06p5FenceHolderMaxConns caps the dedicated fence-holder pool: the
+// boundary storm takes 8 concurrent holder sessions, parallel sibling
+// tests hold at most a couple of leases each, and package parallelism is
+// GOMAXPROCS-bounded — 32 covers the worst case with margin while the
+// shared stand stays far below the container's max_connections.
+const n06p5FenceHolderMaxConns = 32
+
+// n06p5FenceHolderPool is the package-wide pool dedicated to recovery
+// fence holder sessions, separate from the shared testdb pool (W34).
+//
+// Why it exists: a RecoveryLease pins one pooled connection for its whole
+// lifetime by design (reservations_fence.go), while its verdict needs
+// MORE connections from the same pool for the candidate scan and the
+// per-row transactions. The package runs GOMAXPROCS tests in parallel
+// against a pool sized max(4, NumCPU) — on a 4-CPU runner, four parallel
+// fence-holding tests pin every shared connection and each waits for one
+// more: a deterministic client-side pool deadlock (no goroutine ever
+// reaches Postgres; all sit in puddle.Acquire). Keeping holder sessions
+// on this dedicated pool removes the cycle structurally: verdict work
+// acquires only shared-pool connections, fence Acquire/Release acquires
+// only fence-pool connections (Release reuses the holder's own session),
+// so neither side can hold-and-wait on the other.
+//
+// Mirror of the fence design: one connection per active lease stays true
+// (per pool), crash semantics stay true (pg_terminate_backend kills the
+// holder session; the pool destroys the broken connection and the
+// session-scoped advisory lock dies with it), and repeated Acquire on
+// one fence object after a kill keeps working because every Begin gets a
+// fresh session. Never closed explicitly — same lifetime discipline as
+// the shared testdb singleton (process exit, then the container reaps).
+var (
+	n06p5FenceHolderOnce sync.Once
+	n06p5FenceHolder     *pgxpool.Pool
+)
+
+func n06p5FenceHolderPool(shared *pgxpool.Pool) *pgxpool.Pool {
+	n06p5FenceHolderOnce.Do(func() {
+		cfg := shared.Config() // same server/auth; Config returns a copy
+		cfg.MinConns = 0
+		cfg.MaxConns = n06p5FenceHolderMaxConns
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			// Stand misconfiguration only (no dialing at MinConns=0);
+			// panic stays FailNow-safe from racer goroutines.
+			panic(fmt.Sprintf("budget tests: fence holder pool: %v", err))
+		}
+		n06p5FenceHolder = pool
+	})
+	return n06p5FenceHolder
+}
+
+// n06p5LiveDeadline bounds every blocking live-PG interaction of one
+// crash-family test (W34): healthy passes finish in seconds even under
+// -race on the 4-CPU hosted runner, so 2 minutes is an order-of-magnitude
+// margin — and any future pool/starvation regression surfaces as a
+// bounded context-deadline test failure instead of hanging the gate
+// until go test's own timeout dumps 10-minute-old stacks.
+const n06p5LiveDeadline = 2 * time.Minute
+
 // n06p5TryAcquireFence acquires a recovery lease with a bounded retry on
 // ErrRecoveryFenceHeld (the loser of an in-flight handover waits for the
-// winner's release instead of failing the test). Plain error returns —
-// safe to call from racer goroutines.
-func n06p5TryAcquireFence(pool *pgxpool.Pool, replica, owner string, ttl time.Duration) (*RecoveryLease, error) {
-	fence := NewRecoveryFence(pool, nil)
+// winner's release instead of failing the test). Holder sessions come
+// from the dedicated fence pool; ctx bounds each acquisition attempt.
+// Plain error returns — safe to call from racer goroutines.
+func n06p5TryAcquireFence(ctx context.Context, pool *pgxpool.Pool, replica, owner string, ttl time.Duration) (*RecoveryLease, error) {
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		lease, err := fence.Acquire(context.Background(), replica, owner, ttl)
+		lease, err := fence.Acquire(ctx, replica, owner, ttl)
 		if err == nil {
 			return lease, nil
 		}
@@ -79,19 +139,21 @@ func n06p5ShiftLease(t *testing.T, pool *pgxpool.Pool, replica string, lapse tim
 // n06p5TerminateFenceHolder simulates a crashed verdict process: it
 // terminates the backend holding the replica's recovery fence, so the
 // session-level advisory lock dies with the session while the in-process
-// lease object keeps claiming Held.
-func n06p5TerminateFenceHolder(t *testing.T, pool *pgxpool.Pool, replica string) {
+// lease object keeps claiming Held. ctx bounds the kill queries — this
+// helper was one of the W34 hang frames when it ran on an unbounded
+// context against an exhausted pool.
+func n06p5TerminateFenceHolder(t *testing.T, ctx context.Context, pool *pgxpool.Pool, replica string) {
 	t.Helper()
 	var pid int32
 	for i := 0; i < 50; i++ {
-		err := pool.QueryRow(context.Background(), `
+		err := pool.QueryRow(ctx, `
 			SELECT pid FROM pg_locks
 			WHERE locktype = 'advisory' AND classid = 0
 			  AND objid = hashtext($1)::bigint
 			LIMIT 1`, recoveryFenceKey(replica)).Scan(&pid)
 		if err == nil {
 			var terminated bool
-			require.NoError(t, pool.QueryRow(context.Background(),
+			require.NoError(t, pool.QueryRow(ctx,
 				`SELECT pg_terminate_backend($1)`, pid).Scan(&terminated),
 				"terminate fence holder backend %d", pid)
 			require.True(t, terminated)
@@ -156,7 +218,8 @@ func TestN06P05Live_FencedVsFencedAfterHolderCrashExactlyOnce(t *testing.T) {
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5-zomb-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -178,9 +241,9 @@ func TestN06P05Live_FencedVsFencedAfterHolderCrashExactlyOnce(t *testing.T) {
 	// Verdict A acquires the fence, then its process "crashes": the
 	// advisory-lock holder backend is terminated. The in-process lease
 	// object cannot know (the zombie window above).
-	leaseA, err := n06p5TryAcquireFence(pool, "n06p5-zomb-dead", "verdict-a", time.Hour)
+	leaseA, err := n06p5TryAcquireFence(ctx, pool, "n06p5-zomb-dead", "verdict-a", time.Hour)
 	require.NoError(t, err)
-	n06p5TerminateFenceHolder(t, pool, "n06p5-zomb-dead")
+	n06p5TerminateFenceHolder(t, ctx, pool, "n06p5-zomb-dead")
 	require.True(t, leaseA.Held(), "the crashed lease object still claims Held — the documented zombie window")
 	orphanBefore := releasedCounter(t, ReleaseReasonCrashOrphan)
 
@@ -198,7 +261,7 @@ func TestN06P05Live_FencedVsFencedAfterHolderCrashExactlyOnce(t *testing.T) {
 	}()
 	go func() {
 		defer wg.Done()
-		leaseB, acqErr := n06p5TryAcquireFence(pool, "n06p5-zomb-dead", "verdict-b", time.Hour)
+		leaseB, acqErr := n06p5TryAcquireFence(ctx, pool, "n06p5-zomb-dead", "verdict-b", time.Hour)
 		if acqErr != nil {
 			errB = acqErr
 			return
@@ -230,7 +293,7 @@ func TestN06P05Live_FencedVsFencedAfterHolderCrashExactlyOnce(t *testing.T) {
 
 	// A re-verdict under a fresh lease observes the losing side: idempotent
 	// convergence, not a second pass over closed rows.
-	leaseC, err := n06p5TryAcquireFence(pool, "n06p5-zomb-dead", "verdict-c", time.Hour)
+	leaseC, err := n06p5TryAcquireFence(ctx, pool, "n06p5-zomb-dead", "verdict-c", time.Hour)
 	require.NoError(t, err)
 	defer func() { _ = leaseC.Release(ctx) }()
 	sumC, err := store.CloseAbandonedReplicaFenced(ctx, leaseC, 30*time.Minute)
@@ -260,7 +323,8 @@ func TestN06P05Live_MidPassLeaseExpiryAbortsAndConverges(t *testing.T) {
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5-midx-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -273,7 +337,7 @@ func TestN06P05Live_MidPassLeaseExpiryAbortsAndConverges(t *testing.T) {
 	// past the TTL as soon as the first row is released — the abort lands
 	// mid-pass, after real progress. The flip goes through an atomic so
 	// watcher and pass never share unsynchronized state.
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	base := time.Now()
 	var expiry atomic.Int64 // unix nanos of the faked now, 0 = real base
 	fence.now = func() time.Time {
@@ -325,7 +389,7 @@ func TestN06P05Live_MidPassLeaseExpiryAbortsAndConverges(t *testing.T) {
 	require.NoError(t, leaseA.Release(ctx), "the session is alive — release succeeds")
 
 	// Takeover: verdict B finishes whatever A left open, exactly once.
-	leaseB, err := n06p5TryAcquireFence(pool, dead, "verdict-b", time.Hour)
+	leaseB, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-b", time.Hour)
 	require.NoError(t, err)
 	sumB, err := store.CloseAbandonedReplicaFenced(ctx, leaseB, 30*time.Minute)
 	require.NoError(t, err)
@@ -352,7 +416,7 @@ func TestN06P05Live_MidPassLeaseExpiryAbortsAndConverges(t *testing.T) {
 	require.ErrorIs(t, err, ErrStaleRecoveryFence)
 
 	// A fresh re-verdict observes the exactly-once losing side.
-	leaseC, err := n06p5TryAcquireFence(pool, dead, "verdict-c", time.Hour)
+	leaseC, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-c", time.Hour)
 	require.NoError(t, err)
 	defer func() { _ = leaseC.Release(ctx) }()
 	sumC, err := store.CloseAbandonedReplicaFenced(ctx, leaseC, 30*time.Minute)
@@ -373,7 +437,8 @@ func TestN06P05Live_LiveReservationNeverReleasedByCrashRecovery(t *testing.T) {
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5-livg-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -400,7 +465,7 @@ func TestN06P05Live_LiveReservationNeverReleasedByCrashRecovery(t *testing.T) {
 		require.NoError(t, err)
 		require.Zero(t, s.Closed, "unfenced verdict released a live row")
 		skipped += s.SkippedLive
-		lease, err := n06p5TryAcquireFence(pool, live, "fenced-verdict", time.Hour)
+		lease, err := n06p5TryAcquireFence(ctx, pool, live, "fenced-verdict", time.Hour)
 		require.NoError(t, err)
 		sf, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 		require.NoError(t, err)
@@ -460,7 +525,7 @@ func TestN06P05Live_LiveReservationNeverReleasedByCrashRecovery(t *testing.T) {
 	// exactly-once losing side.
 	require.Zero(t, mustRenew(t, store, ctx, live), "released rows are never resurrected by a renewal")
 	require.Zero(t, battery(false), "post-mortem battery: nothing live left to skip")
-	lease, err := n06p5TryAcquireFence(pool, live, "post-mortem", time.Hour)
+	lease, err := n06p5TryAcquireFence(ctx, pool, live, "post-mortem", time.Hour)
 	require.NoError(t, err)
 	sumF, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 	require.NoError(t, err)
@@ -486,7 +551,8 @@ func TestN06P05Live_BoundedRecoveryRoundsConverge(t *testing.T) {
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5-cvge-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 20_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -577,7 +643,7 @@ func TestN06P05Live_BoundedRecoveryRoundsConverge(t *testing.T) {
 
 		// Fenced verdicts close each replica exactly once (round 1).
 		for _, rep := range []string{d1, d2, d3} {
-			lease, err := n06p5TryAcquireFence(pool, rep, fmt.Sprintf("verdict-r%d", round), time.Hour)
+			lease, err := n06p5TryAcquireFence(ctx, pool, rep, fmt.Sprintf("verdict-r%d", round), time.Hour)
 			require.NoError(t, err)
 			s, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 			require.NoError(t, err)
@@ -651,7 +717,8 @@ func TestN06P05Live_OrphanVerdictsRacingSettleExactlyOnce(t *testing.T) {
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5-unio-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -694,7 +761,7 @@ func TestN06P05Live_OrphanVerdictsRacingSettleExactlyOnce(t *testing.T) {
 	go func() { // one fenced verdict with the deliberate override
 		defer wg.Done()
 		<-start
-		lease, err := n06p5TryAcquireFence(pool, "n06p5-unio-dead", "fenced-racer", time.Hour)
+		lease, err := n06p5TryAcquireFence(ctx, pool, "n06p5-unio-dead", "fenced-racer", time.Hour)
 		if err != nil {
 			errs[2] = err
 			return
@@ -759,4 +826,71 @@ func TestN06P05Live_OrphanVerdictsRacingSettleExactlyOnce(t *testing.T) {
 	// sibling-shared on this stand, see the zombie test's closing comment).
 	_, err = NewReconcileWorker(pool, newBudgetTestLogger(), DefaultReconcileConfig()).CheckInvariants(ctx)
 	require.NoError(t, err)
+}
+
+// TestN06P05Live_SharedPoolExhaustionFailsBoundedNotHang is the W34
+// negative control and regression pin in one: under an artificial total
+// exhaustion of the shared pool — the exact starvation shape that
+// deadlocked the gate when fence holders still pinned shared-pool
+// connections — (a) fence acquisition must still succeed (holder
+// sessions live on the dedicated fence pool, so a lease never waits on
+// verdict capacity), (b) a fenced verdict that needs the exhausted pool
+// must fail within its context deadline instead of hanging forever, and
+// (c) once capacity returns the very same verdict converges normally.
+func TestN06P05Live_SharedPoolExhaustionFailsBoundedNotHang(t *testing.T) {
+	t.Parallel()
+	pool := testdb.Postgres(t)
+	store := newReservationStore(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
+	org := "org-n06p5-strv-" + uuid.NewString()[:8]
+	setWallet(t, pool, org, 10_000_000, nil)
+	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
+
+	const dead = "n06p5-strv-dead"
+	n06p5GrantFourScopes(t, pool, org, dead)
+	n06p5ShiftLease(t, pool, dead, time.Hour) // lapsed: closable by a fenced 30m override
+
+	// Artificially pin every shared-pool connection. Sibling tests' brief
+	// shared-pool queries queue behind these pins for the few seconds the
+	// exhaustion phases last; with fence holders off this pool nothing can
+	// hold-and-wait, so the stand cannot deadlock.
+	pins := make([]*pgxpool.Conn, 0, pool.Stat().MaxConns())
+	releaseAll := func() {
+		for _, c := range pins {
+			c.Release()
+		}
+		pins = pins[:0]
+	}
+	defer releaseAll()
+	for range pool.Stat().MaxConns() {
+		c, err := pool.Acquire(ctx)
+		require.NoError(t, err, "pinning shared-pool capacity must itself succeed")
+		pins = append(pins, c)
+	}
+	require.Len(t, pins, int(pool.Stat().MaxConns()), "every shared connection is pinned")
+
+	// (a) Fence acquisition is independent of shared-pool capacity.
+	lease, err := n06p5TryAcquireFence(ctx, pool, dead, "starvation-verdict", time.Hour)
+	require.NoError(t, err, "holder sessions come from the dedicated fence pool — never from the exhausted shared pool")
+	defer func() { _ = lease.Release(ctx) }()
+
+	// (b) The verdict needing the exhausted pool fails bounded — the
+	// candidate scan blocks in pool.Acquire until the deadline, then
+	// surfaces a context error instead of waiting forever.
+	verdictCtx, verdictCancel := context.WithTimeout(ctx, 2*time.Second)
+	start := time.Now()
+	_, err = store.CloseAbandonedReplicaFenced(verdictCtx, lease, 30*time.Minute)
+	verdictCancel()
+	require.Error(t, err, "an exhausted shared pool must fail the verdict, not stall it invisibly")
+	require.ErrorIs(t, err, context.DeadlineExceeded, "the failure is the bounded context deadline")
+	require.Less(t, time.Since(start), 30*time.Second, "bounded failure — nowhere near a gate-level hang")
+
+	// (c) Capacity returns and the very same held verdict converges: the
+	// escrow closes exactly once, nothing was touched while starved.
+	releaseAll()
+	sum, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
+	require.NoError(t, err)
+	require.Equal(t, int64(4), sum.Closed, "the starved verdict completes once capacity returns")
+	require.Zero(t, walletState(t, pool, org))
 }

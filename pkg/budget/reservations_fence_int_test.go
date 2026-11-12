@@ -51,7 +51,7 @@ func TestN06P05Live_FencedVerdictOverridesSafetyWindow(t *testing.T) {
 
 	// Fenced: the serialized, TTL-bounded override closes exactly once.
 	orphanBefore := releasedCounter(t, ReleaseReasonCrashOrphan)
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	lease, err := fence.Acquire(ctx, "n06p5-fence1-dead", "verdict-a", time.Hour)
 	require.NoError(t, err)
 	defer lease.Release(ctx)
@@ -109,7 +109,7 @@ func TestN06P05Live_FenceMutualExclusionOldOwnerPauseTakeoverResume(t *testing.T
 	require.Equal(t, int64(250_000), walletState(t, pool, org))
 
 	orphanBefore := releasedCounter(t, ReleaseReasonCrashOrphan)
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 
 	// Old owner A: acquires, then pauses past its TTL (a hung verdict
 	// process). The override is bounded — an expired lease cannot close.
@@ -207,7 +207,7 @@ func TestN06P05Live_FencedOverrideRacesUnfencedExactlyOnce(t *testing.T) {
 		unfenced = 4
 		passes   = 2
 	)
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	orphanSummaries := make([]AbandonedReplicaSummary, unfenced)
 	orphanErrs := make([]error, unfenced)
 	passSummaries := make([]ReconcileSummary, passes)

@@ -899,7 +899,7 @@ func TestN06P05Live_CloseAbandonedReplicaClosesOrphansSafely(t *testing.T) {
 	require.Equal(t, int64(550_000), walletState(t, pool, org))
 	// The same verdict under a held fence closes: the serialized,
 	// TTL-bounded override is the one authority allowed to accelerate.
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	lease, err := fence.Acquire(ctx, "n06p5-orph-recent", "verdict-t04", time.Hour)
 	require.NoError(t, err)
 	s, err = store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)

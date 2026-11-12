@@ -128,7 +128,8 @@ func TestN06P05T08Live_AbortThenCrashRetryChainResumesAtRowBoundaryExactlyOnce(t
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5t08-chn-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -141,7 +142,7 @@ func TestN06P05T08Live_AbortThenCrashRetryChainResumesAtRowBoundaryExactlyOnce(t
 	// count exceeds the per-pass threshold. The pass reads now() once
 	// pre-verdict and once per stop() — before EVERY candidate row in id
 	// order (wallet, team, agent, session), already-released ones included.
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	base := time.Now()
 	var (
 		calls       atomic.Int64
@@ -267,7 +268,8 @@ func TestN06P05T08Live_EscrowExactlyOnceAcrossRepeatedHolderCrashes(t *testing.T
 	t.Parallel()
 	pool := testdb.Postgres(t)
 	store := newReservationStore(pool)
-	ctx := context.Background()
+	ctx, cancel := context.WithTimeout(context.Background(), n06p5LiveDeadline)
+	defer cancel()
 	org := "org-n06p5t08-cyc-" + uuid.NewString()[:8]
 	setWallet(t, pool, org, 10_000_000, nil)
 	t.Cleanup(func() { cleanupReservationState(t, pool, org) })
@@ -284,7 +286,7 @@ func TestN06P05T08Live_EscrowExactlyOnceAcrossRepeatedHolderCrashes(t *testing.T
 		prevReleased           int64
 	)
 	for i := 1; i <= cycles; i++ {
-		lease, err := n06p5TryAcquireFence(pool, dead, fmt.Sprintf("t08-cycle-%d", i), time.Hour)
+		lease, err := n06p5TryAcquireFence(ctx, pool, dead, fmt.Sprintf("t08-cycle-%d", i), time.Hour)
 		require.NoError(t, err)
 		var (
 			sum     AbandonedReplicaSummary
@@ -333,7 +335,7 @@ func TestN06P05T08Live_EscrowExactlyOnceAcrossRepeatedHolderCrashes(t *testing.T
 
 	// The final clean verdict converges: whatever the crashes left open
 	// closes here; the DB rows carry the exactly-once authority.
-	leaseFinal, errFinalAcq := n06p5TryAcquireFence(pool, dead, "t08-cycle-final", time.Hour)
+	leaseFinal, errFinalAcq := n06p5TryAcquireFence(ctx, pool, dead, "t08-cycle-final", time.Hour)
 	require.NoError(t, errFinalAcq)
 	sumFinal, errFinal := store.CloseAbandonedReplicaFenced(ctx, leaseFinal, 30*time.Minute)
 	require.NoError(t, errFinal)
@@ -358,7 +360,7 @@ func TestN06P05T08Live_EscrowExactlyOnceAcrossRepeatedHolderCrashes(t *testing.T
 	}
 
 	// Idempotent tail: one more verdict observes only the losing side.
-	leaseTail, errTailAcq := n06p5TryAcquireFence(pool, dead, "t08-cycle-tail", time.Hour)
+	leaseTail, errTailAcq := n06p5TryAcquireFence(ctx, pool, dead, "t08-cycle-tail", time.Hour)
 	require.NoError(t, errTailAcq)
 	sumTail, errTail := store.CloseAbandonedReplicaFenced(ctx, leaseTail, 30*time.Minute)
 	require.NoError(t, errTail)
