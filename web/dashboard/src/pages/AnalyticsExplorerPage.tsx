@@ -643,7 +643,7 @@ export function AnalyticsExplorerPage() {
       </div>
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-        {/* Result first (IMP-36): query summary row, chart, totals, table. */}
+        {/* Result first: query summary row, chart, totals, table. */}
         <div className="flex min-w-0 flex-col gap-4">
           <section aria-label={t('analytics.results')} className="card flex flex-col gap-2">
             {chips.length > 0 && (
@@ -762,7 +762,7 @@ export function AnalyticsExplorerPage() {
           ) : null}
         </div>
 
-        {/* IMP-36: the query configuration — what to count, how to split,
+        {/* The query configuration — what to count, how to split,
             which data, comparison — in one collapsible side panel. Open by
             default; on narrow screens it stacks below the result. */}
         <aside

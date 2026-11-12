@@ -1,8 +1,6 @@
-//
-// The onboarding card used to forget being dismissed on every reload. The v2
-// checklist and the ✕ on the collapsed «Setup complete ✓» chip persist in
-// localStorage, so an operator who closed it never sees it again on this
-// browser profile.
+// The onboarding checklist and the ✕ on the collapsed «Setup complete ✓»
+// chip persist in localStorage, so an operator who closed them never sees
+// the card again on this browser profile.
 
 export const ONBOARDING_MEMORY_KEY = 'yabanin.onboarding.v1'
 

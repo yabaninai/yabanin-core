@@ -130,11 +130,9 @@ export function FeedbackPage() {
         </a>
       </div>
 
-      {/* a failed load is ONLY the error notice (server text +
-          retry). Previously the error rendered above the card, whose
-          `empty` branch then also claimed «No feedback recorded yet…» —
-          a conflicting state where a failure reads as a successful empty
-          result. Unknown is not empty: the card yields until a load settles. */}
+      {/* a failed load is ONLY the error notice (server text + retry).
+          Unknown is not empty: the card yields until a load settles, so a
+          failure can never read as a successful «No feedback recorded yet…». */}
       {error ? (
         <StateNotice
           state="error"

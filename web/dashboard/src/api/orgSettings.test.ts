@@ -164,9 +164,8 @@ test('validators: mode set and grace range incl. NULL vs 0', () => {
 
 
 // The strict-decode + required-config contract on PUT /api/organizations/{id}/policy-packs/{region}.
-// The wizard used to send {} and the settings pack-add {enabled:true} — both
-// are 400s ("config is required and must be non-null JSON") on the fixed
-// handler, and were silent SQL 500s before it.
+// {} (wizard) and {enabled:true} (settings pack-add) are both 400s:
+// "config is required and must be non-null JSON".
 test('upsertPolicyPack PUTs a non-null config document (required by pkfix1 contract)', async () => {
   installFetch(call => {
     if (call.url === '/auth/csrf') return { status: 200, body: { csrf_token: 'tok-pk' } }

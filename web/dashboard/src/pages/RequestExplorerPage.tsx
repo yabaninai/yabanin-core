@@ -1334,10 +1334,9 @@ export function RequestExplorerPage() {
                 ? t(EXPLORER_EVIDENCE_KEYS[typeof inspectRecord.region_evidence === 'string' ? inspectRecord.region_evidence : ''])
                 : t('explorer.noLineageRecord'),
             } : undefined,
-          // The raw block previously showed ONLY the lineage record; for
-          // requests without one it disappeared entirely ("raw record
-          // null"). Fall back to the full request-log detail — the snapshot
-          // fields already render above, this is the complete record.
+          // Requests without a lineage record fall back to the full request-log
+          // detail — the snapshot fields already render above, this is the
+          // complete record.
           raw: privacy ? undefined : (inspectRecord ?? inspectDetail ?? undefined),
           } : null}
           fields={buildDetailFields(t, inspectDetail, privacy, (key, value) => addLabelClause(key, value))}
