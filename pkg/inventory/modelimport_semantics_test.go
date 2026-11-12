@@ -46,6 +46,26 @@ func wantStrings(t *testing.T, got, want []string, what string) {
 	}
 }
 
+func wantTimePtr(t *testing.T, got *time.Time, want time.Time, what string) {
+	t.Helper()
+	if got == nil || !got.Equal(want.UTC()) {
+		t.Fatalf("%s = %v, want %v", what, got, want.UTC())
+	}
+}
+
+func checkAssetHeader(t *testing.T, a Asset, want Source, firstSeen, lastSeen time.Time) {
+	t.Helper()
+	if a.OrgID != "org-42" || a.Confidence != ConfidenceHigh || a.Source != want {
+		t.Fatalf("%s header wrong: %+v (want source %s)", a.AssetKey, a, want)
+	}
+	if !a.FirstSeen.Equal(firstSeen) || !a.LastSeen.Equal(lastSeen) {
+		t.Fatalf("%s seen window not propagated: %+v", a.AssetKey, a)
+	}
+	if err := a.Validate(); err != nil {
+		t.Fatalf("asset %s invalid: %v", a.AssetKey, err)
+	}
+}
+
 // TestBuildModelAssetsOutputOrder pins the deterministic asset sequence:
 // model assets sorted by (provider, model) first, provider assets sorted by
 // name after them.
@@ -92,13 +112,13 @@ func TestBuildModelAssetsHeaderFields(t *testing.T) {
 		t.Fatalf("skips: %+v", skips)
 	}
 	wantSource := map[string]Source{
-		ModelKey("pr", "m1"):    SourceModelsRegistry,
-		ModelKey("pc", "m2"):    SourceModelCatalog,
-		ModelKey("pp", "m3"):    SourceModelCatalog,
-		ProviderKey("pr"):       SourceModelsRegistry,
-		ProviderKey("pc"):       SourceModelCatalog,
-		ProviderKey("pp"):       SourceModelCatalog,
-		ProviderKey("pw"):       SourceModelCatalog,
+		ModelKey("pr", "m1"): SourceModelsRegistry,
+		ModelKey("pc", "m2"): SourceModelCatalog,
+		ModelKey("pp", "m3"): SourceModelCatalog,
+		ProviderKey("pr"):    SourceModelsRegistry,
+		ProviderKey("pc"):    SourceModelCatalog,
+		ProviderKey("pp"):    SourceModelCatalog,
+		ProviderKey("pw"):    SourceModelCatalog,
 	}
 	if len(assets) != len(wantSource) {
 		t.Fatalf("assets = %v, want exactly %v", assetKeys(assets), wantSource)
@@ -108,15 +128,7 @@ func TestBuildModelAssetsHeaderFields(t *testing.T) {
 		if !ok {
 			t.Fatalf("unexpected asset %s", a.AssetKey)
 		}
-		if a.OrgID != "org-42" || a.Confidence != ConfidenceHigh || a.Source != want {
-			t.Fatalf("%s header wrong: %+v (want source %s)", a.AssetKey, a, want)
-		}
-		if !a.FirstSeen.Equal(firstSeen) || !a.LastSeen.Equal(semanticAt) {
-			t.Fatalf("%s seen window not propagated: %+v", a.AssetKey, a)
-		}
-		if err := a.Validate(); err != nil {
-			t.Fatalf("asset %s invalid: %v", a.AssetKey, err)
-		}
+		checkAssetHeader(t, a, want, firstSeen, semanticAt)
 	}
 	if k := mustAsset(t, assets, ModelKey("pr", "m1")); k.Kind != KindModel {
 		t.Fatalf("model asset kind = %q", k.Kind)
@@ -237,19 +249,19 @@ func TestBuildModelAssetsWithdrawalOverrideCarriesDeprecatedAt(t *testing.T) {
 		t.Fatalf("skips: %+v", skips)
 	}
 	m := modelPayloadOf(t, mustAsset(t, assets, ModelKey("p1", "depd")))
-	if m.Status != "withdrawn" || m.WithdrawnAt == nil || !m.WithdrawnAt.Equal(wd.UTC()) {
+	if m.Status != "withdrawn" {
 		t.Fatalf("withdrawal override missing: %+v", m)
 	}
-	if m.DeprecatedAt == nil || !m.DeprecatedAt.Equal(dep.UTC()) {
-		t.Fatalf("deprecation instant must survive the withdrawal override: %+v", m)
-	}
+	wantTimePtr(t, m.WithdrawnAt, wd, "depd withdrawn_at")
+	wantTimePtr(t, m.DeprecatedAt, dep, "depd deprecated_at")
 	if p := modelPayloadOf(t, mustAsset(t, assets, ModelKey("p1", "live"))); p.Status != "withdrawn" {
 		t.Fatalf("live model under withdrawal: %+v", p)
 	}
 	pp := providerPayloadOf(t, mustAsset(t, assets, ProviderKey("p1")))
-	if pp.Status != "withdrawn" || pp.WithdrawnAt == nil || !pp.WithdrawnAt.Equal(wd.UTC()) {
+	if pp.Status != "withdrawn" {
 		t.Fatalf("provider withdrawal missing: %+v", pp)
 	}
+	wantTimePtr(t, pp.WithdrawnAt, wd, "provider withdrawn_at")
 }
 
 // TestBuildModelAssetsPricingObservationMerge pins the many-rows-to-one-pair
