@@ -88,7 +88,7 @@ func TestN06P05BoundaryLive_FenceTtlExactEqualityEdge(t *testing.T) {
 	total := n06p5GrantFourScopes(t, pool, org, dead)
 	n06p5ShiftLease(t, pool, dead, time.Hour) // lapsed 1h: outside the 30m fenced override, inside the 2h default
 
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	base := time.Now()
 	var now atomic.Int64 // unix nanos of the faked now, 0 = acquisition base
 	fence.now = func() time.Time {
@@ -160,7 +160,7 @@ func TestN06P05BoundaryLive_MidPassExpiryLandsOnExactRowBoundary(t *testing.T) {
 		closeFirstK  = 2 // rows 1..K close; the abort lands exactly before row K+1
 		stoppedAfter = 300_000
 	)
-	fence := NewRecoveryFence(pool, nil)
+	fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 	base := time.Now()
 	var calls atomic.Int64
 	fence.now = func() time.Time {
@@ -196,7 +196,7 @@ func TestN06P05BoundaryLive_MidPassExpiryLandsOnExactRowBoundary(t *testing.T) {
 
 	// Takeover: a fresh lease finishes exactly what the aborted pass left —
 	// the union is the full escrow, exactly once.
-	leaseB, err := n06p5TryAcquireFence(pool, dead, "verdict-boundary-b", time.Hour)
+	leaseB, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-boundary-b", time.Hour)
 	require.NoError(t, err)
 	sumB, err := store.CloseAbandonedReplicaFenced(ctx, leaseB, 30*time.Minute)
 	require.NoError(t, err)
@@ -211,7 +211,7 @@ func TestN06P05BoundaryLive_MidPassExpiryLandsOnExactRowBoundary(t *testing.T) {
 	// verdict observes the exactly-once losing side.
 	_, err = store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 	require.ErrorIs(t, err, ErrStaleRecoveryFence)
-	leaseC, err := n06p5TryAcquireFence(pool, dead, "verdict-boundary-c", time.Hour)
+	leaseC, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-boundary-c", time.Hour)
 	require.NoError(t, err)
 	defer func() { _ = leaseC.Release(ctx) }()
 	sumC, err := store.CloseAbandonedReplicaFenced(ctx, leaseC, 30*time.Minute)
@@ -271,7 +271,7 @@ func TestN06P05BoundaryLive_MoneyRemainderEdgesOneVerdict(t *testing.T) {
 
 	// Phase 1: a fenced verdict over the young rows. Zero remainders close
 	// immediately and return nothing; live remainders freeze.
-	lease, err := n06p5TryAcquireFence(pool, dead, "verdict-money", time.Hour)
+	lease, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-money", time.Hour)
 	require.NoError(t, err)
 	sum, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 	require.NoError(t, err)
@@ -339,7 +339,7 @@ func TestN06P05BoundaryLive_MoneyRemainderEdgesOneVerdict(t *testing.T) {
 		"Σ settled keys == granted + injected drift, untouched by the verdict")
 
 	// Idempotent tail: every later verdict only reports the losing side.
-	lease2, err := n06p5TryAcquireFence(pool, dead, "verdict-money-tail", time.Hour)
+	lease2, err := n06p5TryAcquireFence(ctx, pool, dead, "verdict-money-tail", time.Hour)
 	require.NoError(t, err)
 	sum3, err := store.CloseAbandonedReplicaFenced(ctx, lease2, 30*time.Minute)
 	require.NoError(t, err)
@@ -380,7 +380,7 @@ func TestN06P05BoundaryLive_SafetyWindowEdgesBothSides(t *testing.T) {
 	n06p5bShiftScopeLease(t, pool, fenced, ScopeWallet, 30*time.Minute-10*time.Second)
 	n06p5bShiftScopeLease(t, pool, fenced, ScopeTeamMonth, 30*time.Minute+10*time.Second)
 
-	lease, err := n06p5TryAcquireFence(pool, fenced, "verdict-winf", time.Hour)
+	lease, err := n06p5TryAcquireFence(ctx, pool, fenced, "verdict-winf", time.Hour)
 	require.NoError(t, err)
 	sum, err := store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
 	require.NoError(t, err)
@@ -394,7 +394,7 @@ func TestN06P05BoundaryLive_SafetyWindowEdgesBothSides(t *testing.T) {
 	// Ten seconds later the inside row crosses the same edge and closes
 	// under an identical verdict — the edge itself is what separates them.
 	n06p5bShiftScopeLease(t, pool, fenced, ScopeWallet, 30*time.Minute+10*time.Second)
-	lease2, err := n06p5TryAcquireFence(pool, fenced, "verdict-winf-2", time.Hour)
+	lease2, err := n06p5TryAcquireFence(ctx, pool, fenced, "verdict-winf-2", time.Hour)
 	require.NoError(t, err)
 	sum2, err := store.CloseAbandonedReplicaFenced(ctx, lease2, 30*time.Minute)
 	require.NoError(t, err)
@@ -454,7 +454,7 @@ func TestN06P05BoundaryLive_FenceAcquireStormExactlyOneWinner(t *testing.T) {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				fence := NewRecoveryFence(pool, nil)
+				fence := NewRecoveryFence(n06p5FenceHolderPool(pool), nil)
 				<-start
 				leases[i], errs[i] = fence.Acquire(ctx, dead, fmt.Sprintf("%s-storm-%d", round, i), time.Hour)
 			}(i)
