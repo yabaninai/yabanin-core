@@ -281,6 +281,10 @@ func paddedNameProblem(where, key, kind, value string) string {
 	return fmt.Sprintf("%s (%s): whitespace-padded %s name %q", where, key, kind, value)
 }
 
+// catalogProblems is the append-and-format callback shared by the section
+// validators, so findings stay in document order.
+type catalogProblems func(format string, args ...any)
+
 // ValidateCatalogDocument checks structural and semantic soundness:
 //   - schema_version must equal CatalogSchemaV1 or CatalogSchemaV2; a v1
 //     document must not carry v2 data (deprecated_at, customizations) —
@@ -301,14 +305,30 @@ func paddedNameProblem(where, key, kind, value string) string {
 //     and deprecated_at obey the same rules as a model row.
 func ValidateCatalogDocument(doc CatalogDocument) error {
 	var problems []string
-	add := func(format string, args ...any) {
+	add := catalogProblems(func(format string, args ...any) {
 		problems = append(problems, fmt.Sprintf(format, args...))
-	}
+	})
 
+	validateCatalogHeader(doc, add)
+	models := validateCatalogModels(doc, add)
+	catalogAliasModelCollisions(doc.Models, models, add)
+	validateCatalogCustomizations(doc, add)
+	validateCatalogWithdrawals(doc.WithdrawnProviders, add)
+
+	if len(problems) > 0 {
+		return &CatalogDocumentError{Problems: problems}
+	}
+	return nil
+}
+
+// validateCatalogHeader checks the header fields; its findings precede any
+// row finding.
+func validateCatalogHeader(doc CatalogDocument, add catalogProblems) {
 	if doc.SchemaVersion == 0 {
 		add("schema_version is required")
 	} else if doc.SchemaVersion != CatalogSchemaV1 && doc.SchemaVersion != CatalogSchemaV2 {
-		add("unsupported schema_version %d (this parser understands %d and %d)", doc.SchemaVersion, CatalogSchemaV1, CatalogSchemaV2)
+		add("unsupported schema_version %d (this parser understands %d and %d)",
+			doc.SchemaVersion, CatalogSchemaV1, CatalogSchemaV2)
 	}
 	if strings.TrimSpace(doc.Version) == "" {
 		add("version is required")
@@ -319,104 +339,181 @@ func ValidateCatalogDocument(doc CatalogDocument) error {
 	if _, err := parseCatalogTime("as_of", doc.AsOf); err != nil {
 		add("%v", err)
 	}
+}
 
+// validateCatalogModels walks the model rows in document order and returns
+// the trimmed model namespace (provider:model) that the deferred alias
+// collision pass checks against.
+func validateCatalogModels(doc CatalogDocument, add catalogProblems) map[string]struct{} {
 	models := make(map[string]struct{}, len(doc.Models))
 	aliases := make(map[string]struct{})
 	for i, m := range doc.Models {
-		where := fmt.Sprintf("models[%d]", i)
-		providerName := strings.TrimSpace(m.Provider)
-		model := strings.TrimSpace(m.Model)
-		if providerName == "" || model == "" {
-			add("%s: provider and model are required", where)
+		validateCatalogModelRow(i, m, doc.SchemaVersion, models, aliases, add)
+	}
+	return models
+}
+
+// validateCatalogModelRow validates one model row. A row missing either
+// name contributes only the required-name finding: without both names
+// there is no identity to check the remaining fields against.
+func validateCatalogModelRow(i int, m CatalogModelEntry, schema int, models, aliases map[string]struct{}, add catalogProblems) {
+	where := fmt.Sprintf("models[%d]", i)
+	providerName := strings.TrimSpace(m.Provider)
+	model := strings.TrimSpace(m.Model)
+	if providerName == "" || model == "" {
+		add("%s: provider and model are required", where)
+		return
+	}
+	key := providerName + ":" + model
+	addCatalogPaddedNames(where, key, m.Provider, m.Model, add)
+	if _, dup := models[key]; dup {
+		add("%s: duplicate entry for %s", where, key)
+	}
+	models[key] = struct{}{}
+
+	catalogAliasProblems(where, key, providerName, model, m.Aliases, aliases, "in this provider", add)
+	addCatalogCapabilityProblems(where, key, m.Capabilities, add)
+	if m.Limits != nil {
+		addCatalogLimitProblems(where, key, m.Limits, add)
+	}
+	if m.Price != nil {
+		addCatalogPriceProblems(where, key, m.Price, add)
+	}
+	validateCatalogModelWindow(where, key, m, schema, add)
+}
+
+// addCatalogPaddedNames reports whitespace-padded provider and model
+// spellings: the checks below compare trimmed spellings and the runtime
+// snapshot layers trim again before installing, so a padded form that
+// passed validation would be silently repaired into an identity other than
+// the one the document wrote.
+func addCatalogPaddedNames(where, key, providerRaw, modelRaw string, add catalogProblems) {
+	if p := paddedNameProblem(where, key, "provider", providerRaw); p != "" {
+		add("%s", p)
+	}
+	if p := paddedNameProblem(where, key, "model", modelRaw); p != "" {
+		add("%s", p)
+	}
+}
+
+// catalogAliasProblems validates one row's alias list in listed order.
+// owner is the provider-scoped alias namespace of the section;
+// usedByNote completes the already-used finding ("in this provider" for
+// vendor rows, "by another override in this provider" for overrides).
+func catalogAliasProblems(where, key, providerName, model string, rawAliases []string, owner map[string]struct{}, usedByNote string, add catalogProblems) {
+	seen := make(map[string]struct{}, len(rawAliases))
+	for _, rawAlias := range rawAliases {
+		a := strings.TrimSpace(rawAlias)
+		if a == "" {
+			add("%s (%s): empty alias", where, key)
 			continue
 		}
-		key := providerName + ":" + model
-		if p := paddedNameProblem(where, key, "provider", m.Provider); p != "" {
+		if p := paddedNameProblem(where, key, "alias", rawAlias); p != "" {
 			add("%s", p)
+			continue
 		}
-		if p := paddedNameProblem(where, key, "model", m.Model); p != "" {
-			add("%s", p)
+		if a == model {
+			add("%s (%s): alias %q shadows the model name", where, key, a)
+			continue
 		}
-		if _, dup := models[key]; dup {
-			add("%s: duplicate entry for %s", where, key)
+		if _, dup := seen[a]; dup {
+			add("%s (%s): duplicate alias %q", where, key, a)
+			continue
 		}
-		models[key] = struct{}{}
+		seen[a] = struct{}{}
+		aliasKey := providerName + ":" + a
+		if _, dup := owner[aliasKey]; dup {
+			add("%s (%s): alias %q is already used %s", where, key, a, usedByNote)
+			continue
+		}
+		owner[aliasKey] = struct{}{}
+	}
+}
 
-		seenAlias := make(map[string]struct{}, len(m.Aliases))
-		for _, rawAlias := range m.Aliases {
-			a := strings.TrimSpace(rawAlias)
-			if a == "" {
-				add("%s (%s): empty alias", where, key)
-				continue
-			}
-			if p := paddedNameProblem(where, key, "alias", rawAlias); p != "" {
-				add("%s", p)
-				continue
-			}
-			if a == model {
-				add("%s (%s): alias %q shadows the model name", where, key, a)
-				continue
-			}
-			if _, dup := seenAlias[a]; dup {
-				add("%s (%s): duplicate alias %q", where, key, a)
-				continue
-			}
-			seenAlias[a] = struct{}{}
-			aliasKey := providerName + ":" + a
-			if _, dup := aliases[aliasKey]; dup {
-				add("%s (%s): alias %q is already used in this provider", where, key, a)
-				continue
-			}
-			aliases[aliasKey] = struct{}{}
-		}
+// addCatalogCapabilityProblems reports capability keys outside the pinned
+// vocabulary, sorted for deterministic messages.
+func addCatalogCapabilityProblems(where, key string, caps map[string]bool, add catalogProblems) {
+	if unknown := unknownCapabilityKeys(caps); len(unknown) > 0 {
+		add("%s (%s): unknown capability keys: %s", where, key, strings.Join(unknown, ", "))
+	}
+}
 
-		if unknown := unknownCapabilityKeys(m.Capabilities); len(unknown) > 0 {
-			add("%s (%s): unknown capability keys: %s", where, key, strings.Join(unknown, ", "))
-		}
-		if m.Limits != nil {
-			for _, f := range catalogLimitFields {
-				if v := f.value(m.Limits); v < 0 {
-					add("%s (%s): limits.%s must not be negative (%d)", where, key, f.name, v)
-				}
-			}
-		}
-		if m.Price != nil {
-			for _, name := range catalogPriceFields {
-				v := catalogPriceField(m.Price, name)
-				if math.IsNaN(v) || math.IsInf(v, 0) {
-					add("%s (%s): price.%s must be a finite number (%v)", where, key, name, v)
-				} else if v < 0 {
-					add("%s (%s): price.%s must not be negative (%v)", where, key, name, v)
-				}
-			}
-		}
-		from, errFrom := parseCatalogTime(where+".effective_from", m.EffectiveFrom)
-		to, errTo := parseCatalogTime(where+".effective_to", m.EffectiveTo)
-		if errFrom != nil {
-			add("%v", errFrom)
-		}
-		if errTo != nil {
-			add("%v", errTo)
-		}
-		if errFrom == nil && errTo == nil && !from.IsZero() && !to.IsZero() && to.Before(from) {
-			add("%s (%s): sell window closes before it opens", where, key)
-		}
-		if m.DeprecatedAt != "" {
-			if doc.SchemaVersion == CatalogSchemaV1 {
-				add("%s (%s): deprecated_at requires schema_version %d", where, key, CatalogSchemaV2)
-			}
-			dep, errDep := parseCatalogTime(where+".deprecated_at", m.DeprecatedAt)
-			if errDep != nil {
-				add("%v", errDep)
-			} else if p := deprecationWindowProblem(from, to, dep); p != "" {
-				add("%s (%s): %s", where, key, p)
-			}
+// addCatalogLimitProblems reports negative limits in the pinned field
+// order (catalogLimitFields), so identical documents always produce
+// identical problem lists.
+func addCatalogLimitProblems(where, key string, l *CatalogLimits, add catalogProblems) {
+	for _, f := range catalogLimitFields {
+		if v := f.value(l); v < 0 {
+			add("%s (%s): limits.%s must not be negative (%d)", where, key, f.name, v)
 		}
 	}
+}
 
-	// An alias may not shadow any model name of the same provider, including
-	// names declared later in the document, so re-check after all rows.
-	for _, m := range doc.Models {
+// addCatalogPriceProblems walks the price fields in the pinned order
+// (catalogPriceFields): non-finite values (reachable only through the
+// struct API — JSON cannot spell them) are rejected before negativity.
+func addCatalogPriceProblems(where, key string, p *CatalogPrice, add catalogProblems) {
+	for _, name := range catalogPriceFields {
+		v := catalogPriceField(p, name)
+		if math.IsNaN(v) || math.IsInf(v, 0) {
+			add("%s (%s): price.%s must be a finite number (%v)", where, key, name, v)
+		} else if v < 0 {
+			add("%s (%s): price.%s must not be negative (%v)", where, key, name, v)
+		}
+	}
+}
+
+// catalogWindowTimes parses the optional sell-window endpoints, reporting
+// parse findings; an endpoint that fails to parse (or is absent) yields
+// the zero instant, which the inversion checks treat as unset.
+func catalogWindowTimes(where, fromStr, toStr string, add catalogProblems) (from, to time.Time) {
+	from, errFrom := parseCatalogTime(where+".effective_from", fromStr)
+	to, errTo := parseCatalogTime(where+".effective_to", toStr)
+	if errFrom != nil {
+		add("%v", errFrom)
+	}
+	if errTo != nil {
+		add("%v", errTo)
+	}
+	return from, to
+}
+
+// validateCatalogModelWindow checks the sell window and, when present, the
+// deprecation instant of a model row (the v1 schema guard's message names
+// the row key).
+func validateCatalogModelWindow(where, key string, m CatalogModelEntry, schema int, add catalogProblems) {
+	from, to := catalogWindowTimes(where, m.EffectiveFrom, m.EffectiveTo, add)
+	if !from.IsZero() && !to.IsZero() && to.Before(from) {
+		add("%s (%s): sell window closes before it opens", where, key)
+	}
+	if m.DeprecatedAt == "" {
+		return
+	}
+	if schema == CatalogSchemaV1 {
+		add("%s (%s): deprecated_at requires schema_version %d", where, key, CatalogSchemaV2)
+	}
+	addCatalogDeprecationProblems(where, key, m.DeprecatedAt, from, to, add)
+}
+
+// addCatalogDeprecationProblems parses a present deprecated_at instant and
+// checks it against the row's parsed sell window. The v1 schema guard is
+// emitted by the callers because its message differs per section.
+func addCatalogDeprecationProblems(where, key, dep string, from, to time.Time, add catalogProblems) {
+	depTime, err := parseCatalogTime(where+".deprecated_at", dep)
+	if err != nil {
+		add("%v", err)
+		return
+	}
+	if p := deprecationWindowProblem(from, to, depTime); p != "" {
+		add("%s (%s): %s", where, key, p)
+	}
+}
+
+// catalogAliasModelCollisions re-checks every alias against the full model
+// namespace after all rows: an alias may not shadow any model name of the
+// same provider, including names declared later in the document.
+func catalogAliasModelCollisions(rows []CatalogModelEntry, models map[string]struct{}, add catalogProblems) {
+	for _, m := range rows {
 		providerName := strings.TrimSpace(m.Provider)
 		model := strings.TrimSpace(m.Model)
 		for _, a := range m.Aliases {
@@ -429,103 +526,73 @@ func ValidateCatalogDocument(doc CatalogDocument) error {
 			}
 		}
 	}
+}
 
-	// Customizations validate like model rows, with two differences: one
-	// (provider, model) pair may be customized at most once, and override
-	// aliases are checked for self-consistency and cross-override
-	// uniqueness only — an override alias may legitimately restate an
-	// alias of the vendor row it replaces, so collisions against the
-	// vendor name space are left to the merge (BuildModelCatalog), which
-	// validates the merged name space as a whole.
+// validateCatalogCustomizations walks the customization rows (they obey
+// the same rules as model rows) and enforces the v2 schema requirement for
+// the section as a whole. Override aliases are checked for
+// self-consistency and cross-override uniqueness only — an override alias
+// may legitimately restate an alias of the vendor row it replaces, so
+// collisions against the vendor name space are left to the merge
+// (BuildModelCatalog), which validates the merged name space as a whole.
+func validateCatalogCustomizations(doc CatalogDocument, add catalogProblems) {
 	overridden := make(map[string]struct{}, len(doc.Customizations))
 	overrideAliases := make(map[string]struct{})
 	for i, o := range doc.Customizations {
-		where := fmt.Sprintf("customizations[%d]", i)
-		providerName := strings.TrimSpace(o.Provider)
-		model := strings.TrimSpace(o.Model)
-		if providerName == "" || model == "" {
-			add("%s: provider and model are required", where)
-			continue
-		}
-		key := providerName + ":" + model
-		if p := paddedNameProblem(where, key, "provider", o.Provider); p != "" {
-			add("%s", p)
-		}
-		if p := paddedNameProblem(where, key, "model", o.Model); p != "" {
-			add("%s", p)
-		}
-		if _, dup := overridden[key]; dup {
-			add("%s: duplicate override for %s", where, key)
-		}
-		overridden[key] = struct{}{}
-
-		seenAlias := make(map[string]struct{}, len(o.Aliases))
-		for _, rawAlias := range o.Aliases {
-			a := strings.TrimSpace(rawAlias)
-			if a == "" {
-				add("%s (%s): empty alias", where, key)
-				continue
-			}
-			if p := paddedNameProblem(where, key, "alias", rawAlias); p != "" {
-				add("%s", p)
-				continue
-			}
-			if a == model {
-				add("%s (%s): alias %q shadows the model name", where, key, a)
-				continue
-			}
-			if _, dup := seenAlias[a]; dup {
-				add("%s (%s): duplicate alias %q", where, key, a)
-				continue
-			}
-			seenAlias[a] = struct{}{}
-			aliasKey := providerName + ":" + a
-			if _, dup := overrideAliases[aliasKey]; dup {
-				add("%s (%s): alias %q is already used by another override in this provider", where, key, a)
-				continue
-			}
-			overrideAliases[aliasKey] = struct{}{}
-		}
-
-		if unknown := unknownCapabilityKeys(o.Capabilities); len(unknown) > 0 {
-			add("%s (%s): unknown capability keys: %s", where, key, strings.Join(unknown, ", "))
-		}
-		if o.Limits != nil {
-			for _, f := range catalogLimitFields {
-				if v := f.value(o.Limits); v < 0 {
-					add("%s (%s): limits.%s must not be negative (%d)", where, key, f.name, v)
-				}
-			}
-		}
-		from, errFrom := parseCatalogTime(where+".effective_from", o.EffectiveFrom)
-		to, errTo := parseCatalogTime(where+".effective_to", o.EffectiveTo)
-		if errFrom != nil {
-			add("%v", errFrom)
-		}
-		if errTo != nil {
-			add("%v", errTo)
-		}
-		if errFrom == nil && errTo == nil && !from.IsZero() && !to.IsZero() && to.Before(from) {
-			add("%s (%s): override window closes before it opens", where, key)
-		}
-		if o.DeprecatedAt != "" {
-			if doc.SchemaVersion == CatalogSchemaV1 {
-				add("%s: deprecated_at requires schema_version %d", where, CatalogSchemaV2)
-			}
-			dep, errDep := parseCatalogTime(where+".deprecated_at", o.DeprecatedAt)
-			if errDep != nil {
-				add("%v", errDep)
-			} else if p := deprecationWindowProblem(from, to, dep); p != "" {
-				add("%s (%s): %s", where, key, p)
-			}
-		}
+		validateCatalogOverrideRow(i, o, doc.SchemaVersion, overridden, overrideAliases, add)
 	}
 	if len(doc.Customizations) > 0 && doc.SchemaVersion == CatalogSchemaV1 {
 		add("customizations require schema_version %d", CatalogSchemaV2)
 	}
+}
 
-	withdrawn := make(map[string]struct{}, len(doc.WithdrawnProviders))
-	for i, w := range doc.WithdrawnProviders {
+// validateCatalogOverrideRow validates one customization row; like a model
+// row, a row missing either name contributes only the required-name
+// finding. One (provider, model) pair may be customized at most once.
+func validateCatalogOverrideRow(i int, o CatalogOverride, schema int, overridden, overrideAliases map[string]struct{}, add catalogProblems) {
+	where := fmt.Sprintf("customizations[%d]", i)
+	providerName := strings.TrimSpace(o.Provider)
+	model := strings.TrimSpace(o.Model)
+	if providerName == "" || model == "" {
+		add("%s: provider and model are required", where)
+		return
+	}
+	key := providerName + ":" + model
+	addCatalogPaddedNames(where, key, o.Provider, o.Model, add)
+	if _, dup := overridden[key]; dup {
+		add("%s: duplicate override for %s", where, key)
+	}
+	overridden[key] = struct{}{}
+
+	catalogAliasProblems(where, key, providerName, model, o.Aliases, overrideAliases, "by another override in this provider", add)
+	addCatalogCapabilityProblems(where, key, o.Capabilities, add)
+	if o.Limits != nil {
+		addCatalogLimitProblems(where, key, o.Limits, add)
+	}
+	validateCatalogOverrideWindow(where, key, o, schema, add)
+}
+
+// validateCatalogOverrideWindow mirrors validateCatalogModelWindow for a
+// customization row (the v1 schema guard's message omits the row key).
+func validateCatalogOverrideWindow(where, key string, o CatalogOverride, schema int, add catalogProblems) {
+	from, to := catalogWindowTimes(where, o.EffectiveFrom, o.EffectiveTo, add)
+	if !from.IsZero() && !to.IsZero() && to.Before(from) {
+		add("%s (%s): override window closes before it opens", where, key)
+	}
+	if o.DeprecatedAt == "" {
+		return
+	}
+	if schema == CatalogSchemaV1 {
+		add("%s: deprecated_at requires schema_version %d", where, CatalogSchemaV2)
+	}
+	addCatalogDeprecationProblems(where, key, o.DeprecatedAt, from, to, add)
+}
+
+// validateCatalogWithdrawals checks the provider-level delist rows: a
+// named provider with a parseable instant, at most one row per provider.
+func validateCatalogWithdrawals(rows []CatalogWithdrawal, add catalogProblems) {
+	withdrawn := make(map[string]struct{}, len(rows))
+	for i, w := range rows {
 		where := fmt.Sprintf("withdrawn_providers[%d]", i)
 		name := strings.TrimSpace(w.Provider)
 		if name == "" {
@@ -544,11 +611,6 @@ func ValidateCatalogDocument(doc CatalogDocument) error {
 			add("%s: withdrawn_at is required", where)
 		}
 	}
-
-	if len(problems) > 0 {
-		return &CatalogDocumentError{Problems: problems}
-	}
-	return nil
 }
 
 // ParseCatalogDocument reads, decodes and validates a document. The returned
