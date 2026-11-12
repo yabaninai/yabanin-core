@@ -1,17 +1,22 @@
 package mcp
 
 // Partner-bridge protocol version matrix pin. The partner server delegates
-// protocol-version handling to mcp-go v0.57.0: ValidProtocolVersions =
-// {2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05}, negotiation =
-// echo-or-latest (unknown/missing → the SDK's LATEST_PROTOCOL_VERSION,
-// 2025-11-25).
+// protocol-version handling to mcp-go v1.5.0: ValidProtocolVersions =
+// {2026-07-28, 2025-11-25, 2025-06-18, 2025-03-26, 2024-11-05}. The modern
+// 2026-07-28 revision removed the initialize handshake (stateless core,
+// reached via server/discover), so initialize negotiation is
+// legacy-echo-or-capped: legacy valid versions echo exactly; modern or
+// unknown non-empty requests cap at the SDK's LATEST_LEGACY_PROTOCOL_VERSION
+// (2025-11-25); a missing version falls back to the spec's assumed
+// 2025-03-26.
 //
 // Pinned here so the cross-surface interop invariant stays executable:
 // every version the NATIVE gateway endpoint offers (pkg/mcpserver
 // version.go matrix: 2025-06-18, 2025-03-26) must remain a member of the
-// SDK's valid set — a client negotiated to any native version speaks a
-// version this bridge accepts. If the native matrix bumps to a revision
-// outside the SDK set, this test fails (the interop tripwire).
+// SDK's initialize-negotiable legacy set — a client negotiated to any
+// native version speaks a version this bridge accepts. If the native
+// matrix bumps to a revision outside that set, this test fails (the
+// interop tripwire).
 
 import (
 	"context"
@@ -74,32 +79,47 @@ func partnerInitVersion(t *testing.T, requested string) (string, string) {
 	return resp.Result.ProtocolVersion, resp.Result.ServerInfo.Name
 }
 
-// TestPartnerVersionMatrix pins the SDK-side negotiation: every SDK-valid
-// version echoes exactly; unknown and missing requests fall back to the
-// SDK's latest (explicit, never an echo of the unknown value).
+// TestPartnerVersionMatrix pins the SDK-side negotiation: every legacy
+// SDK-valid version echoes exactly; modern and unknown non-empty requests
+// cap at the SDK's latest legacy version (explicit, never an echo of the
+// requested value).
 func TestPartnerVersionMatrix(t *testing.T) {
-	if !slices.Contains(mcp.ValidProtocolVersions, mcp.LATEST_PROTOCOL_VERSION) {
-		t.Fatalf("SDK latest %q not a member of its own valid set", mcp.LATEST_PROTOCOL_VERSION)
+	// The initialize-negotiable ceiling must itself be a known version.
+	if !slices.Contains(mcp.ValidProtocolVersions, mcp.LATEST_LEGACY_PROTOCOL_VERSION) {
+		t.Fatalf("SDK latest legacy %q not a member of its own valid set", mcp.LATEST_LEGACY_PROTOCOL_VERSION)
 	}
-	for _, v := range mcp.ValidProtocolVersions {
+	for _, v := range mcp.LegacyProtocolVersions() {
 		got, name := partnerInitVersion(t, v)
 		if got != v {
-			t.Fatalf("SDK-valid %q negotiated to %q, want exact echo", v, got)
+			t.Fatalf("SDK legacy %q negotiated to %q, want exact echo", v, got)
 		}
 		if name != "yabanin-mcp" {
 			t.Fatalf("serverInfo.name = %q, want yabanin-mcp", name)
 		}
 	}
-	// Unknown non-empty requests fall back to the SDK's latest — explicit,
-	// never an echo of the unknown value. A MISSING version is different:
-	// the SDK applies the spec's header-assumption rule (no version
-	// identifier available → assume 2025-03-26), an intentional asymmetry
-	// versus the native endpoint, whose missing initialize param falls back
-	// to its latest (pkg/mcpserver negotiateProtocolVersion).
+	// Modern protocol revisions removed the initialize handshake, so
+	// initialize never negotiates them: the SDK caps at its latest legacy
+	// version. Clients reach the modern protocol via server/discover,
+	// which this bridge does not expose.
+	for _, v := range mcp.ValidProtocolVersions {
+		if !mcp.IsModernProtocol(v) {
+			continue
+		}
+		got, _ := partnerInitVersion(t, v)
+		if got != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Fatalf("modern %q via initialize negotiated to %q, want capped %q", v, got, mcp.LATEST_LEGACY_PROTOCOL_VERSION)
+		}
+	}
+	// Unknown non-empty requests cap at the SDK's latest legacy version —
+	// explicit, never an echo of the unknown value. A MISSING version is
+	// different: the SDK applies the spec's header-assumption rule (no
+	// version identifier available → assume 2025-03-26), an intentional
+	// asymmetry versus the native endpoint, whose missing initialize param
+	// falls back to its latest (pkg/mcpserver negotiateProtocolVersion).
 	for _, requested := range []string{"1999-01-01", "2030-01-01", "garbage"} {
 		got, _ := partnerInitVersion(t, requested)
-		if got != mcp.LATEST_PROTOCOL_VERSION {
-			t.Fatalf("unknown %q negotiated to %q, want explicit SDK latest %q", requested, got, mcp.LATEST_PROTOCOL_VERSION)
+		if got != mcp.LATEST_LEGACY_PROTOCOL_VERSION {
+			t.Fatalf("unknown %q negotiated to %q, want explicit SDK latest legacy %q", requested, got, mcp.LATEST_LEGACY_PROTOCOL_VERSION)
 		}
 	}
 	if got, _ := partnerInitVersion(t, ""); got != "2025-03-26" {
@@ -112,8 +132,11 @@ func TestPartnerVersionMatrix(t *testing.T) {
 // SDK valid set (see the file comment).
 func TestPartnerAcceptsEveryNativeVersion(t *testing.T) {
 	for _, v := range nativeOfferedVersions {
-		if !slices.Contains(mcp.ValidProtocolVersions, v) {
-			t.Fatalf("native-offered version %q is NOT in the partner SDK valid set %v — native matrix bumped past the SDK (interop tripwire)", v, mcp.ValidProtocolVersions)
+		// The native matrix must stay inside the bridge's initialize-
+		// negotiable set: a native bump to a modern-only revision would be
+		// valid to the SDK but silently downgraded by the bridge.
+		if !slices.Contains(mcp.LegacyProtocolVersions(), v) {
+			t.Fatalf("native-offered version %q is NOT in the partner SDK legacy set %v — native matrix bumped past the SDK (interop tripwire)", v, mcp.ValidProtocolVersions)
 		}
 		got, _ := partnerInitVersion(t, v)
 		if got != v {
