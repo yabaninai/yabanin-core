@@ -375,6 +375,10 @@ func ValidateCatalog(c Catalog) error {
 	return pc.err()
 }
 
+// validateModel checks one model entry and registers its identity and
+// aliases in the catalog-wide namespaces (first occurrence wins). The
+// per-concern helpers must run in this exact order: problems are reported
+// in declaration order and the identity namespaces are order-sensitive.
 func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, seenAlias map[string]int) {
 	where := fmt.Sprintf("models[%d]", i)
 	if strings.TrimSpace(m.Provider) == "" {
@@ -386,6 +390,25 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 	if m.Provider == "" || m.Model == "" {
 		return
 	}
+	validateModelIdentity(pc, where, i, m, seenIdentity, seenAlias)
+	validateModelStatus(pc, where, m)
+	validateModelWindow(pc, where, m)
+	validateModelReview(pc, where, m)
+	validateModelAliases(pc, where, i, m, seenIdentity, seenAlias)
+	seenAxis := make(map[string]int, len(m.Rates))
+	for j := range m.Rates {
+		validateRate(pc, fmt.Sprintf("%s.rates[%d]", where, j), j, &m.Rates[j], seenAxis)
+	}
+	seenSource := validateModelSources(pc, where, m)
+	validateModelConflicts(pc, where, m, seenSource)
+	validateConflictCompleteness(pc, where, m)
+}
+
+// validateModelIdentity registers (or rejects) the entry's identity in the
+// catalog-wide namespace. An identity that duplicates an earlier entry or
+// collides with an earlier alias is reported and NOT registered, so the
+// first occurrence keeps serving later checks.
+func validateModelIdentity(pc *refProblemCollector, where string, i int, m *RefModel, seenIdentity, seenAlias map[string]int) {
 	key := m.Provider + "\x00" + m.Model
 	if prev, dup := seenIdentity[key]; dup {
 		pc.add(where, "duplicate entry for %s:%s (first at models[%d])", m.Provider, m.Model, prev)
@@ -394,7 +417,10 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 	} else {
 		seenIdentity[key] = i
 	}
+}
 
+// validateModelStatus checks the lifecycle status and the currency scope.
+func validateModelStatus(pc *refProblemCollector, where string, m *RefModel) {
 	switch m.Status {
 	case RefStatusDraft, RefStatusActive, RefStatusRetired:
 	default:
@@ -406,6 +432,12 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 		// silent unit mismatch later.
 		pc.add(where+".currency", "must be USD, got %q", m.Currency)
 	}
+}
+
+// validateModelWindow checks the applicability window: both bounds must be
+// well-formed schema instants, and a closed window must open strictly
+// before it closes (half-open [EffectiveFrom, EffectiveTo)).
+func validateModelWindow(pc *refProblemCollector, where string, m *RefModel) {
 	if err := ValidateRefTime(m.EffectiveFrom); err != nil {
 		pc.add(where+".effective_from", "%v", err)
 	}
@@ -417,6 +449,12 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 			pc.add(where, "effective window closes at or before it opens (%s >= %s)", m.EffectiveTo, m.EffectiveFrom)
 		}
 	}
+}
+
+// validateModelReview checks the review provenance an active entry must
+// carry: a verification instant and at least one primary source. Draft and
+// retired entries are exempt.
+func validateModelReview(pc *refProblemCollector, where string, m *RefModel) {
 	if err := ValidateRefTime(m.VerifiedAt); err != nil {
 		pc.add(where+".verified_at", "%v", err)
 	}
@@ -426,7 +464,13 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 	if m.Status == RefStatusActive && len(m.Sources) == 0 {
 		pc.add(where+".sources", "an active entry needs at least one primary source")
 	}
+}
 
+// validateModelAliases checks and registers the entry's aliases in the
+// provider namespace. Aliases resolve by exact string match (ResolveModel),
+// so what validates is exactly what resolves: no padding, no shadowing the
+// model's own name, no collisions with earlier models or aliases.
+func validateModelAliases(pc *refProblemCollector, where string, i int, m *RefModel, seenIdentity, seenAlias map[string]int) {
 	for j, a := range m.Aliases {
 		apath := fmt.Sprintf("%s.aliases[%d]", where, j)
 		trimmed := strings.TrimSpace(a)
@@ -435,10 +479,8 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 			continue
 		}
 		if trimmed != a {
-			// Aliases resolve by exact string match (ResolveModel), so a
-			// stored " x" would validate as "x" yet never resolve as
-			// "x". Reject instead of normalizing the caller's slice: what
-			// validates is exactly what resolves.
+			// A stored " x" would validate as "x" yet never resolve as
+			// "x". Reject instead of normalizing the caller's slice.
 			pc.add(apath, "alias %q must not have leading or trailing whitespace", a)
 			continue
 		}
@@ -457,12 +499,12 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 		}
 		seenAlias[aliasKey] = i
 	}
+}
 
-	seenAxis := make(map[string]int, len(m.Rates))
-	for j := range m.Rates {
-		validateRate(pc, fmt.Sprintf("%s.rates[%d]", where, j), j, &m.Rates[j], seenAxis)
-	}
-
+// validateModelSources checks the primary-source records and returns the
+// set of source refs the entry declared (conflict resolutions must name one
+// of them).
+func validateModelSources(pc *refProblemCollector, where string, m *RefModel) map[string]struct{} {
 	seenSource := make(map[string]struct{}, len(m.Sources))
 	for j, s := range m.Sources {
 		spath := fmt.Sprintf("%s.sources[%d]", where, j)
@@ -483,7 +525,12 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 			pc.add(spath+".verified_at", "%v", err)
 		}
 	}
+	return seenSource
+}
 
+// validateModelConflicts checks the declared conflict resolutions: known
+// axis, a reason, and a ref naming one of the entry's declared sources.
+func validateModelConflicts(pc *refProblemCollector, where string, m *RefModel, seenSource map[string]struct{}) {
 	for j, cf := range m.Conflicts {
 		cpath := fmt.Sprintf("%s.conflicts[%d]", where, j)
 		if _, known := axisUnits[cf.Axis]; !known {
@@ -498,34 +545,39 @@ func validateModel(pc *refProblemCollector, i int, m *RefModel, seenIdentity, se
 			pc.add(cpath+".reason", "conflict resolution needs a reason")
 		}
 	}
+}
 
-	// Conflict completeness: every axis whose evidence disagrees must carry
-	// a resolution naming an amount the evidence actually observed.
+// validateConflictCompleteness enforces that every axis whose evidence
+// disagrees carries a resolution naming an amount the evidence actually
+// observed.
+func validateConflictCompleteness(pc *refProblemCollector, where string, m *RefModel) {
 	for j := range m.Rates {
 		r := &m.Rates[j]
 		if !rateEvidenceConflicts(r) {
 			continue
 		}
-		resolved := false
-		for _, cf := range m.Conflicts {
-			if cf.Axis != r.Axis || r.Amount == nil {
-				continue
-			}
-			for _, ev := range r.Evidence {
-				if ev.Ref == cf.Ref && sameRefAmount(ev.Amount, *r.Amount) {
-					resolved = true
-					break
-				}
-			}
-			if resolved {
-				break
-			}
+		if rateConflictResolved(r, m.Conflicts) {
+			continue
 		}
-		if !resolved {
-			pc.add(fmt.Sprintf("%s.rates[%d]", where, j),
-				"conflicting evidence on axis %q without a resolution choosing one observed amount", r.Axis)
+		pc.add(fmt.Sprintf("%s.rates[%d]", where, j),
+			"conflicting evidence on axis %q without a resolution choosing one observed amount", r.Axis)
+	}
+}
+
+// rateConflictResolved reports whether one of the declared resolutions
+// chooses the rate's amount from an observation on the conflicting axis.
+func rateConflictResolved(r *RefRate, conflicts []RefConflict) bool {
+	for _, cf := range conflicts {
+		if cf.Axis != r.Axis || r.Amount == nil {
+			continue
+		}
+		for _, ev := range r.Evidence {
+			if ev.Ref == cf.Ref && sameRefAmount(ev.Amount, *r.Amount) {
+				return true
+			}
 		}
 	}
+	return false
 }
 
 func validateRate(pc *refProblemCollector, where string, idx int, r *RefRate, seenAxis map[string]int) {
