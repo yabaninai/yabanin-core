@@ -20,6 +20,7 @@ const EXIT_FOR = { PASS: 0, FAIL: 1, FLAG: 2 }
 const EXPECTATIONS = [
   { name: 'pass-comment-churn', result: 'PASS', contains: 'summary: 1 pass, 0 flag, 0 fail' },
   { name: 'pass-tsx-comment-churn', result: 'PASS', contains: 'summary: 1 pass, 0 flag, 0 fail' },
+  { name: 'pass-jsdoc-reword', result: 'PASS', contains: 'summary: 1 pass, 0 flag, 0 fail' },
   { name: 'fail-token-edit', result: 'FAIL', contains: ['token #', '"active"', '"enabled"'] },
   { name: 'fail-asi-hazard', result: 'FAIL', contains: 'ASI hazard' },
   { name: 'flag-ts-ignore-removed', result: 'FLAG', contains: 'removed ts-pragma directive' },

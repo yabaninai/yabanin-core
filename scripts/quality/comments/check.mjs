@@ -69,7 +69,8 @@ function parse(fileName, text) {
 
 // Collect leaf tokens in document order. The parser (not a raw scanner pass)
 // assigns JSX text, regex literals and template spans correctly, so trivia
-// never leaks into the executable stream.
+// never leaks into the executable stream. JSDoc nodes are parsed children of
+// their declaration, not trivia — they are comments, so they are skipped.
 function collectTokens(sourceFile) {
   const fullText = sourceFile.getFullText()
   const tokens = []
@@ -81,9 +82,10 @@ function collectTokens(sourceFile) {
     }
   }
   sourceFile.getChildren(sourceFile).forEach(visit)
-  tokens.sort((a, b) => a.start - b.start)
+  const executable = tokens.filter((token) => !ts.SyntaxKind[token.kind].startsWith('JSDoc'))
+  executable.sort((a, b) => a.start - b.start)
   let previousEnd = null
-  return tokens.map((token, index) => {
+  return executable.map((token, index) => {
     // Leading line breaks before the first token cannot affect ASI, so
     // deleting a leading comment line must not fail on token #0.
     const trivia = index === 0 ? '' : fullText.slice(previousEnd, token.start)
