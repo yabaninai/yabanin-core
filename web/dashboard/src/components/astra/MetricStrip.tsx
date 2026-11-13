@@ -8,7 +8,7 @@ import { MetricHint } from './MetricHint'
 // so a missing baseline can never masquerade as a measured one. Values are
 // tabular (mono) numerals; the band is a polite live region.
 //
-// AUX-10: a metric can carry a glossary `description` (from the
+// A metric can carry a glossary `description` (from the
 // lib/analyticsQuery.ts registry); it renders as a hover/focus tooltip
 // through the shared MetricHint primitive.
 
@@ -24,7 +24,7 @@ export interface Metric {
   source?: ReactNode
   /** Coverage such as "3 of 4 requests priced". */
   coverage?: ReactNode
-  /** Glossary text for the "what does this mean" tooltip (AUX-10). */
+  /** Glossary text for the "what does this mean" tooltip. */
   description?: ReactNode
   state?: MetricState
 }
@@ -75,7 +75,7 @@ export function MetricStrip({ metrics, 'aria-label': ariaLabel }: { metrics: Met
               }}
             >
               {st === 'loading' ? (
-                // AVR-05 (F08): motion-safe so prefers-reduced-motion users
+                // Motion-safe so prefers-reduced-motion users
                 // get a static ellipsis instead of the pulse.
                 <span aria-label={t('states.loading')} className="inline-block motion-safe:animate-pulse">
                   …

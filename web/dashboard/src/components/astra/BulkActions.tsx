@@ -1,4 +1,4 @@
-// AUX-20: bulk selection bar + honest per-row report.
+// Bulk selection bar + honest per-row report.
 //
 // The page owns the selection state (DataTable `selection` spec); this
 // component renders the sticky action bar for the current selection and,
@@ -8,14 +8,14 @@
 // action is applied row by row through the existing single-row APIs, so a
 // partial failure is the normal honest outcome, reported as such.
 //
-// Mutating actions run through the AUX-12/14b contract: an ActionDialog
+// Mutating actions run through the shared action contract: an ActionDialog
 // (medium risk) collects an optional operator reason that rides to every
 // row call as X-Audit-Reason. Reversible runs offer an Undo that inverts
 // exactly the rows that succeeded. Instant actions (CSV export, add to
 // filter) run without a dialog.
 //
 // This file must stay free of any org/root authorization logic — the page
-// disables action items via its own permission gates (AUX-13).
+// disables action items via its own permission gates.
 import { useCallback, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useAction } from './ActionDialog'
@@ -72,7 +72,7 @@ export function BulkActions<T>({
   onSelectionChange: (next: string[]) => void
   limit?: number
   actions: Array<BulkActionItem<T>>
-  /** Carries the AUX-12 confirm dialog for mutating items. */
+  /** Carries the confirm dialog for mutating items. */
   dialog?: ReturnType<typeof useAction>
   /** Refetch after a mutating run (or its undo). */
   onChanged?: () => void
@@ -84,7 +84,7 @@ export function BulkActions<T>({
   const selectedSet = new Set(selectedIds)
   const selectedRows = rows.filter(r => selectedSet.has(getRowId(r)))
 
-  // Sequential by design (AUX-20): no batch endpoint exists, and the report
+  // Sequential by design: no batch endpoint exists, and the report
   // must reflect each row's real outcome in order.
   const runRows = useCallback(
     async (targets: T[], apply: (row: T, reason: string) => Promise<void>, reason: string): Promise<BulkRowResult[]> => {

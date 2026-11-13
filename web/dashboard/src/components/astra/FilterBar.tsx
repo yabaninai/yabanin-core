@@ -6,9 +6,9 @@ import {
   type YqlClause, type YqlFieldMeta, type YqlOp,
 } from '../../lib/queryLang'
 
-// AUX-05 — the shared filter bar behind the request explorer, the analytics
+// The shared filter bar behind the request explorer, the analytics
 // explorer and the dashboards boards. One component owns the draft/applied
-// contract every screen must honour (plan "Фильтры"):
+// contract every screen must honour:
 //   - the draft is what the input shows; `applied` is what onApply received;
 //   - parse-ok drafts commit automatically after debounceMs (300-400ms);
 //     debounceMs = 0 commits on every keystroke (the explorer adds its own
@@ -312,8 +312,8 @@ export const FilterBar = forwardRef<FilterBarHandle, FilterBarProps>(function Fi
     // In yql and hybrid modes the section stays unlabeled: the input inside
     // carries the accessible name, and a same-named region would make
     // getByLabel(name)/role lookups ambiguous for assistive queries.
-    // hybrid tightens the card padding: the explorer's vertical budget
-    // belongs to the rows (v2 checklist item 8).
+  // hybrid tightens the card padding: the explorer's vertical budget
+  // belongs to the rows.
     <section className={`card flex flex-col gap-2 ${hybrid ? '!px-4 !py-2' : ''}`} aria-label={simple ? label : undefined}>
       {simple && (
         <div className="flex flex-wrap items-end gap-3">
@@ -452,7 +452,7 @@ export const FilterBar = forwardRef<FilterBarHandle, FilterBarProps>(function Fi
               className="inline-flex items-center gap-1 rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] bg-[color:var(--astra-surface-muted)] px-2 py-1 text-xs"
             >
               <span style={{ fontFamily: 'var(--astra-font-code)' }}>{clauseToString(cl)}</span>
-              {/* AVR-07 (F09): 44px touch target floor on the remove hit area. */}
+              {/* 44px touch target floor on the remove hit area. */}
               <button
                 type="button"
                 onClick={() => removeChip(i)}

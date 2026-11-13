@@ -5,11 +5,11 @@ import { useDisclosureDismiss } from './disclosure'
 // at most one primary action in the row, everything else lives here).
 //
 // Contract:
-//   * items carry a risk level (the AUX-12 ActionRisk vocabulary): `high`
+//   * items carry a risk level (the shared ActionRisk vocabulary): `high`
 //     renders in the danger token (destructive/irreversible), `medium`
 //     gets a warning glyph; the risk decision itself (dialog, type-the-name,
 //     reason) stays with the page's useAction/ActionDialog flow;
-//   * the disclosure follows the shared AUX-06 dismissal pattern
+//   * the disclosure follows the shared dismissal pattern
 //     (useDisclosureDismiss): Escape closes and refocuses the «⋯» toggle,
 //     an outside click closes while letting that click land;
 //   * plain buttons in a disclosure (no menu roving) — the same ARIA shape

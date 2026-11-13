@@ -3,13 +3,13 @@ import { useTranslation } from 'react-i18next'
 import { Search } from 'lucide-react'
 import { filterCommands, groupCommands, type CommandOption } from '../../lib/commandPalette'
 
-// AUX-21: the ⌘K / Ctrl+K command palette — a search field over the visible
-// navigation (the AUX-13 access-filtered NAV_SECTIONS) plus a few navigation
+// The ⌘K / Ctrl+K command palette — a search field over the visible
+// navigation (the access-filtered NAV_SECTIONS) plus a few navigation
 // actions. Navigation-only on purpose: nothing here mutates — a selection
 // either moves to a page or lands on one with a prefilled filter; mutating
-// flows stay behind their dialogs (AUX-12).
+// flows stay behind their dialogs.
 //
-// Keyboard contract (aux12/aux17 pattern): the field takes focus on open,
+// Keyboard contract (dialog pattern): the field takes focus on open,
 // Tab/Shift+Tab cycle inside the dialog, Escape closes it and focus returns
 // to the opener — or, for a keyboard-opened palette (no opener element), to
 // the first focusable in the admin content region. Arrow keys move the
@@ -17,8 +17,8 @@ import { filterCommands, groupCommands, type CommandOption } from '../../lib/com
 // field to the list (aria-activedescendant, aria-selected).
 //
 // The layer is a fixed inset-0 flex container with a panel capped at
-// min(36rem, 100%) — no horizontal document growth at 360px (the AUX-21
-// overflow gate, same approach as .astra-drawer in index.css).
+// min(36rem, 100%) — no horizontal document growth at 360px (same
+// approach as .astra-drawer in index.css).
 
 export interface CommandPaletteProps {
   commands: CommandOption[]

@@ -1,8 +1,8 @@
 import { useTranslation } from 'react-i18next'
 import { useOrgs } from '../../i18n/useOrgPresentation'
 
-// «страница v2» item 1: the operator sees the organization, not a UUID).
-// Backed by the shared org-list cache (UI-VF-1), so a screen full of rows
+// The operator sees the organization, not a UUID.
+// Backed by the shared org-list cache, so a screen full of rows
 // costs one request. Until the list loads — or when the id is unknown — the
 // raw id shows in its place (honest fallback, never an invented name).
 

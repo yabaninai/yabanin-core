@@ -16,7 +16,7 @@ import {
   computeSignals, registryFormatters, type Signal, type SignalCompare,
 } from '../../lib/signals'
 
-// AUX-18 — the "requires attention" inbox block on Overview.
+// The "requires attention" inbox block on Overview.
 //
 // Signals are computed client-side by lib/signals.ts over data that already
 // exists (no new endpoints): the org analytics compare query (analytics.read),
@@ -35,7 +35,7 @@ import {
 //   - otherwise the signal list: severity, the "why" with registry-formatted
 //     numbers, and a link to the existing page carrying the evidence.
 
-/** One compare query backs every analytics-based detector (AUX-18). */
+/** One compare query backs every analytics-based detector. */
 const SIGNAL_METRICS = ['error_rate', 'latency_p95', 'cache_hit_rate']
 
 function severityGlyph(severity: Signal['severity']): string {
