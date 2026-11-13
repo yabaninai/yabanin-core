@@ -269,12 +269,31 @@ type pairKey struct {
 // error (the «пустое upstream» rule).
 func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog ModelCatalogSource, pack PricingPack, prov *ReferenceProvenance) ([]Asset, []ModelImportSkip) {
 	now := at.LastSeen
-	var skips []ModelImportSkip
 
-	// Deployment side: registry rows, attributed through alias resolution
-	// to the canonical pair.
-	registryByPair := map[pairKey][]RegistryModelObservation{}
-	registryProviders := map[string]int{}
+	registryByPair, registryProviders, skips := collectRegistryObservations(reg, catalog, now)
+	catalogByPair, catalogProviders, catalogSkips := collectCatalogObservations(catalog, now)
+	skips = append(skips, catalogSkips...)
+	pricingByPair, pricingProviders, pricingSkips := collectPricingObservations(pack)
+	skips = append(skips, pricingSkips...)
+	withdrawn := withdrawnProviders(catalog)
+
+	pairs := unionPairs(registryByPair, catalogByPair, pricingByPair)
+	modelAssets, marshalSkips := modelAssetsForPairs(pairs, registryByPair, catalogByPair,
+		pricingByPair, withdrawn, at, orgID, prov, now)
+	skips = append(skips, marshalSkips...)
+	providerAssetBatch, providerSkips := providerAssets(registryProviders, catalogProviders,
+		pricingProviders, withdrawn, at, orgID, prov, now)
+	skips = append(skips, providerSkips...)
+	return append(modelAssets, providerAssetBatch...), skips
+}
+
+// collectRegistryObservations is the deployment side: registry rows, quoted
+// verbatim and attributed through alias resolution to the canonical pair.
+// Defective rows are skipped (counted), never fatal for healthy siblings.
+func collectRegistryObservations(reg []RegistryModel, catalog ModelCatalogSource, now time.Time) (map[pairKey][]RegistryModelObservation, map[string]int, []ModelImportSkip) {
+	byPair := map[pairKey][]RegistryModelObservation{}
+	providers := map[string]int{}
+	var skips []ModelImportSkip
 	for _, m := range reg {
 		if m.ModelName == "" || m.Provider == "" {
 			skips = append(skips, ModelImportSkip{Plane: "registry", Ref: m.Provider + "/" + m.ModelName,
@@ -286,25 +305,38 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 				Reason: "model_name fails key rules"})
 			continue
 		}
-		name := m.ModelName
-		if catalog != nil {
-			if canonical, st := catalog.ResolveAlias(m.Provider, name, now); canonical != "" && st != provider.StatusUnknown {
-				name = canonical // alias-named row → canonical pair (exact wins, ResolveAlias contract)
-			}
-		}
-		k := pairKey{m.Provider, name}
-		registryByPair[k] = append(registryByPair[k], RegistryModelObservation{
+		k := pairKey{m.Provider, canonicalModelName(catalog, m, now)}
+		byPair[k] = append(byPair[k], RegistryModelObservation{
 			ModelName: m.ModelName, Tier: m.Tier, UpstreamURL: m.UpstreamURL, Enabled: m.Enabled,
 		})
-		registryProviders[m.Provider]++
+		providers[m.Provider]++
 	}
+	return byPair, providers, skips
+}
 
-	// Reference side, catalog half. Entries are re-validated defensively
-	// (a constructed *provider.ModelCatalog already passed validation; a
-	// fixture or a future source may not): the deprecation-window rule
-	// follows the validateDeprecation pattern (modelcatalog.go:338).
-	catalogByPair := map[pairKey]*CatalogModelObservation{}
-	catalogProviders := map[string]int{}
+// canonicalModelName attributes a registry row to its canonical pair: an
+// alias that resolves to a non-empty name with a non-unknown status
+// redirects the observation (exact names win, the ResolveAlias contract);
+// everything else keeps the row's own name.
+func canonicalModelName(catalog ModelCatalogSource, m RegistryModel, now time.Time) string {
+	if catalog == nil {
+		return m.ModelName
+	}
+	canonical, st := catalog.ResolveAlias(m.Provider, m.ModelName, now)
+	if canonical == "" || st == provider.StatusUnknown {
+		return m.ModelName
+	}
+	return canonical
+}
+
+// collectCatalogObservations is the reference side, catalog half. Entries
+// are re-validated defensively (a constructed *provider.ModelCatalog already
+// passed validation; a fixture or a future source may not). A duplicate pair
+// keeps the first entry.
+func collectCatalogObservations(catalog ModelCatalogSource, now time.Time) (map[pairKey]*CatalogModelObservation, map[string]int, []ModelImportSkip) {
+	byPair := map[pairKey]*CatalogModelObservation{}
+	providers := map[string]int{}
+	var skips []ModelImportSkip
 	var entries []provider.ModelCatalogEntry
 	if catalog != nil {
 		entries = catalog.Entries()
@@ -325,12 +357,12 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 			continue
 		}
 		k := pairKey{e.Provider, e.Model}
-		if _, dup := catalogByPair[k]; dup {
+		if _, dup := byPair[k]; dup {
 			skips = append(skips, ModelImportSkip{Plane: "catalog", Ref: e.Provider + "/" + e.Model,
 				Reason: "duplicate entry for pair"})
 			continue
 		}
-		catalogByPair[k] = &CatalogModelObservation{
+		byPair[k] = &CatalogModelObservation{
 			Aliases:       append([]string(nil), e.Aliases...),
 			Status:        modelStatusAt(e, now),
 			EffectiveFrom: e.EffectiveFrom,
@@ -338,18 +370,23 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 			DeprecatedAt:  e.DeprecatedAt,
 			Custom:        e.Custom,
 		}
-		sort.Strings(catalogByPair[k].Aliases)
-		catalogProviders[e.Provider]++
+		sort.Strings(byPair[k].Aliases)
+		providers[e.Provider]++
 	}
+	return byPair, providers, skips
+}
 
-	// Reference side, pricing half.
-	pricingByPair := map[pairKey]*PricingModelObservation{}
-	pricingProviders := map[string]int{}
-	var refModels []pricing.RefModel
+// collectPricingObservations is the reference side, pricing half: many
+// refpack rows merge into one observation per pair.
+func collectPricingObservations(pack PricingPack) (map[pairKey]*PricingModelObservation, map[string]int, []ModelImportSkip) {
+	byPair := map[pairKey]*PricingModelObservation{}
+	providers := map[string]int{}
+	var skips []ModelImportSkip
+	var models []pricing.RefModel
 	if pack != nil {
-		refModels = pack.Models()
+		models = pack.Models()
 	}
-	for _, rm := range refModels {
+	for _, rm := range models {
 		if rm.Provider == "" || rm.Model == "" {
 			skips = append(skips, ModelImportSkip{Plane: "pricing", Ref: rm.Provider + "/" + rm.Model,
 				Reason: "empty provider or model"})
@@ -361,52 +398,77 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 			continue
 		}
 		k := pairKey{rm.Provider, rm.Model}
-		po, seen := pricingByPair[k]
+		po, seen := byPair[k]
 		if !seen {
 			po = &PricingModelObservation{}
-			pricingByPair[k] = po
-			pricingProviders[rm.Provider]++
+			byPair[k] = po
+			providers[rm.Provider]++ // rollups count pairs, not rows
 		}
-		po.Statuses = appendUniqueSorted(po.Statuses, rm.Status)
-		po.Regions = appendUniqueSorted(po.Regions, rm.Region)
-		po.Tiers = appendUniqueSorted(po.Tiers, rm.Tier)
-		for _, a := range rm.Aliases {
-			po.Aliases = appendUniqueSorted(po.Aliases, a)
-		}
+		mergeRefModel(po, rm)
 	}
+	return byPair, providers, skips
+}
 
-	// Provider withdrawals (reference side): a withdrawn provider's models
-	// report withdrawn regardless of their own window.
+// mergeRefModel folds one refpack row into a pair's pricing observation.
+func mergeRefModel(po *PricingModelObservation, rm pricing.RefModel) {
+	po.Statuses = appendUniqueSorted(po.Statuses, rm.Status)
+	po.Regions = appendUniqueSorted(po.Regions, rm.Region)
+	po.Tiers = appendUniqueSorted(po.Tiers, rm.Tier)
+	for _, a := range rm.Aliases {
+		po.Aliases = appendUniqueSorted(po.Aliases, a)
+	}
+}
+
+// withdrawnProviders reduces the catalog's provider withdrawals to the
+// earliest instant per provider; malformed rows carry no signal and no asset
+// noise.
+func withdrawnProviders(catalog ModelCatalogSource) map[string]time.Time {
 	withdrawn := map[string]time.Time{}
-	if catalog != nil {
-		for _, w := range catalog.Withdrawals() {
-			if w.Provider == "" || w.WithdrawnAt.IsZero() {
-				continue // malformed withdrawal row: no signal, no asset noise
-			}
-			if prev, dup := withdrawn[w.Provider]; !dup || w.WithdrawnAt.Before(prev) {
-				withdrawn[w.Provider] = w.WithdrawnAt
-			}
+	if catalog == nil {
+		return withdrawn
+	}
+	for _, w := range catalog.Withdrawals() {
+		if w.Provider == "" || w.WithdrawnAt.IsZero() {
+			continue
+		}
+		if prev, dup := withdrawn[w.Provider]; !dup || w.WithdrawnAt.Before(prev) {
+			withdrawn[w.Provider] = w.WithdrawnAt
 		}
 	}
+	return withdrawn
+}
 
-	// Union of pairs, deterministic order.
-	pairs := make([]pairKey, 0, len(registryByPair)+len(catalogByPair)+len(pricingByPair))
-	seenPair := map[pairKey]bool{}
-	for k := range registryByPair {
-		if !seenPair[k] {
-			seenPair[k] = true
-			pairs = append(pairs, k)
-		}
+// providerWithdrawalAt reports a provider's withdrawal instant when it is
+// already in effect at the import instant (a future withdrawal is not yet a
+// fact).
+func providerWithdrawalAt(withdrawn map[string]time.Time, name string, now time.Time) (time.Time, bool) {
+	wd, ok := withdrawn[name]
+	if !ok || now.Before(wd) {
+		return time.Time{}, false
+	}
+	return wd, true
+}
+
+// unionPairs lists every pair any plane knows, in deterministic
+// (provider, model) order.
+func unionPairs(registry map[pairKey][]RegistryModelObservation,
+	catalogByPair map[pairKey]*CatalogModelObservation,
+	pricingByPair map[pairKey]*PricingModelObservation) []pairKey {
+	seen := map[pairKey]bool{}
+	pairs := make([]pairKey, 0, len(registry)+len(catalogByPair)+len(pricingByPair))
+	for k := range registry {
+		seen[k] = true
+		pairs = append(pairs, k)
 	}
 	for k := range catalogByPair {
-		if !seenPair[k] {
-			seenPair[k] = true
+		if !seen[k] {
+			seen[k] = true
 			pairs = append(pairs, k)
 		}
 	}
 	for k := range pricingByPair {
-		if !seenPair[k] {
-			seenPair[k] = true
+		if !seen[k] {
+			seen[k] = true
 			pairs = append(pairs, k)
 		}
 	}
@@ -416,54 +478,23 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 		}
 		return pairs[i].model < pairs[j].model
 	})
+	return pairs
+}
 
+// modelAssetsForPairs builds one kind=model asset per known pair; a pair
+// only the marshaler rejects lands as a skip instead of aborting the batch.
+func modelAssetsForPairs(pairs []pairKey, registryByPair map[pairKey][]RegistryModelObservation,
+	catalogByPair map[pairKey]*CatalogModelObservation, pricingByPair map[pairKey]*PricingModelObservation,
+	withdrawn map[string]time.Time, at Timestamps, orgID string, prov *ReferenceProvenance,
+	now time.Time) ([]Asset, []ModelImportSkip) {
 	var assets []Asset
+	var skips []ModelImportSkip
 	for _, k := range pairs {
-		regObs := registryByPair[k]
-		catObs := catalogByPair[k]
-		priceObs := pricingByPair[k]
-		referenceKnown := catObs != nil || priceObs != nil
-		registryKnown := len(regObs) > 0
-		if !registryKnown && !referenceKnown {
-			continue // unreachable given the union construction
+		p, ok := assembleModelPayload(k, registryByPair[k], catalogByPair[k], pricingByPair[k],
+			withdrawn, prov, now)
+		if !ok {
+			continue
 		}
-
-		p := ModelPayload{Provider: k.provider, Model: k.model, Status: "unknown"}
-		switch {
-		case catObs != nil:
-			p.Status = catObs.Status
-			p.Aliases = append(p.Aliases, catObs.Aliases...)
-		case priceObs != nil:
-			p.Status = "unknown" // pricing knows the pair, the lifecycle catalog does not
-		}
-		if wd, isWithdrawn := withdrawn[k.provider]; isWithdrawn && !now.Before(wd) {
-			p.Status = "withdrawn"
-			t := wd.UTC()
-			p.WithdrawnAt = &t
-		}
-		if catObs != nil && !catObs.DeprecatedAt.IsZero() && !now.Before(catObs.DeprecatedAt) {
-			t := catObs.DeprecatedAt.UTC()
-			p.DeprecatedAt = &t // in-effect deprecation instant, carried even when a withdrawal overrides the status
-		}
-		if registryKnown {
-			sort.Slice(regObs, func(i, j int) bool { return regObs[i].ModelName < regObs[j].ModelName })
-			p.Registry = regObs
-		}
-		if catObs != nil {
-			p.Catalog = catObs
-		}
-		if priceObs != nil {
-			p.Pricing = priceObs
-			p.Aliases = append(p.Aliases, priceObs.Aliases...)
-		}
-		p.Aliases = dedupeSorted(p.Aliases)
-		switch {
-		case registryKnown && !referenceKnown:
-			p.Discrepancy = "registry_only"
-		case !registryKnown && referenceKnown:
-			p.Discrepancy = "reference_only"
-		}
-		p.Provenance = prov
 		payload, err := json.Marshal(p)
 		if err != nil { // unreachable for all-scalar payloads; still never fatal
 			skips = append(skips, ModelImportSkip{Plane: "catalog", Ref: k.provider + "/" + k.model,
@@ -472,52 +503,98 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 		}
 		assets = append(assets, Asset{
 			OrgID: orgID, AssetKey: ModelKey(k.provider, k.model), Kind: KindModel,
-			Payload: payload, Source: modelAssetSource(registryKnown),
+			Payload: payload, Source: modelAssetSource(len(registryByPair[k]) > 0),
 			Confidence: ConfidenceHigh, FirstSeen: at.FirstSeen, LastSeen: at.LastSeen,
 		})
 	}
+	return assets, skips
+}
 
-	// Provider assets: every provider seen on either side, plus
-	// withdrawal-only providers (no models at all).
-	providerNames := map[string]bool{}
-	for name := range registryProviders {
-		providerNames[name] = true
+// assembleModelPayload merges the three plane observations of one pair into
+// its registry payload. The sides stay disjoint sections: no field of one
+// side is derived from another (W03-C02).
+func assembleModelPayload(k pairKey, regObs []RegistryModelObservation, catObs *CatalogModelObservation,
+	priceObs *PricingModelObservation, withdrawn map[string]time.Time, prov *ReferenceProvenance,
+	now time.Time) (ModelPayload, bool) {
+	registryKnown := len(regObs) > 0
+	referenceKnown := catObs != nil || priceObs != nil
+	if !registryKnown && !referenceKnown {
+		return ModelPayload{}, false // unreachable given the union construction
 	}
-	for name := range catalogProviders {
-		providerNames[name] = true
+	p := ModelPayload{Provider: k.provider, Model: k.model}
+	p.Status, p.WithdrawnAt, p.DeprecatedAt = modelStatusFields(k.provider, catObs, withdrawn, now)
+	if catObs != nil {
+		p.Catalog = catObs
+		p.Aliases = append(p.Aliases, catObs.Aliases...)
 	}
-	for name := range pricingProviders {
-		providerNames[name] = true
+	if priceObs != nil {
+		p.Pricing = priceObs
+		p.Aliases = append(p.Aliases, priceObs.Aliases...)
 	}
-	for name := range withdrawn {
-		providerNames[name] = true
+	if registryKnown {
+		sort.Slice(regObs, func(i, j int) bool { return regObs[i].ModelName < regObs[j].ModelName })
+		p.Registry = regObs
 	}
-	names := make([]string, 0, len(providerNames))
-	for name := range providerNames {
-		names = append(names, name)
+	p.Aliases = dedupeSorted(p.Aliases)
+	p.Discrepancy = pairDiscrepancy(registryKnown, referenceKnown)
+	p.Provenance = prov
+	return p, true
+}
+
+// modelStatusFields derives the payload lifecycle at import time: the
+// catalog's status when the lifecycle plane knows the pair (pricing alone
+// leaves "unknown"), overridden by an in-effect provider withdrawal, with
+// the in-effect deprecation instant carried even then.
+func modelStatusFields(providerName string, catObs *CatalogModelObservation, withdrawn map[string]time.Time, now time.Time) (status string, withdrawnAt, deprecatedAt *time.Time) {
+	status = "unknown"
+	if catObs != nil {
+		status = catObs.Status
 	}
-	sort.Strings(names)
-	for _, name := range names {
+	if wd, inEffect := providerWithdrawalAt(withdrawn, providerName, now); inEffect {
+		status = "withdrawn"
+		t := wd.UTC()
+		withdrawnAt = &t
+	}
+	if catObs != nil && !catObs.DeprecatedAt.IsZero() && !now.Before(catObs.DeprecatedAt) {
+		t := catObs.DeprecatedAt.UTC()
+		deprecatedAt = &t
+	}
+	return status, withdrawnAt, deprecatedAt
+}
+
+// pairDiscrepancy flags pairs exactly one side knows (registry = deployment,
+// catalog+pricing = reference); both or neither means no flag.
+func pairDiscrepancy(registryKnown, referenceKnown bool) string {
+	switch {
+	case registryKnown && !referenceKnown:
+		return "registry_only"
+	case !registryKnown && referenceKnown:
+		return "reference_only"
+	}
+	return ""
+}
+
+// providerAssets builds one kind=provider asset per provider seen on either
+// side, plus withdrawal-only providers (no models at all — W03-C03).
+func providerAssets(registryProviders, catalogProviders, pricingProviders map[string]int,
+	withdrawn map[string]time.Time, at Timestamps, orgID string, prov *ReferenceProvenance,
+	now time.Time) ([]Asset, []ModelImportSkip) {
+	var assets []Asset
+	var skips []ModelImportSkip
+	for _, name := range providerNameUnion(registryProviders, catalogProviders, pricingProviders, withdrawn) {
 		pp := ProviderPayload{Provider: name, Status: "active",
 			RegistryModels: registryProviders[name],
 			CatalogModels:  catalogProviders[name],
 			PricingModels:  pricingProviders[name],
 			Provenance:     prov,
 		}
-		registrySide := pp.RegistryModels > 0
-		referenceSide := pp.CatalogModels > 0 || pp.PricingModels > 0
-		if wd, isWithdrawn := withdrawn[name]; isWithdrawn && !now.Before(wd) {
+		if wd, inEffect := providerWithdrawalAt(withdrawn, name, now); inEffect {
 			pp.Status = "withdrawn"
 			t := wd.UTC()
 			pp.WithdrawnAt = &t
 		}
-		switch {
-		case registrySide && !referenceSide:
-			pp.Discrepancy = "registry_only"
-		case !registrySide && referenceSide:
-			pp.Discrepancy = "reference_only"
-		}
-		ppPayload, err := json.Marshal(pp)
+		pp.Discrepancy = pairDiscrepancy(pp.RegistryModels > 0, pp.CatalogModels > 0 || pp.PricingModels > 0)
+		payload, err := json.Marshal(pp)
 		if err != nil { // unreachable for all-scalar payloads; still never fatal
 			skips = append(skips, ModelImportSkip{Plane: "catalog", Ref: name,
 				Reason: "payload marshal: " + err.Error()})
@@ -525,11 +602,35 @@ func BuildModelAssets(at Timestamps, orgID string, reg []RegistryModel, catalog 
 		}
 		assets = append(assets, Asset{
 			OrgID: orgID, AssetKey: ProviderKey(name), Kind: KindProvider,
-			Payload: ppPayload, Source: modelAssetSource(registrySide),
+			Payload: payload, Source: modelAssetSource(pp.RegistryModels > 0),
 			Confidence: ConfidenceHigh, FirstSeen: at.FirstSeen, LastSeen: at.LastSeen,
 		})
 	}
 	return assets, skips
+}
+
+// providerNameUnion is the sorted set of providers any plane (including
+// withdrawals) vouches for.
+func providerNameUnion(registry, catalogProviders, pricing map[string]int, withdrawn map[string]time.Time) []string {
+	names := map[string]bool{}
+	for name := range registry {
+		names[name] = true
+	}
+	for name := range catalogProviders {
+		names[name] = true
+	}
+	for name := range pricing {
+		names[name] = true
+	}
+	for name := range withdrawn {
+		names[name] = true
+	}
+	out := make([]string, 0, len(names))
+	for name := range names {
+		out = append(out, name)
+	}
+	sort.Strings(out)
+	return out
 }
 
 // modelAssetSource picks the provenance source: the deployment registry
