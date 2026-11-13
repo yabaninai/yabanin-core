@@ -26,6 +26,15 @@ func deprecationPhaseDocument() CatalogDocument {
 	}
 }
 
+type deprecationPhaseCase struct {
+	name       string
+	at         time.Time
+	status     provider.ModelStatus
+	available  bool
+	deprecated bool
+	state      provider.ModelLifecycle
+}
+
 // TestLifecycleReportDeprecationPhases pins the deprecation flag against the
 // sell-window phases: it appears exactly from the deprecation instant while
 // the model is still sellable, and never on a pending or retired row.
@@ -35,14 +44,7 @@ func TestLifecycleReportDeprecationPhases(t *testing.T) {
 		t.Fatalf("build: %v", err)
 	}
 	depInstant := time.Date(2023, 1, 1, 0, 0, 0, 0, time.UTC)
-	tests := []struct {
-		name       string
-		at         time.Time
-		status     provider.ModelStatus
-		available  bool
-		deprecated bool
-		state      provider.ModelLifecycle
-	}{
+	tests := []deprecationPhaseCase{
 		{"pending before the window opens", time.Date(2021, 7, 1, 0, 0, 0, 0, time.UTC),
 			provider.StatusPending, false, false, provider.LifecycleUnavailable},
 		{"active before the deprecation instant", time.Date(2022, 7, 1, 0, 0, 0, 0, time.UTC),
@@ -64,39 +66,53 @@ func TestLifecycleReportDeprecationPhases(t *testing.T) {
 			if r.Provider != "demo" || r.Model != "m1" || !r.Discovered {
 				t.Fatalf("row identity = %s:%s discovered=%v", r.Provider, r.Model, r.Discovered)
 			}
-			if r.CatalogStatus != tt.status {
-				t.Fatalf("catalog status = %v, want %v", r.CatalogStatus, tt.status)
-			}
-			if r.Available != tt.available {
-				t.Fatalf("available = %v, want %v", r.Available, tt.available)
-			}
-			if r.Deprecated != tt.deprecated {
-				t.Fatalf("deprecated = %v, want %v", r.Deprecated, tt.deprecated)
-			}
-			if r.DeprecatedAt.IsZero() != !tt.deprecated {
-				t.Fatalf("deprecated_at = %v, want zero iff not deprecated", r.DeprecatedAt)
-			}
-			if tt.deprecated && !r.DeprecatedAt.Equal(depInstant) {
-				t.Fatalf("deprecated_at = %v, want %v", r.DeprecatedAt, depInstant)
-			}
-			if r.State != tt.state {
-				t.Fatalf("state = %v, want %v", r.State, tt.state)
-			}
+			checkDeprecationPhaseRow(t, tt, r, depInstant)
 		})
 	}
 }
 
-// TestLifecycleReportWrongProviderFactStaysFactsOnly pins that identity is
-// the (provider, model) pair: a configured fact naming another provider's
-// model never folds into that model's row and opens its own facts-only row.
-func TestLifecycleReportWrongProviderFactStaysFactsOnly(t *testing.T) {
+// checkDeprecationPhaseRow asserts one phase row's catalog opinion against
+// its case: availability, the deprecation flag with its instant, and the
+// derived state.
+func checkDeprecationPhaseRow(t *testing.T, tt deprecationPhaseCase, r ModelLifecycleRow, depInstant time.Time) {
+	t.Helper()
+	if r.CatalogStatus != tt.status {
+		t.Fatalf("catalog status = %v, want %v", r.CatalogStatus, tt.status)
+	}
+	if r.Available != tt.available {
+		t.Fatalf("available = %v, want %v", r.Available, tt.available)
+	}
+	if r.Deprecated != tt.deprecated {
+		t.Fatalf("deprecated = %v, want %v", r.Deprecated, tt.deprecated)
+	}
+	if r.DeprecatedAt.IsZero() == tt.deprecated {
+		t.Fatalf("deprecated_at = %v, want zero iff not deprecated", r.DeprecatedAt)
+	}
+	if tt.deprecated && !r.DeprecatedAt.Equal(depInstant) {
+		t.Fatalf("deprecated_at = %v, want %v", r.DeprecatedAt, depInstant)
+	}
+	if r.State != tt.state {
+		t.Fatalf("state = %v, want %v", r.State, tt.state)
+	}
+}
+
+// wrongProviderFactReport builds the report for the identity pin: a
+// configured fact naming another provider's model.
+func wrongProviderFactReport(t *testing.T) LifecycleReport {
+	t.Helper()
 	c, err := BuildModelCatalog(sampleDocument())
 	if err != nil {
 		t.Fatalf("build: %v", err)
 	}
 	facts := []LifecycleFact{{Provider: "anthropic", Model: "gpt-doc", Configured: true}}
-	report := BuildLifecycleReport(c, facts, u2022)
+	return BuildLifecycleReport(c, facts, u2022)
+}
 
+// TestLifecycleReportWrongProviderFactRowSet pins that identity is the
+// (provider, model) pair: the fact neither folds into openai:gpt-doc nor
+// disturbs its row, and opens its own facts-only row instead.
+func TestLifecycleReportWrongProviderFactRowSet(t *testing.T) {
+	report := wrongProviderFactReport(t)
 	wantKeys := []string{"anthropic:claude-doc", "anthropic:gpt-doc", "openai:gpt-doc"}
 	if len(report.Rows) != len(wantKeys) {
 		t.Fatalf("rows = %d, want %d: %+v", len(report.Rows), len(wantKeys), report.Rows)
@@ -106,6 +122,10 @@ func TestLifecycleReportWrongProviderFactStaysFactsOnly(t *testing.T) {
 			t.Fatalf("row %d = %q, want %q", i, got, key)
 		}
 	}
+}
+
+func TestLifecycleReportWrongProviderFactRows(t *testing.T) {
+	report := wrongProviderFactReport(t)
 	drift := report.Rows[1]
 	if drift.Discovered || !drift.Configured || drift.Tested {
 		t.Fatalf("facts-only row = %+v", drift)
@@ -209,10 +229,22 @@ func TestLifecycleReportAliasesArePrivateSortedCopies(t *testing.T) {
 	}
 }
 
-// TestBuildModelCatalogMaterializesDocumentFields pins the document-to-entry
-// mapping: metadata, document order, capability/limit/price conversion and
-// the PriceListed distinction between a listed zero and no listing.
-func TestBuildModelCatalogMaterializesDocumentFields(t *testing.T) {
+// builtSampleEntries materializes the sample document's entries once for
+// the per-row mapping pins.
+func builtSampleEntries(t *testing.T) []provider.ModelCatalogEntry {
+	t.Helper()
+	c, err := BuildModelCatalog(sampleDocument())
+	if err != nil {
+		t.Fatalf("build: %v", err)
+	}
+	entries := c.Entries()
+	if len(entries) != 2 {
+		t.Fatalf("entries = %d, want 2", len(entries))
+	}
+	return entries
+}
+
+func TestBuildModelCatalogSnapshotMetadata(t *testing.T) {
 	c, err := BuildModelCatalog(sampleDocument())
 	if err != nil {
 		t.Fatalf("build: %v", err)
@@ -223,11 +255,10 @@ func TestBuildModelCatalogMaterializesDocumentFields(t *testing.T) {
 	if !c.AsOf().Equal(u2022) {
 		t.Fatalf("as_of = %v, want %v", c.AsOf(), u2022)
 	}
-	entries := c.Entries()
-	if len(entries) != 2 {
-		t.Fatalf("entries = %d, want 2", len(entries))
-	}
-	gpt, claude := entries[0], entries[1]
+}
+
+func TestBuildModelCatalogGptDocEntryMapping(t *testing.T) {
+	gpt := builtSampleEntries(t)[0]
 	if gpt.Provider != "openai" || gpt.Model != "gpt-doc" {
 		t.Fatalf("first entry = %s:%s, want openai:gpt-doc", gpt.Provider, gpt.Model)
 	}
@@ -243,15 +274,29 @@ func TestBuildModelCatalogMaterializesDocumentFields(t *testing.T) {
 	if !gpt.PriceListed || gpt.Price != wantPrice {
 		t.Fatalf("gpt-doc price = (%+v, listed=%v), want (%+v, true)", gpt.Price, gpt.PriceListed, wantPrice)
 	}
-	if !gpt.EffectiveTo.Equal(u2024) || !gpt.EffectiveFrom.IsZero() || !gpt.DeprecatedAt.IsZero() || gpt.Custom {
-		t.Fatalf("gpt-doc window/custom = (%v, %v, %v, %v)", gpt.EffectiveFrom, gpt.EffectiveTo, gpt.DeprecatedAt, gpt.Custom)
-	}
 	if strings.Join(gpt.Aliases, ",") != "gpt-doc-short" {
 		t.Fatalf("gpt-doc aliases = %v", gpt.Aliases)
 	}
+}
+
+func TestBuildModelCatalogGptDocWindow(t *testing.T) {
+	gpt := builtSampleEntries(t)[0]
+	if !gpt.EffectiveTo.Equal(u2024) || !gpt.EffectiveFrom.IsZero() {
+		t.Fatalf("gpt-doc window = (%v, %v), want (zero, %v)", gpt.EffectiveFrom, gpt.EffectiveTo, u2024)
+	}
+	if !gpt.DeprecatedAt.IsZero() || gpt.Custom {
+		t.Fatalf("gpt-doc deprecated_at/custom = (%v, %v), want (zero, false)", gpt.DeprecatedAt, gpt.Custom)
+	}
+}
+
+func TestBuildModelCatalogClaudeDocEntryMapping(t *testing.T) {
+	claude := builtSampleEntries(t)[1]
+	if claude.Provider != "anthropic" || claude.Model != "claude-doc" {
+		t.Fatalf("second entry = %s:%s, want anthropic:claude-doc", claude.Provider, claude.Model)
+	}
 	wantClaudeCaps := provider.ModelCapabilities{Chat: true, PDFInput: true}
-	if claude.Provider != "anthropic" || claude.Model != "claude-doc" || claude.Capabilities != wantClaudeCaps {
-		t.Fatalf("claude-doc = (%s:%s %+v)", claude.Provider, claude.Model, claude.Capabilities)
+	if claude.Capabilities != wantClaudeCaps {
+		t.Fatalf("claude-doc capabilities = %+v, want %+v", claude.Capabilities, wantClaudeCaps)
 	}
 	if claude.Limits != (provider.ModelLimits{}) || claude.PriceListed || claude.Price != (pricing.Price{}) {
 		t.Fatalf("claude-doc must carry no limits and no listing: %+v listed=%v", claude.Limits, claude.PriceListed)
