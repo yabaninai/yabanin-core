@@ -1,4 +1,4 @@
-// AF-12 unit tests: the locale switcher contract over async bundles.
+// Unit tests: the locale switcher contract over async bundles.
 //
 // The switcher is dependency-injected (no i18next/vite here), so these run
 // under node --test against the production module. Covered invariants:

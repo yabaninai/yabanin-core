@@ -1,4 +1,4 @@
-// AF-12 unit tests: the QA-only pseudo locale is derived from `en` on demand.
+// Unit tests: the QA-only pseudo locale is derived from `en` on demand.
 //
 // The production entry never builds it (index.ts only calls buildPseudo when
 // a QA request selects ?locale=pseudo); these tests pin the derivation
