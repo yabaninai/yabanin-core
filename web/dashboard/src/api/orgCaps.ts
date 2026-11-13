@@ -1,12 +1,13 @@
-// W-CAPS: org caps — the beta limits surface (RPM / TPM / hard monthly
+// Org caps — the beta limits surface (RPM / TPM / hard monthly budget). GET
 // returns the effective block (beta defaults merged with the org's
 // overrides) plus the measured month-to-date spend; the PUT sends the full
 // sextuple with a MANDATORY operator reason (the server 400s an empty one)
 // and answers the re-read effective block.
 //
-// AF-01 honesty rule: null means "beta default" — never "unlimited" — for
+// Honesty rule: null means "beta default" — never "unlimited" — for
 // rpm/tpm/budget (the server applies 60 RPM / 200k TPM / $50 month). The
-// key_tokens_per_min) have NO beta default: null = OFF (0 = no window; the
+// per-stream token axes (input/output/key_tokens_per_min) have NO beta
+// default: null = OFF (0 = no window; the
 // aggregate TPM default keeps applying). A partial PUT never disables a cap.
 
 import { readJSON, sendMutation } from './transport.ts'

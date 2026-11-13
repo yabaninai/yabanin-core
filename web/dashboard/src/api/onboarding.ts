@@ -1,8 +1,8 @@
-// W-WELCOME (wave 3): client module for the org onboarding progress flag —
+// Client module for the org onboarding progress flag —
 // GET/POST /api/me/onboarding (contract: services/admin/handlers/me.go, the
 // org target rides the ?org_id= query string on BOTH verbs).
 //
-// Degradation contract (AUX-13 honesty): the flag is a UI-progress hint, so
+// Degradation contract (honesty): the flag is a UI-progress hint, so
 // this module never throws. GET answers null when the state is unknown (old
 // backend 404, store without the capability → 501, network failure) — the
 // flow still renders, it just cannot persist. POST answers false when the

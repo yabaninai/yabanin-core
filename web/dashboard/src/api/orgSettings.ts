@@ -91,7 +91,7 @@ export function updateOrgDefaultOutputCap(
   return putOrgSetting(orgId, 'output-cap', { default_output_cap_tokens: defaultOutputCapTokens, reason }, opts)
 }
 
-// ===== AUX-24: organization settings (one screen over EXISTING endpoints) =====
+// ===== Organization settings (one screen over EXISTING endpoints) =====
 //
 // Every endpoint here is a root-only route today (services/admin/handlers/
 // router.go: the cache-settings, routing, residency/policy-packs, spend-alert,

@@ -18,7 +18,7 @@ export async function createRoutingRule(orgId: string, matchExpr: string, target
   return postJSON('/rules', { org_id: orgId, match_expr: matchExpr, target_model: targetModel, priority }, 'POST', opts)
 }
 
-/** UI-VF-1: PUT /api/rules/{id} — partial update (empty fields are ignored server-side). */
+/** PUT /api/rules/{id} — partial update (empty fields are ignored server-side). */
 export async function updateRoutingRule(
   id: string,
   values: { match_expr?: string; target_model?: string; priority?: number },
@@ -27,17 +27,17 @@ export async function updateRoutingRule(
   await postJSON(`/rules/${encodeURIComponent(id)}`, values, 'PUT', opts)
 }
 
-/** UI-VF-1: PUT /api/rules/{id}/enable — toggle a rule without touching its fields. */
+/** PUT /api/rules/{id}/enable — toggle a rule without touching its fields. */
 export async function setRoutingRuleEnabled(id: string, enabled: boolean, opts?: RequestOptions): Promise<void> {
   await postJSON(`/rules/${encodeURIComponent(id)}/enable`, { enabled }, 'PUT', opts)
 }
 
-/** UI-VF-1: DELETE /api/rules/{id}. */
+/** DELETE /api/rules/{id}. */
 export async function deleteRoutingRule(id: string, opts?: RequestOptions): Promise<void> {
   await postJSON(`/rules/${encodeURIComponent(id)}`, {}, 'DELETE', opts)
 }
 
-// ===== AUX-19: server-side rules preview (POST /api/rules/preview) =====
+// ===== Server-side rules preview (POST /api/rules/preview) =====
 //
 // The server is the single arbiter: the candidate is compiled and evaluated
 // by the same evaluator.Snapshot the gateway uses. org scope is the session's
@@ -83,7 +83,7 @@ export interface RulePreviewRequest {
   samples: RulePreviewSample[]
 }
 
-/** AUX-19: evaluate a draft rule against sample requests. Errors are typed
+/** Evaluate a draft rule against sample requests. Errors are typed
  *  ApiErrors — the server answers 400 {reason: "invalid_match_expression"}
  *  for an expression that would never match, so the UI can say so honestly. */
 export async function previewRoutingRule(body: RulePreviewRequest, opts?: RequestOptions): Promise<RulePreviewResponse> {

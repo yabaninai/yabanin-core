@@ -1,4 +1,4 @@
-// surface — services/admin/handlers/policy_pipelines.go, mounted under
+// The policy pipeline admin surface — services/admin/handlers/policy_pipelines.go, mounted under
 // RequireOrgPermissionPoliciesManage (policies.manage; root passes; a
 // foreign org is 404, a member without the permission 403).
 //
@@ -8,18 +8,19 @@
 //    enabled (mode flag), active_version (activate/rollback),
 //    attachments (replace-all). The server 400s unknown fields
 //    (DisallowUnknownFields) and a body with no recognized field ("nothing
-//    to update"). git_sha is NOT a UI field (owner decision 2026-11-04, G3):
+//    to update"). git_sha is NOT a UI field:
 //    the API rejects any caller-supplied value — git authorship is
 //    reconcile-managed, UI versions carry git_sha="" so drift attribution
 //    stays unspoofable;
-//  - validation is SERVER-SIDE and STRICT (owner decision 2026-11-04 (a)):
+//  - validation is SERVER-SIDE and STRICT:
 //    every save passes pkg/pipeline.ParsePolicy + Policy.Validate — the
 //    SAME parser the gateway compiles at load time; an unparseable policy
 //    is never stored. The editor calls POST /policies/validate (the same
 //    validation) BEFORE the mutation, so invalid drafts never reach the
 //    store; a 400 body {error} surfaces verbatim to the editor; this
 //    client adds no local YAML opinion;
-//    token: the policy.current_version the caller loaded. Stale → the
+//  - PUT is guarded by an optimistic-concurrency token: the
+//    policy.current_version the caller loaded. Stale → the
 //    server applies NOTHING and answers 409 {"error","current":{policy}};
 //    policyConflictCurrent unwraps the live current_version for the
 //    refresh-and-rebase offer.
@@ -101,7 +102,7 @@ export interface PolicyValidateOk {
   mode: string
 }
 
-/** The save-time arbiter (owner decision 2026-11-04 (a)): runs EXACTLY the
+/** The save-time arbiter: runs EXACTLY the
  * strict validation the create/update path runs (one parser, one message),
  * never touches the store. A 200 here means the same bytes would store;
  * a 400 answers with the exact save-error text (ApiError, code = message).
@@ -115,7 +116,7 @@ export async function validatePolicyDoc(orgId: string, yaml: string, opts?: Requ
 
 /** PUT patch — exactly the fields the server's update body accepts; omit
     everything you do not want to change (unknown fields 400). `version` is
-    the optimistic-concurrency token (R070 D2, owner 2026-10-18): the
+    the optimistic-concurrency token: the
     policy.current_version the editor loaded — present → the server applies
     the whole body atomically or answers 409 with the live row. */
 export interface PolicyUpdatePatch {
@@ -175,8 +176,8 @@ export function policyValidationErrorText(err: unknown): string {
 
 // --- Drift (GET /policies/drift, services/admin/handlers/policy_reconcile.go)
 
-/** DB-side drift classification of one policy (owner decision 2026-11-04
- * (b): the dashboard SHOWS drift, it does not hide it):
+/** DB-side drift classification of one policy (the dashboard SHOWS
+ * drift, it does not hide it):
  *  - managed: the newest version was authored by a git reconcile;
  *  - drift:   edited past git after a reconcile (authored outside git,
  *             but git history exists) — the incident state;

@@ -57,7 +57,7 @@ export interface UnitSpendRollup {
 export interface BudgetCapLine {
   id: string
   used: Measure
-  /** null = not configured (carbon cap unknown ≠ 0 — brief §2). */
+  /** null = not configured (carbon cap unknown ≠ 0). */
   limit: number | null
   status: string
   note?: string

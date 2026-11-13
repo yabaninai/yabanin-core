@@ -163,7 +163,7 @@ export interface RequestDetail {
   attempt_count?: number | null
   retry_count?: number | null
   labels?: Record<string, string>
-  // FIX-20: parsed envelope of the processed, client-facing response
+  // Parsed envelope of the processed, client-facing response
   // (status/reason/model/content/reasoning/tool_calls). Absent for legacy
   // rows and when no processed response was captured — the raw `response`
   // field stays the verbatim column either way.
