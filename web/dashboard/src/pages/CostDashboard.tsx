@@ -15,11 +15,11 @@ import { useOrgPresentation } from '../i18n/useOrgPresentation'
 import type { MetricState } from '../components/astra/MetricStrip'
 import { useCostReport, type CostReport } from './hooks/useCostReport'
 
-// PO-05c / AVR-02 (F02) on the Cost screen: incomplete pricing coverage must
-// share ≠ 0 semantics) lives in lib/pricingCoverage — an unmeasured share
-// (JSON null) or a missing coverage_status resolves to 'unknown' too, not to
-// the ok branch. Mirrors OverviewPage.pricingCoverage — the cost endpoint
-// (GetCostAnalytics) returns the same pricing metadata.
+// Pricing-coverage handling on the Cost screen: the shared derivation
+// (incomplete coverage ≠ ok semantics) lives in lib/pricingCoverage — an
+// unmeasured share (JSON null) or a missing coverage_status resolves to
+// 'unknown' too, not to the ok branch. Mirrors OverviewPage.pricingCoverage
+// — the cost endpoint (GetCostAnalytics) returns the same pricing metadata.
 type CostPricingCoverage =
   | { state: 'ok'; note?: string }
   | { state: 'warning'; note: string }
@@ -42,13 +42,13 @@ function costPricingCoverage(
 
 export default function CostDashboard() {
   const { t } = useTranslation()
-  // U03: scope (org + provider) from the shared ScopeBar; URL-synced.
+  // Scope (org + provider) from the shared ScopeBar; URL-synced.
   const [scope, setScope] = useState<{ orgId: string; provider: string }>({ orgId: '', provider: '' })
   const [days, setDays] = useState(30)
   const orgId = scope.orgId
   const { currency, timezone } = useOrgPresentation(orgId || undefined)
-  // AF-17: the scoped read lifecycle (generation/abort/applied guards,
-  // U04 screen states) lives in useScopedQuery via the domain hook.
+  // The scoped read lifecycle (generation/abort/applied guards,
+  // screen states) lives in useScopedQuery via the domain hook.
   const { report, loading, error, state, load } = useCostReport(orgId, scope.provider, days)
 
 
@@ -59,9 +59,9 @@ export default function CostDashboard() {
         purpose={t('cost.purpose')}
       />
 
-      {/* U03: org + provider scope (URL-synced). The per-org cost endpoint
+      {/* Org + provider scope (URL-synced). The per-org cost endpoint
           requires an org; provider is recorded/deep-linked for the scope.
-          AUX-04: both fields are real — GET /api/analytics/{org}/cost accepts
+          Both fields are real — GET /api/analytics/{org}/cost accepts
           org_id + provider (+ days from the window select below;
           cost_handlers.go CostAnalyticsHandler). */}
       <ScopeBar
@@ -72,7 +72,7 @@ export default function CostDashboard() {
         fields={['org', 'provider']}
       />
 
-      {/* UX-03: days filter — a change refetches automatically (the load
+      {/* Days filter — a change refetches automatically (the load
           callback identity depends on the window; no Load button). The scope
           (ScopeBar) commits after its own debounce. */}
       <div className="card flex flex-wrap gap-4 items-end">
@@ -90,7 +90,7 @@ export default function CostDashboard() {
         </div>
       </div>
 
-      {/* U04: states */}
+      {/* State notices: error / not-loaded / stale / empty. */}
       {state === 'error' && <StateNotice state="error" message={error} action={{ label: t('common.retry'), onClick: () => void load() }} />}
       {state === 'not-loaded' && !orgId && (
         <StateNotice state="not-loaded" message={t('cost.notLoaded')} />
@@ -101,7 +101,7 @@ export default function CostDashboard() {
       )}
 
       {report && (state === 'ready' || state === 'stale') && (() => {
-          // PO-05c / AVR-02: resolve pricing coverage once for the KPI strip.
+          // Resolve pricing coverage once for the KPI strip.
           // Unknown (all unpriced) cost is never shown as $0.0000.
           const pc = costPricingCoverage(report.pricing, t)
           const allUnpriced = pc.state === 'unknown'
@@ -128,7 +128,7 @@ export default function CostDashboard() {
                  unit: allUnpriced ? undefined : 'USD',
                  state: costState,
                  coverage: pc.note || undefined,
-                // AVR-01 (F01): the endpoint is per-org, so the caption names
+                // The endpoint is per-org, so the caption names
                 // the applied org explicitly (not just the provider).
                 source: allUnpriced
                   ? t('cost.sourceUnpriced')
@@ -150,7 +150,7 @@ export default function CostDashboard() {
                {
                   label: t('cost.savings'),
                   value: usd(report.savings_usd),
-                 // TP-05: values are USD by origin (no FX) — label the
+                  // Values are USD by origin (no FX) — label the
                  // honest unit, never the org's presentation code.
                  unit: allUnpriced ? undefined : 'USD',
                 // Honest states: positive savings are good, zero is neutral
@@ -210,7 +210,7 @@ export default function CostDashboard() {
                 rows={report.by_model}
                 totalCostUsd={report.total_cost_usd}
                 currency={currency}
-                // AUX-09: the drill carries the exact applied window (the
+                // The drill carries the exact applied window (the
                 // report is always fetched for the current `days` — a change
                 // refetches immediately) and the scoped org.
                 org={orgId}
@@ -226,10 +226,10 @@ export default function CostDashboard() {
   )
 }
 
-// AUX-03: the model breakdown runs on DataTable v2 (client mode) — money by
+// The model breakdown runs on DataTable v2 (client mode) — money by
 // cent value, requests numerically, share of total as a derived sort value;
 // the default sort is the most expensive model first.
-// AUX-09: the model name drills into its requests — org + applied window ride
+// The model name drills into its requests — org + applied window ride
 // along, the model id becomes the applied YQL chip in the explorer.
 function CostModelTable({ rows, totalCostUsd, currency, org, from, to }: {
   rows: CostReport['by_model']

@@ -30,6 +30,7 @@ import { useAutoRefresh, useAutoRefreshInterval, useDocumentHidden } from '../li
 import { FreshnessControl } from '../components/astra/FreshnessControl'
 import { useTablePrefs } from '../hooks/useTablePrefs'
 
+// The request explorer's data surfaces:
 //   - GET /api/organizations/{id}/requests — one YQL filter system (quick
 //     fields and the errors-only toggle compile into the committed query),
 //     honest pagination (server total);
@@ -39,16 +40,16 @@ import { useTablePrefs } from '../hooks/useTablePrefs'
 // Privacy mode masks error text and hides raw JSON.
 
 const PRIVACY_KEY = 'explorer-privacy-mode'
-// v2 button budget: one «⋯» RowActions toggle per row — the page size keeps
-// the whole page (rows + chrome) within the ≤40 button acceptance.
+// One «⋯» RowActions toggle per row — the page size keeps
+// the whole page (rows + chrome) within the ≤40-button budget.
 const PAGE_SIZE = 25
 const TABLE_ID = 'requests-explorer'
 
-// v2 checklist item 5/8: compact rows and a short default column set — the
+// Compact rows and a short default column set — the
 // identity/error/tool columns move to the table settings menu.
 const DEFAULT_HIDDEN_COLUMNS = ['request_id', 'tool_calls', 'error']
 
-// AUX-01: the explorer sorts SERVER-side — a header click rewrites the
+// The explorer sorts SERVER-side — a header click rewrites the
 // `order by` clause of the committed YQL query (the single sort source of
 // truth, already URL-persisted via the `query` param) and the refetch applies
 // it. Columns without an orderable YQL counterpart (composite/label columns)
@@ -85,8 +86,8 @@ const EXPLORER_EVIDENCE_KEYS: Record<string, string> = {
   provider_declared: 'explorer.evidenceProviderDeclared',
 }
 
-// PO-04: request-log detail fields for the inspector. The stored response
-// snapshot (redacted/truncated by PH.1) is shown as raw JSON; the request
+// Request-log detail fields for the inspector. The stored response
+// snapshot (redacted/truncated at storage) is shown as raw JSON; the request
 // body is NOT stored and is stated as such, never invented. Privacy mode hides
 // the raw snapshot and the error text.
 
@@ -94,7 +95,7 @@ const EXPLORER_EVIDENCE_KEYS: Record<string, string> = {
 // on purpose (technical tokens only): "tier_router: a → b (medium @0.60)"
 // or "passthrough: a". A cross-route move (from ≠ to) gets a ⚠ prefix so the
 // cost/route implication is impossible to miss.
-// CORE-TRACE-04: when the decision carries the matched routing rule's
+// When the decision carries the matched routing rule's
 // identity ref, a mono chip appends the short rule id + content version;
 // the tooltip holds the full id. Two same-name rules stay distinguishable in
 // request history, and rows logged before that rule's edit keep showing the
@@ -278,7 +279,7 @@ function buildDetailFields(
   //   - d.tool_call_invocations — per-occurrence calls with reassembled
   //     arguments, recorded by loggerd from the PRE-truncation sample
   //     (0014 table). The full truth where it exists;
-  //   - d.response_view.tool_calls — the FIX-20 processed-response
+  //   - d.response_view.tool_calls — the processed-response
   //     envelope's calls, merged by index from the actual served response
   //     (survives when no original sample was retained);
   //   - d.tool_calls — recorded distinct names (older table, same
@@ -347,7 +348,7 @@ function buildDetailFields(
       value: <span className="text-[color:var(--astra-text-muted)]">{t('explorer.detailToolCallsTruncated')}</span>,
     })
   }
-  // FIX-20: the model answer — the processed, client-facing response the
+  // The model answer — the processed, client-facing response the
   // gateway actually served (post policy/routing), with an explicit
   // completeness status. Reason tokens are shown as-is: technical tokens,
   // language-neutral like the routing decision above. Content and reasoning
@@ -395,7 +396,7 @@ function buildDetailFields(
       ? <span className="text-[color:var(--astra-text-muted)]">•••</span>
       : d.response && d.response !== null && d.response !== 'null'
         ? <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-[length:var(--astra-radius-control)] bg-[color:var(--astra-surface-muted)] p-3 text-xs">{
-            // PH.1 stores long snapshots truncated; such rows arrive as JSON
+            // Long snapshots are stored truncated; such rows arrive as JSON
             // strings (not objects) — render them as text, never as "null".
             typeof d.response === 'string' ? d.response : JSON.stringify(d.response, null, 2)
           }</pre>
@@ -557,9 +558,9 @@ async function copyText(value: string): Promise<void> {
 
 export function RequestExplorerPage() {
   const { t, i18n } = useTranslation()
-  // AUX-08: the org scope is the shared GlobalScope (hash ?org=, remembered
+  // The org scope is the shared GlobalScope (hash ?org=, remembered
   // across screens) — picked once, it follows the operator; the shared bar
-  // below renders its controls. UI-contract #1 still holds: a filtered view
+  // below renders its controls. A filtered view
   // is a shareable link and survives reload/back-forward.
   const gs = useGlobalScope()
   const org = gs.org.trim()
@@ -603,7 +604,7 @@ export function RequestExplorerPage() {
     setYqlCommitted(query)
     setUrlQuery(query)
   }
-  // AUX-08: the applied window is the GlobalScope period — ONE range field
+  // The applied window is the GlobalScope period — ONE range field
   // (the preset select in the shared bar). The datetime-local inputs appear
   // only for a hand-pinned custom range and mirror the shared scope.
   const [fromLocal, setFromLocal] = useState(() => toLocalInput(gs.from))
@@ -622,7 +623,7 @@ export function RequestExplorerPage() {
   })
 
   const [rows, setRows] = useState<RequestRow[]>([])
-  // AUX-20: bulk selection for the export / add-to-filter actions. Requests
+  // Bulk selection for the export / add-to-filter actions. Requests
   // are ephemeral (scope + page window), so the selection survives page
   // changes but is dropped whenever the applied scope changes (the debounce
   // effect below) — a stale id must never export or filter silently.
@@ -640,7 +641,7 @@ export function RequestExplorerPage() {
   const [loading, setLoading] = useState(false)
   const [loaded, setLoaded] = useState(false)
   const [loadError, setLoadError] = useState('')
-  // AUX-23: freshness — clock label of the last successful load and the
+  // Freshness — clock label of the last successful load and the
   // honest stale marker when a REFRESH failed (the shown rows stay).
   const [asOf, setAsOf] = useState<number | null>(null)
   const [refreshStale, setRefreshStale] = useState(false)
@@ -653,7 +654,7 @@ export function RequestExplorerPage() {
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
   const [inspectDetail, setInspectDetail] = useState<RequestDetail | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
-  // CORE-TRACE-03: the policy decisions attached to the inspected request —
+  // The policy decisions attached to the inspected request —
   // a separate record from the request log (the log answers "what happened",
   // the decision log answers "what the policy made of it"). Tri-state so the
   // drawer never renders a bare nothing while the fetch is in flight or
@@ -662,7 +663,7 @@ export function RequestExplorerPage() {
   const [inspectDecisions, setInspectDecisions] = useState<PolicyDecision[] | null>(null)
   const [inspectDecisionsState, setInspectDecisionsState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle')
   const gen = useRef(0)
-  // AUX-22: per-table column visibility + density (compact is the v2
+  // Per-table column visibility + density (compact is the
   // default; seeded once for operators without stored prefs).
   const tablePrefs = useTablePrefs(TABLE_ID)
   useEffect(() => {
@@ -688,7 +689,7 @@ export function RequestExplorerPage() {
     setUrlQuery(next)
   }
 
-  // AUX-05: the field registry is a prop — the base YQL registry plus the
+  // The field registry is a prop — the base YQL registry plus the
   // org's live label keys (GET /api/analytics/label-keys), so the builder can
   // add label.<key> clauses without typing raw syntax.
   const filterFields = useMemo<YqlFieldMeta[]>(() => [
@@ -741,7 +742,7 @@ export function RequestExplorerPage() {
     }
   }
 
-  // AUX-23 refresh (manual ⟳ / auto tick): the SAME applied filters and page,
+  // Refresh (manual ⟳ / auto tick): the SAME applied filters and page,
   // nothing cleared or reset — sorting lives in the committed query, the open
   // inspector (drawer) is untouched, rows are replaced in place on success.
   // A failed refresh keeps the shown rows and sets the honest stale marker
@@ -766,7 +767,7 @@ export function RequestExplorerPage() {
         setPage(resp.value.pagination?.page ?? p)
         setAsOf(Date.now())
         setRefreshStale(false)
-        // AUX-23: a SUCCESSFUL refresh is also the recovery path after a
+        // A SUCCESSFUL refresh is also the recovery path after a
         // failed initial load — the list renders again, the error notice
         // goes, and auto-refresh becomes active with the fresh data.
         setLoadError('')
@@ -820,7 +821,7 @@ export function RequestExplorerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [requestedPage])
 
-  // UX-03: auto-search — any filter edit (org, window, YQL query) refetches
+  // Auto-search — any filter edit (org, window, YQL query) refetches
   // page 1 after a 400ms debounce. Requires an org (the endpoint is
   // org-scoped); pagination is not part of the debounce (its own effect).
   // The YQL dependency is the COMMITTED value: invalid drafts are held back
@@ -834,7 +835,7 @@ export function RequestExplorerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [org, fromLocal, toLocal, yqlCommitted])
 
-  // AUX-23: auto-refresh — the operator's interval (localStorage); paused
+  // Auto-refresh — the operator's interval (localStorage); paused
   // while the tab is hidden OR the request inspector (drawer) is open; ticks
   // landing on an in-flight load are skipped inside the hook.
   useAutoRefresh({
@@ -872,7 +873,7 @@ export function RequestExplorerPage() {
     return () => { cancelled = true }
   }, [inspectId, org])
 
-  // CORE-TRACE-03: fetch the decision-log rows for this request. First page
+  // Fetch the decision-log rows for this request. First page
   // only — the drawer shows the freshest evaluations plus a link into the
   // full log; it must not re-implement the log's pagination. The callback
   // form lets the section's retry affordance re-run the same scoped fetch.
@@ -909,8 +910,8 @@ export function RequestExplorerPage() {
     setInspectDecisionsState('idle')
   }
 
-  // AUX-05: chips, the add-filter builder, the YQL input with the error
-  // highlight and the cheatsheet now live in the shared FilterBar. The page
+  // Chips, the add-filter builder, the YQL input with the error
+  // highlight and the cheatsheet live in the shared FilterBar. The page
   // keeps only the committed value, URL sync and refetching.
   const addLabelClause = (key: string, value: string) => {
     filterBarRef.current?.appendClause(
@@ -918,7 +919,7 @@ export function RequestExplorerPage() {
     )
   }
 
-  // AUX-20: the requests API is read-only, so the honest bulk actions are
+  // The requests API is read-only, so the honest bulk actions are
   // the client-side ones — a CSV export of the selected rows and an
   // `request in (…)` filter clause through the shared FilterBar. Privacy
   // mode masks error text in the UI, so the export masks it too.
@@ -946,9 +947,9 @@ export function RequestExplorerPage() {
     filterBarRef.current?.appendClause({ kind: 'clause', field: 'request', op: 'in', values: ids })
   }
 
-  // drawer; Copy / Inspect / Lineage / label filters live in the «⋯» menu.
+  // Copy / Inspect / Lineage / label filters live in the per-row «⋯» menu.
   // The toggle keeps its 36px target but is pulled over the cell padding
-  // (-my-2) so it does not inflate the compact row height (v2 item 8).
+  // (-my-2) so it does not inflate the compact row height.
   const rowActions = (r: RequestRow) => (
     // The menu's clicks must not also trigger the row's open-drawer click.
     <span className="-my-2 inline-flex items-center" onClick={e => e.stopPropagation()}>
@@ -975,7 +976,7 @@ export function RequestExplorerPage() {
     {
       key: 'cost_usd', header: t('explorer.headerCostUsd'), align: 'right', mono: true, type: 'money', unit: 'USD',
       // Zero cost is "no per-token charge on this route", not "$0.00" —
-      // honest em dash; the exact value rides the title hint (v2 money rule).
+      // honest em dash; the exact value rides the title hint.
       render: r => {
         if (!(r.cost_usd > 0)) return '—'
         const cell = formatMoneyCell(r.cost_usd, { locale: i18n.language, currency: 'USD' })
@@ -984,7 +985,7 @@ export function RequestExplorerPage() {
     },
     {
       // Composite "in/out" display over two server fields — no single order
-      // expression, so the header is not a sort control (AUX-02 tooltip).
+      // expression, so the header is not a sort control (the tooltip explains).
       key: 'tokens', header: t('explorer.headerTokens'), align: 'right', mono: true, sortable: false,
       render: r => `${r.tokens_in}/${r.tokens_out}`,
     },
@@ -1000,7 +1001,7 @@ export function RequestExplorerPage() {
     {
       // Labels are not orderable server-side (YQL: "cannot order by label").
       // Scanning-only here: filtering by a label lives in the row menu and
-      // the drawer (v2 item 4: one interaction per row).
+      // the drawer (one interaction per row).
       key: 'labels', header: t('explorer.labels'), sortable: false,
       render: r => {
         const entries = sortedLabelEntries(r.labels)
@@ -1096,7 +1097,7 @@ export function RequestExplorerPage() {
     ]
   })()
 
-  // CORE-TRACE-03: the drawer's decision-log section. Rendered inside the
+  // The drawer's decision-log section. Rendered inside the
   // inspector body (routeTimeline slot) so it shows for EVERY inspected
   // request — including requests whose request-log row is gone, where this
   // section plus the unknown-request diagnosis is the only evidence the
@@ -1166,7 +1167,7 @@ export function RequestExplorerPage() {
   )
 
   return (
-    // (v2 item 8 — ≥15 rows at 1440×900). One compact band carries the
+    // Density budget: ≥15 rows at 1440×900. One compact band carries the
     // applied scope AND the table settings; the aggregate strip sits under
     // the table so the rows start as high as possible.
     <div className="flex flex-col gap-3">
@@ -1191,7 +1192,7 @@ export function RequestExplorerPage() {
           message={t('explorer.privacyOnMessage')} />
       )}
 
-      {/* The applied scope: org · period from the shared GlobalScope (AUX-08).
+      {/* The applied scope: org · period from the shared GlobalScope.
           ONE range field — the preset; the two borders appear only for a
           hand-pinned custom range. The privacy toggle carries its hint as a
           native tooltip (what masking covers) plus the banner above. */}
@@ -1334,16 +1335,15 @@ export function RequestExplorerPage() {
                 ? t(EXPLORER_EVIDENCE_KEYS[typeof inspectRecord.region_evidence === 'string' ? inspectRecord.region_evidence : ''])
                 : t('explorer.noLineageRecord'),
             } : undefined,
-          // The raw block previously showed ONLY the lineage record; for
-          // requests without one it disappeared entirely ("raw record
-          // null"). Fall back to the full request-log detail — the snapshot
-          // fields already render above, this is the complete record.
+          // Requests without a lineage record fall back to the full request-log
+          // detail — the snapshot fields already render above, this is the
+          // complete record.
           raw: privacy ? undefined : (inspectRecord ?? inspectDetail ?? undefined),
           } : null}
           fields={buildDetailFields(t, inspectDetail, privacy, (key, value) => addLabelClause(key, value))}
           costProvenance={costProvenanceNode(t, inspectDetail)}
           routeTimeline={(
-            // CORE-TRACE-03: the timeline slot carries three layers so the
+            // The timeline slot carries three layers so the
             // drawer stays informative even when the request-log row is
             // gone: the explicit unknown-request diagnosis (never a bare
             // empty shell), the policy decisions for this request, and —

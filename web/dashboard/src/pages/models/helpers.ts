@@ -131,9 +131,9 @@ export interface ChainValidation {
 }
 
 /**
- * IMP-39 acceptance: a chain cannot be saved onto a non-existent (or
- * disabled) model. The UI check runs against the loaded registry slice —
- * the server stays the source of truth and re-checks on save.
+ * A chain cannot be saved onto a non-existent (or disabled) model. The UI
+ * check runs against the loaded registry slice — the server stays the source
+ * of truth and re-checks on save.
  */
 export function validateChainTargets(
   targets: readonly string[], known: ReadonlyMap<string, boolean>,

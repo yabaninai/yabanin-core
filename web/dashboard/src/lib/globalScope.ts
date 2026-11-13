@@ -135,10 +135,10 @@ export function scopeKey(s: GlobalScopeState): string {
 /**
  * Mirror the scope into the hash query (preserving every page-specific param)
  * and the memory fallbacks. replaceState: scope changes do not spam history.
- * IMP-31: the path segment is normalized to a SINGLE '#' — location.hash
- * already carries one, and unlike `location.hash =` assignments replaceState
- * does not normalize, so each scope commit previously grew the fragment
- * («#analytics» → «##analytics» → …) and a reload then resolved the page id
+ * The path segment is normalized to a SINGLE '#' — location.hash already
+ * carries one, and unlike `location.hash =` assignments replaceState does
+ * not normalize, so each scope commit would otherwise grow the fragment
+ * («#analytics» → «##analytics» → …) and a reload then resolves the page id
  * to the bare overview.
  */
 export function writeGlobalScope(scope: GlobalScopeState): void {

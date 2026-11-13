@@ -2,14 +2,13 @@ import { useCallback } from 'react'
 import { fetchTaskAnalytics, type TaskAnalyticsReport, type TaskGroupBy } from '../../api/client'
 import { deriveScreenState, useScopedQuery, type ScreenState } from '../../hooks/useScopedQuery'
 
-// AF-17 domain hook: the Tasks screen read (ADL-01) — CTOR cost per
-// task/session/agent over the applied org+window+grouping. The applied
-// scope/window/grouping freeze at load time and ride back with the result,
-// so the drill links and the applied caption always describe the report the
-// shown rows were actually fetched for (AVR-01 applied vs draft) — including
-// the stale window while a refetch for a newer scope is in flight.
-// The lifecycle (generation, abort, AUX-22-safe table state untouched) lives
-// in useScopedQuery.
+// The Tasks screen read — CTOR cost per task/session/agent over the applied
+// org+window+grouping. The applied scope/window/grouping freeze at load time
+// and ride back with the result, so the drill links and the applied caption
+// always describe the report the shown rows were actually fetched for
+// (applied, not draft) — including the stale window while a refetch for a
+// newer scope is in flight. The lifecycle (generation, abort; table state
+// untouched) lives in useScopedQuery.
 
 export interface TaskLoad {
   report: TaskAnalyticsReport

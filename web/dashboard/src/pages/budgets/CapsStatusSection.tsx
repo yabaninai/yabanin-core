@@ -41,7 +41,7 @@ function CapsStatusSection({ org }: { org: string }) {
   const [loading, setLoading] = useState(true)
 
   // Scope guard: on org change the previous effect's AbortController fires,
-  // so a delayed org-A response can never land in org B (TP-06 pattern).
+  // so a delayed org-A response can never land in org B.
   const abortRef = useRef<AbortController | null>(null)
 
   const load = useCallback(async (signal?: AbortSignal) => {

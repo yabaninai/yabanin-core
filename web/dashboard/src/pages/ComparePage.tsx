@@ -27,10 +27,10 @@ import { useCompareReports } from './hooks/useCompareReports'
 //     shows an honest "not available" state rather than fabricating a number —
 //     the same availability-honesty posture as the Cost screen's unknown pricing.
 //
-// Every figure carries an applied-scope caption (AVR-01 / F01): the scope and
+// Every figure carries an applied-scope caption: the scope and
 // window the number was computed over, frozen at load time. The read
-// lifecycle (generation/abort/applied guards, U04 states) lives in
-// useScopedQuery (AF-17) via the domain hook.
+// lifecycle (generation/abort/applied guards, screen states) lives in
+// useScopedQuery via the domain hook.
 
 const VERDICT_STATE: Record<ShadowComparison['verdict'], MetricState> = {
   cheaper: 'ok',
@@ -42,9 +42,9 @@ export function ComparePage() {
   const { t } = useTranslation()
   const [scope, setScope] = useState<{ orgId: string; provider: string }>({ orgId: '', provider: '' })
   const [days, setDays] = useState(30)
-  // AF-17: the scoped read lifecycle lives in the domain hook; latency and
+  // The scoped read lifecycle lives in the domain hook; latency and
   // quality stay supplementary (a failure there never blanks the shadow
-  // comparison), and `applied` is frozen at load time (AVR-01).
+  // comparison), and `applied` is frozen at load time.
   const { shadow, latency, quality, applied, loading, error, state, load } = useCompareReports(scope.orgId, days)
   const orgId = scope.orgId
   const { currency } = useOrgPresentation(orgId || undefined)
@@ -62,7 +62,7 @@ export function ComparePage() {
     ? t(`compare.verdict_${shadow.verdict}`)
     : t('common.unknown')
 
-  // ADL-04: per-primary-model quality (the cheap side = the primary model). A
+  // Per-primary-model quality (the cheap side = the primary model). A
   // row with no judged sample in the window shows "—", not a fabricated number.
   const qualityByPrimary = new Map<string, QualityReport['by_model'][number]>()
   if (quality) for (const m of quality.by_model) qualityByPrimary.set(m.primary_model, m)
@@ -71,7 +71,7 @@ export function ComparePage() {
     return m && m.verdicts > 0 ? m : null
   }
 
-  // AUX-03: the four tables run on DataTable v2 in client mode — every header
+  // The four tables run on DataTable v2 in client mode — every header
   // sorts via the typed comparator (money/mumber/date semantics), the default
   // sort is the analytically useful one, and the third click returns to it.
   const [costPage, setCostPage] = useState(1)
@@ -196,7 +196,7 @@ export function ComparePage() {
     { key: 'upgrade_rate', header: t('compare.qualityUpgradeRate'), type: 'number', unit: '%', align: 'right', render: g => <span style={{ fontVariantNumeric: 'tabular-nums' }}>{Math.round(g.upgrade_rate * 100)}%</span> },
   ]
 
-  // ADL-04: apply → DRAFT. Pre-fills the Rules form via query params and does
+  // Apply → DRAFT. Pre-fills the Rules form via query params and does
   // NOT save (human-only). task_id is not a rule field, so the draft is a
   // model-swap (model_requested == <primary>).
   const applyRecommendation = () => {
@@ -215,7 +215,7 @@ export function ComparePage() {
     <div className="space-y-6">
       <PageHeader title={t('compare.title')} purpose={t('compare.purpose')} />
 
-      {/* U03: org scope (URL-synced). AUX-04: the provider field is HIDDEN
+      {/* Org scope (URL-synced). The provider field is HIDDEN
           here, not decorative — GET /api/analytics/shadow, /latency and
           /quality accept org_id + window only (services/admin/handlers/
           cost_handlers.go, analytics.go); they have no provider param, so
@@ -237,7 +237,7 @@ export function ComparePage() {
         </div>
       </div>
 
-      {/* U04: states */}
+      {/* Derived screen states. */}
       {state === 'error' && <StateNotice state="error" message={error} action={{ label: t('common.retry'), onClick: () => void load() }} />}
       {state === 'not-loaded' && !orgId && <StateNotice state="not-loaded" message={t('compare.notLoaded')} />}
       {state === 'stale' && <StateNotice state="stale" message={t('compare.refreshingPrevious')} />}
@@ -246,7 +246,7 @@ export function ComparePage() {
       {shadow && (state === 'ready' || state === 'stale') && (
         <>
           {/* KPI strip: headline verdict + per-side avg cost + overlap. Each is
-              captioned with the applied scope (AVR-01). */}
+              captioned with the applied scope. */}
           <MetricStrip
             aria-label={t('compare.title')}
             metrics={[
@@ -318,7 +318,7 @@ export function ComparePage() {
             </div>
           )}
 
-          {/* ADL-08: the task-tag dimension — cost + latency per model × task
+          {/* The task-tag dimension — cost + latency per model × task
               class (request_logs.task_id; NULL → "(untagged)"). */}
           {shadow.by_task_class.length > 0 && (
             <div className="card overflow-x-auto">
@@ -357,7 +357,7 @@ export function ComparePage() {
             )}
           </div>
 
-          {/* ADL-04: quality closed-loop. evalgate (LLM-as-judge) verdicts are
+          {/* Quality closed-loop. evalgate (LLM-as-judge) verdicts are
               aggregated into per-model + per-task-class quality scores. The
               sample scope + window are stated honestly (the judge samples a
               subset of low-confidence medium-class requests — not the whole

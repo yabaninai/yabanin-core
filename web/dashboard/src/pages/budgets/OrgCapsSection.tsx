@@ -49,7 +49,7 @@ export function OrgCapsSection({ org, canBudgets, isRoot, currency }: {
   const [loadError, setLoadError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // Scope epoch: a delayed org-A response can never land in org B (TP-06).
+  // Scope epoch: a delayed org-A response can never land in org B.
   const epoch = useRef(0)
   const orgRef = useRef(org)
   useEffect(() => {
@@ -88,7 +88,7 @@ export function OrgCapsSection({ org, canBudgets, isRoot, currency }: {
     return () => { abortRef.current?.abort() }
   }, [org, isRoot, canBudgets, load])
 
-  // ----- actions (AUX-12 contract; reasons ride X-Audit-Reason, AUX-14b) -----
+  // ----- actions (ActionDialog contract; reasons ride X-Audit-Reason) -----
   const rpmAction = useAction({ id: 'budgets.caps.rpm', risk: 'high', permission: 'budgets.manage', reversible: true })
   const tpmAction = useAction({ id: 'budgets.caps.tpm', risk: 'high', permission: 'budgets.manage', reversible: true })
   const budgetAction = useAction({ id: 'budgets.caps.budget', risk: 'high', permission: 'budgets.manage', reversible: true })

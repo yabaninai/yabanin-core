@@ -24,9 +24,9 @@ import { formatMoney } from '../i18n/format'
 import { useOrgPresentation } from '../i18n/useOrgPresentation'
 import { useTaskReport } from './hooks/useTaskReport'
 
-// ADL-01: Tasks screen — CTOR cost per task / session / agent.
+// Tasks screen — CTOR cost per task / session / agent.
 //
-// The backend (GET /api/analytics/tasks, G4) already groups request_logs by
+// The backend (GET /api/analytics/tasks) already groups request_logs by
 // task_id / session_id / agent_id into cost / counterfactual / savings /
 // cache-hits. This screen renders that report and exports it as CSV — the
 // chargeback-ready artifact for "what did this task/PR cost". The pairing that
@@ -34,10 +34,10 @@ import { useTaskReport } from './hooks/useTaskReport'
 // `Yabanin-Task:` commit trailer (what shipped under the tag) + the `YABANIN_TASK`
 // CI env (what the tag spent).
 //
-// States follow U04 (empty ≠ not-loaded ≠ stale ≠ error, derived in the
-// domain hook). Auto-load follows UX-03: the scope commits via the ScopeBar
-// debounce and the window/group selects refetch immediately (no Load button);
-// the read lifecycle itself lives in useScopedQuery (AF-17).
+// States are derived (empty ≠ not-loaded ≠ stale ≠ error) in the domain
+// hook. Auto-load: the scope commits via the ScopeBar debounce and the
+// window/group selects refetch immediately (no Load button); the read
+// lifecycle itself lives in useScopedQuery.
 
 const PAGE_SIZE = 20
 
@@ -46,14 +46,14 @@ export function TasksPage() {
   const [scope, setScope] = useState<{ orgId: string; provider: string }>({ orgId: '', provider: '' })
   const [days, setDays] = useState(30)
   const [groupBy, setGroupBy] = useState<TaskGroupBy>('task')
-  // AF-17: the scoped read lifecycle (generation/abort/applied guards, U04
+  // The scoped read lifecycle (generation/abort/applied guards, screen
   // states) lives in useScopedQuery via the domain hook; `applied` is frozen
-  // at load time (AVR-01), never the live draft.
+  // at load time, never the live draft.
   const { report, applied, loading, error, state, load } = useTaskReport(scope.orgId, days, groupBy)
-  // AUX-01: sort + page live in the URL (#tasks?tasks__sort=…:…) — a sorted
+  // Sort + page live in the URL (#tasks?tasks__sort=…:…) — a sorted
   // view is a shareable link and survives reload.
   const { page, setPage, sort, setSort } = useTableUrlState('tasks')
-  // AUX-22: per-table personalization (hidden columns + density) and the
+  // Per-table personalization (hidden columns + density) and the
   // local saved-views registry, both keyed by the table id in localStorage.
   const prefs = useTablePrefs('tasks')
   const [views, setViews] = useState<SavedViewRecord[]>(() => listSavedViews('tasks'))
@@ -83,7 +83,7 @@ export function TasksPage() {
 
   // CSV export: one row per group, chargeback-ready (cost / counterfactual /
   // savings / cache hits / request count) for the applied window + group.
-  // AUX-22: hidden columns stay out of the export — the CSV mirrors exactly
+  // Hidden columns stay out of the export — the CSV mirrors exactly
   // what the table renders.
   const exportCsv = () => {
     if (!report || groups.length === 0) return
@@ -102,7 +102,7 @@ export function TasksPage() {
     downloadCSV(`yabanin-tasks-${groupBy}${stamp}.csv`, toCSV(visible.map(c => c.header), rows))
   }
 
-  // AUX-09: drill-down — the group value opens its requests in the explorer.
+  // Drill-down — the group value opens its requests in the explorer.
   // task/agent map 1:1 onto request-side YQL fields; sessions have no
   // request-side field, so that drill narrows by the applied window alone
   // (honest fallback — a filter is never invented). Muted buckets ("(untagged)")
@@ -139,7 +139,7 @@ export function TasksPage() {
     { key: 'cache_hits', header: t('tasks.colCacheHits'), align: 'right', type: 'number' },
   ]
 
-  // AUX-22: saved views over the page's URL state. A view snapshot is the
+  // Saved views over the page's URL state. A view snapshot is the
   // hash query at save time; applying restores the table sort/page through
   // the same hook setters (the Tasks scope itself is component state, so it
   // is honestly not part of the snapshot — only what the URL carries).
@@ -168,7 +168,7 @@ export function TasksPage() {
     <div className="space-y-6">
       <PageHeader title={t('tasks.title')} purpose={t('tasks.purpose')} />
 
-      {/* AUX-04: org scope only — GET /api/analytics/tasks accepts org_id,
+      {/* Org scope only — GET /api/analytics/tasks accepts org_id,
           from/to, group_by and limit (services/admin/handlers/analytics.go);
           there is no provider param, so the provider field is hidden rather
           than rendered as a filter that changes nothing. */}
@@ -230,7 +230,7 @@ export function TasksPage() {
             ]}
           />
 
-          {/* Group table + CSV export (chargeback artifact) + AUX-22
+          {/* Group table + CSV export (chargeback artifact) + table
               personalization (views, columns, density). */}
           <div className="card">
             <div className="mb-3 flex flex-wrap items-center justify-between gap-2">

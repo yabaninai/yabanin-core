@@ -48,9 +48,9 @@ export function LabelPolicyPage() {
     return () => { live = false }
   }, [org])
 
-  // AUX-12 action contract: saving with on_missing=reject is medium risk —
+  // ActionDialog contract: saving with on_missing=reject is medium risk —
   // the dialog shows was -> becomes and consequences. Reset is high risk
-  // (drops the whole policy) with a name confirmation. AUX-14b: both dialogs
+  // (drops the whole policy) with a name confirmation. Both dialogs
   // collect an operator reason and send it as X-Audit-Reason (the journal
   // stores and shows it).
   const saveAction = useAction({
@@ -120,7 +120,7 @@ export function LabelPolicyPage() {
     <div className="space-y-6">
       <PageHeader title={t('labelPolicy.title')} purpose={t('labelPolicy.purpose')} />
 
-      {/* AUX-12 action surfaces (dialogs), fixed-position. */}
+      {/* ActionDialog surfaces (dialogs), fixed-position. */}
       {saveAction.ui}
       {resetAction.ui}
       <label className="flex flex-col gap-1 text-sm">
@@ -208,7 +208,7 @@ function AliasTable({ policy, onChange }: { policy: LabelPolicy; onChange: (p: L
   const [to, setTo] = useState('')
   const [page, setPage] = useState(1)
   const rows = Object.entries(policy.aliases).map(([src, dst]) => ({ src, dst }))
-  // AUX-03: DataTable v2, client mode. The edit-list keeps its insertion
+  // DataTable v2, client mode. The edit-list keeps its insertion
   // order by default (no default sort); headers still sort on click.
   const columns: DataTableColumn<{ src: string; dst: string }>[] = [
     { key: 'src', header: t('labelPolicy.from'), type: 'text', mono: true, render: r => r.src },
@@ -261,7 +261,7 @@ function DeriveTable({ policy, onChange, sample, onSample, onTest, result }: {
   const { t } = useTranslation()
   const [row, setRow] = useState({ from: '', regex: '', to: '', template: '' })
   const [page, setPage] = useState(1)
-  // AUX-03: DataTable v2, client mode; insertion order by default.
+  // DataTable v2, client mode; insertion order by default.
   const columns: DataTableColumn<LabelPolicy['derive'][number] & { __idx: number }>[] = [
     { key: 'from', header: t('labelPolicy.from'), type: 'text', mono: true, render: d => d.from },
     { key: 'regex', header: t('labelPolicy.regex'), type: 'text', mono: true, render: d => d.regex },

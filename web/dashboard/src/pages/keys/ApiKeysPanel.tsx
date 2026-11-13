@@ -20,9 +20,10 @@ import { relatedListHref, currentHashQuery } from '../../lib/inspectUrl'
 import { KeyDrawer } from './KeyDrawer'
 import { OneTimeSecretBanner } from './OneTimeSecretBanner'
 
-// FormDrawer opened from the page header; the row keeps one ⋯ action menu
-// and a name click opens the key card. The org comes from the global scope
-// render ONLY when the API provides the fields.
+// Create/edit lives in the FormDrawer opened from the page header; each
+// row keeps one ⋯ action menu and a name click opens the key card. The
+// org comes from the global scope; columns render ONLY when the API
+// provides the fields.
 
 export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
   org: string
@@ -34,7 +35,7 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
   const canManageKeys = perms.can('keys.manage')
   const keysHint = canManageKeys ? undefined : t('perms.required', { permission: 'keys.manage' })
 
-  // AUX-03 (server sort): page + sort live in the URL and the server owns
+  // Server sort: page + sort live in the URL and the server owns
   // the row order (allowlist: id, name, active — a foreign column answers
   // 400 invalid_sort and surfaces as an error notice).
   const { page, setPage, sort, setSort } = useTableUrlState('keys')
@@ -51,20 +52,20 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
     fetcher: fetchKeys,
   })
 
-  // AT-13: a saved label set patches the loaded row until the next refetch.
+  // A saved label set patches the loaded row until the next refetch.
   const [overrides, setOverrides] = useState<Record<string, APIKey>>({})
   const fetchedRows = useMemo(() => keysQuery.data?.data ?? [], [keysQuery.data])
   const pagedRows = useMemo(() => fetchedRows.map(r => overrides[r.id] ?? r), [fetchedRows, overrides])
   const total = keysQuery.data?.pagination?.total ?? pagedRows.length
   const totalPages = keysQuery.data?.pagination?.total_pages ?? 1
 
-  // AUX-20: bulk selection (panel-owned state; the bar renders the
+  // Bulk selection (panel-owned state; the bar renders the
   // permission-gated actions + the per-row report).
   const [selectedIds, setSelectedIds] = useState<string[]>([])
-  // AUX-17: the key card — from a name click and the ?inspect= deep link.
+  // The key card — from a name click and the ?inspect= deep link.
   const [inspectId, setInspectId] = useInspectParam()
   const inspectedKey = pagedRows.find(k => k.id === inspectId) ?? null
-  // TP-06: a one-time secret belongs to exactly one org — any org switch
+  // A one-time secret belongs to exactly one org — any org switch
   // clears it; in-flight mutations are dropped when their org is gone.
   const [oneTimeKey, setOneTimeKey] = useState('')
   const [error, setError] = useState('')
@@ -130,7 +131,7 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
     })()
   }
 
-  // --- row mutations (AUX-12 contracts unchanged) ---
+  // --- row mutations (ActionDialog contracts unchanged) ---
   const rotateAction = useAction({
     id: 'keys.rotate', risk: 'high', permission: 'keys.manage', reversible: false,
     impact: t('keys.rotateConfirm'),
@@ -180,7 +181,7 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
     })
   }
 
-  // AUX-20: bulk enable/disable (delete never batches — see BulkActions).
+  // Bulk enable/disable (delete never batches — see BulkActions).
   const bulkKeysAction = useAction({ id: 'keys.bulk', risk: 'medium', permission: 'keys.manage', reversible: true })
   const exportSelectedKeysCsv = (selected: APIKey[]) => {
     downloadCSV('api-keys.csv', toCSV(
@@ -205,7 +206,7 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
       header: t('keys.name'),
       type: 'text',
       render: k => (
-        // AUX-17: the key name opens the key card (read-only).
+        // The key name opens the key card (read-only).
         <button
           type="button"
           onClick={() => setInspectId(k.id)}
@@ -272,7 +273,7 @@ export function ApiKeysPanel({ org, createOpen, onCreateClosed }: {
 
   return (
     <div className="flex flex-col gap-4">
-      {/* AUX-12 surfaces (dialogs + undo toast). The bulk dialog renders
+      {/* ActionDialog surfaces (dialogs + undo toast). The bulk dialog renders
           inside <BulkActions> — do not duplicate it here. */}
       {rotateAction.ui}
       {setActiveAction.ui}

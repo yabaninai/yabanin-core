@@ -14,8 +14,7 @@ import { formatDateTime, formatMoney } from '../i18n/format'
 import { useOrgPresentation } from '../i18n/useOrgPresentation'
 import { isCurrentScope, type AsyncScope } from '../lib/asyncScope'
 
-// cut is READ-ONLY over the receivers that actually exist (the card's
-// pre-RM-92/93 scope):
+// The receivers list is READ-ONLY over the receivers that actually exist:
 //   - Spend-alert webhook — GET/PATCH /api/organizations/{id}/spend-alert,
 //     MustBeRoot server-side (router_billing.go). last_alert_at is the only
 //     delivery signal; the API has no connection-test endpoint, no privacy
@@ -23,10 +22,10 @@ import { isCurrentScope, type AsyncScope } from '../lib/asyncScope'
 //     "not supported by this API" rows — never as fake controls.
 //   - WORM lineage export — CLI-only today (pkg/trcli/lineage_export.go),
 //     no admin API: the card says so instead of inventing a status.
-//   - OTLP spans (RM-93) / SIEM (RM-92): planned rows without data.
+//   - OTLP spans / SIEM: planned rows without data.
 // Honest-data rules: no delivery success/failure is claimed (the API does
 // not track it); a failed save keeps the previous receiver state visible;
-// edits go through the AUX-12 ActionDialog (reason rides X-Audit-Reason and
+// edits go through the ActionDialog (reason rides X-Audit-Reason and
 // the server writes the audit journal).
 
 function errorOf(e: unknown): string {
@@ -44,7 +43,7 @@ export function ExportsPage() {
   const [alertError, setAlertError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // Org-scope epoch (TP-06): a delayed response can never land in another org.
+  // Org-scope epoch: a delayed response can never land in another org.
   const orgEpoch = useRef(0)
   const orgRef = useRef('')
   useEffect(() => {
@@ -80,7 +79,7 @@ export function ExportsPage() {
     return () => { clearTimeout(timer); abortRef.current?.abort() }
   }, [load, org])
 
-  // ----- actions (AUX-12 contract; reasons ride X-Audit-Reason, AUX-14b) -----
+  // ----- actions (ActionDialog contract; reasons ride X-Audit-Reason) -----
 
   const thresholdAction = useAction({ id: 'exports.alert.threshold', risk: 'medium', reversible: true })
   const webhookAction = useAction({ id: 'exports.alert.webhook', risk: 'medium', reversible: true })

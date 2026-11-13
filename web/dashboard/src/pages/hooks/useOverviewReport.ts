@@ -2,14 +2,14 @@ import { useCallback } from 'react'
 import { fetchSavingsReport, type CostAnalyticsData } from '../../api/client'
 import { deriveScreenState, useScopedQuery, type ScreenState } from '../../hooks/useScopedQuery'
 
-// savings report over the committed org (the shell's GlobalScope org, no
-// page-local scope any more) and window, with the AUX-23 freshness semantics
-// on top of the shared lifecycle:
+// Savings report over the committed org (the shell's GlobalScope org, no
+// page-local scope) and window, with the freshness semantics on top of the
+// shared lifecycle:
 //   * an org/window change is a NEW load (error resets, data is replaced);
 //   * a refresh (manual ⟳ or an auto tick) keeps the last good data on the
 //     screen and raises the honest `refreshStale` marker on failure;
 //   * `asOf` (the "data as of" clock) is set on every SUCCESSFUL load;
-//   * the applied org and window (AVR-01) freeze at load time and ride back
+//   * the applied org and window freeze at load time and ride back
 //     with the result — captions and drill links always describe the scope
 //     the shown numbers were computed over, including in the stale window
 //     while a refetch for a newer scope is still in flight, never the live
@@ -37,7 +37,7 @@ export function useOverviewReport(org: string, days: number): {
   state: ScreenState
   /** A new (screen-replacing) load — the Retry action. */
   load: (opts?: { refresh?: boolean }) => void
-  /** AUX-23: keep-data reload (manual ⟳, auto-refresh ticks). */
+  /** Keep-data reload (manual ⟳, auto-refresh ticks). */
   refresh: () => void
 } {
   const orgId = org.trim()
@@ -58,7 +58,7 @@ export function useOverviewReport(org: string, days: number): {
   const { load } = q
   const state = deriveScreenState({
     error: q.error,
-    // AUX-23: a refresh must not flash the stale/loading notice over data
+    // A refresh must not flash the stale/loading notice over data
     // that stays on screen.
     loading: q.loading && !q.refreshing,
     hasResult: q.data != null,

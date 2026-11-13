@@ -25,7 +25,7 @@ import { formatMoney, formatNumber } from '../../i18n/format'
 //  - every mutation is high/medium risk with a MANDATORY reason (server 400s
 //    an empty one), sent as X-Audit-Reason and in the body;
 //  - grace_floor_cents: null (platform default) and explicit 0 (no
-//    overdraft) are distinct states the form never conflates (AF-01).
+//    overdraft) are distinct states the form never conflates.
 
 const GRACE_FLOOR_MIN = -100_000
 const GRACE_FLOOR_MAX = 0
@@ -45,7 +45,7 @@ export function BudgetSettingsSection({ org, isRoot, canBudgets, currency }: {
   const [loadError, setLoadError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // Scope epoch: a delayed org-A response can never land in org B (TP-06).
+  // Scope epoch: a delayed org-A response can never land in org B.
   const epoch = useRef(0)
   const orgRef = useRef(org)
   useEffect(() => {
@@ -84,7 +84,7 @@ export function BudgetSettingsSection({ org, isRoot, canBudgets, currency }: {
     return () => { abortRef.current?.abort() }
   }, [org, isRoot, canBudgets, load])
 
-  // ----- actions (AUX-12 contract; reasons ride X-Audit-Reason, AUX-14b) -----
+  // ----- actions (ActionDialog contract; reasons ride X-Audit-Reason) -----
   const graceAction = useAction({ id: 'budgets.settings.grace', risk: 'high', permission: 'budgets.manage', reversible: true })
   const modeAction = useAction({ id: 'budgets.settings.reservations', risk: 'high', permission: 'budgets.manage', reversible: true })
   const capAction = useAction({ id: 'budgets.settings.outputCap', risk: 'medium', permission: 'budgets.manage', reversible: true })
