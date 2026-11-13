@@ -4,11 +4,18 @@
 //
 // SANDBOX MODEL:
 //
-//   - The grammar has NO loop or recursion constructs: termination is
-//     guaranteed by construction, and evaluation cost is bounded by
-//     |expression| × |env data|. There is no step limit, wall-clock budget
-//     or memory cap because there is nothing to loop — the env data comes
-//     from the engine's own snapshots and is bounded upstream.
+//   - Budgets (bounded, not stepped): the grammar has NO loop or recursion
+//     constructs, so termination is guaranteed by construction and
+//     evaluation cost is bounded by |expression| × |env data| — the syntax
+//     and env budgets cap both factors before compilation, and the VM's
+//     tracked MemoryBudget (a deterministic byte counter) caps allocations.
+//     expr-lang exposes no per-instruction hook in production builds (its
+//     debug step channel only compiles under the expr_debug tag), so a
+//     deterministic step budget is infeasible without a fork. The residual
+//     bound is a wall-clock CEILING (DefaultEvalTimeout, scaled on -race
+//     builds, see race_on.go) that backstops slow-but-bounded work.
+//     RESIDUAL LIMIT: that ceiling is wall-clock — a bounded evaluation can
+//     still abort on a machine slow enough to exceed it.
 //   - The environment is a typed Go struct: unknown identifiers and unknown
 //     fields/methods are COMPILE errors, so a condition can only touch the
 //     three roots (Findings, Steps, Meta — contract in the parent package;
@@ -55,10 +62,16 @@ const (
 )
 
 const (
-	// DefaultEvalTimeout is the maximum caller wait per Expr evaluation.
+	// DefaultEvalTimeout is the per-evaluation wall-clock CEILING. It only
+	// backstops bounded work on a slow machine; boundedness itself comes
+	// from the loop-free grammar plus the deterministic VM MemoryBudget.
+	// New scales it by raceWallScale on -race builds (load tolerance, not
+	// semantics).
 	DefaultEvalTimeout = 25 * time.Millisecond
 	// DefaultMemoryBudget is the Expr VM's tracked allocation budget in bytes.
 	DefaultMemoryBudget = 1 << 20
+	// raceWallScale is applied to the wall ceiling on -race builds only.
+	raceWallScale = 10
 )
 
 // Engine compiles expr condition sources. Create with New, then register
@@ -74,7 +87,9 @@ type Engine struct {
 // Option configures Expr evaluation budgets.
 type Option func(*Engine)
 
-// WithEvalTimeout sets the maximum time the caller waits for one evaluation.
+// WithEvalTimeout sets the maximum time the caller waits for one evaluation;
+// on -race builds New scales it by raceWallScale. The allocation budget is
+// unaffected.
 func WithEvalTimeout(timeout time.Duration) Option {
 	return func(engine *Engine) { engine.evalTimeout = timeout }
 }
@@ -93,6 +108,9 @@ func New(options ...Option) *Engine {
 	}
 	for _, option := range options {
 		option(e)
+	}
+	if raceEnabled {
+		e.evalTimeout *= raceWallScale
 	}
 	return e
 }

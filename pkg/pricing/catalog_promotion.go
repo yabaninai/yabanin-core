@@ -38,81 +38,24 @@ const Day0UpdatedByPromotionPrefix = "rates-promotion:"
 // Ops are sorted by (provider, model) and the close block after them, so two
 // runs on the same inputs produce identical reports.
 func PlanCatalogPromotion(catalog PriceFile, active map[string]*Day0ActiveRow) Day0Report {
-	projected := make(map[string]PriceFileModel, len(catalog.Models))
-	order := make([]string, 0, len(catalog.Models))
-	for _, m := range catalog.Models {
-		k := day0Key(m.Provider, m.Model)
-		if _, dup := projected[k]; !dup {
-			order = append(order, k)
-		}
-		projected[k] = m // last entry wins, matching the FilePricer projection
-	}
-	sort.Strings(order)
+	projected, order := promoProjection(catalog)
 
 	var report Day0Report
 	report.Total = len(order)
 	for _, k := range order {
-		m := projected[k]
-		op := Day0Op{
-			Provider: m.Provider,
-			Model:    m.Model,
-			Insert: Day0Insert{
-				Provider:       m.Provider,
-				Model:          m.Model,
-				InputPerM:      m.Input,
-				OutputPerM:     m.Output,
-				CacheWritePerM: m.CacheW,
-				CacheReadPerM:  m.CacheR,
-				SourceRef:      catalog.Source + "#" + m.Provider + "/" + m.Model,
-			},
-		}
-		switch {
-		case !day0Storable(m.Input) || !day0Storable(m.Output) ||
-			!day0Storable(m.CacheW) || !day0Storable(m.CacheR):
-			op.Action = Day0ActionSkip
-			op.Reason = "price outside numeric(10,6) range"
-			report.Skipped++
-		default:
-			row := active[k]
-			switch {
-			case row == nil:
-				op.Action = Day0ActionAdd
-				report.Added++
-			case row.Source == Day0SourceCatalog || row.Source == Day0SourceSeed:
-				if day0SamePrice(row, m) {
-					op.Action = Day0ActionSkip
-					op.Reason = "unchanged"
-					report.Skipped++
-				} else {
-					op.Action = Day0ActionUpdate
-					op.Reason = "catalog price changed"
-					op.CloseID = row.ID
-					report.Updated++
-				}
-			default:
-				op.Action = Day0ActionSkip
-				op.Reason = "manual override (source=" + row.Source + ")"
-				report.Skipped++
-			}
-		}
+		op := promoEntryOp(catalog.Source, projected[k], active[k])
 		report.Ops = append(report.Ops, op)
+		switch op.Action {
+		case Day0ActionAdd:
+			report.Added++
+		case Day0ActionUpdate:
+			report.Updated++
+		default:
+			report.Skipped++
+		}
 	}
 
-	// Retired keys: every active key whose newest open row is catalog
-	// machinery (seed or catalog) and that the promoted catalog no longer
-	// projects. Operator overrides (manual / local_gpu newest row) keep
-	// serving — the close block must not retire operator intent.
-	var retired []string
-	for k, row := range active {
-		if _, projectedKey := projected[k]; projectedKey {
-			continue
-		}
-		if row.Source == Day0SourceCatalog || row.Source == Day0SourceSeed {
-			retired = append(retired, k)
-		}
-	}
-	sort.Strings(retired)
-	for _, k := range retired {
+	for _, k := range promoRetiredKeys(projected, active) {
 		provider, model, _ := strings.Cut(k, "\x00")
 		report.Ops = append(report.Ops, Day0Op{
 			Provider: provider,
@@ -123,4 +66,89 @@ func PlanCatalogPromotion(catalog PriceFile, active map[string]*Day0ActiveRow) D
 		report.Removed++
 	}
 	return report
+}
+
+// promoProjection projects the catalog the way NewFilePricer builds byKey:
+// one key per (provider, model) with the LAST entry winning, and the keys
+// in sorted order so the plan is deterministic.
+func promoProjection(catalog PriceFile) (projected map[string]PriceFileModel, order []string) {
+	projected = make(map[string]PriceFileModel, len(catalog.Models))
+	order = make([]string, 0, len(catalog.Models))
+	for _, m := range catalog.Models {
+		k := day0Key(m.Provider, m.Model)
+		if _, dup := projected[k]; !dup {
+			order = append(order, k)
+		}
+		projected[k] = m
+	}
+	sort.Strings(order)
+	return projected, order
+}
+
+// promoEntryOp plans one projected entry against its newest open row.
+func promoEntryOp(source string, m PriceFileModel, row *Day0ActiveRow) Day0Op {
+	op := Day0Op{
+		Provider: m.Provider,
+		Model:    m.Model,
+		Insert: Day0Insert{
+			Provider:       m.Provider,
+			Model:          m.Model,
+			InputPerM:      m.Input,
+			OutputPerM:     m.Output,
+			CacheWritePerM: m.CacheW,
+			CacheReadPerM:  m.CacheR,
+			SourceRef:      source + "#" + m.Provider + "/" + m.Model,
+		},
+	}
+	switch {
+	case !day0Storable(m.Input) || !day0Storable(m.Output) ||
+		!day0Storable(m.CacheW) || !day0Storable(m.CacheR):
+		op.Action = Day0ActionSkip
+		op.Reason = "price outside numeric(10,6) range"
+	default:
+		promoRowDecision(&op, row, m)
+	}
+	return op
+}
+
+// promoRowDecision resolves the newest open row for one projected entry:
+// no row → add; a catalog or seed row is superseded when prices differ and
+// skipped as unchanged otherwise (seed rows are catalog-machinery defaults
+// a promotion owns, not operator intent); any other source is an operator
+// override and is skipped, exactly like the day-0 sync.
+func promoRowDecision(op *Day0Op, row *Day0ActiveRow, m PriceFileModel) {
+	switch {
+	case row == nil:
+		op.Action = Day0ActionAdd
+	case row.Source == Day0SourceCatalog || row.Source == Day0SourceSeed:
+		if day0SamePrice(row, m) {
+			op.Action = Day0ActionSkip
+			op.Reason = "unchanged"
+		} else {
+			op.Action = Day0ActionUpdate
+			op.Reason = "catalog price changed"
+			op.CloseID = row.ID
+		}
+	default:
+		op.Action = Day0ActionSkip
+		op.Reason = "manual override (source=" + row.Source + ")"
+	}
+}
+
+// promoRetiredKeys lists the sorted active keys whose newest open row is
+// catalog machinery (seed or catalog) and that the promoted catalog no
+// longer projects. Operator overrides (manual / local_gpu newest row) keep
+// serving — the close block must not retire operator intent.
+func promoRetiredKeys(projected map[string]PriceFileModel, active map[string]*Day0ActiveRow) []string {
+	var retired []string
+	for k, row := range active {
+		if _, projectedKey := projected[k]; projectedKey {
+			continue
+		}
+		if row.Source == Day0SourceCatalog || row.Source == Day0SourceSeed {
+			retired = append(retired, k)
+		}
+	}
+	sort.Strings(retired)
+	return retired
 }

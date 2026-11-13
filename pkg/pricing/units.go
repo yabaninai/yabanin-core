@@ -175,32 +175,11 @@ type UnitImportStats struct {
 // the same (provider, model) is seen again the maximum rate is kept — the
 // bound must cover the most expensive catalog variant of the model.
 func ImportLiteLLMUnits(r io.Reader, source, date string) (UnitFile, UnitImportStats, error) {
-	var root map[string]json.RawMessage
-	dec := json.NewDecoder(r)
-	dec.UseNumber()
-	if err := dec.Decode(&root); err != nil {
-		return UnitFile{}, UnitImportStats{}, fmt.Errorf("parse litellm catalog: %w", err)
+	root, err := parseLiteLLMCatalog(r)
+	if err != nil {
+		return UnitFile{}, UnitImportStats{}, err
 	}
-	if root == nil {
-		// Valid JSON that is not a flat object (null) is a layout
-		// violation, not an empty catalog (parity with ImportLiteLLM).
-		return UnitFile{}, UnitImportStats{}, fmt.Errorf("parse litellm catalog: top level must be a JSON object")
-	}
-	if _, err := dec.Token(); err != io.EOF {
-		// Decode consumes only the FIRST JSON value; without this check a
-		// catalog with trailing data imports silently truncated (parity
-		// with ImportLiteLLM).
-		return UnitFile{}, UnitImportStats{}, fmt.Errorf("parse litellm catalog: trailing data after the top-level object")
-	}
-
-	keys := make([]string, 0, len(root))
-	for key := range root {
-		if key == "sample_spec" {
-			continue
-		}
-		keys = append(keys, key)
-	}
-	sort.Strings(keys)
+	keys := litellmCatalogKeys(root)
 
 	var stats UnitImportStats
 	stats.Total = len(keys)
@@ -208,54 +187,28 @@ func ImportLiteLLMUnits(r io.Reader, source, date string) (UnitFile, UnitImportS
 	best := make(map[string]int, len(keys)) // "provider:model" → index in entries
 
 	for _, key := range keys {
-		var obj map[string]any
-		if err := json.Unmarshal(root[key], &obj); err != nil {
-			stats.SkippedInvalid++
+		e, class := litellmUnitsEntry(key, root[key])
+		if class != litellmEntryImport {
+			switch class {
+			case litellmEntryInvalid:
+				stats.SkippedInvalid++
+			case litellmEntryMode:
+				stats.SkippedMode++
+			case litellmEntryNoPrice:
+				stats.SkippedNoPrice++
+			}
 			continue
 		}
-		mode, _ := obj["mode"].(string)
-		unit, fields, ok := litellmUnitFields(mode)
-		if !ok {
-			stats.SkippedMode++
-			continue
-		}
-		provider := normalizeLiteLLMProvider(stringField(obj, "litellm_provider"))
-		if strings.TrimSpace(provider) == "" {
-			stats.SkippedInvalid++
-			continue
-		}
-		model := key
-		if i := strings.LastIndexByte(key, '/'); i >= 0 {
-			model = key[i+1:]
-		}
-		if strings.TrimSpace(model) == "" {
-			stats.SkippedInvalid++
-			continue
-		}
-		rate, present, ok := litellmMaxRate(obj, fields)
-		if !ok {
-			stats.SkippedInvalid++
-			continue
-		}
-		if !present || rate <= 0 {
-			stats.SkippedNoPrice++
-			continue
-		}
-		id := provider + "\x00" + model
+		id := e.Provider + "\x00" + e.Model
 		if idx, dup := best[id]; dup {
 			stats.Duplicates++
-			if rate > entries[idx].Rate {
-				entries[idx].Rate = rate
+			if e.Rate > entries[idx].Rate {
+				entries[idx].Rate = e.Rate
 			}
 			continue
 		}
 		best[id] = len(entries)
-		entries = append(entries, UnitEntry{
-			Provider: provider,
-			Model:    model,
-			Unit:     unit,
-			Rate:     roundUnitPrice(rate),
-		})
+		entries = append(entries, e)
 		stats.Imported++
 	}
 
@@ -272,6 +225,57 @@ func ImportLiteLLMUnits(r io.Reader, source, date string) (UnitFile, UnitImportS
 		Currency: "USD",
 		Units:    entries,
 	}, stats, nil
+}
+
+// litellmUnitsEntry classifies one catalog entry for the unit import.
+// Duplicate collapsing stays with the caller, which keeps the maximum rate
+// across size classes of the same model.
+func litellmUnitsEntry(key string, raw json.RawMessage) (UnitEntry, litellmEntryClass) {
+	var obj map[string]any
+	if err := json.Unmarshal(raw, &obj); err != nil {
+		return UnitEntry{}, litellmEntryInvalid
+	}
+	unit, fields, ok := litellmUnitFields(stringField(obj, "mode"))
+	if !ok {
+		return UnitEntry{}, litellmEntryMode
+	}
+	provider, model, ok := litellmUnitsIdentity(key, obj)
+	if !ok {
+		return UnitEntry{}, litellmEntryInvalid
+	}
+	rate, present, ok := litellmMaxRate(obj, fields)
+	if !ok {
+		return UnitEntry{}, litellmEntryInvalid
+	}
+	if !present || rate <= 0 {
+		return UnitEntry{}, litellmEntryNoPrice
+	}
+	return UnitEntry{
+		Provider: provider,
+		Model:    model,
+		Unit:     unit,
+		Rate:     roundUnitPrice(rate),
+	}, litellmEntryImport
+}
+
+// litellmUnitsIdentity names the unit entry: normalized provider plus the
+// LAST "/" segment of the key, so size-class keys
+// ("1024-x-1024/gpt-image-1.5") collapse onto the registry model name —
+// unlike the token import, which keeps region segments. ok=false for an
+// empty provider or model (counted invalid, parity with the token import).
+func litellmUnitsIdentity(key string, obj map[string]any) (provider, model string, ok bool) {
+	provider = normalizeLiteLLMProvider(stringField(obj, "litellm_provider"))
+	if strings.TrimSpace(provider) == "" {
+		return "", "", false
+	}
+	model = key
+	if i := strings.LastIndexByte(key, '/'); i >= 0 {
+		model = key[i+1:]
+	}
+	if strings.TrimSpace(model) == "" {
+		return "", "", false
+	}
+	return provider, model, true
 }
 
 // litellmUnitFields maps a catalog mode onto the metering unit and the

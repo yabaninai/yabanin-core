@@ -232,10 +232,12 @@ func (al AllowList) TrustsExactPin(hostname string) bool {
 
 // defaultResolverLookup resolves a hostname through the system resolver with
 // a bounded timeout: an unbounded resolver stall must not hold the request
-// path (noctx). Package-level var = test seam for the default-resolution
+// path (noctx). ctx is the SSRF guard context — already detached from caller
+// cancellation by ValidateUpstreamWithContext — so the 5s bound stays the
+// only deadline. Package-level var = test seam for the default-resolution
 // error/empty branches (the allow-list seam covers the injected path).
-var defaultResolverLookup = func(hostname string) ([]net.IP, error) {
-	resolveCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+var defaultResolverLookup = func(ctx context.Context, hostname string) ([]net.IP, error) {
+	resolveCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	addrs, err := net.DefaultResolver.LookupIPAddr(resolveCtx, hostname)
 	if err != nil {
@@ -259,8 +261,19 @@ func (al AllowList) Contains(hostname string) bool {
 }
 
 // ValidateUpstream resolves a hostname and checks both DNS allow-list membership
-// and IP reservation status to prevent SSRF attacks.
+// and IP reservation status to prevent SSRF attacks. The no-context form runs
+// the guard on the detached background context (QG2-D3).
 func (al AllowList) ValidateUpstream(hostname string) error {
+	return al.ValidateUpstreamWithContext(context.Background(), hostname)
+}
+
+// ValidateUpstreamWithContext is the context-aware form of ValidateUpstream:
+// the guard resolves on a context detached from caller cancellation
+// (context.WithoutCancel), so a client disconnect never aborts the SSRF
+// decision, while the caller's ctx values still reach the resolver (QG2-D3).
+// The resolver keeps its own bounded timeout on top of the detached context.
+func (al AllowList) ValidateUpstreamWithContext(ctx context.Context, hostname string) error {
+	guardCtx := context.WithoutCancel(ctx)
 	hostname = strings.TrimSpace(strings.ToLower(hostname))
 	if hostname == "" {
 		return fmt.Errorf("ssrf: empty hostname")
@@ -274,14 +287,14 @@ func (al AllowList) ValidateUpstream(hostname string) error {
 	var ips []net.IP
 	if al.lookup != nil {
 		// Test seam (NewAllowListWithResolver): deterministic answers.
-		resolved, err := al.lookup(context.Background(), hostname)
+		resolved, err := al.lookup(guardCtx, hostname)
 		if err != nil {
 			return fmt.Errorf("ssrf: failed to resolve %q: %w", hostname, err)
 		}
 		ips = resolved
 	} else {
 		var lookupErr error
-		ips, lookupErr = defaultResolverLookup(hostname)
+		ips, lookupErr = defaultResolverLookup(guardCtx, hostname)
 		if lookupErr != nil {
 			return fmt.Errorf("ssrf: failed to resolve %q: %w", hostname, lookupErr)
 		}
@@ -297,17 +310,22 @@ func (al AllowList) ValidateUpstream(hostname string) error {
 	// entries keep the refusal at this layer — their answers are not under
 	// keep it everywhere (metadata/loopback/RFC1918 vectors stay blocked).
 	if !al.trustExactPins || !al.literalIPPin(hostname) {
-		var badIPs []string
-		for _, ip := range ips {
-			if IsReserved(ip) {
-				badIPs = append(badIPs, ip.String())
-			}
-		}
-
-		if len(badIPs) > 0 {
+		if badIPs := reservedAnswers(ips); len(badIPs) > 0 {
 			return fmt.Errorf("ssrf: %q resolved to reserved IP(s): %v", hostname, badIPs)
 		}
 	}
 
 	return nil
+}
+
+// reservedAnswers collects the string form of every resolved IP that falls
+// into a reserved range — the D-4 reserved-verdict evidence.
+func reservedAnswers(ips []net.IP) []string {
+	var badIPs []string
+	for _, ip := range ips {
+		if IsReserved(ip) {
+			badIPs = append(badIPs, ip.String())
+		}
+	}
+	return badIPs
 }

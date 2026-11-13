@@ -22,11 +22,12 @@ import (
 // enginesUnderTest maps registry names to factories. Adding an engine here
 // automatically extends every contract test below.
 var enginesUnderTest = map[string]func() script.Engine{
-	// W-VER-style flake fix: the default 5ms wall-clock Lua budget is
-	// load-sensitive (no debug hooks — F1 in the OP-7 decision doc);
-	// under full-suite contention a legit evaluation can exceed it.
-	// This test asserts concurrency safety, not budget enforcement —
-	// give it a generous budget; the budget itself has a dedicated test.
+	// All three engines are load-tolerant at production defaults: each has a
+	// deterministic budget primary (Lua/starlark VM steps, expr grammar plus
+	// memory budget) and a wall-clock ceiling that New scales on -race
+	// builds. The generous Lua ceiling here is belt-and-braces only: this
+	// test asserts concurrency safety, not budget enforcement — each engine's
+	// budgets have dedicated tests.
 	"lua":      func() script.Engine { return lua.New(lua.WithEvalTimeout(2 * time.Second)) },
 	"starlark": func() script.Engine { return starlark.New() },
 	"expr":     func() script.Engine { return expr.New() },

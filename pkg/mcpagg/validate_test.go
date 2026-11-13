@@ -106,7 +106,7 @@ func TestValidateServerURL_SSRFCoverage(t *testing.T) {
 	// Hermetic resolver (QG2-D3): github.com answers a fixed public IP.
 	allow := testAllowResolved(t, "github.com", "140.82.121.3")
 	// Production mode: the full guard (https-only + allow-list + reserved-IP).
-	validate := func(u string) error { return validateServerURL(u, allow, false) }
+	validate := func(u string) error { return validateServerURL(context.Background(), u, allow, false) }
 
 	cases := []struct {
 		name    string
@@ -164,7 +164,7 @@ func TestValidateServerURL_DNSRebindToReserved(t *testing.T) {
 	// IP-literal host fails even when the operator allow-lists it — the
 	// reserved check is independent of the domain list.
 	allow := testAllow(t, "127.0.0.1") // even if the operator allow-lists it...
-	err := validateServerURL("https://127.0.0.1/mcp", allow, false)
+	err := validateServerURL(context.Background(), "https://127.0.0.1/mcp", allow, false)
 	if err == nil {
 		t.Fatal("reserved IP must be rejected even if allow-listed (reserved check is independent of the domain list)")
 	}

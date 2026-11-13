@@ -1,6 +1,7 @@
 package mcpagg
 
 import (
+	"context"
 	"fmt"
 	"net/url"
 	"regexp"
@@ -72,8 +73,10 @@ func ValidateAllowedTools(tools []string) error {
 // test seam (Config.testAllowHTTP): it relaxes BOTH the https-only rule and
 // the reserved-IP check so httptest loopback upstreams can be exercised.
 // Production always runs with testMode=false. The full guard (https-only +
-// allow-list + reserved-IP) is pinned in validate_test.go.
-func validateServerURL(urlStr string, allow ssrf.AllowList, testMode bool) error {
+// allow-list + reserved-IP) is pinned in validate_test.go. The ctx flows
+// into the SSRF resolver detached from cancellation (QG2-D3; values
+// propagate, a client disconnect never aborts the guard).
+func validateServerURL(ctx context.Context, urlStr string, allow ssrf.AllowList, testMode bool) error {
 	u, err := url.Parse(urlStr)
 	if err != nil {
 		return fmt.Errorf("mcpagg: invalid url: %w", err)
@@ -96,7 +99,7 @@ func validateServerURL(urlStr string, allow ssrf.AllowList, testMode bool) error
 		// reserved-IP vector is covered in validate_test.go.
 		return nil
 	}
-	if err := allow.ValidateUpstream(host); err != nil {
+	if err := allow.ValidateUpstreamWithContext(ctx, host); err != nil {
 		return fmt.Errorf("mcpagg: %w", err)
 	}
 	return nil
@@ -115,13 +118,16 @@ func validateServerURL(urlStr string, allow ssrf.AllowList, testMode bool) error
 // (ValidateURLAtInvoke) because a DNS-rebinding window between registration
 // and invoke would otherwise be exploitable.
 func ValidateServerURL(urlStr string, allow ssrf.AllowList) error {
-	return validateServerURL(urlStr, allow, false)
+	return validateServerURL(context.Background(), urlStr, allow, false)
 }
 
 // ValidateURLAtInvoke is the second-layer SSRF guard, run on every tool
 // invoke (docs/mcp-gateway.md §6 R1: the rebind window). Same checks as
 // ValidateServerURL; the URL comes from the registry row, not from the
-// client. allowTestHTTP is the unit-test seam (Config.testAllowHTTP).
+// client. allowTestHTTP is the unit-test seam (Config.testAllowHTTP). This
+// no-context form runs on the detached background guard context; the
+// request path (Proxy.Invoke) threads its ctx through validateServerURL
+// with the same checks (QG2-D3).
 func ValidateURLAtInvoke(urlStr string, allow ssrf.AllowList, allowTestHTTP bool) error {
-	return validateServerURL(urlStr, allow, allowTestHTTP)
+	return validateServerURL(context.Background(), urlStr, allow, allowTestHTTP)
 }

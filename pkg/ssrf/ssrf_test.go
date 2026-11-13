@@ -386,14 +386,14 @@ func TestValidateUpstream_DefaultResolverBranches(t *testing.T) {
 	orig := defaultResolverLookup
 	t.Cleanup(func() { defaultResolverLookup = orig })
 
-	defaultResolverLookup = func(hostname string) ([]net.IP, error) {
+	defaultResolverLookup = func(_ context.Context, hostname string) ([]net.IP, error) {
 		return nil, errors.New("resolver down")
 	}
 	if err := al.ValidateUpstream("gpu.internal"); err == nil || !strings.Contains(err.Error(), "failed to resolve") {
 		t.Fatalf("default-resolver error must refuse with the resolve diagnostic, got %v", err)
 	}
 
-	defaultResolverLookup = func(hostname string) ([]net.IP, error) {
+	defaultResolverLookup = func(_ context.Context, hostname string) ([]net.IP, error) {
 		return nil, nil
 	}
 	if err := al.ValidateUpstream("gpu.internal"); err == nil || !strings.Contains(err.Error(), "no IPs resolved") {
@@ -408,7 +408,7 @@ func TestValidateUpstream_DefaultResolverBranches(t *testing.T) {
 // Non-parallel by design: the var is patched by the (sequential) branches
 // test above.
 func TestDefaultResolverLookup_LocalHostResolution(t *testing.T) {
-	ips, err := defaultResolverLookup("localhost")
+	ips, err := defaultResolverLookup(context.Background(), "localhost")
 	if err != nil {
 		t.Fatalf("localhost must resolve through the hosts file: %v", err)
 	}
