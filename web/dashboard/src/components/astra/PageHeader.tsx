@@ -27,7 +27,7 @@ export interface PageHeaderProps {
   /** The single primary action (v2: «Создать …», opens a FormDrawer). */
   primaryAction?: PageHeaderAction
   actions?: PageHeaderAction[]
-  /** AUX-23 freshness slot: «данные на ЧЧ:ММ» · ⟳ · auto-refresh selector
+  /** Freshness slot: «данные на ЧЧ:ММ» · ⟳ · auto-refresh selector
       (FreshnessControl). Sits before the action buttons in the action group. */
   freshness?: ReactNode
 }
@@ -46,7 +46,7 @@ export function PageHeader({ title, purpose, appliedScope, primaryAction, action
           <p className="mt-1 text-sm text-[color:var(--astra-text-muted)]">{purpose}</p>
         )}
         {appliedScope != null && appliedScope !== '' && (
-          // AVR-10 (F09 text-enlarge): overflow-wrap so long scope strings
+          // Text-enlarge safe: overflow-wrap so long scope strings
           // (org ids, key versions) break instead of pushing the header wider.
           // Mono, letter-spaced, but verbatim case — no uppercase for IDs.
           <p
@@ -61,7 +61,7 @@ export function PageHeader({ title, purpose, appliedScope, primaryAction, action
         )}
       </div>
       {(primaryAction != null || actions.length > 0 || freshness != null) && (
-        // AVR-10 (F09 text-enlarge): min-w-0 + max-w-full (not shrink-0) so the
+        // Text-enlarge safe: min-w-0 + max-w-full (not shrink-0) so the
         // action group wraps to its own line and the buttons wrap inside it
         // instead of growing the header — and the document — past the viewport
         // when the root font is enlarged.

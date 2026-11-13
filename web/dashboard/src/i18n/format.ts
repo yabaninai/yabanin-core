@@ -1,4 +1,4 @@
-// I18N-11 frontend ICU formatters.
+// Frontend ICU formatters.
 //
 // The Go backend (pkg/i18n) holds the canonical CLDR value formatters for
 // server-side text (webhook messages, audit reports). The browser does the
@@ -25,7 +25,7 @@ export function uiLocale(): string {
  * Format a USD amount as a money string in the active UI locale.
  * `amount` is in *currency units* (dollars), NOT cents.
  *
- * TP-05: every money value the dashboard renders is USD by origin
+ * Every money value the dashboard renders is USD by origin
  * (`*_usd` / USD cents). The `currency` argument is the org's presentation
  * code — a non-USD code is NOT a conversion (no FX is applied), so the
  * amount keeps its honest unit: a locale-formatted number with an explicit

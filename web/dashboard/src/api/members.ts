@@ -1,4 +1,3 @@
-// (AUX-16; extracted from client.ts unchanged).
 // Wrappers over EXISTING endpoints only (no new server contracts): whitelists
 // and model aliases are root-only routes today; members/developers are
 // org-scoped under members.manage.

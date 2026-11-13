@@ -1,4 +1,4 @@
-// TP-05 unit tests: USD money formatting keeps the honest unit.
+// Unit tests: USD money formatting keeps the honest unit.
 //
 // A non-USD org presentation must never relabel USD amounts with a foreign
 // symbol (that would imply an FX conversion that does not exist). These cases

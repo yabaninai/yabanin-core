@@ -60,7 +60,7 @@ export async function deleteAgentProfile(id: string, opts?: RequestOptions): Pro
   await postJSON(`/agent-profiles/${encodeURIComponent(id)}`, {}, 'DELETE', opts)
 }
 
-// createAgentKey optionally issues the key "on a profile" (ADL-06): the key
+// createAgentKey optionally issues the key "on a profile": the key
 // then inherits the profile's tier hint, budget cap, and MCP grants.
 export interface CreateAgentKeyResponse {
   key: string

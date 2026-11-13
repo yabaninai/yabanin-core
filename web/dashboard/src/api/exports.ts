@@ -1,5 +1,5 @@
 //
-// Verified receiver inventory (this tree, 2026-10-03):
+// Verified receiver inventory:
 //   - Spend-alert webhook: GET/PATCH /api/organizations/{id}/spend-alert
 //     (services/admin/handlers/router_billing.go, MustBeRoot group; the PATCH
 //     overwrites BOTH fields, so callers always send the full pair). GET
@@ -10,9 +10,10 @@
 //   - WORM lineage export: NO admin API — export/verify run via the trcli
 //     binary (pkg/trcli/lineage_export.go). The page renders an honest
 //     "not configured via API" state; nothing is invented.
-//   - OTLP GenAI spans (RM-93) and SIEM (RM-92): not merged — planned rows
+//   - OTLP GenAI spans and SIEM: not merged — planned rows
 //     only, without data.
-// A connection-test/receiver-config API is a needs-lease (see work record
+// A connection-test/receiver-config API would need its own lease; none
+// exists today.
 
 export {
   getOrgSpendAlert,

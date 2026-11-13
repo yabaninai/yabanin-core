@@ -1,16 +1,15 @@
-// client.ts unchanged).
-
 import { ApiError } from './transport.ts'
 import { fetchJSON, postJSON, listQuery, DEFAULT_PAGE_SIZE, type ListSortParams, type RequestOptions } from './http.ts'
 import type { APIKeyLabelsUpdate } from './keys.ts'
 
-// AUX-14a: the audit journal (GET /api/audit-logs, MustBeRoot). The response
+// The audit journal (GET /api/audit-logs, MustBeRoot). The response
 // is the handler's own shape (audit_logs/total/page/page_size), not the
-// generic Paginated envelope. Sorting follows the AUX-02 contract (allowlist
+// generic Paginated envelope. Sorting follows the shared allowlist contract
+// (allowlist
 // id/action/resource/admin_id/admin_name/ip_address/timestamp; unknown column
 // → 400 invalid_sort, surfaced as an error). The endpoint has NO filter
 // parameters — none are invented here.
-// AUX-14b: mutating entries can carry `before`/`after` entity snapshots
+// Mutating entries can carry `before`/`after` entity snapshots
 // (secret-like fields already redacted server-side) and the operator
 // `reason` (X-Audit-Reason header captured at write time).
 export interface AuditLogEntry {
@@ -38,10 +37,10 @@ export async function listAuditLogs(page = 1, opts?: RequestOptions & ListSortPa
   return fetchJSON(`/audit-logs?${listQuery(page, opts?.pageSize ?? DEFAULT_PAGE_SIZE, opts?.sort, opts?.dir)}`, opts)
 }
 
-// AUX-14b: the audit page's rollback replays the reverse call on these
+// The audit page's rollback replays the reverse call on these
 // existing root-only routes (no dedicated endpoint).
 
-// ===== AF-09: preconditioned rollback calls (audit journal) ================
+// ===== Preconditioned rollback calls (audit journal) ========================
 //
 // The audit page replays the recorded reverse call on the EXISTING mutation
 // routes; every rollback additionally carries the entry's recorded AFTER
@@ -145,7 +144,7 @@ export async function executeRollback(call: RollbackCall, opts?: RequestOptions)
 
 /**
  * Extracts the server-reported current state from a rollback conflict.
- * Returns null unless `err` is the AF-09 409 envelope
+ * Returns null unless `err` is the rollback 409 envelope
  * {"error":"conflict","current":{…}} — the honest surface for the dialog.
  */
 export function rollbackConflictCurrent(err: unknown): { error: string; current?: unknown } | null {

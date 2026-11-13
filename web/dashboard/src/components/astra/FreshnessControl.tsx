@@ -2,7 +2,7 @@ import { useTranslation } from 'react-i18next'
 import { AUTO_REFRESH_OPTIONS, formatAsOfTime } from '../../lib/freshness'
 import { uiLocale } from '../../i18n/format'
 
-// Astra companion for the data screens (AUX-23): «данные на ЧЧ:ММ» + a manual
+// Astra companion for the data screens: «данные на ЧЧ:ММ» + a manual
 // refresh button + the auto-refresh selector. Rendered inside PageHeader's
 // freshness slot, next to the page actions. The time label is honest by
 // construction: it is set by the screen on every SUCCESSFUL load and gains
@@ -36,7 +36,7 @@ export function FreshnessControl({
   return (
     <div className="flex min-w-0 max-w-full flex-wrap items-center gap-2">
       {asOf != null && (
-        // AVR-10 (F09): the label can wrap inside the header instead of
+        // The label can wrap inside the header instead of
         // growing the document past the viewport at 360px.
         <span
           role="status"

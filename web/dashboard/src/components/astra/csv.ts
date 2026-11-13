@@ -1,4 +1,4 @@
-// ASTR-10: CSV serialization with correct quoting and formula-injection
+// CSV serialization with correct quoting and formula-injection
 // guarding. Every cell is quoted; internal quotes are doubled; CRLF row
 // endings; a leading = + - @ (or tab/CR) gets a single-quote prefix so a
 // spreadsheet does not execute the cell as a formula.

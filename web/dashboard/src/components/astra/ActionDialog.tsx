@@ -1,4 +1,4 @@
-// AUX-12: shared action-contract surface (useAction + ActionDialog + toast).
+// Shared action-contract surface (useAction + ActionDialog + toast).
 //
 // Replaces the browser confirm()/prompt() dialogs with a keyboard-accessible
 // surface driven by an ActionDescriptor. Risk routing:
@@ -7,7 +7,7 @@
 //   medium -> modal with was -> becomes and consequences.
 //   high / irreversible -> modal with consequences and a type-the-entity-name
 //     confirmation.
-// AUX-14b: dialogs can collect an operator reason (opts.reason) and hand it
+// Dialogs can collect an operator reason (opts.reason) and hand it
 // to execute — callers send it as the X-Audit-Reason header, which the audit
 // journal stores and shows. The toast-undo path has no dialog, so it sends
 // no reason (the journal still records the inverse call itself).
@@ -31,7 +31,7 @@ export interface ActionRunOptions {
   was?: ReactNode
   becomes?: ReactNode
   input?: { label: string; initial: string }
-  /** AUX-14b: collect an operator reason and pass it to execute. */
+  /** Collect an operator reason and pass it to execute. */
   reason?: { required?: boolean }
   confirmLabel: string
   impact?: ReactNode
@@ -44,7 +44,7 @@ export interface ActionRunOptions {
 /** Reasons are capped in step with the server (auditReasonMaxRunes = 512). */
 const REASON_MAX = 512
 
-/** AUX-14b: map a collected reason onto request options (X-Audit-Reason). */
+/** Map a collected reason onto request options (X-Audit-Reason). */
 export function auditReasonOpts(reason: string): { headers?: Record<string, string> } {
   const trimmed = reason.trim()
   return trimmed ? { headers: { 'X-Audit-Reason': trimmed } } : {}

@@ -1,4 +1,4 @@
-// N02-P08 (T02/T06): the guard detector-pack surface client.
+// The guard detector-pack surface client.
 //
 // Every shape mirrors the Go handlers exactly (services/admin/handlers/
 // guardpacks.go + guardpacks_read.go). The chain this client serves:

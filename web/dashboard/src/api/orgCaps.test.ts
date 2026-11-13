@@ -1,4 +1,4 @@
-// W-CAPS unit tests for the org caps API client: contract shape (URL,
+// Unit tests for the org caps API client: contract shape (URL,
 // method, body, X-Audit-Reason), null-means-beta-default honesty, and typed
 // error propagation. Runs under `node --test` with a stubbed fetch (same
 // pattern as orgSettings.test.ts).

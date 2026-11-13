@@ -16,7 +16,7 @@ import {
 // over the fetched (server-scoped) rows, loading/empty/error via StateNotice.
 // The sticky header lives INSIDE the designated scroll container only.
 //
-// AUX-01 (DataTable v2) contract:
+// DataTable v2 contract:
 //  - every column declares `type` (+ `unit` metadata); `sortable` defaults to
 //    true and `getSortValue` stays as a value override;
 //  - ordering goes through the typed comparator in lib/tableSort (numbers,
@@ -28,17 +28,17 @@ import {
 //    only reports header clicks to `onSortChange` (the backend owns order);
 //  - `pagination: 'external'` hides the built-in prev/next when the page
 //    renders its own <Pagination>;
-//  - `selection` (AUX-20) renders a leading checkbox column: per-row toggles
+//  - `selection` renders a leading checkbox column: per-row toggles
 //    (Shift-click extends from the last clicked row within the current page),
 //    a header "select all on this page" checkbox (indeterminate when partial),
 //    all capped at `selection.limit`. The page owns the bulk action bar
 //    (components/astra/BulkActions.tsx); `hiddenColumnIds` excludes columns
 //    from render, sort, aria-colcount and the consumer's CSV exports (the
-//    Columns menu and per-table localStorage prefs ship with AUX-22 —
+//    Columns menu and per-table localStorage prefs live in
 //    lib/tablePrefs);
-//  - `density` (AUX-22) switches row spacing between 'compact' (default —
-//    the v2 checklist density; pages with per-table prefs pass their own
-//    value, which always wins) and 'comfortable';
+//  - `density` switches row spacing between 'compact' (default; pages
+//    with per-table prefs pass their own value, which always wins) and
+//    'comfortable';
 //    date/code/duration/percent get the built-in formatters from
 //    lib/columnFormat (2-decimal money with the "<$0.01" sub-cent bound and
 //    the exact value in the cell hint; tokens as "input / output"), plus
@@ -49,7 +49,7 @@ import {
 export interface DataTableColumn<T> {
   key: string
   header: string
-  /** Glossary text shown as the header's native title hint (AUX-10). */
+  /** Glossary text shown as the header's native title hint. */
   headerHint?: string
   /** Cell content; defaults to String(row[key]). */
   render?: (row: T) => ReactNode
@@ -57,7 +57,7 @@ export interface DataTableColumn<T> {
   type?: ColumnSortType
   /**
    * Display semantic of the column; with no `render` the matching built-in
-   * formatter renders the cell (IMP-32). Implies a default sort `type`
+   * formatter renders the cell. Implies a default sort `type`
    * unless one is set explicitly.
    */
   format?: ColumnFormatType
@@ -74,7 +74,7 @@ export interface DataTableColumn<T> {
   mono?: boolean
 }
 
-/** AUX-20: row-selection state owned by the page (see BulkActions.tsx). */
+/** Row-selection state owned by the page (see BulkActions.tsx). */
 export interface DataTableSelectionSpec<T> {
   selectedRowIds?: ReadonlyArray<string>
   onSelectionChange?: (next: string[]) => void
@@ -108,12 +108,12 @@ export interface DataTableProps<T> {
   /** Row actions cell (copy-ID, inspect, …). */
   renderActions?: (row: T) => ReactNode
   /**
-   * AUX-06: click a row to drill somewhere (the request explorer). Pointer
+   * Click a row to drill somewhere (the request explorer). Pointer
    * convenience only — keyboard parity stays with the row's action buttons.
    */
   onRowClick?: (row: T) => void
   /**
-   * AUX-03: optional full-width row rendered directly under its data row
+   * Optional full-width row rendered directly under its data row
    * (e.g. an inline per-row editor). It belongs to the row visually but
    * participates in neither sort nor pagination.
    */
@@ -125,11 +125,11 @@ export interface DataTableProps<T> {
   onSortChange?: (next: SortState | null) => void
   /** Sort assumed when none is active (and the third click's return target). */
   defaultSort?: SortState | null
-  /** AUX-20: leading checkbox column + select-all-on-page (bar lives in the page). */
+  /** Leading checkbox column + select-all-on-page (bar lives in the page). */
   selection?: DataTableSelectionSpec<T>
-  /** AUX-22 contract: columns excluded from render, sort and aria-colcount. */
+  /** Columns excluded from render, sort and aria-colcount. */
   hiddenColumnIds?: ReadonlyArray<string>
-  /** AUX-22: row spacing; 'comfortable' (default) or 'compact'. */
+  /** Row spacing; 'compact' (default) or 'comfortable'. */
   density?: TableDensity
 }
 
@@ -140,6 +140,7 @@ const cellValue = (row: unknown, key: string): SortValue => {
   return String(v)
 }
 
+// Built-in formatting applies only to columns without an explicit
 // `render`. The raw value goes through the pure formatter; the optional
 // exact-value hint (sub-cent money) rides on a title span.
 function formattedCell<T>(col: DataTableColumn<T>, row: T, locale: string): ReactNode {
@@ -165,7 +166,7 @@ export function DataTable<T>({
   const sort = controlled ? sortProp : internalSort
   const clientSort = sortMode === 'client'
 
-  // AUX-20 selection: controlled via selection.selectedRowIds when provided,
+  // Selection: controlled via selection.selectedRowIds when provided,
   // otherwise an internal fallback so simple consumers still get checkboxes.
   // Memoized identity: the controlled array is a page-owned prop that may be
   // a fresh literal each render, which would invalidate the Set below.
@@ -230,7 +231,7 @@ export function DataTable<T>({
     if (clientSort) onPageChange(1)
   }
 
-  // ----- AUX-20 selection (checkbox column; the bulk bar lives in the page) -----
+  // ----- Selection (checkbox column; the bulk bar lives in the page) -----
   const pageIds = pageRows.map(getRowId)
   const emitSelection = (next: ReadonlyArray<string>) => {
     const limit = selection?.limit
@@ -266,16 +267,17 @@ export function DataTable<T>({
   }
   const selectColCount = visibleColumns.length + (renderActions ? 1 : 0) + (selection ? 1 : 0)
 
-  // AUX-22: row spacing by density. 'compact' is the primitive default (the
-  // v2 checklist density); pages with per-table prefs pass their own value,
-  // which always wins. The sort button keeps its 36px target (AVR-07) in
+  // Row spacing by density. 'compact' is the primitive default; pages
+  // with per-table prefs pass their own value, which always wins.
+  // The sort button keeps its 36px target in
   // both densities — only the cell breathing room changes.
   const rowPad = density === 'compact' ? 'py-1' : 'py-2'
   const headPad = density === 'compact' ? 'py-1.5' : 'py-2'
   const thCls = `whitespace-nowrap border-b border-[color:var(--astra-rule-strong)] px-3 ${headPad} text-start text-[length:12px] font-medium uppercase tracking-wide text-[color:var(--astra-text-muted)]`
   const tdBase = `border-b border-[color:var(--astra-rule)] px-3 ${rowPad} align-top text-sm text-[color:var(--astra-ink)]`
 
-  // the first data column) stays visible during horizontal scrolling. The
+  // The sticky lead column (the first data column) stays visible during
+  // horizontal scrolling. The
   // separation edge is an inset shadow — a collapsed-table border would
   // scroll away with the sticky cell. Opaque backgrounds keep scrolled
   // content from showing through; selected rows carry the accent surface.
@@ -285,7 +287,7 @@ export function DataTable<T>({
   const stickyTh = `sticky z-[2] bg-[color:var(--astra-surface)] ${stickyShadow}`
 
   return (
-    // AVR-10 (F09 text-enlarge): min-w-0 + max-w-full on the wrapper and the
+    // Text-enlarge safe: min-w-0 + max-w-full on the wrapper and the
     // scroll region so a wide table scrolls inside its container (bounded to
     // the viewport) instead of pushing the document wider when the root font
     // is enlarged. The table keeps its intrinsic width and scrolls locally.
@@ -300,7 +302,7 @@ export function DataTable<T>({
       >
         <table
           className="w-full border-collapse"
-          // AUX-22: hidden columns do not count — aria-colcount mirrors what
+          // Hidden columns do not count — aria-colcount mirrors what
           // is actually rendered (+ selection/actions columns when present).
           aria-colcount={selectColCount}
         >
@@ -343,7 +345,7 @@ export function DataTable<T>({
                       <button
                         type="button"
                         onClick={() => toggleSort(c.key)}
-                        // AVR-07 (F09): 36px compact sort target (desktop density).
+                        // 36px compact sort target (desktop density).
                         className="inline-flex min-h-[36px] items-center gap-1 uppercase tracking-wide hover:text-[color:var(--astra-ink)]"
                       >
                         {c.header}
@@ -384,7 +386,8 @@ export function DataTable<T>({
                   {visibleColumns.map((c, colIdx) => {
                     const isLead = colIdx === 0
                     const leadLeft = selection ? 'left-10' : 'left-0'
-                    // nowrap cell for date/code); an explicit `mono` wins.
+                    // Built-in formats imply mono (and a nowrap cell for
+                    // date/code); an explicit `mono` wins.
                     const effMono = c.mono ?? (c.format ? FORMAT_MONO[c.format] : false)
                     const nowrap = effMono || c.format === 'date'
                     // Numeric formats read better right-aligned; explicit

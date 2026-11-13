@@ -1,4 +1,4 @@
-// MC-4 (MCP-CREDENTIALS-PLAN-2026-10-05): the MCP credentials client module.
+// The MCP credentials client module.
 //
 // Frozen contracts, read from the handlers (services/admin/handlers/
 // mcp_credentials_handlers.go, mcp_servers_handlers.go, router_mcp.go) and
@@ -156,9 +156,9 @@ export async function listMcpUserCredentials(orgId: string, opts?: RequestOption
 
 /**
  * Revokes (deletes) the agent's credential on the server. Same PROPOSED
- * admin surface as listMcpUserCredentials (the store method
- * adminstore.Store.DeleteMCPUserCredential exists; the route is part of the
- * MC-4 contract-hole documentation in the lane handoff).
+ * admin surface as listMcpUserCredentials: the store method
+ * adminstore.Store.DeleteMCPUserCredential exists; the route's availability
+ * is documented as a known contract hole.
  */
 export async function deleteMcpUserCredential(orgId: string, server: string, agentId: string, opts?: RequestOptions): Promise<void> {
   await postJSON(

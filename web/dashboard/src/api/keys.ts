@@ -57,12 +57,12 @@ export async function rotateAPIKey(id: string, opts?: RequestOptions): Promise<s
   return rawKey
 }
 
-/** UI-VF-1: PUT /api/api-keys/{id} — activate/deactivate. Deactivation also purges resolver keys server-side. */
+/** PUT /api/api-keys/{id} — activate/deactivate. Deactivation also purges resolver keys server-side. */
 export async function setAPIKeyActive(id: string, active: boolean, opts?: RequestOptions): Promise<void> {
   await postJSON(`/api-keys/${encodeURIComponent(id)}`, { active }, 'PUT', opts)
 }
 
-/** UI-VF-1: DELETE /api/api-keys/{id}. */
+/** DELETE /api/api-keys/{id}. */
 export async function deleteAPIKey(id: string, opts?: RequestOptions): Promise<void> {
   await postJSON(`/api-keys/${encodeURIComponent(id)}`, {}, 'DELETE', opts)
 }

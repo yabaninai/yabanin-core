@@ -4,7 +4,7 @@ import {
   type TableDensity, type TablePrefs,
 } from '../lib/tablePrefs'
 
-// AUX-22 — page-owned table preferences (hidden columns + density). The page
+// Page-owned table preferences (hidden columns + density). The page
 // instance is the single owner: it hands the same state to the DataTable
 // (hiddenColumnIds, density), the Columns menu and the CSV export, so the
 // three can never disagree. Persistence is per tableId via lib/tablePrefs

@@ -1,4 +1,4 @@
-// I18N-11: resolve the applied org's presentation settings (currency +
+// Resolve the applied org's presentation settings (currency +
 // timezone) so any screen can render amounts/dates in the org's currency and
 // timezone. The org list is fetched once and cached; passing no `orgId`
 // yields the safe defaults (USD / UTC / current UI locale).
@@ -6,8 +6,8 @@
 import { useCallback, useEffect, useMemo, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { listOrganizations, type Organization } from '../api/client'
-// (format imports removed — the hook returns raw currency/timezone strings;
-//  the page's formatMoney/formatNumber consume them.)
+// The hook returns raw currency/timezone strings; the page's
+// formatMoney/formatNumber consume them.
 import { DEFAULT_CURRENCY, DEFAULT_TIMEZONE } from './format'
 
 export interface OrgPresentation {
@@ -75,7 +75,7 @@ export function useOrgPresentation(orgId?: string): OrgPresentation {
 }
 
 /**
- * UI-VF-1: shared org-list hook for scope pickers. Backed by the same
+ * Shared org-list hook for scope pickers. Backed by the same
  * module-level cache as useOrgPresentation, so mounting several pickers on
  * one screen still costs a single request. Returns `null` until loaded and
  * `[]` on failure; callers render their fallback (manual UUID input) then.

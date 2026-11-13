@@ -295,12 +295,12 @@ test('files with dynamic t() first arguments match DYNAMIC_ALLOWLIST exactly', (
 })
 
 // ---------------------------------------------------------------------------
-// Cross-locale parity gate (I18N-PARITY audit 2026-11-01, fix lane 2026-11-02).
+// Cross-locale parity gate.
 //
 // The tests above prove that src references resolve in en.json; they say
 // nothing about the seven resource locales — which is exactly how
-// prompts.reloadConflict/versionConflict/versionRequired drifted (en landed
-// via 1be6cb1, the translations never followed, and no gate noticed).
+// prompts.reloadConflict/versionConflict/versionRequired drifted (en gained
+// the keys, the translations never followed, and no gate noticed).
 //
 // `en` is the canonical bundle: every leaf key in en.json must resolve in each
 // resource locale, MODULO i18next v4 CLDR plural categories. A plural family
@@ -313,9 +313,9 @@ test('files with dynamic t() first arguments match DYNAMIC_ALLOWLIST exactly', (
 //
 // The second test rejects the structural residue class the audit surfaced:
 // a top-level key that duplicates a `<ns>.<key>` name inside an existing
-// namespace group (the 43 top-level `routingMap` copies deleted 2026-11-02
-// were exactly this — dead, yet inflating the canonical key set and poisoning
-// every naive parity diff, which hid the real 3-key drift behind 43 keys of
+// namespace group (the stray top-level `routingMap` copies were exactly
+// this — dead, yet inflating the canonical key set and poisoning
+// every naive parity diff, which hid the real key drift behind pure
 // noise). Top-level scalars belong in a namespace; bare copies are residue.
 
 const PARITY_LOCALES = ['ja', 'ko', 'hi', 'id', 'pt-BR', 'es', 'ar'] as const

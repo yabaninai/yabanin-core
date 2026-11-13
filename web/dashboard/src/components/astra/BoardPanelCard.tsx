@@ -12,13 +12,13 @@ import {
 } from '../../lib/analyticsQuery'
 import { hygieneShare, issueURL, monthForecast, pipelineAverage, type ResolvedPanel } from '../../lib/boards'
 
-// AUX-07 — the shared board-panel card. One rendering for the Dashboards
+// The shared board-panel card. One rendering for the Dashboards
 // boards and the Overview pinned-panels section (a pin re-renders the SAME
 // panel, not a snapshot of numbers). The card owns the per-panel honesty
 // contract:
 //   * the applied-scope caption names the window and filter the shown data
-//     was actually fetched with (AVR-01: captions describe applied scope);
-//   * numbers go through the AUX-10 metric registry — locale-aware values,
+//     was actually fetched with (captions describe applied scope);
+//   * numbers go through the metric registry — locale-aware values,
 //     display units, glossary hints, never a raw id or String(number);
 //   * table panels render a real DataTable (client-mode: the analytics
 //     endpoint owns neither paging nor ordering), chart panels the series
@@ -64,7 +64,7 @@ export function BoardPanelCard({ panel, result, applied, explorerHref, metricFmt
       })
     : undefined
 
-  // AUX-10: table columns through the metric registry — glossary headers,
+  // Table columns through the metric registry — glossary headers,
   // formatted numbers, typed sorting.
   const table = useMemo(() => {
     if (!data || panel.query.chart !== 'table') return null
@@ -119,7 +119,7 @@ export function BoardPanelCard({ panel, result, applied, explorerHref, metricFmt
         </div>
       </div>
       {caption && (
-        // AVR-10: an applied filter clause can be long — it wraps, never
+        // An applied filter clause can be long — it wraps, never
         // widens the document.
         <p className="overflow-wrap-anywhere text-xs text-[color:var(--astra-text-muted)]"
           style={{ font: '11px/1.4 var(--astra-font-code)' }}>

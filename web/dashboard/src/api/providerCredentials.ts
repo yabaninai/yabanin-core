@@ -1,5 +1,5 @@
-// W-BYOK (wave 2, card W-BYOK-UI): org provider credentials — the BYOK
-// client module, written against the frozen W-BYOK-API contract:
+// Org provider credentials — the BYOK
+// client module, written against the frozen API contract:
 //
 //   GET    /api/orgs/{orgId}/provider-credentials
 //   POST   /api/orgs/{orgId}/provider-credentials                    body {name, provider, base_url, key}

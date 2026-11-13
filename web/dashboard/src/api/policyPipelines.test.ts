@@ -136,7 +136,7 @@ test('conflict helpers stay strict about what is NOT a conflict', async () => {
   assert.equal(policyConflictCurrent(new Error('x')), null, 'non-ApiError is never a conflict')
 })
 
-// --- N16-P01-T02: validate endpoint, drift report, git_sha ban
+// --- validate endpoint, drift report, git_sha ban
 
 test('validatePolicyDoc posts the draft to /policies/validate and echoes the identity', async () => {
   installFetch(csrfAware(() => ({ status: 200, body: { valid: true, name: 'pii-guard', mode: 'shadow' } })))

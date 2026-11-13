@@ -1,4 +1,4 @@
-// W-WELCOME unit tests for the onboarding-flag client: contract shape (the
+// Unit tests for the onboarding-flag client: contract shape (the
 // org target rides the ?org_id= query on BOTH verbs), honest degradation
 // (any failure → null / false, never a throw) and payload validation (shape
 // drift degrades to null instead of trusting a partial object).

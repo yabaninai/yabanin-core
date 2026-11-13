@@ -3,7 +3,7 @@ import assert from 'node:assert/strict'
 import { getEventListeners } from 'node:events'
 import { ApiError, DEFAULT_READ_TIMEOUT_MS, loginNextUrl, onUnauthorized, readJSON, resetCsrf, sendMutation } from './transport.ts'
 
-// AF-08 acceptance: the transport owns the full HTTP lifecycle — a documented
+// Transport acceptance: the transport owns the full HTTP lifecycle — a documented
 // default read timeout that is really armed (even without options), a caller
 // abort that stays connected through body parsing, CSRF dedup where one
 // cancelled caller never cancels the token for everyone, and cleanup that
@@ -331,7 +331,7 @@ test('mutation: first-attempt 401 throws unauthorized and drops the cached token
   assert.equal(csrfLoads, 2)
   assert.equal(outcome.ok, false)
   // Post-replay 401 is reported as a plain ApiError of the final response,
-  // exactly like the pre-AF-08 contract (not as the unauthorized() reset).
+  // exactly like the historical contract (not as the unauthorized() reset).
   assert.equal(outcome.ok ? 0 : outcome.status, 401)
   assert.equal(mutationCount, 2)
 })

@@ -1,8 +1,8 @@
-// AF-12: pseudo-localization is QA-only and must never cost the production
+// Pseudo-localization is QA-only and must never cost the production
 // entry anything: the stretched bundle is derived from `en` on demand (when a
 // QA request selects ?locale=pseudo), not built eagerly at module load.
 //
-// The stretch contract is unchanged from I18N-01: deterministic middle padding
+// The stretch contract is unchanged: deterministic middle padding
 // (stable across runs — the pseudo gate compares rendered text between
 // locales), wrapping every string in «…». Pseudo text must NEVER ship to a
 // real locale — it only exercises layout under longer strings.

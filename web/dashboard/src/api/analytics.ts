@@ -27,7 +27,7 @@ export async function fetchRecentErrors(orgId?: string, limit = 50, opts?: Reque
   return Array.isArray(result) ? result : []
 }
 
-// AF-07 pricing-coverage classification of the cost window (matches
+// Pricing-coverage classification of the cost window (matches
 // PricingMetadata in pkg/adminstore/savings.go): complete = every request
 // priced, partial = measured, some unpriced, unknown = the cost of the
 // window cannot be quantified (measurement failed, or 100% unpriced),
@@ -165,7 +165,7 @@ export async function fetchLatency(params: { org_id?: string; since?: string } =
   return readJSON<LatencyReport>(`/api/analytics/latency?${qs}`, opts)
 }
 
-// ===== ADL-04: quality closed-loop (evalgate LLM-as-judge verdicts) =====
+// ===== Quality closed-loop (evalgate LLM-as-judge verdicts) =====
 
 // One (primary, shadow) model pair's quality over the window: the average
 // cheap-model (primary) and premium-model (shadow) quality the judge assigned,
@@ -225,7 +225,7 @@ export async function fetchQualityScores(params: { days?: number; org_id?: strin
   return readJSON<QualityReport>(`/api/analytics/quality?${qs}`, opts)
 }
 
-// ===== ADL-01: CTOR / task cost analytics (the Tasks screen) =====
+// ===== CTOR / task cost analytics (the Tasks screen) =====
 //
 // GET /api/analytics/tasks — per-group cost / counterfactual / savings /
 // cache-hits for an org. The backend already exists (G4); ADL-01 adds the

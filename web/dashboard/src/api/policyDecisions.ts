@@ -1,8 +1,8 @@
-// OP-9: policy decision log endpoints (read-only view of what the policy
+// Policy decision log endpoints (read-only view of what the policy
 // pipeline did — one row per evaluation attached to a request event;
 // content-free findings, 90d retention).
 //
-// CORE-TRACE-01 contract: `findings` is ALWAYS a JSON array of content-free
+// Wire contract: `findings` is ALWAYS a JSON array of content-free
 // finding objects on the wire (never a base64 string or null). When
 // `findings_valid` is false the stored findings were malformed/legacy
 // non-array and are served as [] — such a row must never be presented as a
@@ -58,7 +58,7 @@ export interface PolicyDecisionFilters {
  */
 export type PolicyDecisionEntity = 'decisions' | 'requests'
 
-/** One entry of the requests view (CORE-TRACE-02). */
+/** One entry of the requests view. */
 export interface PolicyDecisionRequestSummary {
   request_id: string
   evaluations: number
@@ -121,7 +121,7 @@ export async function listPolicyDecisions(
 }
 
 /**
- * Lists the REQUEST side (entity=requests, CORE-TRACE-02): distinct requests
+ * Lists the REQUEST side (entity=requests): distinct requests
  * behind the filtered decisions with their evaluation footprint. A request
  * with three evaluations is one row here, and totals count requests.
  */
