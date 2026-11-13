@@ -14,7 +14,7 @@ const config: Config = {
   organizationName: 'yabaninai',
   projectName: 'yabanin-core',
 
-  // PostHog analytics (2026-09-14): cookieless pageviews + explicit CTA
+  // PostHog analytics: cookieless pageviews + explicit CTA
   // events only. Privacy posture: no cookies (persistence memory), no
   // autocapture, no session recording, Do-Not-Track respected.
   //

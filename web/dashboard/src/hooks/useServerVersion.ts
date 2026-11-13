@@ -25,7 +25,7 @@ import { ApiError, readJSON } from '../api/transport.ts'
 //   request.
 
 /** The admin API contract level this dashboard build is compiled against
- * (mirrors the server's `AdminAPILevel` const from IMP-10a, currently 1). */
+ * (mirrors the server's `AdminAPILevel` const, currently 1). */
 export const EXPECTED_API_LEVEL = 1
 
 export interface ServerVersionInfo {

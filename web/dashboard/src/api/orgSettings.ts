@@ -201,13 +201,13 @@ export async function listPolicyPacks(orgId: string, opts?: RequestOptions): Pro
   return Array.isArray(rows) ? rows : []
 }
 
-/** PUT upsert for one region. Wire contract (pkfix1, review 98613b94):
+/** PUT upsert for one region. Wire contract:
     `config` is REQUIRED and must be non-null JSON (missing/null → 400 before
-    the store is touched — it used to surface as a 500 SQLSTATE 23502);
+    the store is touched, never a 500 from the store's NOT NULL constraint);
     `pack_id` may be omitted and the server defaults it per region; the body
     is strict-decoded, so send exactly pack_id/config/enabled and nothing
     else. `config: {}` is the honest "pack defaults, no overrides" document
-    (PA.6 override loading reads it later). */
+    (override loading reads it later). */
 export async function upsertPolicyPack(
   orgId: string, region: string, body: { pack_id?: string; config: unknown; enabled?: boolean }, opts?: RequestOptions,
 ): Promise<OrgPolicyPack> {

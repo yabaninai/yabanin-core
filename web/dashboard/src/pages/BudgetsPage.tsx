@@ -33,7 +33,7 @@ import {
 } from '../lib/budgetForecast'
 import type { AnalyticsResult } from '../lib/analyticsQuery'
 
-// AUX-15: one control surface over the EXISTING budget and alert APIs.
+// One control surface over the EXISTING budget and alert APIs.
 //
 // Honest-data rules this page lives by:
 //  - a bar exists only where both spent and limit are measured (team budgets
@@ -141,7 +141,7 @@ export function BudgetsPage() {
   const isRoot = perms.isRoot
 
   const [teams, setTeams] = useState<TeamSpendSummary[] | null>(null)
-  // AUX-20: per-table bulk selection. The budgets API is write-only for this
+  // Per-table bulk selection. The budgets API is write-only for this
   // page's mutations (upsert/delete with per-row dialogs already), and a
   // bulk upsert without per-row values is meaningless — so the honest bulk
   // action here is the CSV export of the selected rows.
@@ -167,14 +167,14 @@ export function BudgetsPage() {
   // consistent snapshot (a render-time Date() would drift mid-view).
   const [forecastNow, setForecastNow] = useState(() => new Date())
 
-  // AUX-01: sort + page in the URL, default order = usage percentage desc
+  // Sort + page in the URL, default order = usage percentage desc
   // (the whole point of the center: what burns first sorts first).
   const { page: teamsPage, setPage: setTeamsPage, sort: teamsSort, setSort: setTeamsSort } =
     useTableUrlState('budgets-teams', { defaultSort: { key: 'usage', dir: 'desc' } })
   const { page: agentsPage, setPage: setAgentsPage, sort: agentsSort, setSort: setAgentsSort } =
     useTableUrlState('budgets-agents', { defaultSort: { key: 'usage', dir: 'desc' } })
 
-  // Org-scope epoch (TP-06): a delayed org-A response can never land in org B.
+  // Org-scope epoch: a delayed org-A response can never land in org B.
   const orgEpoch = useRef(0)
   const orgRef = useRef('')
   useEffect(() => {
@@ -332,7 +332,7 @@ export function BudgetsPage() {
     if (live()) setLoading(false)
   }, [orgId, perms.loading, canBudgets, canAgentKeys, canAnalytics, isRoot])
 
-  // UX-03 pattern: debounced auto-load on org change (Enter commits at once).
+  // Debounced auto-load on org change (Enter commits at once).
   useEffect(() => {
     if (!orgId.trim()) return
     const timer = setTimeout(() => { void load() }, 300)
@@ -387,7 +387,7 @@ export function BudgetsPage() {
     })
   }, [agentKeys, agentBudgets, agentSpend, todayKey, forecastNow])
 
-  // ----- actions (AUX-12 contract) -----
+  // ----- actions (ActionDialog contract) -----
 
   const editTeamAction = useAction({ id: 'budgets.team.limit', risk: 'medium', permission: 'budgets.manage', reversible: true })
   const hardToggleAction = useAction({ id: 'budgets.team.hard', risk: 'low', permission: 'budgets.manage', reversible: true })
@@ -675,7 +675,7 @@ export function BudgetsPage() {
   const rowBtnQuietCls =
     'rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] px-2 py-1 text-xs text-[color:var(--astra-text-muted)] hover:text-[color:var(--astra-ink)] disabled:opacity-50'
 
-  // AUX-20: CSV export of the selected rows — client-side over data already
+  // CSV export of the selected rows — client-side over data already
   // on the page (the budgets API has no batch endpoint, and a bulk upsert
   // without per-row values is meaningless). Missing numbers export as empty
   // cells, never as faked zeros.
@@ -721,7 +721,7 @@ export function BudgetsPage() {
 
   const balanceLow = balance != null && balance.balance_cents < 500
   const balanceCritical = balance != null && balance.balance_cents <= -100
-  // a pre-fix backend encodes a no-hit list as null
+  // an older backend encodes a no-hit list as null
   const orgOnLowList = lowBalance != null && (lowBalance.org_ids ?? []).includes(orgId.trim())
   const org = orgId.trim()
 

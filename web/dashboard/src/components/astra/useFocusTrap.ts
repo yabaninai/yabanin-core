@@ -1,11 +1,11 @@
 import { useEffect, type RefObject } from 'react'
 
-// EntityDrawer, FormDrawer). Previously each surface kept its own copy of
-// this logic; the contract is identical everywhere:
+// Shared focus trap for the overlay surfaces (ActionDialog, RequestInspector,
+// EntityDrawer, FormDrawer). The contract is identical everywhere:
 //   * on mount: remember the opener (document.activeElement) and move focus
 //     to the panel's first focusable element;
-//   * Tab / Shift+Tab cycle INSIDE the panel (av03 acceptance: focus never
-//     reaches background controls);
+//   * Tab / Shift+Tab cycle INSIDE the panel (focus never reaches
+//     background controls);
 //   * Escape calls `onEscape` (the surface decides what closing means);
 //   * on unmount focus returns to the opener — or, when the opener is gone
 //     (deep link, list re-render, pointer tap that never focused it), to the

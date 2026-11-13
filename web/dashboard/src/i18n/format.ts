@@ -48,7 +48,7 @@ export function formatNumber(value: number): string {
 /**
  * Format an instant (ISO string or Date) as a localized date in the org's
  * timezone. Empty/unknown timezone falls back to UTC. A zero or unparseable
- * instant (year < 2000) renders as "—" (IMP-11), never as "Jan 1, 1".
+ * instant (year < 2000) renders as "—", never as "Jan 1, 1".
  */
 export function formatDate(value: string | Date, timezone?: string): string {
   return formatDateIn(uiLocale(), value, timezone)
