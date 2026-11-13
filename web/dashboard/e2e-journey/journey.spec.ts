@@ -117,18 +117,23 @@ function countersLine(o: Oracle): string {
 
 /** Contract: "⚠ source: from → to (class @conf/threshold reason)" for a
  * cross-route move; "passthrough: model" for an unchanged route. */
-function decisionText(raw: string): string {
-  const d = JSON.parse(raw) as DecisionDoc
-  const parts: string[] = []
-  if (d.source === 'passthrough') parts.push(`passthrough: ${d.from ?? ''}`)
-  else if (d.from && d.to && d.from !== d.to) parts.push(`⚠ ${d.source}: ${d.from} → ${d.to}`)
-  else parts.push(`${d.source}: ${d.to || d.from} kept`)
+function decisionMeta(d: DecisionDoc): string[] {
   const meta: string[] = []
   if (d.class) meta.push(d.class)
   if (typeof d.confidence === 'number') {
     meta.push(`@${d.confidence.toFixed(2)}${typeof d.threshold === 'number' ? `/${d.threshold}` : ''}`)
   }
   if (d.reason) meta.push(d.reason)
+  return meta
+}
+
+function decisionText(raw: string): string {
+  const d = JSON.parse(raw) as DecisionDoc
+  const parts: string[] = []
+  if (d.source === 'passthrough') parts.push(`passthrough: ${d.from ?? ''}`)
+  else if (d.from && d.to && d.from !== d.to) parts.push(`⚠ ${d.source}: ${d.from} → ${d.to}`)
+  else parts.push(`${d.source}: ${d.to || d.from} kept`)
+  const meta = decisionMeta(d)
   if (meta.length > 0) parts.push(`(${meta.join(' ')})`)
   return parts.join(' ')
 }
@@ -190,13 +195,8 @@ async function openJourney(p: Page, row: FixtureRow): Promise<void> {
 // inside the decision li, so match the attribute, not a tag.
 const stage = (p: Page, id: string) => p.locator(`[data-testid="journey-${id}"]`)
 
-/** Asserts the whole journey matches the oracle for a SERVED row, taking the
- * policy-gated fields (error text, upstream URL, cache type) from the REAL
- * API payload so UI == API == DB holds under whatever the ACL exposes. */
-async function expectServedJourney(p: Page, row: FixtureRow, detail: Record<string, unknown>): Promise<void> {
-  const o = row.oracle
-  await expect(stage(p, 'request')).toContainText(o.method)
-  await expect(stage(p, 'request')).toContainText(o.model_requested)
+/** Stage 2: routing decision + classifier chip. */
+async function expectDecisionStage(p: Page, o: Oracle): Promise<void> {
   if (o.routing_decision !== null) {
     await expect(stage(p, 'decision')).toContainText(decisionText(o.routing_decision))
     const chip = ruleChipText(o.routing_decision)
@@ -211,6 +211,11 @@ async function expectServedJourney(p: Page, row: FixtureRow, detail: Record<stri
   } else {
     await expect(stage(p, 'classifier')).toHaveCount(0)
   }
+}
+
+/** Stage 3: upstream serving, with the policy-gated upstream URL taken from
+ * the REAL API payload so UI == API == DB holds under whatever the ACL exposes. */
+async function expectUpstreamStage(p: Page, o: Oracle, detail: Record<string, unknown>): Promise<void> {
   await expect(stage(p, 'upstream')).toContainText(o.model_used)
   await expect(stage(p, 'upstream')).toContainText(`${o.status_code} · ${o.duration_ms} ms`)
   await expect(stage(p, 'upstream')).toContainText(countersLine(o))
@@ -220,6 +225,11 @@ async function expectServedJourney(p: Page, row: FixtureRow, detail: Record<stri
   } else {
     await expect(stage(p, 'upstream')).toContainText(COPY.upstreamUrlNotRecorded)
   }
+}
+
+/** Stage 4: outcome — status, error (policy-gated via the API payload),
+ * cache hit, tokens and the answer-view presence. */
+async function expectResponseStage(p: Page, o: Oracle, detail: Record<string, unknown>): Promise<void> {
   await expect(stage(p, 'response')).toContainText(String(o.status_code))
   const apiError = detail.error
   if (typeof apiError === 'string' && apiError) {
@@ -236,6 +246,18 @@ async function expectServedJourney(p: Page, row: FixtureRow, detail: Record<stri
     o.answer_status === 'complete' ? COPY.answerComplete : COPY.answerAbsent,
   )
   await expect(p.getByText(COPY.perAttemptNote)).toBeVisible()
+}
+
+/** Asserts the whole journey matches the oracle for a SERVED row, taking the
+ * policy-gated fields (error text, upstream URL, cache type) from the REAL
+ * API payload so UI == API == DB holds under whatever the ACL exposes. */
+async function expectServedJourney(p: Page, row: FixtureRow, detail: Record<string, unknown>): Promise<void> {
+  const o = row.oracle
+  await expect(stage(p, 'request')).toContainText(o.method)
+  await expect(stage(p, 'request')).toContainText(o.model_requested)
+  await expectDecisionStage(p, o)
+  await expectUpstreamStage(p, o, detail)
+  await expectResponseStage(p, o, detail)
 }
 
 /** Screenshots into the stand-provided artifacts dir and attaches them. */
