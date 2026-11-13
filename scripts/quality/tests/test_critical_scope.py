@@ -26,6 +26,14 @@ class CriticalScopeControls(unittest.TestCase):
         for argv in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'base']):
             subprocess.run(['git', *argv], cwd=self.root, check=True, capture_output=True)
         self.base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
+        # These controls assert legacy behavior; pin the mode so an ambient
+        # CRITICAL_SCOPE_SELECTOR value cannot change what they verify.
+        self.previous_mode = os.environ.get(critical_scope.MODE_ENV)
+        os.environ[critical_scope.MODE_ENV] = critical_scope.LEGACY
+        if self.previous_mode is None:
+            self.addCleanup(os.environ.pop, critical_scope.MODE_ENV, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, critical_scope.MODE_ENV, self.previous_mode)
 
     def selected(self):
         return critical_scope.targets(self.root, self.base, {'critical_paths': ['pkg/auth/**']})
