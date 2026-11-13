@@ -87,13 +87,44 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
     return results.mutation_report(report, functions, package)
 
 
+BUDGET_KINDS = ('unit', 'fuzz', 'mutation')
+APPROVED_BUDGET = {'unit': 300, 'fuzz': 420, 'mutation': 300}
+
+
+def budget(config):
+    """Approved per-package seconds by check kind; any deviation is an error.
+
+    The versioned budget block replaced the flat seconds_per_package_and_kind
+    field so fuzzing can carry a different approved ceiling than unit and
+    mutation. Kind budgets are shared across the package's build modes.
+    """
+    block = config.get('budget')
+    if not isinstance(block, dict) or block.get('schema_version') != 1:
+        raise ValueError('Expected budget schema 1 with seconds_per_package by kind')
+    seconds = block.get('seconds_per_package')
+    if not isinstance(seconds, dict) or set(seconds) != set(BUDGET_KINDS):
+        raise ValueError('Budget must define exactly unit, fuzz and mutation seconds')
+    if seconds != APPROVED_BUDGET:
+        raise ValueError('Expected approved budgets unit=300s fuzz=420s mutation=300s')
+    return seconds
+
+
 def validate_config(config):
-    if config.get('schema_version') != 2 or config.get('seconds_per_package_and_kind') != 300:
-        raise ValueError('Expected schema 2 and approved 300-second check budget')
+    if config.get('schema_version') != 2:
+        raise ValueError('Expected critical config schema 2')
+    if 'seconds_per_package_and_kind' in config:
+        raise ValueError('Legacy seconds_per_package_and_kind was replaced by the '
+                         'versioned budget block')
+    budget(config)
     if not config.get('critical_paths') or not config.get('build_tags'):
         raise ValueError('Critical scope and build modes must not be empty')
     if config.get('fuzz_applicability') != 'fuzz-targets':
         raise ValueError("Expected fuzz applicability 'fuzz-targets' (per-mode target detection)")
+    validate_mutation_scope(config)
+
+
+def validate_mutation_scope(config):
+    """Mutation qualification is an explicit list of critical packages."""
     qualified = config.get('mutation_qualified_packages')
     if not isinstance(qualified, list):
         raise ValueError('mutation_qualified_packages must be an explicit versioned list')
@@ -122,8 +153,9 @@ def active_functions(root, package, functions, tags, out, deadline):
 def run_package(root, package, functions, config, out, gremlins):
     result = {}
     qualified = package in set(config['mutation_qualified_packages'])
+    seconds = budget(config)
     for kind in ('unit', 'fuzz', 'mutation'):
-        deadline = time.monotonic() + config['seconds_per_package_and_kind']
+        deadline = time.monotonic() + seconds[kind]
         covered = set()
         for index, tags in enumerate(config['build_tags']):
             target = out / kind / str(index)
