@@ -10,13 +10,15 @@
 //     Recursion=false, GlobalReassign=false). The only loop form is a
 //     comprehension, which is bounded natively by the execution-step budget.
 //   - Thread.SetMaxExecutionSteps provides a TRUE instruction-level budget
-//     (unlike the Lua engine, which only has a wall-clock deadline): every
+//     (deterministic, like the Lua engine's dispatch budget): every
 //     operation counts, comprehension iterations included. A wall-clock
-//     watchdog (thread.Cancel) bounds single huge operations such as
-//     `"a" * 10**9`, which complete in one step. KNOWN GAP for the owner
-//     decision: starlark-go has no per-value memory cap either — one step
-//     can transiently allocate at operand size before cancellation lands;
-//     the watchdog bounds the time, not the peak.
+//     watchdog (thread.Cancel) backs up the step budget for single huge
+//     operations such as `"a" * 10**9`, which complete in one step; New
+//     scales it by raceWallScale on -race builds (see race_on.go) so race
+//     instrumentation and runner load cannot abort legitimate evaluations.
+//     KNOWN GAP for the owner decision: starlark-go has no per-value memory
+//     cap either — one step can transiently allocate at operand size before
+//     cancellation lands; the watchdog bounds the time, not the peak.
 //   - The predeclared environment is empty apart from the three condition
 //     roots (findings, steps, meta — contract in the parent package); the
 //     Starlark universe is pure (no I/O, time, randomness). thread.Print is
@@ -56,9 +58,14 @@ const (
 	maxEnvBytes             = 1 << 20
 	// DefaultStepLimit bounds Starlark operations per evaluation.
 	DefaultStepLimit = 100_000
-	// DefaultEvalTimeout is the wall-clock watchdog for single huge
-	// operations that bypass per-step accounting.
+	// DefaultEvalTimeout is the wall-clock watchdog backing up the step
+	// budget for single huge operations that bypass per-step accounting.
+	// New scales it by raceWallScale on -race builds (load tolerance, not
+	// semantics); the step budget needs no scaling — step counts do not
+	// depend on machine speed.
 	DefaultEvalTimeout = 25 * time.Millisecond
+	// raceWallScale is applied to the wall watchdog on -race builds only.
+	raceWallScale = 10
 	// cacheLimit caps the compiled-program cache (spike-simple FIFO reset).
 	cacheLimit = 1024
 )
@@ -99,7 +106,8 @@ type Option func(*Engine)
 // WithStepLimit overrides the native execution-step budget.
 func WithStepLimit(n uint64) Option { return func(e *Engine) { e.stepLimit = n } }
 
-// WithEvalTimeout overrides the wall-clock watchdog budget.
+// WithEvalTimeout overrides the wall-clock watchdog budget; on -race builds
+// New scales it by raceWallScale. The step budget is unaffected.
 func WithEvalTimeout(d time.Duration) Option { return func(e *Engine) { e.evalTimeout = d } }
 
 // WithMaxWorkers sets the maximum number of concurrent VM evaluations. A
@@ -123,6 +131,9 @@ func New(opts ...Option) *Engine {
 	}
 	for _, opt := range opts {
 		opt(e)
+	}
+	if raceEnabled {
+		e.evalTimeout *= raceWallScale
 	}
 	return e
 }
