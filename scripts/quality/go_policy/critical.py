@@ -182,9 +182,12 @@ def run(args):
     validate_config(config)
     base = source.git(root, 'rev-parse', '--verify', '--end-of-options', args.base + '^{commit}').decode().strip()
     before = source.snapshot(root)
+    mode = scope.selector_mode()
     targets = scope.targets(root, base, config)
     report = {'base': base, 'source': before, 'config_sha256': source.digest(HERE / 'critical.json'),
               'packages': {}, 'status': 'not_applicable' if not targets else 'running'}
+    if mode != scope.LEGACY:
+        report['selector'] = {'mode': mode, 'evidence': scope.selection_evidence()}
     source.write(out / 'report.json', report)
     try:
         if targets:
@@ -203,6 +206,8 @@ def run(args):
         source.write(out / 'report.json', report)
         for line in applicability_lines(report):
             print('Critical Go applicability: ' + line)
+        if report.get('selector'):
+            print('Critical selector: ' + report['selector']['mode'])
     print('Critical Go checks: ' + report['status'] + '; ' + str(out / 'report.json'))
     print('Report SHA256: ' + source.digest(out / 'report.json'))
     return 0
