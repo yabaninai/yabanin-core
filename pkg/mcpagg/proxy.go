@@ -398,7 +398,9 @@ func (p *Proxy) invokeGuardArgs(ctx context.Context, c *invokeCall) (string, err
 }
 
 // invokeSSRFCheck is the SSRF guard, second layer (rebind window —
-// docs/mcp-gateway.md R1).
+// docs/mcp-gateway.md R1). The request ctx threads into the guard for
+// values; the ssrf layer detaches it from cancellation, so the DNS re-check
+// stays bounded and client-disconnect-proof (QG2-D3).
 func (p *Proxy) invokeSSRFCheck(ctx context.Context, c *invokeCall) (string, error) {
 	// p.testAllowHTTP is the unit-test seam for httptest loopback upstreams
 	// (production never sets it — see Config.testAllowHTTP). The full guard
@@ -407,7 +409,7 @@ func (p *Proxy) invokeSSRFCheck(ctx context.Context, c *invokeCall) (string, err
 	if p.testAllowHTTP {
 		return "", nil
 	}
-	if err := ValidateURLAtInvoke(c.srv.URL, p.allow, false); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := validateServerURL(ctx, c.srv.URL, p.allow, false); err != nil {
 		p.auditDone(ctx, c.orgID, c.id, c.srv.Name, c.req.Tool, c.params,
 			OutcomeSSRFBlocked, 0, 0, c.start, c.srv.URL)
 		return OutcomeSSRFBlocked, &InvokeError{Code: ErrCodeSSRF, Message: err.Error()}
