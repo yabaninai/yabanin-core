@@ -29,6 +29,7 @@ import { useGlobalScope } from '../lib/globalScope'
 import { useAutoRefresh, useAutoRefreshInterval, useDocumentHidden } from '../lib/freshness'
 import { FreshnessControl } from '../components/astra/FreshnessControl'
 import { useTablePrefs } from '../hooks/useTablePrefs'
+import { buildRequestJourney, decisionText, type StoredDecision } from '../lib/requestJourney'
 
 // The request explorer's data surfaces:
 //   - GET /api/organizations/{id}/requests — one YQL filter system (quick
@@ -91,99 +92,161 @@ const EXPLORER_EVIDENCE_KEYS: Record<string, string> = {
 // body is NOT stored and is stated as such, never invented. Privacy mode hides
 // the raw snapshot and the error text.
 
-// Compact human-readable form of the routing_decision JSON. Language-neutral
-// on purpose (technical tokens only): "tier_router: a → b (medium @0.60)"
-// or "passthrough: a". A cross-route move (from ≠ to) gets a ⚠ prefix so the
-// cost/route implication is impossible to miss.
-// When the decision carries the matched routing rule's
-// identity ref, a mono chip appends the short rule id + content version;
-// the tooltip holds the full id. Two same-name rules stay distinguishable in
-// request history, and rows logged before that rule's edit keep showing the
-// ORIGINAL version (the ref was frozen into the stored payload at match
-// time). Absent ref → unchanged rendering (never a fabricated identity).
-function renderRoutingDecision(raw: string): React.ReactNode {
-  let d: { source?: string; from?: string; to?: string; class?: string; confidence?: number; threshold?: number; reason?: string; rule?: { id?: string; version?: string } } | null = null
-  try { d = JSON.parse(raw) } catch { /* fall through to raw */ }
-  if (!d || !d.source) return raw
-  const parts: string[] = []
-  const from = d.from ?? ''
-  const to = d.to ?? ''
-  if (d.source === 'passthrough') parts.push(`passthrough: ${from}`)
-  else if (from && to && from !== to) parts.push(`⚠ ${d.source}: ${from} → ${to}`)
-  else parts.push(`${d.source}: ${to || from} kept`)
-  const meta: string[] = []
-  if (d.class) meta.push(d.class)
-  if (typeof d.confidence === 'number') {
-    const thr = typeof d.threshold === 'number' ? `/${d.threshold}` : ''
-    meta.push(`@${d.confidence.toFixed(2)}${thr}`)
-  }
-  if (d.reason) meta.push(d.reason)
-  if (meta.length) parts.push(`(${meta.join(' ')})`)
-  const text = parts.join(' ')
+// CV-02: the one-request journey renders from the pure view model
+// (../lib/requestJourney.ts) so every displayed fact reconciles with a
+// stored request_logs column. Stages: request → routing decision → upstream
+// serving → response outcome. Absence stays explicit at each stage:
+//   - legacy rows without routing_decision state that (never a blank skip);
+//   - a pre-upstream termination (budget 429 projection: model_used='')
+//     renders "no upstream attempt" and NO attempt/retry/TTFT facts;
+//   - null counters (legacy rows) render "not recorded", never 0/1;
+//   - the per-attempt note states why no attempt list exists (field-matrix
+//     G2: producers record summary counters only). Config is never shown
+//     here — only what this row actually recorded.
+
+// CORE-TRACE-04: when the parsed decision carries the matched routing
+// rule's identity ref, a mono chip appends the short rule id + content
+// version; the tooltip holds the full id. Two same-name rules stay
+// distinguishable in request history, and rows logged before that rule's
+// edit keep showing the ORIGINAL version (the ref was frozen into the
+// stored payload at match time). Absent ref → no chip (never a fabricated
+// identity). The compact decision text itself (⚠ reroute marker, class
+// @confidence/threshold) comes from the view model's decisionText —
+// technical tokens only, language-neutral on purpose.
+function ruleChip(d: StoredDecision): React.ReactNode {
   const ruleID = typeof d.rule?.id === 'string' ? d.rule.id : ''
-  if (!ruleID) return text
+  if (!ruleID) return null
   const short = ruleID.length > 8 ? ruleID.slice(0, 8) : ruleID
   const version = typeof d.rule?.version === 'string' && d.rule.version ? ` · v${d.rule.version}` : ''
   return (
-    <span>
-      {text}{' '}
-      <span
-        title={`rule ${ruleID}${version}`}
-        className="rounded border border-[color:var(--astra-rule-strong)] px-1 text-xs text-[color:var(--astra-text-muted)]"
-        style={{ fontFamily: 'var(--astra-font-code)' }}
-      >
-        rule {short}{version}
-      </span>
+    <span
+      title={`rule ${ruleID}${version}`}
+      className="rounded border border-[color:var(--astra-rule-strong)] px-1 text-xs text-[color:var(--astra-text-muted)]"
+      style={{ fontFamily: 'var(--astra-font-code)' }}
+    >
+      rule {short}{version}
     </span>
   )
 }
 
-// fields the request-log API already carries (routing_decision,
-// attempt_count, retry_count, first_token_ms, cache_hit_type, duration). A
-// per-attempt list (model/provider/status/duration per try — Portkey-style
-// AttemptOutcome) is NOT recorded by the API; until it is, this block shows
-// the recorded facts and never invents intermediate attempts.
+// Stage 3 — upstream serving, or the recorded pre-upstream termination.
+function journeyUpstreamNode(
+  t: (k: string, opts?: Record<string, unknown>) => string,
+  j: ReturnType<typeof buildRequestJourney>,
+): React.ReactNode {
+  if (!j.upstream.reached) {
+    // Blocked rows carry no attempt columns (NULL) — nothing attempt-shaped
+    // may render here; the outcome lives in stage 4 (status/error).
+    return (
+      <span className="flex flex-col gap-1" data-testid="journey-blocked">
+        <span className="font-medium">{t('explorer.journeyBlockedTitle')}</span>
+        <span className="text-xs text-[color:var(--astra-text-muted)]">
+          {t('explorer.journeyBlockedDetail', { status: j.response.statusCode })}
+        </span>
+      </span>
+    )
+  }
+  return (
+    <>
+      <span style={{ fontFamily: 'var(--astra-font-code)' }}>{j.upstream.modelUsed.value ?? ''}</span>
+      <span style={{ fontFamily: 'var(--astra-font-code)' }}>
+        {j.response.statusCode}{j.upstream.durationMs ? ` · ${j.upstream.durationMs} ms` : ''}
+      </span>
+      <span className="text-xs text-[color:var(--astra-text-muted)]">
+        {t('explorer.detailAttempts')}: {j.upstream.attemptCount != null ? j.upstream.attemptCount : t('explorer.journeyUnknown')}
+        {' · '}{t('explorer.detailRetries')}: {j.upstream.retryCount != null ? j.upstream.retryCount : t('explorer.journeyUnknown')}
+        {' · '}{t('explorer.detailTtft')}: {j.upstream.firstTokenMs != null ? j.upstream.firstTokenMs : t('explorer.journeyUnknown')}
+      </span>
+      <span className="text-xs text-[color:var(--astra-text-muted)]">
+        {j.upstream.upstreamUrl.presence === 'recorded'
+          ? <span style={{ fontFamily: 'var(--astra-font-code)' }}>{j.upstream.upstreamUrl.value}</span>
+          : t('explorer.journeyUpstreamNotRecorded')}
+      </span>
+    </>
+  )
+}
+
+// Stage 4 — response outcome. Error absence on a failing status is stated
+// ("no error detail recorded"), not glossed as success.
+function journeyResponseNode(
+  t: (k: string, opts?: Record<string, unknown>) => string,
+  j: ReturnType<typeof buildRequestJourney>,
+): React.ReactNode {
+  return (
+    <>
+      <span style={{ fontFamily: 'var(--astra-font-code)' }}>{j.response.statusCode}</span>
+      {j.response.error.presence === 'recorded'
+        ? <span className="break-all" style={{ fontFamily: 'var(--astra-font-code)' }}>{j.response.error.value}</span>
+        : (j.response.statusCode >= 400
+            ? <span className="text-xs text-[color:var(--astra-text-muted)]">{t('explorer.journeyNoErrorDetail')}</span>
+            : null)}
+      <span className="text-xs text-[color:var(--astra-text-muted)]">
+        {t('explorer.detailCache')}: {j.response.cacheHit.presence === 'recorded' ? j.response.cacheHit.value : t('explorer.journeyCacheNone')}
+        {' · '}{j.response.tokensIn} → {j.response.tokensOut}
+        {' · '}{j.response.answerView.presence === 'recorded'
+          ? (j.response.answerView.value === 'complete'
+              ? t('explorer.detailAnswerComplete')
+              : t('explorer.detailAnswerPartial'))
+          : t('explorer.journeyAnswerAbsent')}
+        {j.response.finishReason.presence === 'recorded' ? ` · ${j.response.finishReason.value}` : ''}
+      </span>
+    </>
+  )
+}
+
+// CV-02: routeTimelineNode now renders the full recorded journey from the
+// pure view model — kept under its original name and signature so the
+// change stays inside this helper (the page component body is untouched).
 function routeTimelineNode(
-  t: (k: string) => string,
+  t: (k: string, opts?: Record<string, unknown>) => string,
   d: RequestDetail,
 ): React.ReactNode {
-  let routed: React.ReactNode
-  if (d.routing_decision) routed = renderRoutingDecision(d.routing_decision)
-  const requested = d.model_requested || undefined
-  const servedLatency = typeof d.duration_ms === 'number' ? ` · ${d.duration_ms} ms` : ''
-  const facts: string[] = []
-  if (d.attempt_count != null && d.attempt_count > 0) facts.push(`${t('explorer.detailAttempts')}: ${d.attempt_count}`)
-  if (d.retry_count != null && d.retry_count > 0) facts.push(`${t('explorer.detailRetries')}: ${d.retry_count}`)
-  if (d.first_token_ms != null) facts.push(`${t('explorer.detailTtft')}: ${d.first_token_ms}`)
-  if (d.cache_hit_type) facts.push(`${t('explorer.detailCache')}: ${d.cache_hit_type}`)
+  const j = buildRequestJourney(d)
+  const stageIndex = (n: number) => (
+    <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-[color:var(--astra-rule-strong)] text-xs text-[color:var(--astra-text-muted)]">{n}</span>
+  )
   return (
-    <section aria-label={t('explorer.detailRouting')} className="flex flex-col gap-2">
-      <h4 className="text-xs font-medium uppercase tracking-wide text-[color:var(--astra-text-muted)]">{t('explorer.detailRouting')}</h4>
+    <section aria-label={t('explorer.journeyHeading')} className="flex flex-col gap-2">
+      <h4 className="text-xs font-medium uppercase tracking-wide text-[color:var(--astra-text-muted)]">{t('explorer.journeyHeading')}</h4>
       <ol className="flex flex-col gap-1 text-sm">
-        {requested && (
-          <li className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-[color:var(--astra-rule-strong)] text-xs text-[color:var(--astra-text-muted)]">1</span>
-            <span className="text-[color:var(--astra-text-muted)]">{t('explorer.model')}:</span>
-            <span style={{ fontFamily: 'var(--astra-font-code)' }}>{requested}</span>
-          </li>
-        )}
-        {routed !== undefined && (
-          <li className="flex flex-wrap items-center gap-2">
-            <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-[color:var(--astra-rule-strong)] text-xs text-[color:var(--astra-text-muted)]">2</span>
-            <span className="text-[color:var(--astra-text-muted)]">{t('explorer.detailRouting')}:</span>
-            <span className="break-all" style={{ fontFamily: 'var(--astra-font-code)' }}>{routed}</span>
-          </li>
-        )}
-        <li className="flex flex-wrap items-center gap-2">
-          <span className="inline-flex h-5 w-5 items-center justify-center rounded-full border border-[color:var(--astra-rule-strong)] text-xs text-[color:var(--astra-text-muted)]">3</span>
-          <span className="text-[color:var(--astra-text-muted)]">{t('inspector.modelActual')}:</span>
-          <span style={{ fontFamily: 'var(--astra-font-code)' }}>{d.model_used}</span>
-          <span style={{ fontFamily: 'var(--astra-font-code)' }}>{d.status_code}{servedLatency}</span>
+        <li className="flex flex-wrap items-center gap-2" data-testid="journey-request">
+          {stageIndex(1)}
+          <span className="text-[color:var(--astra-text-muted)]">{t('explorer.journeyStageRequest')}:</span>
+          <span style={{ fontFamily: 'var(--astra-font-code)' }}>{j.request.method}</span>
+          <span className="text-[color:var(--astra-text-muted)]">→</span>
+          {j.request.modelRequested.presence === 'recorded'
+            ? <span style={{ fontFamily: 'var(--astra-font-code)' }}>{j.request.modelRequested.value}</span>
+            : <span className="text-[color:var(--astra-text-muted)]">{t('explorer.journeyUnknown')}</span>}
+        </li>
+        <li className="flex flex-wrap items-center gap-2" data-testid="journey-decision">
+          {stageIndex(2)}
+          <span className="text-[color:var(--astra-text-muted)]">{t('explorer.detailRouting')}:</span>
+          {j.decision.parseFailed
+            ? <span className="break-all" style={{ fontFamily: 'var(--astra-font-code)' }}>{d.routing_decision}</span>
+            : <span className="break-all" style={{ fontFamily: 'var(--astra-font-code)' }}>
+                {j.decision.presence === 'recorded' ? decisionText(j.decision) : t('explorer.journeyDecisionNotRecorded')}{' '}
+                {ruleChip(j.decision)}
+              </span>}
+          {j.decision.classifierClass.presence === 'recorded' && (
+            <span className="text-xs text-[color:var(--astra-text-muted)]" data-testid="journey-classifier">
+              {t('explorer.detailClassifier')}: {j.decision.classifierClass.value}
+              {j.decision.classifierConfidence != null ? ` @${j.decision.classifierConfidence.toFixed(2)}` : ''}
+              {j.decision.classifierSource.presence === 'recorded' ? ` (${j.decision.classifierSource.value})` : ''}
+            </span>
+          )}
+        </li>
+        <li className="flex flex-wrap items-center gap-2" data-testid="journey-upstream">
+          {stageIndex(3)}
+          <span className="text-[color:var(--astra-text-muted)]">{t('explorer.journeyStageUpstream')}:</span>
+          {journeyUpstreamNode(t, j)}
+        </li>
+        <li className="flex flex-wrap items-center gap-2" data-testid="journey-response">
+          {stageIndex(4)}
+          <span className="text-[color:var(--astra-text-muted)]">{t('explorer.journeyStageResponse')}:</span>
+          {journeyResponseNode(t, j)}
         </li>
       </ol>
-      {facts.length > 0 && (
-        <p className="text-xs text-[color:var(--astra-text-muted)]">{facts.join(' · ')}</p>
-      )}
+      <p className="text-xs text-[color:var(--astra-text-muted)]">{t('explorer.journeyPerAttemptNote')}</p>
     </section>
   )
 }
