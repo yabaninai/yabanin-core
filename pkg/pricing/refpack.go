@@ -280,80 +280,95 @@ func RefDiff(oldJSON, newJSON []byte) (string, error) {
 	if err != nil {
 		return "", fmt.Errorf("ref diff: new snapshot: %w", err)
 	}
-
-	// Promotion gate before any rendering: draft→active needs reviewer and
-	// primary sources on the promoted entry. Validation already refuses
-	// active-without-sources at load; the reviewer gate is the diff's own
-	// stricter check.
-	for i := range newCat.Models {
-		nm := &newCat.Models[i]
-		if nm.Status != RefStatusActive {
-			continue
-		}
-		om := findRefModel(&oldCat, modelIdentity(nm))
-		if om == nil || om.Status != RefStatusDraft {
-			continue
-		}
-		if strings.TrimSpace(nm.Reviewer) == "" {
-			return "", fmt.Errorf("ref diff: refusing draft→active promotion of %s/%s: no reviewer recorded; the review diff never auto-promotes", nm.Provider, nm.Model)
-		}
-		if len(nm.Sources) == 0 {
-			return "", fmt.Errorf("ref diff: refusing draft→active promotion of %s/%s: no primary sources recorded", nm.Provider, nm.Model)
-		}
+	if err := refDiffPromotionGate(&oldCat, &newCat); err != nil {
+		return "", err
 	}
 
 	var sb strings.Builder
 	fmt.Fprintf(&sb, "ref-diff: %s (%s) -> %s (%s)\n", oldCat.Version, shortDigest(oldCat.Digest), newCat.Version, shortDigest(newCat.Digest))
 
-	oldByID := make(map[packModelIdentity]*RefModel, len(oldCat.Models))
-	for i := range oldCat.Models {
-		oldByID[modelIdentity(&oldCat.Models[i])] = &oldCat.Models[i]
-	}
-	newByID := make(map[packModelIdentity]*RefModel, len(newCat.Models))
-	for i := range newCat.Models {
-		newByID[modelIdentity(&newCat.Models[i])] = &newCat.Models[i]
-	}
+	oldByID := refCatalogByID(&oldCat)
+	newByID := refCatalogByID(&newCat)
+	ids := refUnionIdentities(&oldCat, &newCat)
+	added, removed, changed := refDiffRenderEntries(&sb, ids, oldByID, newByID)
+	fmt.Fprintf(&sb, "summary: added=%d removed=%d changed=%d unchanged=%d\n", added, removed, changed, len(ids)-added-removed-changed)
+	return sb.String(), nil
+}
 
-	// Union of identities in canonical order — built from slices, no map
-	// iteration in the output path.
-	var ids []packModelIdentity
-	seen := make(map[packModelIdentity]struct{}, len(oldCat.Models)+len(newCat.Models))
-	for i := range oldCat.Models {
-		id := modelIdentity(&oldCat.Models[i])
-		if _, dup := seen[id]; !dup {
-			seen[id] = struct{}{}
-			ids = append(ids, id)
+// refDiffPromotionGate is the review gate RefDiff runs before any
+// rendering: a draft→active promotion needs a reviewer and primary sources
+// on the promoted entry. Validation already refuses active-without-sources
+// at load; the reviewer gate is the diff's own stricter check.
+func refDiffPromotionGate(oldCat, newCat *Catalog) error {
+	for i := range newCat.Models {
+		nm := &newCat.Models[i]
+		if nm.Status != RefStatusActive {
+			continue
+		}
+		om := findRefModel(oldCat, modelIdentity(nm))
+		if om == nil || om.Status != RefStatusDraft {
+			continue
+		}
+		if strings.TrimSpace(nm.Reviewer) == "" {
+			return fmt.Errorf("ref diff: refusing draft→active promotion of %s/%s: no reviewer recorded; the review diff never auto-promotes", nm.Provider, nm.Model)
+		}
+		if len(nm.Sources) == 0 {
+			return fmt.Errorf("ref diff: refusing draft→active promotion of %s/%s: no primary sources recorded", nm.Provider, nm.Model)
 		}
 	}
-	for i := range newCat.Models {
-		id := modelIdentity(&newCat.Models[i])
-		if _, dup := seen[id]; !dup {
-			seen[id] = struct{}{}
-			ids = append(ids, id)
+	return nil
+}
+
+// refCatalogByID indexes a catalog's entries by canonical identity.
+func refCatalogByID(c *Catalog) map[packModelIdentity]*RefModel {
+	byID := make(map[packModelIdentity]*RefModel, len(c.Models))
+	for i := range c.Models {
+		byID[modelIdentity(&c.Models[i])] = &c.Models[i]
+	}
+	return byID
+}
+
+// refUnionIdentities returns the sorted union of both catalogs' identities.
+// Built from the slices and sorted canonically, so no map iteration order
+// can reach the output path.
+func refUnionIdentities(oldCat, newCat *Catalog) []packModelIdentity {
+	ids := make([]packModelIdentity, 0, len(oldCat.Models)+len(newCat.Models))
+	seen := make(map[packModelIdentity]struct{}, cap(ids))
+	for _, cat := range []*Catalog{oldCat, newCat} {
+		for i := range cat.Models {
+			id := modelIdentity(&cat.Models[i])
+			if _, dup := seen[id]; !dup {
+				seen[id] = struct{}{}
+				ids = append(ids, id)
+			}
 		}
 	}
 	sort.Slice(ids, func(i, j int) bool { return identityLess(ids[i], ids[j]) })
+	return ids
+}
 
-	added, removed, changed := 0, 0, 0
+// refDiffRenderEntries writes one line per added, removed or changed
+// identity — in the given canonical order — and returns the three summary
+// counts. Unchanged identities render nothing.
+func refDiffRenderEntries(sb *strings.Builder, ids []packModelIdentity, oldByID, newByID map[packModelIdentity]*RefModel) (added, removed, changed int) {
 	for _, id := range ids {
 		om, nm := oldByID[id], newByID[id]
 		label := id.provider + "/" + id.model
 		switch {
 		case om == nil:
 			added++
-			fmt.Fprintf(&sb, "ADDED %s\n", label)
+			fmt.Fprintf(sb, "ADDED %s\n", label)
 		case nm == nil:
 			removed++
-			fmt.Fprintf(&sb, "REMOVED %s\n", label)
+			fmt.Fprintf(sb, "REMOVED %s\n", label)
 		default:
 			if line := modelDiffLine(om, nm); line != "" {
 				changed++
-				fmt.Fprintf(&sb, "CHANGED %s\n%s", label, line)
+				fmt.Fprintf(sb, "CHANGED %s\n%s", label, line)
 			}
 		}
 	}
-	fmt.Fprintf(&sb, "summary: added=%d removed=%d changed=%d unchanged=%d\n", added, removed, changed, len(ids)-added-removed-changed)
-	return sb.String(), nil
+	return added, removed, changed
 }
 
 // modelDiffLine renders the field-level changes of one entry in fixed
