@@ -269,6 +269,127 @@ class ConservativeScopeControls(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.selected()
 
+    def test_body_swap_selects_both_functions(self):
+        (self.pkg / 'auth.go').write_text(
+            'package auth\n\nconst Limit = 5\n\n'
+            'func Allowed(n int) bool { return n > 0 }\n\n'
+            'func Neighbor() bool { return true }\n\n'
+            'func Guarded(n int) bool { return n > Limit }\n')
+        self.assertEqual(self.names(), {'Allowed', 'Guarded'})
+        self.assertIn('changed function: Allowed', self.reasons()['Allowed'])
+        self.assertIn('changed function: Guarded', self.reasons()['Guarded'])
+
+    def test_renamed_function_selects_new_name(self):
+        (self.pkg / 'auth.go').write_text(
+            'package auth\n\nconst Limit = 5\n\n'
+            'func Allowed(n int) bool { return n > Limit }\n\n'
+            'func Neighbor() bool { return true }\n\n'
+            'func GuardedRenamed(n int) bool { return n > 0 }\n')
+        (self.pkg / 'guarded_fuzz_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func FuzzGuarded(f *testing.F) {\n\tf.Add(1)\n'
+            '\tf.Fuzz(func(t *testing.T, n int) { GuardedRenamed(n) })\n}\n')
+        self.assertEqual(self.names(), {'GuardedRenamed'})
+        self.assertIn('renamed/moved function: GuardedRenamed', self.reasons()['GuardedRenamed'])
+
+    def test_build_tagged_out_test_targets_fail(self):
+        for name in ('auth_test.go', 'fuzz_test.go', 'guarded_fuzz_test.go'):
+            path = self.pkg / name
+            path.write_text('//go:build probe_ignore\n\n' + path.read_text())
+        with self.assertRaisesRegex(ValueError, 'fuzz target coverage loss'):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
+    def test_platform_renamed_test_targets_fail(self):
+        (self.pkg / 'fuzz_test.go').rename(self.pkg / 'fuzz_windows_test.go')
+        (self.pkg / 'guarded_fuzz_test.go').rename(self.pkg / 'guarded_windows_test.go')
+        with self.assertRaises(ValueError):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
+    def test_changed_test_keeps_baseline_consumers_selected(self):
+        (self.pkg / 'auth_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func TestAllowed(t *testing.T) { if !Neighbor() { t.Fatal("denied") } }\n')
+        self.assertEqual(self.names(), {'Allowed', 'Neighbor'})
+        self.assertIn('lost baseline coverage: TestAllowed', self.reasons()['Allowed'])
+
+    def test_removed_function_still_referenced_by_test_widens(self):
+        (self.pkg / 'auth.go').write_text(
+            'package auth\n\nconst Limit = 5\n\n'
+            'func Allowed(n int) bool { return n > Limit }\n\n'
+            'func Neighbor() bool { return true }\n')
+        self.assertEqual(self.names(), {'Allowed', 'Neighbor'})
+        self.assertTrue(any('removed function still referenced' in reason
+                            for reason in self.reasons()['*']))
+
+    def test_reflect_dispatch_literal_blocks_silent_removal(self):
+        (self.pkg / 'dispatch_test.go').write_text(
+            'package auth\n\nimport (\n\t"reflect"\n\t"testing"\n)\n\n'
+            'type holder struct{}\n\n'
+            'func TestDispatch(t *testing.T) { reflect.ValueOf(holder{}).MethodByName("Guarded") }\n')
+        self.commit('dispatch baseline')
+        (self.pkg / 'auth.go').write_text(
+            'package auth\n\nconst Limit = 5\n\n'
+            'func Allowed(n int) bool { return n > Limit }\n\n'
+            'func Neighbor() bool { return true }\n')
+        self.assertEqual(self.names(), {'Allowed', 'Neighbor'})
+        self.assertTrue(any('removed function in dynamic-dispatch package' in reason
+                            for reason in self.reasons()['*']))
+
+
+class CrossPackageConservativeControls(unittest.TestCase):
+    """Opt-in conservative selector: cross-package consumers are never silent."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory(prefix='critical-cross-')
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        hook = self.root / 'pkg/hook'
+        hook.mkdir(parents=True)
+        (self.root / 'go.mod').write_text('module example.test/critical\n\ngo 1.27.4\n')
+        (hook / 'hook.go').write_text(
+            'package hook\n\ntype Hook interface {\n\tRun(n int) bool\n}\n\n'
+            'func Apply(h Hook, n int) bool { return h.Run(n) }\n')
+        user = self.root / 'pkg/hookuser'
+        user.mkdir(parents=True)
+        (user / 'use.go').write_text(
+            'package hookuser\n\nimport "example.test/critical/pkg/hook"\n\n'
+            'type adapter struct{}\n\n'
+            'func (adapter) Run(n int) bool { return n > 0 }\n\n'
+            'func Enabled(n int) bool { return hook.Apply(adapter{}, n) }\n')
+        for argv in (['init', '-q'], ['add', '.'],
+                     ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid',
+                      'commit', '-qm', 'base']):
+            subprocess.run(['git', *argv], cwd=self.root, check=True, capture_output=True)
+        self.base = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                            cwd=self.root, text=True).strip()
+        self.previous_mode = os.environ.get(critical_scope.MODE_ENV)
+        os.environ[critical_scope.MODE_ENV] = critical_scope.CONSERVATIVE
+        if self.previous_mode is None:
+            self.addCleanup(os.environ.pop, critical_scope.MODE_ENV, None)
+        else:
+            self.addCleanup(os.environ.__setitem__, critical_scope.MODE_ENV, self.previous_mode)
+
+    def test_changed_interface_widens_importing_package(self):
+        (self.root / 'pkg/hook/hook.go').write_text(
+            'package hook\n\ntype Hook interface {\n\tRun(n int) bool\n\tName() string\n}\n\n'
+            'func Apply(h Hook, n int) bool { return h.Run(n) }\n')
+        selected = critical_scope.targets(self.root, self.base,
+                                          {'critical_paths': ['pkg/hook/**', 'pkg/hookuser/**']})
+        self.assertEqual({fn['name'] for fn in selected['pkg/hookuser']}, {'Enabled', 'Run'})
+        evidence = critical_scope.selection_evidence()['pkg/hookuser']
+        self.assertTrue(any('cross-package consumer of changed declaration' in reason
+                            for reason in evidence['reasons']['*']))
+
+    def test_unchanged_interface_leaves_importer_unselected(self):
+        (self.root / 'pkg/hook/hook.go').write_text(
+            'package hook\n\ntype Hook interface {\n\tRun(n int) bool\n}\n\n'
+            'func Apply(h Hook, n int) bool { return h.Run(n) && n > 0 }\n')
+        selected = critical_scope.targets(self.root, self.base,
+                                          {'critical_paths': ['pkg/hook/**', 'pkg/hookuser/**']})
+        self.assertNotIn('pkg/hookuser', selected)
+
 
 if __name__ == '__main__':
     unittest.main()

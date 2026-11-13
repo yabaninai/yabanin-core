@@ -13,7 +13,7 @@ reach them, and cross-package declaration changes widen importing critical
 packages. Every case the binding cannot resolve widens to all production
 functions of the package.
 """
-from collections import Counter
+from collections import Counter, defaultdict
 import json
 import os
 from pathlib import Path
@@ -143,6 +143,7 @@ class Selection:
         self.widenings = []
         self.guards = []
         self.cross = []
+        self.renames = {}
 
     def add(self, row, reason):
         self.rows.setdefault((row['file'], row['name']), row)
@@ -268,14 +269,18 @@ def match_functions(previous, current, selection):
     """
     baseline = previous.functions()
     by_identity = Counter((row['name'], row['hash']) for row in baseline)
-    by_body = Counter(row['hash'] for row in baseline)
+    bodies = defaultdict(list)
+    for row in baseline:
+        bodies[row['hash']].append(row['name'])
     names_before = {row['name'] for row in baseline}
     for row in current.functions():
         if spend(by_identity, (row['name'], row['hash'])):
             continue
         if row['name'] in names_before:
             selection.add(row, 'changed function: ' + row['name'])
-        elif spend(by_body, row['hash']):
+        elif bodies[row['hash']]:
+            moved = bodies[row['hash']].pop()
+            selection.renames[moved] = row['name']
             selection.add(row, 'renamed/moved function: ' + row['name'])
         else:
             selection.add(row, 'new function: ' + row['name'])
@@ -557,8 +562,14 @@ def bind_lost_baseline(previous, current, selection):
 
 
 def bind_lost_unit(name, unit, previous, current, selection):
-    """Baseline closure of one changed test unit, widened when unbindable."""
+    """Baseline closure of one changed test unit, widened when unbindable.
+
+    Baseline references follow renames: a lost ref whose symbol moved keeps
+    binding the renamed function while still naming the original, so a
+    rename stays narrow instead of widening the whole package.
+    """
     refs, selrefs = target_closure(unit, previous)
+    refs = refs | {selection.renames[ref] for ref in refs if ref in selection.renames}
     names = {row['name'] for row in current.functions()}
     consumers = [row for row in current.functions() if row['name'] in refs]
     if consumers:
