@@ -15,10 +15,11 @@ import { usePermissions } from '../../hooks/usePermissions'
 import { formatMoneyCell } from '../../lib/columnFormat'
 import { OneTimeSecretBanner } from './OneTimeSecretBanner'
 
-// in the FormDrawer (name + optional profile), the daily budget is edited
+// Agent keys list. Creation lives in the FormDrawer (name + optional
+// profile); the daily budget is edited
 // through the row's ⋯ menu with the amount entered in CURRENCY and stored
 // as cents. Budgets are fetched per agent only when the caller holds
-// agent_keys.manage (a reader never fires the budget requests, AUX-13).
+// agent_keys.manage (a reader never fires the budget requests).
 
 export function AgentKeysPanel({ org, createOpen, onCreateClosed }: {
   org: string

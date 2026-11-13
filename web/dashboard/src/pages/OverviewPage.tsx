@@ -60,8 +60,8 @@ function pricingCoverage(pricing: PricingMetadata | undefined, t: (k: string, o?
   const models = parsePricingMetadata(pricing).models
   // provenance label (pinned git URL + date + sha256, ~170 chars of
   // unbreakable tokens) and the unpriced-models list move into the
-  // collapsed ProvenanceNote below the strip — they used to ride along here
-  // and widened the document to 1517px.
+  // collapsed ProvenanceNote below the strip — inline they widen the
+  // document past ~1500px.
   if (d.state === 'ok') return { state: 'ok', note: '', unpricedModels: models }
   // warning / unknown: the honest coverage wording (pricingExcludes /
   // pricingNoModels / pricingCoverageUnknown) via the shared copy helper.

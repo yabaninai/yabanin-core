@@ -8,9 +8,9 @@ import { OrgSelect } from './OrgSelect'
 // applied values are separated (drafts vs the committed scope, plus an
 // applied-scope summary line).
 //
-// U03 base: selects organization and provider, mirrors them into the URL
+// Selects organization and provider, mirrors them into the URL
 // (?org=<id>&provider=<name>) so a scoped view is shareable and survives a
-// reload. UX-03 (v19.4): drafts AUTO-COMMIT after a 300ms debounce (blur and
+// reload. Drafts AUTO-COMMIT after a 300ms debounce (blur and
 // Enter still commit immediately) — no separate Load/Apply press is needed;
 // screens refetch off the committed scope. When `onApply` is provided, drafts
 // commit only via the Apply button (explicit applied-scope semantics).
@@ -25,7 +25,7 @@ export interface ScopePeriod {
   options: { value: string; label: string }[]
 }
 
-/** Controllable scope fields (AUX-04: honest filters — every visible control
+/** Controllable scope fields (honest filters — every visible control
  * must change the request; a field the server ignores is not rendered). */
 export type ScopeField = 'org' | 'provider' | 'period' | 'tz'
 
@@ -41,7 +41,7 @@ export interface ScopeBarProps extends Scope {
   /** Timezone label (e.g. "UTC"); free text so orgs with non-UTC work too. */
   timezone?: string
   onTimezoneChange?: (timezone: string) => void
-  /** Which fields to render (AUX-04). A hidden field is inert: it is dropped
+  /** Which fields to render. A hidden field is inert: it is dropped
    * from the mirrored URL and emitted as "" so the screen can never send it.
    * Default (prop omitted): org + provider, plus period/tz when wired. */
   fields?: ScopeField[]
@@ -62,7 +62,7 @@ function hashQuery(): string {
 
 // Exported for screens that auto-load on mount: initializing the scope from
 // the URL synchronously (useState initializer) avoids a wasted global request
-// before the ScopeBar's mount-effect adoption lands (UX-03).
+// before the ScopeBar's mount-effect adoption lands.
 export function readScopeFromURL(): Scope {
   try {
     const p = new URLSearchParams(hashQuery())
@@ -92,10 +92,10 @@ function writeScopeToURL(scope: Scope) {
 }
 
 const labelCls = 'flex min-w-0 max-w-full flex-col gap-1 text-sm'
-// AVR-10 (F09 text-enlarge): labels wrap/break so they can't push the form
+// Text-enlarge safety: labels wrap/break so they can't push the form
 // wider than the viewport when the root font is enlarged.
 const labelSpanCls = 'overflow-wrap-anywhere text-[color:var(--astra-text-muted)]'
-// AVR-07 (F09): min-height 44px — the project control height token
+// Min-height 44px — the project control height token
 // (--astra-height-control) as the touch target floor. shared .control class
 // (index.css) carries the porcelain chrome.
 const inputCls = 'control'
@@ -116,7 +116,7 @@ export function ScopeBar({
   appliedSummary,
 }: ScopeBarProps) {
   const { t } = useTranslation()
-  // AUX-04: a field left out of `fields` is not rendered AND is inert — the
+  // A field left out of `fields` is not rendered AND is inert — the
   // URL mirror drops its param and scope emissions carry "" for it. Showing a
   // control the server ignores would be a decorative filter.
   const showProvider = fields ? fields.includes('provider') : true
@@ -149,7 +149,7 @@ export function ScopeBar({
   useEffect(() => { setDraftEnvironment(environment ?? '') }, [environment])
   useEffect(() => { setDraftTimezone(timezone ?? '') }, [timezone])
 
-  // UX-03: auto-commit the drafts after a short debounce so the screen
+  // Auto-commit the drafts after a short debounce so the screen
   // refetches as the user finishes editing — without firing on every keystroke
   // (the original reason drafts existed). onApply screens keep explicit Apply
   // semantics and are excluded. Same-value commits are filtered so the debounce
@@ -165,7 +165,7 @@ export function ScopeBar({
 
   // Mirror the committed scope into the URL and remember the org so other
   // tabs can adopt it when their own URL carries none. Hidden fields are not
-  // advertised as filters (AUX-04): their params are stripped.
+  // advertised as filters: their params are stripped.
   useEffect(() => {
     writeScopeToURL({ orgId, provider: showProvider ? provider : '' })
     rememberOrg(orgId)
@@ -184,14 +184,14 @@ export function ScopeBar({
   // blur must not silently apply (editable ≠ applied).
   const commit = onApply ? () => {} : apply
 
-  // AVR-10 (F09 text-enlarge): min-w-0 on the card and its flex children so
+  // Text-enlarge safety: min-w-0 on the card and its flex children so
   // the form fields can shrink and wrap instead of pushing the document wider
   // when the root font is enlarged (fixed w-64/w-44 inputs overflow at 200%).
   return (
     <div className="card flex min-w-0 flex-wrap items-end gap-3">
       <label className={`${labelCls} min-w-0 max-w-full`}>
         <span className={labelSpanCls}>{t('scope.organization')}</span>
-        {/* UI-VF-1: org picker fed by the shared org-list cache replaces the
+        {/* Org picker fed by the shared org-list cache replaces the
             free-text UUID input; "" still means "all (global)" and manual UUID
             entry stays available as an escape hatch. */}
         <OrgSelect

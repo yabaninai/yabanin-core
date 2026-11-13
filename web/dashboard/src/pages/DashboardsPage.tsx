@@ -23,12 +23,12 @@ import { listPinnedPanels, pinPanel, unpinPanel } from '../lib/pinnedPanels'
 
 const BOARD_IDS = ['agents', 'ci', 'issues', 'reliability', 'budgets'] as const
 
-// AUX-05: the global board filter is a simple-mode FilterBar over the board
+// The global board filter is a simple-mode FilterBar over the board
 // fields the analytics query endpoint actually accepts. Both are YQL
-// label.<key> clauses (the shared server-side ParseYQL whitelist has no bare
-// `team` field — the previous `team = …` quick filter was rejected with
-// invalid_filter and failed every panel; the team cut is still visible via
-// the group-by on the budgets board).
+// label.<key> clauses — the shared server-side ParseYQL whitelist has no
+// bare `team` field (a `team = …` filter is rejected with
+// invalid_filter); the team cut is still visible via the group-by on the
+// budgets board).
 const BOARD_FIELDS: YqlFieldMeta[] = [
   { name: 'label.git.repo', kind: 'text', nullable: true, orderable: false, aliases: [] },
   { name: 'label.issue', kind: 'text', nullable: true, orderable: false, aliases: [] },
@@ -53,24 +53,25 @@ export function DashboardsPage() {
   const { t } = useTranslation()
   const initial = readHash()
   const [board, setBoard] = useState(BOARDS[initial.get('board') ?? ''] ? (initial.get('board') as string) : 'agents')
-  // AUX-08: org/period/tz come from the GlobalScope store (hash first, then
+  // Org/period/tz come from the GlobalScope store (hash first, then
   // the remembered scope) — the same scope Overview/Requests/Analytics use,
   // so a board reproduces the operator's current cut without re-selection.
   const gs = useGlobalScope()
   const org = gs.org
-  // AUX-10: panel totals render through the metric registry — locale-aware
+  // Panel totals render through the metric registry — locale-aware
   // values, display units and the per-metric glossary tooltip.
   const { currency } = useOrgPresentation(org || undefined)
   const metricFmt = useMemo(() => ({ locale: uiLocale(), currency }), [currency])
-  // AUX-05: the global filter is one YQL string (removable chips in the
+  // The global filter is one YQL string (removable chips in the
   // FilterBar). It ANDs into every panel through resolveBoard: repo → every
-  // panel, issue → the issue-scoped panels (pre-existing distribution).
+  // panel, issue → the issue-scoped panels (the existing per-panel
+  // distribution).
   const [globalFilter, setGlobalFilter] = useState(() => initialFilter(initial))
   const [keys, setKeys] = useState<string[]>([])
   const [template, setTemplate] = useState('')
   const [data, setData] = useState<Map<string, PanelPayload>>(new Map())
   const [loading, setLoading] = useState(false)
-  // AUX-07: pins — any visible panel can be pinned to Overview. The list is
+  // Pins — any visible panel can be pinned to Overview. The list is
   // per-browser localStorage (lib/pinnedPanels); toggling re-reads it so the
   // buttons stay honest after cap/dedup decisions in the lib.
   const [pins, setPins] = useState<string[]>(() => listPinnedPanels())
@@ -79,7 +80,7 @@ export function DashboardsPage() {
     else pinPanel(pin)
     setPins(listPinnedPanels())
   }
-  // AUX-23: freshness — clock label of the last successful board load, the
+  // Freshness — clock label of the last successful board load, the
   // honest stale marker when a REFRESH failed entirely, and the operator's
   // auto-refresh interval (localStorage). Dashboards has no modal, so the
   // only pause is the hidden tab.
@@ -90,8 +91,8 @@ export function DashboardsPage() {
   // The store always carries a concrete window (a preset resolves at
   // write/read time; a custom range is pinned), so panels fetch exactly it.
   const range = useMemo(() => ({ from: gs.from, to: gs.to }), [gs.from, gs.to])
-  // AUX-07: the applied scope the SHOWN numbers were fetched with — the
-  // per-panel captions describe this, never the live draft (AVR-01).
+  // The applied scope the SHOWN numbers were fetched with — the
+  // per-panel captions describe this, never the live draft.
   const [applied, setApplied] = useState<{ org: string; from: string; to: string; tz: string; filters: Map<string, string> } | null>(null)
 
   // The simple-mode chips are canonical `label.<key> = value` clauses; read
@@ -124,7 +125,7 @@ export function DashboardsPage() {
     return () => ctrl.abort()
   }, [org, range.from, range.to])
 
-  // AUX-23: the board loader, shared by the scope effect (replace) and the
+  // The board loader, shared by the scope effect (replace) and the
   // manual/auto refresh (merge). One generation guard + one AbortController:
   // a newer run aborts and supersedes the older one (asyncScope — no stale
   // completion ever lands, no parallel board loads pile up).
@@ -132,7 +133,7 @@ export function DashboardsPage() {
   useEffect(() => { dataRef.current = data })
   const boardGen = useRef(0)
   const boardCtrl = useRef<AbortController | null>(null)
-  // AUX-23: an in-flight REFRESH must not flash the loading notice over the
+  // An in-flight REFRESH must not flash the loading notice over the
   // still-shown panels; a scope change is a real load and may.
   const refreshingRun = useRef(false)
 
@@ -148,7 +149,7 @@ export function DashboardsPage() {
     setLoading(true)
     const result = await loadPanels(org, range.from, range.to, gs.tz, runPanels, ctrl.signal)
     if (boardGen.current !== g || ctrl.signal.aborted) return
-    // AUX-07: captions follow the window/filter the data was fetched with.
+    // Captions follow the window/filter the data was fetched with.
     setApplied({
       org,
       from: range.from,
@@ -163,7 +164,7 @@ export function DashboardsPage() {
       setAsOf(Date.now())
       setRefreshStale(false)
     } else {
-      // AUX-23 refresh: successful panels replace their entries; a failed
+      // Refresh: successful panels replace their entries; a failed
       // panel keeps its previous result. Only when EVERY visible panel
       // failed does the refresh admit failure — the last good board stays
       // on screen with the honest stale marker instead of being wiped.
@@ -188,7 +189,7 @@ export function DashboardsPage() {
     return () => boardCtrl.current?.abort()
   }, [runBoard])
 
-  // AUX-23: auto-refresh — the operator's interval (localStorage); paused
+  // Auto-refresh — the operator's interval (localStorage); paused
   // while the tab is hidden; ticks landing on an in-flight load are skipped
   // inside the hook (no parallel requests).
   useAutoRefresh({
@@ -199,7 +200,7 @@ export function DashboardsPage() {
     onRefresh: () => { void runBoard('merge') },
   })
 
-  // AUX-23: uniform data-source evidence (raw / rollup / sample) for the
+  // Uniform data-source evidence (raw / rollup / sample) for the
   // shown panels, via the shared EvidenceLabel primitive. The strictest
   // source present wins: any truncated result reads as a sample, any
   // pre-aggregated result as a rollup.
@@ -215,7 +216,7 @@ export function DashboardsPage() {
         ? 'rollup'
         : 'raw'
 
-  // AUX-07: "Open in Analytics" reproduces the board's cut — the applied
+  // "Open in Analytics" reproduces the board's cut — the applied
   // window (never the live draft) and the global filter ride along
   // (clause-level merge, no duplicates), the applied tz with them.
   const panelExplorerHref = (panelId: string) => {
@@ -244,7 +245,7 @@ export function DashboardsPage() {
           />
         }
       />
-      {/* AUX-07: the active board tab is visibly highlighted (accent surface
+      {/* The active board tab is visibly highlighted (accent surface
           + ink border), not only aria-selected. */}
       <div className="flex flex-wrap gap-2" role="tablist" aria-label={t('dashboards.title')}>
         {BOARD_IDS.map(id => {
@@ -259,12 +260,12 @@ export function DashboardsPage() {
           )
         })}
       </div>
-      {/* AUX-08: the shared GlobalScope controls (org · period · tz) replace
+      {/* The shared GlobalScope controls (org · period · tz) stand in for
           this page's own org picker and period select. */}
       <div className="card flex flex-wrap items-end gap-3">
         <GlobalScopeBar fields={['org', 'period', 'tz']} />
       </div>
-      {/* AUX-05: the global board filter — repo/issue chips (simple mode over
+      {/* The global board filter — repo/issue chips (simple mode over
           the server-valid label fields). The bar commits once 400ms after the
           last keystroke, so the panels below refetch exactly once per edit. */}
       <FilterBar

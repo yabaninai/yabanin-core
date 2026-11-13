@@ -40,7 +40,7 @@ function readLocation(): { params: AnalyticsParams; extra: Array<[string, string
   const q = window.location.hash.split('?')[1] ?? ''
   const src = new URLSearchParams(q)
   const out = parseAnalyticsHash(q)
-  // AUX-08: the GlobalScope store is the org/tz owner (hash first, memory
+  // The GlobalScope store is the org/tz owner (hash first, memory
   // fallback). When the arriving link carries no explicit period (neither
   // ?period= nor pinned borders), the remembered preset applies.
   const gs = readGlobalScope()
@@ -56,7 +56,7 @@ function readLocation(): { params: AnalyticsParams; extra: Array<[string, string
 
 function writeLocation(params: AnalyticsParams) {
   // Unknown params are re-read from the CURRENT hash on every write (not
-  // cached): AUX-01 table state (analytics__sort/__page) lives next to these
+  // cached): table state (analytics__sort/__page) lives next to these
   // params in the same query and must survive every params rewrite.
   const current = window.location.hash.split('?')[1] ?? ''
   const { extra } = parseAnalyticsHash(current)
@@ -101,7 +101,7 @@ export function AnalyticsExplorerPage() {
   const [params, setParams] = useState<AnalyticsParams>(initial.params)
   // collapsible side panel (open by default — it is the page's editor).
   const [configOpen, setConfigOpen] = useState(true)
-  // AUX-08: org/period/tz are owned by the GlobalScope store; the shared bar
+  // Org/period/tz are owned by the GlobalScope store; the shared bar
   // writes through it and this page follows (the preset select below shows
   // the store's applied period — hand-edited borders read as 'custom').
   const gs = useGlobalScope()
@@ -120,7 +120,7 @@ export function AnalyticsExplorerPage() {
     }))
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-syncs only when the shared scope actually moves
   }, [scopeSig])
-  // AUX-10: metric values render in the applied org's presentation currency
+  // Metric values render in the applied org's presentation currency
   // (display only, no FX — i18n/money.ts) and the active UI locale.
   const { currency } = useOrgPresentation(params.org || undefined)
   const metricFmt = { locale: uiLocale(), currency }
@@ -129,26 +129,25 @@ export function AnalyticsExplorerPage() {
   const [dimQuery, setDimQuery] = useState('')
   const [metricQuery, setMetricQuery] = useState('')
   const [result, setResult] = useState<AnalyticsResult | null>(null)
-  // AUX-06: with compare on, the page fetches the same query for the previous
+  // With compare on, the page fetches the same query for the previous
   // window (existing endpoint, no contract change) to draw the dashed previous
   // line and the table's Δ columns. Totals deltas come from result.compare.
   const [prevResult, setPrevResult] = useState<AnalyticsResult | null>(null)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState<ApiError | null>(null)
-  // AUX-01: sort + page live in the URL (#analytics?analytics__sort=…:…) — a
+  // Sort + page live in the URL (#analytics?analytics__sort=…:…) — a
   // sorted view is a shareable link and survives reload.
   const { page, setPage, sort, setSort } = useTableUrlState('analytics')
   const [views, setViews] = useState<AnalyticsView[]>([])
-  // AUX-06: a view may be shared with the organization (server-side flag).
+  // A view may be shared with the organization (server-side flag).
   const [viewShared, setViewShared] = useState(false)
-  // AUX-22: per-table personalization (hidden columns + density) keyed by
+  // Per-table personalization (hidden columns + density) keyed by
   // the table id in localStorage.
   const prefs = useTablePrefs('analytics')
 
-  // AUX-05: the YQL textarea is replaced by the shared FilterBar. The bar
-  // owns draft/debounce/error-highlight; the page keeps params as the single
-  // applied state (the filter commits 300ms after the last parse-ok edit,
-  // exactly like the previous debounce).
+  // The shared FilterBar owns draft/debounce/error-highlight; the page
+  // keeps params as the single applied state (the filter commits 300ms
+  // after the last parse-ok edit).
   const applyFilter = (next: string) => {
     setParams(prev => (prev.filter === next ? prev : { ...prev, filter: next }))
   }
@@ -255,7 +254,7 @@ export function AnalyticsExplorerPage() {
     return query
   }
 
-  // AUX-22: the views menu is the shared SavedViewsMenu component (the same
+  // The views menu is the shared SavedViewsMenu component (the same
   // contract as the localStorage pages; storage stays the server registry).
   // Errors surface on the page banner; dialog rejections surface in-dialog.
   const saveView = async (name: string) => {
@@ -271,7 +270,7 @@ export function AnalyticsExplorerPage() {
   const openView = (view: AnalyticsView) => {
     const q = view.query
     const filter = q.filter ?? ''
-    // AUX-08: a view's org/period/tz move through the GlobalScope store, so
+    // A view's org/period/tz move through the GlobalScope store, so
     // opening a saved view re-scopes every screen, not just this one.
     if (q.org_id && q.org_id !== params.org) gs.setOrg(q.org_id)
     if (q.from && q.to && (q.from !== params.from || q.to !== params.to)) gs.setRange(q.from, q.to)
@@ -287,10 +286,10 @@ export function AnalyticsExplorerPage() {
     }))
   }
 
-  // AUX-12 action contract (enforced inside SavedViewsMenu): rename is
+  // ActionDialog contract (enforced inside SavedViewsMenu): rename is
   // medium risk (dialog with a prefilled name input + optional reason);
   // delete is high risk (name confirmation + optional reason). The reason
-  // rides X-Audit-Reason until AUX-14b wires server persistence.
+  // rides X-Audit-Reason (server-side reason persistence is not wired yet).
   const refreshViews = () => {
     void listAnalyticsViews(params.org).then(setViews).catch(() => {})
   }
@@ -314,7 +313,7 @@ export function AnalyticsExplorerPage() {
     if (view) openView(view)
   }
 
-  // AUX-08: presets go through the GlobalScope store — the unified presets
+  // Presets go through the GlobalScope store — the unified presets
   // are one vocabulary, and the choice follows the operator to other screens.
   // 'custom' is a state (hand-pinned borders), never a selectable action.
   const applyPreset = (next: PeriodPreset) => {
@@ -322,7 +321,7 @@ export function AnalyticsExplorerPage() {
     gs.setPeriod(next)
   }
 
-  // AUX-06 block 1: a ready question applies the query shape of an existing
+  // A ready question applies the query shape of an existing
   // dashboards panel; period, org and filter stay the operator's.
   const applyQuestion = (question: AnalyticsQuestion) => {
     update({
@@ -361,7 +360,7 @@ export function AnalyticsExplorerPage() {
     return q ? all.filter(d => d.includes(q)) : all
   }, [labelKeys, dimQuery, params.groupBy])
 
-  // AUX-06 block 2: searchable metric list (name + glossary description).
+  // Searchable metric list (name + glossary description).
   const translate = t as Translate
   const visibleMetrics = useMemo(() => {
     const q = metricQuery.trim().toLowerCase()
@@ -370,7 +369,7 @@ export function AnalyticsExplorerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- re-filter on locale change
   }, [metricQuery, t, params.metrics])
 
-  // AUX-06: the applied-query summary heads the result block, titles the
+  // The applied-query summary heads the result block, titles the
   // chart and names the exported CSV.
   const summary = useMemo(
     () => summarizeQuery(params, { t: translate, formatDate: iso => formatDate(iso, params.tz || undefined) }),
@@ -459,9 +458,9 @@ export function AnalyticsExplorerPage() {
     })
   }, [result, compareOn, prevRowsByKey])
 
-  // AUX-10: metric columns take their header and glossary hint from the
+  // Metric columns take their header and glossary hint from the
   // registry and render values through the numbers contract (locale-aware
-  // money/percent/counts — never a raw String(number)). AUX-06: with compare
+  // money/percent/counts — never a raw String(number)). With compare
   // on, each metric column is followed by its Δ column.
   const columns: DataTableColumn<AnalyticsTableRow>[] = useMemo(() => {
     const out: DataTableColumn<AnalyticsTableRow>[] = []
@@ -519,7 +518,7 @@ export function AnalyticsExplorerPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps -- metricFmt carries locale/currency
   }, [result, compareOn, t, metricFmt.locale, metricFmt.currency])
 
-  // AUX-10: totals render through the metric registry — localized value,
+  // Totals render through the metric registry — localized value,
   // display unit and the glossary tooltip per metric.
   const metrics: Metric[] = (result ? params.metrics : []).map(id => {
     const cur = result?.totals[id]
@@ -540,9 +539,9 @@ export function AnalyticsExplorerPage() {
     }
   })
 
-  // AUX-06: drill-down — a row or a chart point opens the request explorer
+  // Drill-down — a row or a chart point opens the request explorer
   // with the YQL behind that aggregate (drillable dims + created range).
-  // AUX-09: the link itself is the shared explorerLink helper — the applied
+  // The link itself is the shared explorerLink helper — the applied
   // org/window ride in the hash (GlobalScope deep-link priority), so the
   // explorer reproduces this screen's exact cut.
   const drillPoint = (click: { seriesKey: string; x: string }) => {
@@ -643,7 +642,7 @@ export function AnalyticsExplorerPage() {
       </div>
 
       <div className="grid items-start gap-4 xl:grid-cols-[minmax(0,1fr)_360px]">
-        {/* Result first (IMP-36): query summary row, chart, totals, table. */}
+        {/* Result first: query summary row, chart, totals, table. */}
         <div className="flex min-w-0 flex-col gap-4">
           <section aria-label={t('analytics.results')} className="card flex flex-col gap-2">
             {chips.length > 0 && (
@@ -672,8 +671,8 @@ export function AnalyticsExplorerPage() {
                 {summary}
               </p>
             )}
-            {/* AUX-06 block 1 — ready questions as chips in the query row:
-                one click applies the query shape; period/org/filter stay. */}
+            {/* Ready questions as chips in the query row: one click applies
+                the query shape; period/org/filter stay. */}
             <div className="flex flex-wrap items-center gap-2">
               <span className="text-xs text-[color:var(--astra-text-muted)]">{t('analytics.readyQuestions')}</span>
               {ANALYTICS_QUESTIONS.map(q => (
@@ -720,7 +719,7 @@ export function AnalyticsExplorerPage() {
           {result && metrics.length > 0 && <MetricStrip aria-label={t('analytics.title')} metrics={metrics} />}
 
           {result && result.rows.length === 0 && !loading && (
-            // AUX-06: the empty state names the levers to try and offers the
+            // The empty state names the levers to try and offers the
             // single most useful one.
             <StateNotice state="empty" title={t('analytics.emptyTitle')} message={t('analytics.emptyHints')}
               action={params.filter.trim()
@@ -762,7 +761,7 @@ export function AnalyticsExplorerPage() {
           ) : null}
         </div>
 
-        {/* IMP-36: the query configuration — what to count, how to split,
+        {/* The query configuration — what to count, how to split,
             which data, comparison — in one collapsible side panel. Open by
             default; on narrow screens it stacks below the result. */}
         <aside
@@ -773,7 +772,7 @@ export function AnalyticsExplorerPage() {
         >
           <h2 className="text-base font-semibold text-[color:var(--astra-ink)]">{t('analytics.config')}</h2>
 
-          {/* AUX-06 block 2 — what to count (searchable metric multi-select). */}
+          {/* What to count (searchable metric multi-select). */}
           <section aria-labelledby="an-metrics" className="flex flex-col gap-3 border-t border-[color:var(--astra-rule)] pt-3">
             <div className="flex flex-wrap items-baseline justify-between gap-2">
               <h3 id="an-metrics" className="text-sm font-semibold text-[color:var(--astra-ink)]">{t('analytics.whatToCount')}</h3>
@@ -820,7 +819,7 @@ export function AnalyticsExplorerPage() {
             </fieldset>
           </section>
 
-          {/* AUX-06 block 3 — how to split (up to 2 dims + time step + top). */}
+          {/* How to split (up to 2 dims + time step + top). */}
           <section aria-labelledby="an-split" className="flex flex-col gap-3 border-t border-[color:var(--astra-rule)] pt-3">
             <h3 id="an-split" className="text-sm font-semibold text-[color:var(--astra-ink)]">{t('analytics.howToSplit')}</h3>
             <div className="flex flex-wrap items-end gap-3">
@@ -857,11 +856,11 @@ export function AnalyticsExplorerPage() {
             ))}
           </section>
 
-          {/* AUX-06 block 4 — which data (org · period · tz via the shared
+          {/* Which data (org · period · tz via the shared
               GlobalScopeBar, pinned borders, and the shared FilterBar). */}
           <section aria-labelledby="an-data" className="flex flex-col gap-3 border-t border-[color:var(--astra-rule)] pt-3">
             <h3 id="an-data" className="text-sm font-semibold text-[color:var(--astra-ink)]">{t('analytics.whichData')}</h3>
-            {/* AUX-08: org · period · tz are the shared GlobalScope controls
+            {/* Org · period · tz are the shared GlobalScope controls
                 (one scope across screens); the borders below pin a custom window
                 and the select shows the unified preset it resolves to. */}
             <div className="flex flex-wrap items-end gap-3">
@@ -877,7 +876,7 @@ export function AnalyticsExplorerPage() {
                   className="min-h-[44px] rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] bg-[color:var(--astra-surface)] px-3" />
               </label>
             </div>
-            {/* AUX-05: the shared FilterBar owns draft/debounce/error-highlight;
+            {/* The shared FilterBar owns draft/debounce/error-highlight;
                 it never applies invalid syntax. */}
             <FilterBar
               id="analytics-filter"
@@ -890,7 +889,7 @@ export function AnalyticsExplorerPage() {
             />
           </section>
 
-          {/* AUX-06 block 5 — comparison. */}
+          {/* Comparison. */}
           <section aria-labelledby="an-compare" className="flex flex-col gap-2 border-t border-[color:var(--astra-rule)] pt-3">
             <h3 id="an-compare" className="text-sm font-semibold text-[color:var(--astra-ink)]">{t('analytics.comparison')}</h3>
             <label className="inline-flex min-h-[44px] items-center gap-2 text-sm">

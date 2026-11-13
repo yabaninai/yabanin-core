@@ -138,7 +138,7 @@ export function ModelsPage() {
     [rows],
   )
 
-  // ===== inspector (AUX-17) =====
+  // ===== inspector =====
   const inspected = useMemo(
     () => rows.find(m => m.model_name === inspectId) ?? null,
     [rows, inspectId],
@@ -253,7 +253,7 @@ export function ModelsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [page, setPage, t])
 
-  // AUX-12 contract: a header click in server mode re-asks the backend; the
+  // A header click in server mode re-asks the backend; the
   // sort change resets the page to 1 (the view is a new ordering).
   const handleSortChange = (next: SortState | null) => {
     setSort(next)
@@ -404,7 +404,7 @@ export function ModelsPage() {
         <>
           {/* Client filters — the server list endpoint has no provider/tier/
               status params, so filtering is scoped to the loaded page and
-              labeled as such (AUX-04 honesty). */}
+              labeled as such (honesty). */}
           <div className="flex flex-wrap items-end gap-3">
             <div className="flex flex-col gap-1 text-sm">
               <label className="text-xs font-medium text-[color:var(--astra-text-muted)]" htmlFor="models-filter-provider">
@@ -554,8 +554,8 @@ export function ModelsPage() {
       {disableAction.ui}
       {deleteAction.ui}
 
-      {/* AUX-17: the model inspector card. Detail GET first, row as the
-          fallback; the key is only ever its status (IMP-90). */}
+      {/* the model inspector card. Detail GET first, row as the
+          fallback; the key is only ever its status. */}
       {(inspected || (inspectId && list.data && !list.loading)) && (
         <EntityDrawer
           kind={t('models.title')}

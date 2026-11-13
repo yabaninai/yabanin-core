@@ -22,13 +22,14 @@ export function OrgsPage() {
   const [orgs, setOrgs] = useState<Organization[]>([])
   const [total, setTotal] = useState(0)
   const [totalPages, setTotalPages] = useState(1)
-  // served (echoed in pagination), not a local constant — until the list
+  // The page size is what the server served (echoed in pagination), not a
+  // local constant — PAGE_SIZE only seeds it until the list response lands.
   const [pageSize, setPageSize] = useState(PAGE_SIZE)
-  // AUX-03 (server sort): page + sort live in the URL (#orgs?orgs__sort=name:asc)
+  // Server sort: page + sort live in the URL (#orgs?orgs__sort=name:asc)
   // and the server owns the row order (allowlisted columns, 400 invalid_sort
   // otherwise); the fetched page renders exactly as the backend sent it.
   const { page, setPage, sort, setSort } = useTableUrlState('orgs')
-  // AUX-17: the entity inspector — opened by an entity-name click and by the
+  // The entity inspector — opened by an entity-name click and by the
   // ?inspect=<id> deep link (read once at mount, removed from the hash on
   // close). The row itself carries every field the card shows; there is no
   // per-org activity data on this page, so the drawer shows no activity yet.
@@ -45,7 +46,7 @@ export function OrgsPage() {
   const [name, setName] = useState('')
   const [slug, setSlug] = useState('')
   const [creating, setCreating] = useState(false)
-  // UI-VF-1: row-level mutations — inline edit (name/slug/currency/timezone,
+  // Row-level mutations — inline edit (name/slug/currency/timezone,
   // matching PUT /api/organizations/{id}) and destructive delete. Deletion
   // cascades to keys/rules server-side, so it always asks for confirmation.
   const [busyOrgId, setBusyOrgId] = useState('')
@@ -56,7 +57,7 @@ export function OrgsPage() {
   const [editTimezone, setEditTimezone] = useState('')
   const [editIssue, setEditIssue] = useState('')
 
-  // Stale-fetch safety (U07): a newer page load aborts the previous one.
+  // Stale-fetch safety: a newer page load aborts the previous one.
   const loadAbort = useRef<AbortController | null>(null)
   const load = useCallback(async (p: number, s: SortState | null) => {
     loadAbort.current?.abort()
@@ -90,7 +91,7 @@ export function OrgsPage() {
     return () => loadAbort.current?.abort()
   }, [load, page, sort])
 
-  // AUX-12 contract: a header click in server mode re-asks the backend; the
+  // Sort contract: a header click in server mode re-asks the backend; the
   // sort change resets the page to 1 (the view is a new ordering).
   const handleSortChange = (next: SortState | null) => {
     setSort(next)
@@ -117,7 +118,7 @@ export function OrgsPage() {
     }
   }
 
-  // UI-VF-1: refetch the current page after a row mutation so pagination and
+  // Refetch the current page after a row mutation so pagination and
   // totals stay consistent (unlike the create flow, which resets to page 1).
   const refresh = () => void load(page, sort)
 
@@ -153,7 +154,7 @@ export function OrgsPage() {
     }
   }
 
-  // AUX-12: org deletion is high risk (cascades to keys/rules server-side) —
+  // Org deletion is high risk (cascades to keys/rules server-side) —
   // dialog with consequences, name confirmation and a required reason.
   const deleteOrgAction = useAction({
     id: 'orgs.delete', risk: 'high', reversible: false, impact: t('orgs.deleteConfirm'),
@@ -177,8 +178,8 @@ export function OrgsPage() {
 
   const empty = !loading && orgs.length === 0
 
-  // AUX-03: DataTable v2 columns. Every column declares its sort semantic;
-  // `issue_url_template` is not in the AUX-02 server allowlist, so its header
+  // DataTable v2 columns. Every column declares its sort semantic;
+  // `issue_url_template` is not in the server allowlist, so its header
   // is honestly not sortable (server keeps the fixed default order for it).
   const columns: DataTableColumn<Organization>[] = [
     {
@@ -200,7 +201,7 @@ export function OrgsPage() {
           className="control min-w-0 max-w-full sm:w-40"
         />
       ) : (
-        // AUX-17: the name opens the entity inspector (read-only).
+        // The name opens the entity inspector (read-only).
         <button
           type="button"
           onClick={() => setInspectId(o.id)}
@@ -273,7 +274,7 @@ export function OrgsPage() {
         purpose={t('orgs.purpose')}
       />
 
-      {/* AUX-12 action surface (dialog), fixed-position. */}
+      {/* ActionDialog surface (dialog), fixed-position. */}
       {deleteOrgAction.ui}
 
       {error && <StateNotice state="error" message={error} />}
@@ -344,7 +345,7 @@ export function OrgsPage() {
                 </button>
               </span>
             ) : (
-              // UI-VF-1: edit is reversible (no confirm); delete cascades
+              // Edit is reversible (no confirm); delete cascades
               // server-side and always asks.
               <span className="inline-flex flex-wrap justify-end gap-2">
                 <button
@@ -375,7 +376,7 @@ export function OrgsPage() {
         />
       </div>
 
-      {/* AUX-17: the org inspector card. Fields come from the loaded row
+      {/* The org inspector card. Fields come from the loaded row
           (the list response carries the full record); links navigate to the
           related lists with the scope params kept and ?inspect dropped. */}
       {(inspected || (inspectId && orgsLoaded && !loading)) && (

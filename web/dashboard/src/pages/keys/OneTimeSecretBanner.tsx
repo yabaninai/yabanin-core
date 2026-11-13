@@ -2,7 +2,8 @@ import { useEffect, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { StateNotice } from '../../components/astra/StateNotice'
 
-// agent-key create/rotate flows. TP-06 clipboard contract: success is
+// The one-time secret banner shown after agent-key create/rotate flows.
+// Clipboard contract: success is
 // confirmed only after the writeText await resolves, a rejected clipboard
 // keeps the only copy of the secret on screen (retry or dismiss), and the
 // explicit dismiss is the ONLY remover. 'copied'/'error' feedback resets to

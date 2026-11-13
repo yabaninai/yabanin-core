@@ -71,10 +71,9 @@ export function ToolPolicyPage() {
       .catch(err => setNotice(err instanceof Error ? err.message : String(err)))
   }
 
-  // AUX-12 (13th action point): policy deletion used to fire with no
-  // confirmation at all. It is high risk and irreversible — dialog with
-  // consequences and a name confirmation. Toggle stays a low-risk no-dialog
-  // action (no inverse call exists today, so no undo toast yet).
+  // Deletion is high risk and irreversible — dialog with consequences and a
+  // name confirmation. Toggle stays a low-risk no-dialog action (no inverse
+  // call exists, so no undo toast).
   const removeAction = useAction({
     id: 'tool-policy.delete', risk: 'high', reversible: false,
     impact: t('toolPolicy.deleteConfirm'),
@@ -102,9 +101,9 @@ export function ToolPolicyPage() {
 
   const inputCls = 'min-h-[44px] rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] bg-[color:var(--astra-surface)] px-3 py-2 text-[color:var(--astra-ink)]'
 
-  // AUX-03: DataTable v2, client mode. Priority sorts numerically, the
+  // DataTable v2, client mode. Priority sorts numerically, the
   // enabled flag by its boolean sort value; toggle/delete live in
-  // renderActions (the AUX-12 delete dialog stays wired through `remove`).
+  // renderActions (the delete dialog stays wired through `remove`).
   const [policiesPage, setPoliciesPage] = useState(1)
   const policyColumns: DataTableColumn<ToolPolicy>[] = [
     { key: 'name', header: t('toolPolicy.name'), type: 'text', mono: true, render: p => p.name },
@@ -124,12 +123,12 @@ export function ToolPolicyPage() {
   return (
     <div className="flex flex-col gap-6">
       <PageHeader title={t('toolPolicy.title')} purpose={t('toolPolicy.purpose')} />
-      {/* AUX-12 action surface (dialog), fixed-position. */}
+      {/* Delete-dialog action surface (fixed-position). */}
       {removeAction.ui}
       <form className="card flex flex-wrap items-end gap-3" onSubmit={e => { e.preventDefault() }}>
         <label className="flex flex-col gap-1 text-sm">
           <span className="text-[color:var(--astra-text-muted)]">{t('explorer.organizationId')}</span>
-          {/* UI-VF-1: OrgSelect picker instead of a hand-copied UUID;
+          {/* OrgSelect picker instead of a hand-copied UUID;
               autoSelect pre-commits the last-used or first org. */}
           <OrgSelect
             value={org}

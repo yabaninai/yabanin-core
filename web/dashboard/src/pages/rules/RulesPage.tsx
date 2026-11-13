@@ -20,16 +20,17 @@ import { useAction, auditReasonOpts } from '../../components/astra/ActionDialog'
 import type { SortState } from '../../lib/tableSort'
 import { RuleFormDrawer, type RuleDraftPrefill } from './RuleFormDrawer'
 
-// global scope (the shell's OrgSwitcher owns the organization; the page's
-// own OrgSelect is gone), all reads through useScopedQuery, create/edit in
-// one FormDrawer (constructor + expression text + the AUX-19 server preview
-// expanded by default), at most one primary action per row with Edit/Delete
-// in the «⋯» menu, and a visible one-line explanation of the evaluation
-// order. D-18 lives in RuleFormDrawer: an empty field is never red.
+// The rules center: global scope (the shell's OrgSwitcher owns the
+// organization; the page has no org select of its own), all reads through
+// useScopedQuery, create/edit in one FormDrawer (constructor + expression
+// text + the server preview expanded by default), at most one primary
+// action per row with Edit/Delete in the «⋯» menu, and a visible one-line
+// explanation of the evaluation order. Empty-field behavior lives in
+// RuleFormDrawer: an empty field is never red.
 //
-// The rule CRUD remains root-only server-side (AUX-13): the mutating
+// The rule CRUD remains root-only server-side: the mutating
 // surface is disabled from /api/me, never clicked into a 403.
-// ADL-04: a quality-screen draft (?draft_expr=…) pre-fills the create form
+// A quality-screen draft (?draft_expr=…) pre-fills the create form
 // and shows a provenance banner — nothing is saved automatically.
 
 export function RulesPage() {
@@ -40,8 +41,8 @@ export function RulesPage() {
   const canManageRules = perms.isRoot
   const rulesHint = canManageRules ? undefined : t('perms.requiredRoot')
 
-  // AUX-03 (server sort): page + sort live in the URL; the server owns the
-  // row order (AUX-02 rules allowlist) and 400 invalid_sort surfaces as an
+  // Server sort: page + sort live in the URL; the server owns the
+  // row order (server-side rules allowlist) and 400 invalid_sort surfaces as an
   // error notice — never a silent unsorted view.
   const { page, setPage, sort, setSort } = useTableUrlState('rules')
   const [inspectId, setInspectId] = useInspectParam()
@@ -49,15 +50,15 @@ export function RulesPage() {
   const [selectedRuleIds, setSelectedRuleIds] = useState<string[]>([])
   const [actionError, setActionError] = useState('')
   const [notice, setNotice] = useState('')
-  // AUX-17: the rule inspector — opened from a match-expression click and
+  // The rule inspector — opened from a match-expression click and
   // from the ?inspect=<rule_id> deep link. The row carries the full record
   // (no per-rule detail endpoint exists).
-  // ADL-04: the routing draft from the quality screen pre-fills the create
+  // The routing draft from the quality screen pre-fills the create
   // form but is NEVER saved — applying is human-only; the banner explains
   // the provenance until the user edits a field or dismisses it.
   const [draft, setDraft] = useState<RuleDraftPrefill | null>(null)
 
-  // Scoped read (checklist item 2): org/page/sort form the applied-scope
+  // Scoped read: org/page/sort form the applied-scope
   // identity; a change aborts the in-flight load and starts a new one.
   const listFetcher = useCallback(async (signal: AbortSignal) => {
     const resp = await listRoutingRules(org, page, { signal, sort: sort?.key, dir: sort?.dir })
@@ -78,7 +79,7 @@ export function RulesPage() {
     [rows, inspectId],
   )
 
-  // U02: an org switch resets pagination to page 1 (the row set is
+  // An org switch resets pagination to page 1 (the row set is
   // org-scoped); the scoped key change reloads under the new scope.
   const prevOrgRef = useRef(org)
   useEffect(() => {
@@ -89,14 +90,14 @@ export function RulesPage() {
   }, [org, page, setPage])
 
   // Best-effort model registry slice (page 1) for the target autocomplete —
-  // the same source the pre-v2 page used; never a validator.
+  // never a validator.
   useEffect(() => {
     listModels(1)
       .then(resp => setModels((resp.data ?? []).map(m => m.model_name)))
       .catch(() => setModels([]))
   }, [])
 
-  // ADL-04: on first load, a hash carrying ?draft_expr=…&draft_model=…&
+  // On first load, a hash carrying ?draft_expr=…&draft_model=…&
   // draft_from=quality pre-fills the form (via the drawer's prefill) and
   // surfaces the provenance banner. The params are stripped so a reload
   // does not re-apply the draft; nothing is saved.
@@ -125,7 +126,7 @@ export function RulesPage() {
     }
   }, [])
 
-  // AUX-12: enable/disable is low risk and reversible — no dialog; a toast
+  // Enable/disable is low risk and reversible — no dialog; a toast
   // with a 10s Undo affordance covers the inverse call. Delete stays high
   // risk (dialog with name confirmation + required reason).
   const toggleRuleAction = useAction({ id: 'rules.toggle', risk: 'low', reversible: true })
@@ -168,9 +169,9 @@ export function RulesPage() {
     })
   }
 
-  // AUX-20: bulk enable/disable through the existing single-rule endpoint
+  // Bulk enable/disable through the existing single-rule endpoint
   // (no batch API). Rule CRUD is root-only server-side, so the bar buttons
-  // carry the AUX-13 gate.
+  // carry the root gate.
   const bulkRulesAction = useAction({ id: 'rules.bulk', risk: 'medium', reversible: true })
 
   // ===== form drawer =====
@@ -184,7 +185,7 @@ export function RulesPage() {
     else refresh()
   }, [page, setPage, refresh, t])
 
-  // AUX-12 contract: a header click in server mode re-asks the backend; the
+  // Sort contract: a header click in server mode re-asks the backend; the
   // sort change resets the page to 1 (the view is a new ordering).
   const handleSortChange = (next: SortState | null) => {
     setSort(next)
@@ -205,7 +206,7 @@ export function RulesPage() {
       header: t('rules.match'),
       type: 'text',
       render: r => (
-        // AUX-17: the match expression opens the entity inspector (read-only).
+        // The match expression opens the entity inspector (read-only).
         <button
           type="button"
           onClick={() => setInspectId(r.id)}
@@ -256,7 +257,7 @@ export function RulesPage() {
 
       {notice && <p className="text-xs" style={{ color: 'var(--astra-success)' }}>{notice}</p>}
       {actionError && <StateNotice state="error" message={actionError} />}
-      {/* AUX-03: a failed load (e.g. 400 invalid_sort) is an honest error —
+      {/* A failed load (e.g. 400 invalid_sort) is an honest error —
           shown even when stale rows from the previous scope are still on
           screen (the failed load never replaces the last good data). */}
       {list.error && (
@@ -267,11 +268,11 @@ export function RulesPage() {
         />
       )}
 
-      {/* AUX-12 action surfaces (dialog + undo toast), fixed-position. */}
+      {/* ActionDialog surfaces (dialog + undo toast), fixed-position. */}
       {toggleRuleAction.ui}
       {deleteRuleAction.ui}
 
-      {/* ADL-04: a draft pre-filled from the quality screen. It is NOT saved
+      {/* A draft pre-filled from the quality screen. It is NOT saved
           — review and adjust in the drawer, then create the rule yourself. */}
       {draft && (
         <StateNotice
@@ -280,7 +281,7 @@ export function RulesPage() {
         />
       )}
 
-      {/* AUX-20: sticky bulk bar + per-row report for the rules table. */}
+      {/* Sticky bulk bar + per-row report for the rules table. */}
       <BulkActions
         rows={rows}
         getRowId={r => r.id}
@@ -343,7 +344,7 @@ export function RulesPage() {
             onSortChange={handleSortChange}
             caption={t('rules.title')}
             renderActions={r => (
-              // Checklist item 4: one primary row action (the reversible
+              // One primary row action (the reversible
               // enable/disable); Edit/Delete live in the «⋯» menu.
               <div className="flex justify-end gap-2">
                 <button
@@ -400,7 +401,7 @@ export function RulesPage() {
         onFieldEdit={() => setDraft(null)}
       />
 
-      {/* AUX-17: the rule inspector card. Fields come from the loaded row
+      {/* The rule inspector card. Fields come from the loaded row
           (the list response carries the full record). */}
       {(inspectedRule || (inspectId && list.data && !list.loading)) && (
         <EntityDrawer

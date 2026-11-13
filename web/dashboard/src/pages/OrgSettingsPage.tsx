@@ -25,12 +25,12 @@ import {
   isRoutingMode, isRoutingThreshold, pricingPatch, type PricingDraft,
 } from '../lib/orgSettings'
 
-// AUX-24: organization settings as ONE screen with tabs over the EXISTING
+// Organization settings as ONE screen with tabs over the EXISTING
 // root-only APIs. Route facts this screen is built on (services/admin/
 // handlers/router.go): cache-settings, routing, residency/policy-packs,
 // region, MCP/A2A and pricing all sit under MustBeRoot, so the whole screen —
-// nav entry included — is root-gated (AUX-13 semantics: UI convenience, the
-// server stays the arbiter; when /api/me is unavailable the screen degrades
+// nav entry included — is root-gated (UI convenience; the server stays the
+// arbiter; when /api/me is unavailable the screen degrades
 // to today's show-and-let-403 behavior).
 //
 // Honesty rules:
@@ -39,20 +39,17 @@ import {
 //    handler is surfaced as such, never hidden;
 //  - the two overwriting PATCH contracts (cache-settings, routing) always
 //    send the FULL pair — see client.ts;
-//  - every mutating action runs through useAction/ActionDialog (AUX-12) and
-//    dialogs collect an operator reason (AUX-14b) sent as X-Audit-Reason;
+//  - every mutating action runs through useAction/ActionDialog and
+//    dialogs collect an operator reason sent as X-Audit-Reason;
 //  - the org spend alert is NOT duplicated here: it is managed on the
-//    Budgets & alerts screen (AUX-15), so the Alerts tab is an honest pointer.
+//    Budgets & alerts screen, so the Alerts tab is an honest pointer.
 //
-// FIX-06 (CA-07): the whole settings body below is mounted under key={org}.
+// The whole settings body below is mounted under key={org}.
 // An org switch unmounts EVERYTHING scope-bound — per-endpoint data, action
 // closures, open dialogs, the undo toast, form drafts — aborts the in-flight
 // reads, and mounts a fresh body that fetches the new org before anything is
 // actionable. The screen can therefore never submit one organization's
-// settings to another: pre-fix, org A's panel stayed actionable while org B's
-// data was in flight, and a click in that window PATCHed org A's values to
-// org B (the TP-06 epoch guard only dropped the late response, not the stale
-// state that was still being submitted).
+// settings to another.
 
 type TabId = 'cache' | 'originals' | 'routing' | 'residency' | 'alerts' | 'integrations' | 'provider-keys' | 'pricing'
 
@@ -92,7 +89,7 @@ export function OrgSettingsPage() {
   const org = orgId.trim()
   const perms = usePermissions(org || undefined)
   const isRoot = perms.isRoot
-  // Fail-open (AUX-13): /api/me unavailable ≠ denial — render the tabs and
+  // Fail-open: /api/me unavailable ≠ denial — render the tabs and
   // let the server arbitrate. While loading, stay fail-closed and quiet.
   const allowed = isRoot || perms.me === null
   const ready = !perms.loading && allowed
@@ -129,7 +126,7 @@ export function OrgSettingsPage() {
 }
 
 /**
- * One organization per mount (see the FIX-06 note above): `org` is a
+ * One organization per mount (see the key={org} note above): `org` is a
  * constructor constant for this component — an org switch builds a fresh
  * instance, so no state or closure here can ever mix two organizations.
  */
@@ -158,10 +155,9 @@ function OrgSettingsBody({ org, activeTab, onTab }: { org: string; activeTab: Ta
   const [pricingError, setPricingError] = useState('')
   const [loading, setLoading] = useState(false)
 
-  // FIX-06 (CA-07): org binding is structural (the key={org} mount), so the
-  // old TP-06 cross-org epoch is subsumed — an org switch unmounts this body
-  // and aborts its reads. loadSeq only supersedes a slower earlier read of
-  // the SAME org (a tab switch or a retry racing a slow response); the
+  // Org binding is structural (the key={org} mount): an org switch unmounts
+  // this body and aborts its reads. loadSeq only supersedes a slower earlier
+  // read of the SAME org (a tab switch or a retry racing a slow response); the
   // aborted call's late answer must not overwrite the newer one.
   const loadSeq = useRef(0)
   const abortRef = useRef<AbortController | null>(null)
@@ -253,7 +249,7 @@ function OrgSettingsBody({ org, activeTab, onTab }: { org: string; activeTab: Ta
 
   const reload = useCallback(() => { void load(activeTab) }, [activeTab, load])
 
-  // ----- actions (AUX-12 contract; reasons ride X-Audit-Reason, AUX-14b) -----
+  // ----- actions (ActionDialog contract; reasons ride X-Audit-Reason) -----
 
   const cacheToggleAction = useAction({ id: 'orgSettings.cache.toggle', risk: 'low', reversible: true })
   const originalRetentionAction = useAction({ id: 'orgSettings.originalRetention.toggle', risk: 'high', reversible: true })
@@ -392,7 +388,7 @@ function OrgSettingsBody({ org, activeTab, onTab }: { org: string; activeTab: Ta
         if (!isResidencyRegion(region)) {
           throw new Error(t('orgSettings.invalidResidency', { regions: RESIDENCY_REGIONS.join(', ') }))
         }
-        // pkfix1 contract (review 98613b94): config is required non-null
+        // config is required non-null
         // JSON — {} = the pack's built-in rules; the server still defaults
         // the pack id per region (the form deliberately has no pack input).
         await upsertPolicyPack(org, region, { config: {}, enabled: true }, auditReasonOpts(reason))
@@ -869,7 +865,7 @@ function OrgSettingsBody({ org, activeTab, onTab }: { org: string; activeTab: Ta
         </section>
       )}
 
-      {/* ===== Provider keys (W-BYOK: org provider credentials) ===== */}
+      {/* ===== Provider keys (org provider credentials) ===== */}
       {activeTab === 'provider-keys' && <ProviderKeysSection org={org} />}
 
       {/* ===== Pricing ===== */}
