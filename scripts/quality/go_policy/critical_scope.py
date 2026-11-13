@@ -90,7 +90,7 @@ def targets(root, base, config):
         import critical_conservative
         selected = critical_conservative.packages(root, base, config['critical_paths'])
         changes = source.changes(root, base)
-        critical_conservative.EVIDENCE['packages'] = {}
+        critical_conservative.reset_selection()
     else:
         selected = packages(root, base, config['critical_paths'])
     if not selected:
@@ -104,9 +104,14 @@ def targets(root, base, config):
                 continue
             if mode == CONSERVATIVE:
                 rows = critical_conservative.changed_functions(root, baseline, package,
-                                                               policy.HERE / 'units.go', changes)
+                                                               policy.HERE / 'units.go',
+                                                               changes,
+                                                               config.get('build_tags'))
             else:
                 rows = changed_functions(root, baseline, package, policy.HERE / 'units.go')
             if rows:
                 result[package] = rows
+    if mode == CONSERVATIVE:
+        critical_conservative.widen_cross_package(root, config, policy.HERE / 'units.go',
+                                                  result)
     return result

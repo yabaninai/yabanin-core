@@ -10,12 +10,15 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/ast"
+	"go/build"
 	"go/parser"
 	"go/printer"
 	"go/scanner"
 	"go/token"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -29,12 +32,14 @@ type unit struct {
 	Flags   []string `json:"flags,omitempty"`
 	Refs    []string `json:"refs,omitempty"`
 	SelRefs []string `json:"selrefs,omitempty"`
+	Lits    []string `json:"lits,omitempty"`
 }
 
 type fileUnits struct {
 	Path       string `json:"path"`
 	Units      []unit `json:"units"`
 	Directives string `json:"directives,omitempty"`
+	Matched    []bool `json:"matched,omitempty"`
 }
 
 func main() {
@@ -44,9 +49,32 @@ func main() {
 	}
 }
 
-func run() error {
+// request accepts either a bare path list (legacy callers) or an object with
+// per-build-mode tag sets; only the object form reports mode applicability.
+type request struct {
+	Paths []string   `json:"paths"`
+	Modes [][]string `json:"modes"`
+}
+
+func readRequest() ([]string, [][]string, error) {
+	var raw json.RawMessage
+	if err := json.NewDecoder(os.Stdin).Decode(&raw); err != nil {
+		return nil, nil, err
+	}
 	var paths []string
-	if err := json.NewDecoder(os.Stdin).Decode(&paths); err != nil {
+	if err := json.Unmarshal(raw, &paths); err == nil {
+		return paths, nil, nil
+	}
+	var req request
+	if err := json.Unmarshal(raw, &req); err != nil {
+		return nil, nil, err
+	}
+	return req.Paths, req.Modes, nil
+}
+
+func run() error {
+	paths, modes, err := readRequest()
+	if err != nil {
 		return err
 	}
 	files, table, err := parse(paths)
@@ -55,7 +83,7 @@ func run() error {
 	}
 	result := make([]fileUnits, 0, len(files))
 	for _, item := range files {
-		out, err := scan(item, table)
+		out, err := scan(item, table, modes)
 		if err != nil {
 			return err
 		}
@@ -123,8 +151,11 @@ func declareSpecNames(gen *ast.GenDecl, table map[string]bool) {
 	}
 }
 
-func scan(item parsedFile, table map[string]bool) (fileUnits, error) {
+func scan(item parsedFile, table map[string]bool, modes [][]string) (fileUnits, error) {
 	out := fileUnits{Path: item.path, Units: []unit{}, Directives: directiveDigest(item.src)}
+	if modes != nil {
+		out.Matched = matchModes(item.path, modes)
+	}
 	for _, decl := range item.file.Decls {
 		scanUnit, err := declaration(item.fs, decl, table)
 		if err != nil {
@@ -135,6 +166,23 @@ func scan(item parsedFile, table map[string]bool) (fileUnits, error) {
 	return out, nil
 }
 
+// matchModes reports for each build mode (tag set) whether the go tool would
+// compile this file: filename GOOS/GOARCH suffixes and //go:build constraints
+// included, so target counting can never exceed what a build actually sees.
+// A file that cannot be evaluated counts as excluded; its targets then fail
+// the coverage guard instead of silently passing.
+func matchModes(path string, modes [][]string) []bool {
+	dir, base := filepath.Split(path)
+	matched := make([]bool, len(modes))
+	for index, tags := range modes {
+		ctxt := build.Default
+		ctxt.BuildTags = tags
+		match, err := ctxt.MatchFile(filepath.Clean(dir), base)
+		matched[index] = err == nil && match
+	}
+	return matched
+}
+
 func declaration(fs *token.FileSet, decl ast.Decl, table map[string]bool) (unit, error) {
 	item := unit{Start: fs.Position(decl.Pos()).Line, End: fs.Position(decl.End()).Line}
 	node := ast.Node(decl)
@@ -142,6 +190,7 @@ func declaration(fs *token.FileSet, decl ast.Decl, table map[string]bool) (unit,
 		item.Name = fn.Name.Name
 		item.Kind = "func"
 		item.Symbols = []string{fn.Name.Name}
+		item.Flags, item.Lits = dispatchShape(fn)
 		copy := *fn
 		copy.Name = &ast.Ident{Name: "_"}
 		node = &copy
@@ -152,6 +201,55 @@ func declaration(fs *token.FileSet, decl ast.Decl, table map[string]bool) (unit,
 	item.Hash = hash
 	item.Refs, item.SelRefs = references(decl, table, item.Name)
 	return item, err
+}
+
+// dynamicSelectors are reflect-style member lookups whose target is a runtime
+// string; a removed name behind one of them is invisible to reference counts.
+var dynamicSelectors = map[string]bool{
+	"MethodByName":    true,
+	"FieldByName":     true,
+	"FieldByNameFunc": true,
+}
+
+// dispatchShape flags dynamic member lookup inside a function. Literal
+// argument strings stay bindable; any other argument shape is unresolved and
+// makes the whole package conservative on name removal.
+func dispatchShape(fn *ast.FuncDecl) ([]string, []string) {
+	names, flags := map[string]bool{}, map[string]bool{}
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		if call, ok := n.(*ast.CallExpr); ok {
+			noteDispatchCall(call, names, flags)
+		}
+		return true
+	})
+	return sortedNames(flags), sortedNames(names)
+}
+
+func noteDispatchCall(call *ast.CallExpr, names, flags map[string]bool) {
+	if len(call.Args) == 0 || !isDispatchSelector(call.Fun) {
+		return
+	}
+	name, ok := stringLiteral(call.Args[0])
+	if !ok {
+		flags["dynamic_dispatch_unresolved"] = true
+		return
+	}
+	names[name] = true
+	flags["dynamic_dispatch"] = true
+}
+
+func isDispatchSelector(fun ast.Expr) bool {
+	sel, ok := fun.(*ast.SelectorExpr)
+	return ok && dynamicSelectors[sel.Sel.Name]
+}
+
+func stringLiteral(expr ast.Expr) (string, bool) {
+	lit, ok := expr.(*ast.BasicLit)
+	if !ok || lit.Kind != token.STRING {
+		return "", false
+	}
+	value, err := strconv.Unquote(lit.Value)
+	return value, err == nil
 }
 
 func fingerprint(node ast.Node) (string, error) {
