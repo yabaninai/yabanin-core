@@ -13,7 +13,7 @@
     "openai": "^4.50.0"
   },
   "devDependencies": {
-    "typescript": "^5.4.0",
+    "typescript": "^7.0.2",
     "vitest": "^1.6.0",
     "msw": "^2.3.0"
   },
