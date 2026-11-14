@@ -9,16 +9,20 @@
 // restated below in local formatters. Nothing imports the product's own
 // view model to compute its own expected answer.
 //
-// Coverage (each scenario is a named acceptance contract):
-//   AC-RT     stored facts round-trip: DB oracle == API payload == page
-//   AC-BLK    pre-upstream termination renders NO attempt facts (≠ zero)
-//   AC-UNK    unknown counters render "not recorded" (≠ 0/1)
-//   AC-ZERO   recorded zeros render as real zeros (≠ "not recorded")
-//   AC-STALE  tenant switch clears the previous tenant's facts
-//   AC-IDOR   unauthorized deep link to another tenant is refused, no leak
-//   AC-KB     keyboard-only navigation reaches the journey view
-//   AC-NARROW 390px viewport keeps the journey usable
-//   AC-PERF   deep-link and row-click render timings (documented method)
+// Coverage (each scenario is a named acceptance contract, enforced by the
+// Go stand's FROZEN case registry — every case must run and pass):
+//   AC-RT              stored facts round-trip: DB oracle == API payload == page
+//   AC-BLK             pre-upstream termination renders NO attempt facts (≠ zero)
+//   AC-UNK             unknown counters render "not recorded" (≠ 0/1)
+//   AC-ZERO            recorded zeros render as real zeros (≠ "not recorded")
+//   AC-STALE           tenant switch clears the previous tenant's facts
+//   AC-RACE            a delayed old-tenant response arriving AFTER the org
+//                      switch produces zero protected effects (stand barrier)
+//   AC-IDOR            unauthorized deep link to another tenant is refused, no leak
+//   AC-KB              keyboard-only navigation reaches the journey view
+//   AC-NARROW-SERVED   390px: journey stages stay visible on a served row
+//   AC-NARROW-BLOCKED  390px: blocked row states its termination
+//   AC-PERF            deep-link and row-click render timings (documented method)
 //
 // Run through the Go stand (see playwright.journey.config.ts header).
 import { expect, test, type Page } from '@playwright/test'
@@ -59,9 +63,17 @@ interface Oracle {
   upstream_url: string | null
   error: string | null
   answer_status: string | null
+  answer_content: string | null
 }
 
 interface FixtureRow { org: 'a' | 'b'; request_id: string; oracle: Oracle }
+
+/** Stand barrier control endpoints (AC-RACE; stand test surface, not API). */
+interface FixtureControl {
+  barrier_arm: string
+  barrier_release: string
+  barrier_state: string
+}
 
 interface Fixture {
   run_id: string
@@ -69,6 +81,7 @@ interface Fixture {
   orgs: { a: { id: string; name: string }; b: { id: string; name: string } }
   users: { a_only: { cookie: string }; both: { cookie: string } }
   rows: { served: FixtureRow; blocked: FixtureRow; legacy: FixtureRow; zero: FixtureRow; tenantb: FixtureRow }
+  control: FixtureControl
 }
 
 const BASE_URL = process.env.CV02_BASE_URL
@@ -82,6 +95,14 @@ const TENANT_B_MARKERS = [
   fixture.rows.tenantb.oracle.model_used,
   ...(fixture.rows.tenantb.oracle.error ? [fixture.rows.tenantb.oracle.error] : []),
   ...(fixture.rows.tenantb.oracle.answer_content ? [fixture.rows.tenantb.oracle.answer_content] : []),
+]
+
+// Org-A row markers (unique per row) that must never render once the session
+// has switched to tenant B (AC-RACE / AC-STALE negative scope).
+const ORG_A_MARKERS = [
+  fixture.rows.served.oracle.model_used,
+  fixture.rows.legacy.oracle.model_used,
+  fixture.rows.zero.oracle.model_used,
 ]
 
 // ---------------------------------------------------------------------------
@@ -425,6 +446,59 @@ test('AC-STALE tenant switch clears the previous tenant journey from the drawer'
 })
 
 // ---------------------------------------------------------------------------
+// AC-RACE — a DELAYED in-flight old-tenant response arriving after the org
+// switch produces ZERO protected effects. The stand barrier
+// (fixture.control) parks org A's list/stats requests mid-flight; the
+// switch to tenant B goes through the REAL org switcher while they are
+// parked; only then are they released, so the late org-A payload arrives
+// after the switch. The page's scope guard must discard it: no org-A
+// marker may render and B's rows must remain.
+// ---------------------------------------------------------------------------
+
+test('AC-RACE delayed old-tenant list response after org switch produces no cross-org render', async ({ page }) => {
+  const p = await pageAsFrom(page, 'both')
+  const orgA = fixture.orgs.a.id
+  const orgB = fixture.orgs.b.id
+  const ctl = fixture.control
+  // Tenant A's list is loaded and showing A rows.
+  await p.goto(`/#requests-explorer?org=${orgA}`)
+  await expect(p.locator('table')).toContainText(fixture.rows.served.oracle.model_used, { timeout: 20_000 })
+  // Arm the stand barrier, then refresh: A's list+stats requests are now
+  // genuinely in flight and PARKED at the stand.
+  expect((await p.request.post(ctl.barrier_arm)).status(), 'arming the stand barrier').toBe(204)
+  await p.getByRole('button', { name: 'Refresh now' }).click()
+  await expect.poll(async () => {
+    const res = await p.request.get(ctl.barrier_state)
+    return ((await res.json()) as { held: number }).held
+  }, { timeout: 10_000, message: 'the old-tenant refresh must be parked in flight by the barrier' }).toBeGreaterThanOrEqual(1)
+  // Switch org through the REAL switcher while A's responses are parked.
+  await p.getByRole('button', { name: /org switcher/i }).click()
+  await p.locator(`#org-switcher-option-${orgB}`).click()
+  // From here on, any org-A list RESPONSE observed must have arrived AFTER
+  // the switch (the parked refresh is the only org-A response left).
+  const lateAList = p.waitForResponse(
+    res => new URL(res.url()).pathname === `/api/organizations/${orgA}/requests`,
+    { timeout: 20_000 },
+  )
+  // B's own list loads normally (the barrier only parks org-A paths); its
+  // appearance also proves B's load finished — the scope guard is armed.
+  await expect(p.locator('table')).toContainText(fixture.rows.tenantb.oracle.model_used, { timeout: 20_000 })
+  // Release: the delayed old-tenant responses finally arrive at the page.
+  expect((await p.request.post(ctl.barrier_release)).status(), 'releasing the stand barrier').toBe(204)
+  const late = await lateAList
+  expect(late.status(), 'the parked old-tenant list response completes with real org-A data').toBe(200)
+  // ZERO protected effects: B's rows stay and no org-A marker renders
+  // (innerText: hidden datalist hints do not count as rendering).
+  await expect(p.locator('table')).toContainText(fixture.rows.tenantb.oracle.model_used)
+  const bodyText = await p.locator('body').innerText()
+  for (const marker of ORG_A_MARKERS) {
+    expect(bodyText, `late old-tenant payload must not render: ${marker}`).not.toContain(marker)
+  }
+  await shot(p, 'ac-race-late-old-tenant')
+  await p.close()
+})
+
+// ---------------------------------------------------------------------------
 // AC-IDOR — a deep link into another tenant's journey is refused and leaks
 // nothing (403/404 at the API, notice in the UI, no marker strings in DOM)
 // ---------------------------------------------------------------------------
@@ -481,30 +555,29 @@ test('AC-KB keyboard-only navigation reaches the journey view (Tab + Enter)', as
 })
 
 // ---------------------------------------------------------------------------
-// AC-NARROW — 390px viewport keeps the journey readable
+// AC-NARROW-SERVED / AC-NARROW-BLOCKED — 390px viewport keeps the journey
+// readable (two individually pinned cases of the frozen registry)
 // ---------------------------------------------------------------------------
 
-test.describe('AC-NARROW 390px viewport', () => {
-  const NARROW = { width: 390, height: 844 }
+const NARROW = { width: 390, height: 844 }
 
-  test('journey stages stay visible without the blocked node on a served row', async ({ page }) => {
-    const p = await pageAsFrom(page, 'a_only', NARROW)
-    await openJourney(p, fixture.rows.served)
-    for (const id of ['request', 'decision', 'upstream', 'response']) {
-      await expect(stage(p, id)).toBeVisible()
-    }
-    await expect(p.getByTestId('journey-blocked')).toHaveCount(0)
-    await shot(p, 'ac-narrow-served')
-    await p.close()
-  })
+test('AC-NARROW-SERVED journey stages stay visible without the blocked node on a served row (390px)', async ({ page }) => {
+  const p = await pageAsFrom(page, 'a_only', NARROW)
+  await openJourney(p, fixture.rows.served)
+  for (const id of ['request', 'decision', 'upstream', 'response']) {
+    await expect(stage(p, id)).toBeVisible()
+  }
+  await expect(p.getByTestId('journey-blocked')).toHaveCount(0)
+  await shot(p, 'ac-narrow-served')
+  await p.close()
+})
 
-  test('blocked row states its termination at 390px too', async ({ page }) => {
-    const p = await pageAsFrom(page, 'a_only', NARROW)
-    await openJourney(p, fixture.rows.blocked)
-    await expect(p.getByTestId('journey-blocked')).toContainText(COPY.blockedTitle)
-    await shot(p, 'ac-narrow-blocked')
-    await p.close()
-  })
+test('AC-NARROW-BLOCKED blocked row states its termination at 390px too', async ({ page }) => {
+  const p = await pageAsFrom(page, 'a_only', NARROW)
+  await openJourney(p, fixture.rows.blocked)
+  await expect(p.getByTestId('journey-blocked')).toContainText(COPY.blockedTitle)
+  await shot(p, 'ac-narrow-blocked')
+  await p.close()
 })
 
 // ---------------------------------------------------------------------------

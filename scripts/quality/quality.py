@@ -32,10 +32,11 @@ PROFILES = {
                          "deps", "licenses", "policy", "tests", "int-modules",
                          "integration", "package", "image-scan"],
     "tests": ["self", "tests"],
-    # browser is a web-profile leaf, deliberately NOT part of `full`: the
-    # acceptance evidence (full) does not depend on the browser runtime, while
-    # web-profile runs and changed-file runs that touch e2e/** get the gate.
-    "web": ["dashboard", "site", "design", "browser"],
+    # browser and journey are web-profile leaves, deliberately NOT part of
+    # `full`: the acceptance evidence (full) does not depend on the browser
+    # runtime, while web-profile runs and changed-file runs that touch
+    # e2e/** / e2e-journey/** get the gates.
+    "web": ["dashboard", "site", "design", "browser", "journey"],
     "sdk": ["node-sdk", "python-sdk", "bridge", "go-sdk"],
     "docs": ["docs"],
     # Private planning data does not change the product. Keep its validator
@@ -64,16 +65,17 @@ RELEASE_PLAN_DATA = {RELEASE_PLAN_DIR + "PLAN-DATA.md"}
 # suites, image builds, disposable PG drills). Docker Desktop runs the daemon
 # in a CPU-limited VM; overlapping them starves time-sensitive tests into
 # flakes (observed 2026-10-06: slowlog/timing failures under jobs=4). They
-HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity"}
+HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity", "journey"}
 LIGHT_GATES = LEAVES - HEAVY_GATES
-DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan"}
+DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan", "journey"}
 # NEXT-14b: ordering constraints for the parallel scheduler. The browser gate
 # serves the production builds produced by dashboard/site; those builds wipe
 # their output directories mid-run (Makefile re-stamps the fingerprint after
 # the build), so a concurrently served build yields false element-not-found
 # failures (observed 2026-10-13 under jobs=3). In serial reference mode the
 # gate order already guarantees this; the map only constrains jobs>1.
-GATE_ORDER = {"browser": ("dashboard", "site")}
+# The journey gate serves the same dashboard artifact: same constraint.
+GATE_ORDER = {"browser": ("dashboard", "site"), "journey": ("dashboard",)}
 
 
 def git(root, *args):
@@ -178,6 +180,13 @@ def classify_product_paths(paths):
         # the file still reaches its directory gates below).
         if Path(path).name in ("package.json", "package-lock.json"):
             add(["licenses"], path)
+        # CV-02 journey acceptance scope (2026-11-14 audit repair): the
+        # browser suite, its Playwright config and the Go acceptance stand
+        # itself re-run the mandatory journey gate. Non-consuming: Go files
+        # still receive the cumulative Go gates below.
+        if (path.startswith(("web/dashboard/e2e-journey/", "services/admin/handlers/cv02"))
+                or path == "web/dashboard/playwright.journey.config.ts"):
+            add(["journey"], path)
         # Package names cannot reliably identify trust boundaries. Go changes
         # conservatively receive all cumulative mandatory Go gates.
         if path.endswith("_test.go") and ("integration" in Path(path).parent.name or path.endswith(("integration_test.go", "updown_test.go", "rls_verify_test.go", "drill_test.go", "e2e_test.go"))):
@@ -875,6 +884,10 @@ def gate_entry(gate, directory):
     elif gate == "browser":
         # Isolate this run's traces/screenshots/report in the evidence dir.
         entry["command"] = ["env", "QUALITY_BROWSER_OUT=" + str(directory / "browser")] + entry["command"]
+    elif gate == "journey":
+        # Isolate this run's fixture/stand receipts (stand-summary.json,
+        # playwright.out, screenshots) in the evidence dir.
+        entry["command"] = ["env", "CV02_JOURNEY_OUT=" + str(directory / "journey")] + entry["command"]
     return entry
 
 
