@@ -13,7 +13,7 @@
     "test": "node --test --experimental-strip-types src/contract.test.ts src/listen.test.ts src/runners.test.ts"
   },
   "optionalDependencies": {
-    "@openai/codex-sdk": "0.153.0"
+    "@openai/codex-sdk": "0.167.0"
   },
   "license": "Apache-2.0"
 }
