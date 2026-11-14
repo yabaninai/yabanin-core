@@ -15,7 +15,7 @@ package handlers
 // oracle for the browser suite), and runs the REGISTERED npm command
 // (test:journey) as a subprocess, enforcing its results.
 //
-// MANDATORY semantics (2026-11-14 audit repair): this command NEVER skips.
+// MANDATORY semantics: this command NEVER skips.
 // The built dashboard is a hard prerequisite — a missing artifact fails the
 // run immediately and a stale/unverified one fails the product verifier
 // (scripts/quality/browser-build.sh, the same fingerprint contract the
@@ -72,13 +72,12 @@ import (
 )
 
 // cv02RequiredJourneyCases is the FROZEN browser-acceptance case registry
-// (frozen 2026-11-14, coordination rev 0c85ca3, from b121b30
-// web/dashboard/e2e-journey/journey.spec.ts plus the AC-RACE repair case).
-// Every listed case ID MUST appear in the Playwright results exactly once
-// with a passed verdict; a missing, skipped, duplicate, unknown or unnamed
-// case FAILS the acceptance. IDs 1-10 are the frozen ten (AC-NARROW's two
-// 390px tests pinned as individually addressable IDs); AC-RACE is the
-// delayed-old-tenant-response case added by the 2026-11-14 audit repair.
+// (the ten recorded-journey cases, with AC-NARROW's two 390px tests pinned
+// as individually addressable IDs, plus the AC-RACE delayed-old-tenant-
+// response case). Every listed case ID MUST appear in the Playwright
+// results exactly once with a passed verdict; a missing, skipped,
+// duplicate, unknown or unnamed case FAILS the acceptance. Registry
+// changes are deliberate acceptance-scope decisions, never silent.
 // Registry changes are deliberate acceptance-scope decisions, never silent.
 var cv02RequiredJourneyCases = []string{
 	"AC-RT",
@@ -746,7 +745,7 @@ func TestCV02RequestJourneyBrowserAcceptance(t *testing.T) {
 		dist = filepath.Join(repoRoot, "web", "dashboard", "dist")
 	}
 	// MANDATORY prerequisite — fails on a missing or stale artifact,
-	// never skips (2026-11-14 audit repair).
+	// never skips.
 	distEv := cv02RequireDashboardArtifact(t, repoRoot, dist)
 
 	pool := testdb.Postgres(t)
@@ -934,7 +933,7 @@ func TestCV02RequestJourneyBrowserAcceptance(t *testing.T) {
 	}
 	require.NoError(t, os.MkdirAll(artifacts, 0o755))
 
-	// Registered command + frozen-registry enforcement (audit repair):
+	// Registered command + frozen-registry enforcement:
 	// a green run missing a required case is not acceptance.
 	report, suiteErr, out := cv02RunPlaywright(t, repoRoot, srv.URL, fixturePath, artifacts)
 	specs := cv02FlattenSpecs(report.Suites, "", nil)

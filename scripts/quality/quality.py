@@ -180,12 +180,25 @@ def classify_product_paths(paths):
         # the file still reaches its directory gates below).
         if Path(path).name in ("package.json", "package-lock.json"):
             add(["licenses"], path)
-        # CV-02 journey acceptance scope (2026-11-14 audit repair): the
-        # browser suite, its Playwright config and the Go acceptance stand
-        # itself re-run the mandatory journey gate. Non-consuming: Go files
-        # still receive the cumulative Go gates below.
-        if (path.startswith(("web/dashboard/e2e-journey/", "services/admin/handlers/cv02"))
-                or path == "web/dashboard/playwright.journey.config.ts"):
+        # CV-02 request-journey acceptance scope: the browser acceptance
+        # certifies the recorded-journey feature end to end, so it runs not
+        # only for its harness (suite, Playwright config, Go stand) but for
+        # the product sources it exercises: the journey rendering library,
+        # the explorer page, the requests API client, the request
+        # list/detail endpoints and their read model. Bounded: the shared
+        # API transport and unrelated read models stay out. Non-consuming:
+        # Go and dashboard files still receive the cumulative gates below.
+        if (path.startswith(("web/dashboard/e2e-journey/",
+                             "services/admin/handlers/cv02"))
+                or path in (
+                    "web/dashboard/playwright.journey.config.ts",
+                    "web/dashboard/src/lib/requestJourney.ts",
+                    "web/dashboard/src/pages/RequestExplorerPage.tsx",
+                    "web/dashboard/src/api/requests.ts",
+                    "services/admin/handlers/request_list.go",
+                    "pkg/adminstore/request_list.go",
+                    "pkg/adminstore/request_detail.go",
+                )):
             add(["journey"], path)
         # Package names cannot reliably identify trust boundaries. Go changes
         # conservatively receive all cumulative mandatory Go gates.

@@ -319,8 +319,8 @@ _quality-design:
 _quality-browser:
 	bash scripts/quality/browser.sh
 
-# CV-02 journey browser acceptance (2026-11-14 audit repair): the registered
-# preflight for the MANDATORY acceptance command — builds/verifies the
+# CV-02 journey browser acceptance: the registered preflight for the
+# MANDATORY acceptance command — builds/verifies the
 # dashboard artifact first (same fingerprint contract as the browser gate),
 # then runs the Go stand, which itself FAILS on a missing/stale artifact and
 # enforces the frozen journey case registry (11 cases; no skips, no missing

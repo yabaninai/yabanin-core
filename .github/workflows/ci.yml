@@ -286,6 +286,9 @@ jobs:
           npm ci --prefix web/dashboard --no-audit --no-fund
           npm ci --prefix web/site --no-audit --no-fund
           npm ci --prefix sdks/node --no-audit --no-fund
+          # Journey browser acceptance (part of the changed-gate selection):
+          # idempotent — a no-op while the runner cache holds the browser.
+          npx --prefix web/dashboard playwright install chromium
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
           make install-analysis-tools install-critical-tools security-tools-install security-db-update
@@ -336,72 +339,6 @@ jobs:
 
       - name: Run module integration suites
         run: make _quality-int-modules
-
-  # CV-02 request-journey browser acceptance (2026-11-14 audit repair): the
-  # MANDATORY Go command — fails on a missing/stale dashboard artifact and
-  # enforces the frozen 11-case registry (no skips, no dropped cases) —
-  # runs on PRs that change its scope: the browser suite, its Playwright
-  # config or the Go acceptance stand. Same paths as the quality
-  # changed-run's journey gate (scripts/quality/quality.py classify);
-  # out-of-scope PRs skip the whole job explicitly.
-  cv02-journey:
-    name: CV-02 journey browser acceptance (blocking)
-    if: github.event_name == 'pull_request'
-    runs-on: [self-hosted, core-quality]
-    timeout-minutes: 30
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
-        with:
-          fetch-depth: 0
-
-      - name: Detect journey scope
-        id: scope
-        run: |
-          base="$(git merge-base origin/main HEAD)"
-          if git diff --name-only "$base" HEAD | grep -Eq '^(web/dashboard/e2e-journey/|web/dashboard/playwright\.journey\.config\.ts|services/admin/handlers/cv02)'; then
-            echo 'paths=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'paths=false' >> "$GITHUB_OUTPUT"
-            echo 'cv02-journey: no journey-scope changes (e2e-journey/, playwright.journey.config.ts, services/admin/handlers/cv02*) — job skipped'
-          fi
-
-      - name: Set up Go (runner-local)
-        if: steps.scope.outputs.paths == 'true'
-        run: |
-          test -x /usr/local/go/bin/go
-          /usr/local/go/bin/go version | grep -q 'go1\.27\.' ||
-            { echo 'unexpected runner Go version' >&2; exit 1; }
-          echo "/usr/local/go/bin" >> "$GITHUB_PATH"
-          echo "$HOME/go/bin" >> "$GITHUB_PATH"
-
-      - name: Set up Node
-        if: steps.scope.outputs.paths == 'true'
-        uses: actions/setup-node@v7
-        with:
-          node-version: "22"
-          cache: npm
-          cache-dependency-path: web/dashboard/package-lock.json
-
-      - name: Bootstrap journey prerequisites
-        if: steps.scope.outputs.paths == 'true'
-        run: |
-          docker info > /dev/null
-          npm ci --prefix web/dashboard --no-audit --no-fund
-          npx --prefix web/dashboard playwright install chromium
-
-      # Registered preflight + MANDATORY command: builds/verifies the dist
-      # artifact, then runs the acceptance with its registry enforcement.
-      - name: Run CV-02 journey acceptance
-        if: steps.scope.outputs.paths == 'true'
-        run: make _quality-journey
-
-      - name: Upload journey evidence
-        if: always() && steps.scope.outputs.paths == 'true'
-        uses: actions/upload-artifact@v7
-        with:
-          name: cv02-journey-evidence
-          path: artifacts/cv02-journey/
 
   # The nightly integration job is blocking —
   # a failure turns the scheduled run red. It covers the gateway integration
