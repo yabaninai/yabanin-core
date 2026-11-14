@@ -1,10 +1,10 @@
-// comes from the SERVER — GET /api/client-config/{agent} renders through
-// pkg/clientconfig (services/admin/handlers/client_config_handlers.go), the
-// single source of truth for every client format. The byte-for-byte TS
-// lease) is retired: this module is now a thin typed client plus the
-// browser-local test-connection helpers.
+// Every guided-client config block comes from the SERVER — GET
+// /api/client-config/{agent} renders through pkg/clientconfig
+// (services/admin/handlers/client_config_handlers.go), the
+// single source of truth for every client format. This module is a thin
+// typed client plus the browser-local test-connection helpers.
 //
-// Contracts that survive unchanged:
+// Contracts:
 //   - the API key itself is never embedded: the server renderers emit an env
 //     NAME (env_key / ANTHROPIC_AUTH_TOKEN source / {env:…}) and a key VALUE
 //     never enters the request either (only the env NAME rides key_env);
@@ -16,7 +16,7 @@
 
 import { fetchJSON, type RequestOptions } from './http.ts'
 
-// The FULL six-agent set (owner decision 2026-11-04 (b)): every client the
+// The FULL six-agent set: every client the
 // API renders (services/admin/handlers/client_config_handlers.go
 // clientConfigAgents) and the CLI guides (`yb client-config --client …`) is
 // guided here too — the handler test and the clientConfig contract test pin

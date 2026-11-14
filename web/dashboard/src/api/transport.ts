@@ -1,4 +1,4 @@
-// AF-08: the single owner of the dashboard's HTTP transport lifecycle.
+// The single owner of the dashboard's HTTP transport lifecycle.
 //
 // Every request goes through exactly one of the two entry points:
 // - readJSON:     fetch → status/error parse → JSON body parse → cleanup
@@ -40,7 +40,7 @@ export class ApiError extends Error {
 // requestOpts: `signal` is the caller's AbortSignal (cancellation only — no
 // auto-retry semantics), `timeoutMs` is a per-request timeout that aborts
 // automatically (undefined → default 30s for reads, none for mutations;
-// 0 disables the timer). `headers` (AUX-14b) carries extra request headers,
+// 0 disables the timer). `headers` carries extra request headers,
 // e.g. X-Audit-Reason; the CSRF token is still set by the client and cannot
 // be overridden here.
 export interface RequestOptions {
@@ -99,7 +99,8 @@ function notifyUnauthorized(): void {
   for (const listener of [...unauthorizedListeners]) listener()
 }
 
-// the full deep link (path + query + hash, e.g. "/#keys?org=acme") so the
+// loginNextUrl encodes the full deep link (path + query + hash, e.g.
+// "/#keys?org=acme") so the
 // login flow returns the operator to the exact screen. Same shape the server
 // accepts: relative, starts with "/", never scheme-relative ("//" or "/\"),
 // no scheme — anything else falls back to "/". Encoded exactly once.

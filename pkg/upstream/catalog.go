@@ -646,6 +646,22 @@ func BuildModelCatalog(doc CatalogDocument) (*provider.ModelCatalog, error) {
 	if err != nil {
 		return nil, err
 	}
+	spec, err := catalogSpecFromDocument(doc, asOf)
+	if err != nil {
+		return nil, err
+	}
+	base, err := provider.NewModelCatalog(spec)
+	if err != nil {
+		return nil, err
+	}
+	return applyDocumentOverrides(base, doc)
+}
+
+// catalogSpecFromDocument converts the validated document into the runtime
+// snapshot spec: entries in document order, withdrawals as delist rows.
+// The per-row conversions are defensive: their findings are already
+// excluded by the validation BuildModelCatalog runs first.
+func catalogSpecFromDocument(doc CatalogDocument, asOf time.Time) (provider.ModelCatalogSpec, error) {
 	spec := provider.ModelCatalogSpec{
 		Version:       doc.Version,
 		SchemaVersion: doc.SchemaVersion,
@@ -655,59 +671,72 @@ func BuildModelCatalog(doc CatalogDocument) (*provider.ModelCatalog, error) {
 		Withdrawals:   make([]provider.Withdrawal, 0, len(doc.WithdrawnProviders)),
 	}
 	for _, m := range doc.Models {
-		from, err := parseCatalogTime("effective_from", m.EffectiveFrom)
+		entry, err := catalogEntryFromDocument(m)
 		if err != nil {
-			return nil, err
-		}
-		to, err := parseCatalogTime("effective_to", m.EffectiveTo)
-		if err != nil {
-			return nil, err
-		}
-		dep, err := parseCatalogTime("deprecated_at", m.DeprecatedAt)
-		if err != nil {
-			return nil, err
-		}
-		caps, err := applyCatalogCapabilities(copyBoolMap(m.Capabilities))
-		if err != nil {
-			return nil, fmt.Errorf("models (%s:%s): %w", m.Provider, m.Model, err)
-		}
-		entry := provider.ModelCatalogEntry{
-			Provider:      m.Provider,
-			Model:         m.Model,
-			Aliases:       m.Aliases,
-			Capabilities:  caps,
-			EffectiveFrom: from,
-			EffectiveTo:   to,
-			DeprecatedAt:  dep,
-		}
-		if m.Limits != nil {
-			entry.Limits = provider.ModelLimits{
-				ContextWindowTokens: m.Limits.ContextWindowTokens,
-				MaxOutputTokens:     m.Limits.MaxOutputTokens,
-				MaxTPM:              m.Limits.MaxTPM,
-				MaxRPM:              m.Limits.MaxRPM,
-			}
-		}
-		if m.Price != nil {
-			entry.Price = pricingPrice(*m.Price)
-			entry.PriceListed = true
+			return provider.ModelCatalogSpec{}, err
 		}
 		spec.Entries = append(spec.Entries, entry)
 	}
 	for _, w := range doc.WithdrawnProviders {
 		at, err := parseCatalogTime("withdrawn_at", w.WithdrawnAt)
 		if err != nil {
-			return nil, err
+			return provider.ModelCatalogSpec{}, err
 		}
 		spec.Withdrawals = append(spec.Withdrawals, provider.Withdrawal{
 			Provider:    w.Provider,
 			WithdrawnAt: at,
 		})
 	}
-	base, err := provider.NewModelCatalog(spec)
+	return spec, nil
+}
+
+// catalogEntryFromDocument maps one document model row onto the runtime
+// entry shape (limits and price only when the document carries them, so a
+// listed zero stays distinguishable from an absent listing).
+func catalogEntryFromDocument(m CatalogModelEntry) (provider.ModelCatalogEntry, error) {
+	from, err := parseCatalogTime("effective_from", m.EffectiveFrom)
 	if err != nil {
-		return nil, err
+		return provider.ModelCatalogEntry{}, err
 	}
+	to, err := parseCatalogTime("effective_to", m.EffectiveTo)
+	if err != nil {
+		return provider.ModelCatalogEntry{}, err
+	}
+	dep, err := parseCatalogTime("deprecated_at", m.DeprecatedAt)
+	if err != nil {
+		return provider.ModelCatalogEntry{}, err
+	}
+	caps, err := applyCatalogCapabilities(copyBoolMap(m.Capabilities))
+	if err != nil {
+		return provider.ModelCatalogEntry{}, fmt.Errorf("models (%s:%s): %w", m.Provider, m.Model, err)
+	}
+	entry := provider.ModelCatalogEntry{
+		Provider:      m.Provider,
+		Model:         m.Model,
+		Aliases:       m.Aliases,
+		Capabilities:  caps,
+		EffectiveFrom: from,
+		EffectiveTo:   to,
+		DeprecatedAt:  dep,
+	}
+	if m.Limits != nil {
+		entry.Limits = provider.ModelLimits{
+			ContextWindowTokens: m.Limits.ContextWindowTokens,
+			MaxOutputTokens:     m.Limits.MaxOutputTokens,
+			MaxTPM:              m.Limits.MaxTPM,
+			MaxRPM:              m.Limits.MaxRPM,
+		}
+	}
+	if m.Price != nil {
+		entry.Price = pricingPrice(*m.Price)
+		entry.PriceListed = true
+	}
+	return entry, nil
+}
+
+// applyDocumentOverrides merges the customizations section onto the base
+// snapshot; an empty section returns the base untouched.
+func applyDocumentOverrides(base *provider.ModelCatalog, doc CatalogDocument) (*provider.ModelCatalog, error) {
 	ovs, err := overridesFromDocument(doc)
 	if err != nil {
 		return nil, err
@@ -912,74 +941,115 @@ type LifecycleReport struct {
 // report and the per-name classifier can never disagree.
 func BuildLifecycleReport(c *provider.ModelCatalog, facts []LifecycleFact, at time.Time) LifecycleReport {
 	rows := make(map[string]*ModelLifecycleRow)
-	addRow := func(r *ModelLifecycleRow) { rows[r.Provider+":"+r.Model] = r }
+	addCatalogLifecycleRows(rows, c, at)
+	foldLifecycleFacts(rows, c, facts, at)
+	return finalizeLifecycleReport(rows, c, at)
+}
 
+// addCatalogLifecycleRows opens one Discovered row per catalog entry, keyed
+// by the entry's canonical name.
+func addCatalogLifecycleRows(rows map[string]*ModelLifecycleRow, c *provider.ModelCatalog, at time.Time) {
 	for _, e := range c.Entries() {
-		aliases := append([]string(nil), e.Aliases...)
-		sortStrings(aliases)
-		status := c.Status(e.Provider, e.Model, at)
-		deprecated := !e.DeprecatedAt.IsZero() && status == provider.StatusActive &&
-			c.ProviderAdmitted(e.Provider, at) && !at.Before(e.DeprecatedAt)
-		row := &ModelLifecycleRow{
-			Provider:      e.Provider,
-			Model:         e.Model,
-			Aliases:       aliases,
-			Discovered:    true,
-			Available:     status == provider.StatusActive && c.ProviderAdmitted(e.Provider, at),
-			CatalogStatus: status,
-			Deprecated:    deprecated,
-		}
-		if deprecated {
-			row.DeprecatedAt = e.DeprecatedAt
-		}
-		addRow(row)
+		row := newCatalogLifecycleRow(c, e, at)
+		rows[e.Provider+":"+e.Model] = row
 	}
+}
 
+// newCatalogLifecycleRow materializes one entry's row. The deprecated flag
+// mirrors provider.Deprecated: retirement dominates, so the flag is set
+// only while the model is still sellable past its deprecation instant.
+func newCatalogLifecycleRow(c *provider.ModelCatalog, e provider.ModelCatalogEntry, at time.Time) *ModelLifecycleRow {
+	aliases := append([]string(nil), e.Aliases...)
+	sortStrings(aliases)
+	status := c.Status(e.Provider, e.Model, at)
+	admitted := c.ProviderAdmitted(e.Provider, at)
+	deprecated := !e.DeprecatedAt.IsZero() && status == provider.StatusActive && admitted && !at.Before(e.DeprecatedAt)
+	row := &ModelLifecycleRow{
+		Provider:      e.Provider,
+		Model:         e.Model,
+		Aliases:       aliases,
+		Discovered:    true,
+		Available:     status == provider.StatusActive && admitted,
+		CatalogStatus: status,
+		Deprecated:    deprecated,
+	}
+	if deprecated {
+		row.DeprecatedAt = e.DeprecatedAt
+	}
+	return row
+}
+
+// foldLifecycleFacts merges the installation facts into the rows; a fact
+// with both flags false names nothing the installation does and is not
+// part of the report.
+func foldLifecycleFacts(rows map[string]*ModelLifecycleRow, c *provider.ModelCatalog, facts []LifecycleFact, at time.Time) {
 	for _, f := range facts {
-		if !f.Configured && !f.Tested {
-			continue // no facts: the name is not part of the report
+		if f.Configured || f.Tested {
+			foldLifecycleFact(rows, c, f, at)
 		}
-		key := f.Provider + ":" + f.Model
-		if e, st := c.Lookup(f.Provider, f.Model, at); st != provider.StatusUnknown {
-			// A known name (exact or alias): fold into its canonical row.
-			key = e.Provider + ":" + e.Model
-		}
-		r, ok := rows[key]
-		if !ok {
-			r = &ModelLifecycleRow{
-				Provider:      f.Provider,
-				Model:         f.Model,
-				Available:     c.ProviderAdmitted(f.Provider, at),
-				CatalogStatus: c.Status(f.Provider, f.Model, at),
-			}
-			addRow(r)
-		}
-		r.Configured = r.Configured || f.Configured
-		r.Tested = r.Tested || f.Tested
 	}
+}
 
+// foldLifecycleFact merges one fact into its row: a name the catalog knows
+// (exact or alias) folds into the canonical row so a configured alias
+// never forks a second row; an unknown name opens a facts-only row that
+// keeps the installation drift visible.
+func foldLifecycleFact(rows map[string]*ModelLifecycleRow, c *provider.ModelCatalog, f LifecycleFact, at time.Time) {
+	key := f.Provider + ":" + f.Model
+	if e, st := c.Lookup(f.Provider, f.Model, at); st != provider.StatusUnknown {
+		key = e.Provider + ":" + e.Model
+	}
+	r, ok := rows[key]
+	if !ok {
+		r = &ModelLifecycleRow{
+			Provider:      f.Provider,
+			Model:         f.Model,
+			Available:     c.ProviderAdmitted(f.Provider, at),
+			CatalogStatus: c.Status(f.Provider, f.Model, at),
+		}
+		rows[key] = r
+	}
+	r.Configured = r.Configured || f.Configured
+	r.Tested = r.Tested || f.Tested
+}
+
+// finalizeLifecycleReport derives each row's State through the catalog
+// classifier, sorts the rows by (provider, model) and fills the summary.
+// Row keys are unique, so the sort makes the output deterministic despite
+// map iteration order.
+func finalizeLifecycleReport(rows map[string]*ModelLifecycleRow, c *provider.ModelCatalog, at time.Time) LifecycleReport {
 	report := LifecycleReport{At: at, Rows: make([]ModelLifecycleRow, 0, len(rows))}
 	for _, r := range rows {
 		r.State = c.Lifecycle(r.Provider, r.Model, at, r.Configured, r.Tested)
 		report.Rows = append(report.Rows, *r)
 	}
-	sort.Slice(report.Rows, func(i, j int) bool {
-		if report.Rows[i].Provider != report.Rows[j].Provider {
-			return report.Rows[i].Provider < report.Rows[j].Provider
+	sortLifecycleRows(report.Rows)
+	report.Summary = summarizeLifecycleRows(report.Rows)
+	return report
+}
+
+func sortLifecycleRows(rows []ModelLifecycleRow) {
+	sort.Slice(rows, func(i, j int) bool {
+		if rows[i].Provider != rows[j].Provider {
+			return rows[i].Provider < rows[j].Provider
 		}
-		return report.Rows[i].Model < report.Rows[j].Model
+		return rows[i].Model < rows[j].Model
 	})
-	for _, r := range report.Rows {
+}
+
+func summarizeLifecycleRows(rows []ModelLifecycleRow) LifecycleSummary {
+	var summary LifecycleSummary
+	for _, r := range rows {
 		switch r.State {
 		case provider.LifecycleDiscovered:
-			report.Summary.Discovered++
+			summary.Discovered++
 		case provider.LifecycleConfigured:
-			report.Summary.Configured++
+			summary.Configured++
 		case provider.LifecycleTested:
-			report.Summary.Tested++
+			summary.Tested++
 		case provider.LifecycleUnavailable:
-			report.Summary.Unavailable++
+			summary.Unavailable++
 		}
 	}
-	return report
+	return summary
 }

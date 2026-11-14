@@ -2,7 +2,7 @@ import { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { toCSV, downloadCSV } from './csv'
 
-// Astra primitive: ChartCard (ASTR-10). Accessibility contract for charts:
+// Astra primitive: ChartCard. Accessibility contract for charts:
 //   - the chart is announced as an image with a generated summary;
 //   - the same data is available as an HTML table (chart = table, toggleable);
 //   - units and timezone are labeled next to the title (never implied);
@@ -15,7 +15,7 @@ export interface ChartColumn<T> {
   /** Formats the table/CSV cell (chart formatting may differ). */
   format?: (row: T) => string
   /**
-   * AUX-09: rich table-cell renderer (e.g. a drill-down link on the entity
+   * Rich table-cell renderer (e.g. a drill-down link on the entity
    * name). Display only — CSV export always uses `format`/the raw value, so
    * the downloaded artifact stays plain data.
    */
@@ -60,7 +60,7 @@ export function ChartCard<T extends object>({ title, children, data, columns, un
   }
 
   return (
-    // AVR-10 (F09 text-enlarge): min-w-0 + max-w-full so the chart and its
+    // Text-enlarge safe: min-w-0 + max-w-full so the chart and its
     // data table bound to the viewport and scroll locally when the root font
     // is enlarged, instead of pushing the document wider.
     <figure className="flex min-w-0 max-w-full flex-col gap-2">
@@ -78,7 +78,7 @@ export function ChartCard<T extends object>({ title, children, data, columns, un
           {t('common.exportCsv')}
         </button>
       </figcaption>
-      {/* AVR-10 (F09 text-enlarge): min-w-0 + overflow-hidden bounds the
+      {/* Text-enlarge safe: min-w-0 + overflow-hidden bounds the
           chart (and its Recharts tooltip) to the card width so an enlarged
           tooltip scrolls/clips locally instead of widening the document. */}
       <div role="img" aria-label={ariaLabel} className="relative min-w-0 max-w-full overflow-hidden">

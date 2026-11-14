@@ -1,4 +1,4 @@
-// AF-12: runtime locale switching over async (dynamically imported) locale
+// Runtime locale switching over async (dynamically imported) locale
 // bundles. The orchestration is dependency-injected (no i18next/vite imports
 // here) so node --test can exercise the contract directly:
 //

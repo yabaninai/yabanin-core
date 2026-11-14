@@ -37,10 +37,10 @@ const tierKeys: Record<string, string> = {
   endpoint_pinned: 'evidence.tierEndpointPinned',
   header_observed: 'evidence.tierHeaderObserved',
   provider_declared: 'evidence.tierProviderDeclared',
-  // AUX-15: pace-based projections (budget forecasts) are estimates, not
+  // Pace-based projections (budget forecasts) are estimates, not
   // measurements — they are computed client-side from observed series.
   estimate: 'evidence.tierEstimate',
-  // AUX-23: data-source tiers for analytics results — the same primitive
+  // Data-source tiers for analytics results — the same primitive
   // states whether numbers are raw, pre-aggregated (rollup) or a truncated
   // sample, uniformly across the screens that show them.
   raw: 'evidence.tierRaw',

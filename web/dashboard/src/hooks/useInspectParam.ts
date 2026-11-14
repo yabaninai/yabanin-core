@@ -1,7 +1,7 @@
 import { useCallback, useState } from 'react'
 import { readInspectParam, writeInspectParam } from '../lib/inspectUrl'
 
-// AUX-17 (EntityDrawer): page-local state for the inspect deep-link. Reads
+// Page-local state for the inspect deep-link (EntityDrawer). Reads
 // `?inspect=<id>` from the hash query once at mount (a shared link opens the
 // drawer on load) and rewrites only that param on open/close, preserving
 // everything else (page id, org scope, locale, sort) — the same contract as

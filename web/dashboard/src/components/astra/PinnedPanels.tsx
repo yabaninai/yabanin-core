@@ -8,7 +8,7 @@ import { explorerHash, resolveBoard, type ResolvedPanel } from '../../lib/boards
 import { drillPanelPoint, loadPanels, type PanelPayload } from '../../lib/boardPanels'
 import { listPinnedPanels, unpinPanel } from '../../lib/pinnedPanels'
 
-// AUX-07 — the Overview side of "pin any panel". Pinned panels re-render for
+// The Overview side of "pin any panel". Pinned panels re-render for
 // the Overview APPLIED scope (the org the page loaded + the GlobalScope
 // window), with their own loads: one generation guard + one AbortController
 // (asyncScope — no parallel loads, no stale landing). The board global
@@ -37,7 +37,7 @@ export function PinnedPanels({ org, from, to, tz }: PinnedPanelsProps) {
   const [data, setData] = useState<Map<string, PanelPayload>>(new Map())
   const { currency } = useOrgPresentation(org || undefined)
   const metricFmt = useMemo(() => ({ locale: uiLocale(), currency }), [currency])
-  // AVR-01: the caption must describe the window the shown data was fetched
+  // The caption must describe the window the shown data was fetched
   // with — captured when a load lands, not the live props.
   const [applied, setApplied] = useState<{ from: string; to: string; tz: string } | null>(null)
 

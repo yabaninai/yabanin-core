@@ -14,7 +14,7 @@
 //    `providers: []` (honest empty), never null.
 //  - The health `period` accepts 1h | 24h | 7d | 30d | a Go duration string
 //    (capped at 90d server-side). healthPeriodParam maps the shared
-//    GlobalScope preset (AUX-08) onto that vocabulary without inventing a
+//    GlobalScope preset onto that vocabulary without inventing a
 //    second period control on this screen.
 
 import { fetchJSON, type RequestOptions } from './http.ts'

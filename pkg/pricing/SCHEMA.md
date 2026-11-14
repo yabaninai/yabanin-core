@@ -29,10 +29,9 @@ markup) are separate data planes and deliberately have no fields here.
   was assembled), `reviewer`, `review_sla_days`, `supersedes` (digest of the
   replaced snapshot; empty for genesis), `digest` (SHA256 over the canonical
   form, see below), and `models`.
-- `RefModel` — one entry: stable `(provider, model)` identity plus scoping
-  dimensions `region`, `tier`, `context_band` (all optional, "" = default).
-  Full identity is the 5-tuple; two entries may differ only in a scoping
-  dimension (e.g. per-region prices).
+- `RefModel` — one entry: a `(provider, model)` identity plus optional
+  scoping fields `region`, `tier`, `context_band` ("" = default). Identity
+  has two planes; see [Model identity](#model-identity) below.
 - `RefModel.aliases` — alternative names resolving to the entry. Aliases
   never carry their own rates. Exact names always win resolution
   (`ResolveModel`); the validator rejects an alias equal to any model name
@@ -49,6 +48,32 @@ markup) are separate data planes and deliberately have no fields here.
   `ref`, `verified_at`, `note`.
 - `RefConflict` — resolution of a source disagreement: `axis`, `ref` (the
   chosen source), `reason`.
+
+## Model identity
+
+Two planes, pinned by `schema_identity_test.go`:
+
+- **Validation identity** is exactly the two-part `(provider, model)` pair,
+  compared as written — no trimming, no scoping fields. `ValidateCatalog`
+  rejects a second entry with the same pair as
+  `models[1]: duplicate entry for openai:gpt-4 (first at models[0])` even
+  when it differs from the first only in `region`, `tier` or
+  `context_band`. A valid v1 catalog therefore cannot carry per-region
+  (or per-tier, per-band) variants of one pair.
+- Provider and model spellings are not trimmed and padding is not a
+  finding for them (unlike aliases, which reject padding): `" openai"` +
+  `"gpt-4"` and `"openai"` + `"gpt-4"` are two distinct validation
+  identities, and a catalog holding only one of them validates.
+- **Merge/canonical identity** is the full five-part key
+  `(provider, model, region, tier, context_band)`: `MergeCatalogs` unions
+  entries by it and `CanonicalCatalogJSON` sorts by it. A merge hence
+  appends a scoping variant of an existing pair instead of merging it —
+  and the merged snapshot then fails `ValidateCatalog` on the two-part
+  key above.
+
+The runtime model-catalog document (`pkg/upstream`) is a separate schema
+with its own rule: its identity is the trimmed two-part `(provider, model)`
+pair, and whitespace-padded spellings are rejected at load.
 
 ### Axes and units (closed sets)
 

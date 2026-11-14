@@ -12,7 +12,7 @@ export interface AdminUser {
   updated_at?: string
 }
 
-// Admin users support the AUX-02 server sort allowlist (id, email,
+// Admin users support the server sort allowlist (id, email,
 // display_name, is_root, active, created_at).
 export async function listAdminUsers(page = 1, opts?: RequestOptions & ListSortParams & { pageSize?: number }): Promise<Paginated<AdminUser>> {
   return fetchJSON(`/admin-users?${listQuery(page, opts?.pageSize ?? DEFAULT_PAGE_SIZE, opts?.sort, opts?.dir)}`, opts)

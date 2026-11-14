@@ -4,15 +4,15 @@ import en from './en.json'
 import { buildPseudo } from './pseudo'
 import { createLocaleSwitcher, type LocaleSwitcher } from './switcher'
 
-// I18N-01: dashboard internationalization scaffold.
-// AF-12: only the fallback locale (`en`) ships in the entry bundle; the seven
+// Dashboard internationalization scaffold.
+// Only the fallback locale (`en`) ships in the entry bundle; the seven
 // machine-translated locales are dynamically imported on demand (one Vite
 // chunk per locale). The active locale's chunk is fetched at boot and applied
 // when it lands — the screen renders useful `en` content meanwhile and is
 // never hidden behind a loading gate.
 //
-// - `en` is the canonical source of truth (I18N-03..09 add the seven
-//   machine-translated locales, each flagged needs-review).
+// - `en` is the canonical source of truth (the seven machine-translated
+//   locales are each flagged needs-review).
 // - `pseudo` is a QA-only pseudo-locale that wraps every string in «…» and
 //   stretches it by a fixed factor. It is used by the pseudo-localization gate
 //   (eslint i18next/no-literal-string on the screens, see eslint.config.js)
@@ -23,8 +23,8 @@ import { createLocaleSwitcher, type LocaleSwitcher } from './switcher'
 // The locale is selected from ?locale= on the static preview (the harness
 // never sets it in production), falling back to en.
 
-// I18N-03..09: the seven machine-translated locales (each needs-review —
-// see docs/i18n/glossary.md and the per-locale work-records). `en` remains
+// The seven machine-translated locales (each needs-review —
+// see docs/i18n/glossary.md). `en` remains
 // the canonical source of truth; a real locale is only registered here once
 // its translation file lands, so the locale switch never offers a broken
 // locale (the same invariant as the site's docusaurus `locales` list).
@@ -47,7 +47,7 @@ const LOCALE_HTML: Record<Locale | 'pseudo', { lang: string; dir: 'ltr' | 'rtl' 
   pseudo: { lang: 'en', dir: 'ltr' },
 }
 
-// AF-12: one dynamic chunk per locale. `en` is intentionally NOT here — it is
+// One dynamic chunk per locale. `en` is intentionally NOT here — it is
 // statically imported above because the runtime needs it synchronously as the
 // fallbackLng (and the cold start renders with it until the active locale's
 // chunk lands).
@@ -104,7 +104,7 @@ function applyHtmlLocale(lng: Locale | 'pseudo' | string) {
 
 const initial = initialLocale()
 
-// AF-12: entry resources hold ONLY the fallback locale (+ pseudo when a QA
+// Entry resources hold ONLY the fallback locale (+ pseudo when a QA
 // request selected it — derived from en on the spot, never for normal loads).
 const resources: Record<string, { translation: Record<string, unknown> }> = {
   en: { translation: en as unknown as Record<string, unknown> },
@@ -122,13 +122,13 @@ void i18n.use(initReactI18next).init({
   // Unknown keys fall back to the key itself; the lint gate catches those at
   // build time, so a missing key is a CI failure, not a silent runtime gap.
   parseMissingKeyHandler: (k: string) => `[missing:${k}]`,
-  // AF-12: language changes are pre-loaded via the switcher (bundle
+  // Language changes are pre-loaded via the switcher (bundle
   // registered BEFORE changeLanguage), so nothing ever waits on i18next —
   // there is no Suspense boundary and the screen must never be hidden.
   react: { useSuspense: false },
 })
 
-// AF-12: generation-guarded locale switching (rapid switch → last request
+// Generation-guarded locale switching (rapid switch → last request
 // wins; stale load never resurrects an old locale; failed download keeps the
 // app on the currently rendered language with truthful html attributes).
 const switcher: LocaleSwitcher = createLocaleSwitcher({

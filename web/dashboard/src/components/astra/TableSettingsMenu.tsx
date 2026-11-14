@@ -3,14 +3,14 @@ import { useTranslation } from 'react-i18next'
 import { useDisclosureDismiss } from './disclosure'
 import type { TableDensity } from '../../lib/tablePrefs'
 
-// AUX-22 — the per-table «Table settings» disclosure: column visibility
+// The per-table «Table settings» disclosure: column visibility
 // (checkboxes), row density (compact/comfortable) and the "Reset to default"
 // action. Pure controlled UI — the state and its localStorage persistence
 // live with the page via lib/tablePrefs (useTablePrefs), so the same hidden
 // list also drives the page's CSV exports.
 //
 // Contract: Escape closes and returns focus to the toggle; a click outside
-// closes (useDisclosureDismiss — the AUX-06 disclosure pattern, generalized
+// closes (useDisclosureDismiss — the shared disclosure pattern, generalized
 // to close on click so the first click on an outside control still lands).
 // The last visible column cannot be hidden — an empty table is never a state
 // the operator can reach by accident.

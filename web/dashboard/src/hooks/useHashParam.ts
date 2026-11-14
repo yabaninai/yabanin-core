@@ -22,7 +22,7 @@ export function useHashParam(key: string): [string, (v: string) => void] {
     if (key === 'org') rememberOrg(v.trim())
     // location.hash carries the leading '#'; normalize before re-prefixing so
     // repeated writes never grow '#page' into '##page' (a doubled hash parses
-    // back as an unknown page after reload). AUX-22 reload regression.
+    // back as an unknown page after reload).
     const path = window.location.hash.split('?')[0].replace(/^#+/, '')
     const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
     if (v) params.set(key, v)

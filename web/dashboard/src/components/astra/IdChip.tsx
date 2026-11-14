@@ -1,8 +1,8 @@
 import { useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
-// (checklist «страница v2»: identifiers render verbatim, never uppercased or
-// truncated in copy). The table-sized sibling of CopyIdButton: same clipboard
+// Identifiers render verbatim, never uppercased or truncated in copy.
+// The table-sized sibling of CopyIdButton: same clipboard
 // semantics (full value, transient visible "Copied" confirmation, hidden-
 // textarea fallback for non-secure contexts) at chip height so it fits a
 // dense row or a drawer field line.

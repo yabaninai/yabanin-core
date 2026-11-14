@@ -63,7 +63,7 @@ test('getOrgBudgetSettings GETs the grace endpoint and parses nulls', async () =
   assert.equal(settings.grace_floor_cents, null)
   assert.equal(settings.effective_grace_floor_cents, -100)
   assert.equal(settings.reservations_mode, 'enforce')
-  // N06-P03: saved vs effective are distinct — the deployment rollout
+  // saved vs effective are distinct — the deployment rollout
   // ceiling clamped the stored enforce to shadow; the UI shows the
   // effective mode and marks the clamped state.
   assert.equal(settings.saved_reservations_mode, 'enforce')

@@ -1,9 +1,7 @@
-// (AUX-15; extracted from client.ts unchanged).
-
 import { sendMutation, type RequestOptions } from './transport.ts'
 import { fetchJSON, postJSON, type Paginated } from './http.ts'
 
-// ===== Budgets & alerts center (AUX-15) =====
+// ===== Budgets & alerts center =====
 //
 // Existing endpoints only: team budgets (budgets.manage), agent-key budgets
 // (agent_keys.manage), the org spend alert and the cross-org credits

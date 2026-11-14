@@ -2,7 +2,7 @@ import { useCallback, useRef, useState } from 'react'
 import { readTableUrlState, writeTableUrlState, type TableUrlState } from '../lib/tableUrl'
 import type { SortState } from '../lib/tableSort'
 
-// AUX-01: table-scoped URL state (sort + page) for DataTable consumers.
+// Table-scoped URL state (sort + page) for DataTable consumers.
 //
 // The app routes via the hash (#page?params) — the hook reads and rewrites
 // only the query part, preserving everything else (page id, locale, scope),
@@ -36,7 +36,7 @@ function readHashQuery(): URLSearchParams {
 function writeHashQuery(tableId: string, state: TableUrlState): void {
   // location.hash carries the leading '#'; normalize before re-prefixing so
   // repeated writes never grow '#page' into '##page' (a doubled hash parses
-  // back as an unknown page after reload). AUX-22 reload regression.
+  // back as an unknown page after reload).
   const path = window.location.hash.split('?')[0].replace(/^#+/, '')
   const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
   writeTableUrlState(params, tableId, state)

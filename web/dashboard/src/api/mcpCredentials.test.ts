@@ -1,4 +1,4 @@
-// MC-4 unit tests for the MCP credentials client: frozen-contract shapes
+// Unit tests for the MCP credentials client: frozen-contract shapes
 // (URL, method, body), secret hygiene (values ride the body exactly once —
 // never a URL, never retained by the module), the masked-read contract and
 // the honest `null` for the not-yet-mounted user-credentials list endpoint.

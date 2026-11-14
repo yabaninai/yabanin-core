@@ -1,14 +1,12 @@
-// client.ts unchanged — behavior-preserving split into domain modules).
-//
-// U07: unified API errors + cancellation.
+// Unified API errors + cancellation.
 //
 // - ApiError is the single typed error for every HTTP failure: status, the
 //   server `error` code/message when the body is JSON, and the raw body text.
 // - `signal` is an optional AbortSignal on every request (readonly parameter —
 //   the client NEVER creates or aborts on its own; callers own the
-//   AbortController). AF-08: the transport keeps it connected until body
-//   parsing finished, so an abort during a response-body read still cancels.
-// - AF-08: the documented default 30s read timeout is really armed (even with
+//   AbortController). The transport keeps it connected until body parsing
+//   finishes, so an abort during a response-body read still cancels.
+// - The documented default 30s read timeout is really armed (even with
 //   no options; `timeoutMs: 0` disables it). Mutations arm no timer unless the
 //   caller passes one — a client-side timeout there would leave the
 //   server-side outcome unknown.
@@ -19,7 +17,7 @@
 //   does not duplicate a request the server accepted. GETs are retry-safe but
 //   we still do not retry: the UI decides.
 //
-// AF-08: the HTTP lifecycle itself (CSRF preparation, fetch, error parsing,
+// The HTTP lifecycle itself (CSRF preparation, fetch, error parsing,
 // body parsing, cancellation scope and cleanup) lives in ./transport — one
 // owner for every request. The domain modules (./orgs, ./keys, …) are the
 // endpoint surface; ./client re-exports everything for compatibility.
@@ -43,23 +41,24 @@ export async function postJSON<T>(url: string, body: unknown, method: 'POST' | '
   return outcome.body as T
 }
 
-// ===== Control-plane API (I9) =====
+// ===== Control-plane API =====
 
 export interface Paginated<T> {
   data: T[]
   pagination: { page: number; page_size: number; total: number; total_pages: number }
 }
 
-// AUX-03 (server-side sort, AUX-02 contract): allowlisted `sort` column +
-// `dir`; an unknown column is rejected by the server with 400 invalid_sort,
-// which callers surface as an error state (never silently ignored).
+// Server-side sort contract: allowlisted `sort` column + `dir`; an unknown
+// column is rejected by the server with 400 invalid_sort, which callers
+// surface as an error state (never silently ignored).
 export interface ListSortParams {
   sort?: string
   dir?: 'asc' | 'desc'
 }
 
-// server must slice exactly what the page labels promise. Without it the
-// server serves its own default (50) while pages assume their PAGE_SIZE.
+// listQuery always sends page_size — the server must slice exactly what the
+// page labels promise. Without it the server serves its own default (50)
+// while pages assume their PAGE_SIZE.
 export const DEFAULT_PAGE_SIZE = 50
 
 export function listQuery(page: number, pageSize: number, sort?: string, dir?: 'asc' | 'desc'): string {

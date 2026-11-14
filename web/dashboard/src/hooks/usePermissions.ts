@@ -1,7 +1,7 @@
 import { useEffect, useState } from 'react'
 import { fetchJSON } from '../api/client.ts'
 
-// AUX-13: UI-side permission hints from the console GET /api/me.
+// UI-side permission hints from the console GET /api/me.
 //
 // The server remains the sole arbiter — every mutation can still 403. This
 // hook only feeds convenience: disabling buttons with a "requires permission

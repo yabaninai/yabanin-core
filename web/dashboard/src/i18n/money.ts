@@ -1,9 +1,9 @@
-// TP-05: honest USD money rendering — pure core (no i18n import) so the
+// Honest USD money rendering — pure core (no i18n import) so the
 // locale/separator contract is unit-testable under `node --test`.
 //
 // All money the dashboard displays is USD by origin: backend `*_usd` fields
 // and USD cents / 100. The org `currency` is a PRESENTATION code, not a
-// conversion — the dashboard applies no FX (no rates/cache, see TP-05), so a
+// conversion — the dashboard applies no FX (no rates/cache), so a
 // non-USD presentation must never relabel USD amounts with a foreign symbol
 // (that would invent a conversion). Instead the amount keeps its honest unit:
 // the number is formatted with the active locale's conventions and an

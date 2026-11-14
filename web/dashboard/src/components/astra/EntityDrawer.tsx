@@ -4,19 +4,20 @@ import { CopyIdButton } from './CopyIdButton'
 import { StateNotice } from './StateNotice'
 import { useFocusTrap } from './useFocusTrap'
 
-// AUX-17: EntityDrawer — the side inspector card for an entity (API key,
+// EntityDrawer — the side inspector card for an entity (API key,
 // model, rule, organization). A right-side panel over a dimmed backdrop,
 // opened from an entity-name click and from the `?inspect=<id>` deep link.
 // Read-only on purpose: it surfaces identifiers (full-value copy, as in the
 // DataTable), the typed fields already carried by the list row (or an
 // existing detail GET — no new endpoints), recent related activity when the
 // page already holds that data, and links to the related list pages. The
-// mutating actions stay in the rows (AUX-12 contract); permission gates are
-// untouched (AUX-13).
+// mutating actions stay in the rows (ActionDialog contract); permission
+// gates are untouched.
 //
 // The keyboard contract (opener capture, Tab cycle, Escape, focus restore)
-// the drawer shell. Full-screen width on phones (the AUX-17 acceptance: the
-// layout must not break at 360px — see .astra-drawer in index.css).
+// comes from the shared useFocusTrap hook that backs the drawer.
+// Full-screen width on phones (the layout must not break at 360px — see
+// .astra-drawer in index.css).
 export interface EntityDrawerId {
   label: string
   value: string
