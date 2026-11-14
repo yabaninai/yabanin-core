@@ -15,7 +15,7 @@
   "devDependencies": {
     "typescript": "^5.4.0",
     "vitest": "^1.6.0",
-    "msw": "^2.3.0"
+    "msw": "^3.0.4"
   },
   "license": "Apache-2.0"
 }
