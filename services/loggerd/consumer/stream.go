@@ -687,26 +687,22 @@ func (c *StreamConsumer) handleRequestFailedProfile(ctx context.Context, msg red
 	// safety window. Client-side interrupts (client_cancel, idle_timeout)
 	// keep the consumption model (D1: the delivered prefix is billable).
 	chargeMicro, chargeState := resaleDeductionMicro(ev.costQuote, ev.resaleQuote, ev.costQuoteState, ev.resaleQuoteState)
-	partialUsageKnown := ev.acct.usageSource != "none" && chargeState == money.QuotePositive
-	absorbedUpstream := ev.termination == TerminationUpstreamErr && ev.acct.usageSource != "none"
+	// Client cancel before provider usage: the byte-count estimate is a
+	// bound, not a delivered-usage price. Billing it would charge unknown
+	// usage as if it were known; instead the event stays uncharged-unknown
+	// (reserve returned by reconcile, counted in uncharged_unknown_total,
+	// durable pending_price record) while a cancel AFTER provider usage
+	// keeps billing the delivered prefix below (D1).
+	if ev.termination == TerminationClientCancel && ev.acct.usageSource == "estimated" {
+		chargeMicro, chargeState = 0, money.QuoteUnknown
+	}
+	partialUsageKnown, absorbedUpstream := classifyFailedCharge(ev, chargeState)
 	var plan []scopeCharge
 	switch {
 	case absorbedUpstream:
-		for _, sc := range scopeChargePlan(ev, chargeMicro, chargeState) {
-			metrics.AbsorbedUpstreamErrorMicroUSD.WithLabelValues(sc.scope).Add(float64(sc.amount))
-		}
+		emitAbsorbedUpstreamMetrics(ev, chargeMicro, chargeState)
 	case partialUsageKnown:
-		if mode, modeErr := c.reservationsMode(ctx, ev.orgID); modeErr == nil {
-			switch mode {
-			case modeEnforce:
-				plan = scopeChargePlan(ev, chargeMicro, chargeState)
-			case modeShadow:
-				for _, sc := range scopeChargePlan(ev, chargeMicro, chargeState) {
-					metrics.WouldBillPartialMicroUSD.WithLabelValues(sc.scope).Add(float64(sc.amount))
-				}
-			default: // off — legacy: failed requests are never billed
-			}
-		}
+		plan = c.billablePlanForMode(ctx, ev, chargeMicro, chargeState)
 	}
 	// A priced-and-absorbed upstream failure is not an unknown cost — its
 	// bound belongs to the absorbed metric, not to uncharged_unknown.
@@ -717,12 +713,63 @@ func (c *StreamConsumer) handleRequestFailedProfile(ctx context.Context, msg red
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
+	return c.persistFailedDelivery(ctx, tx, msg, ev, plan, chargeState, absorbedUpstream, policy)
+}
+
+// classifyFailedCharge derives the two charge classes of a request.failed
+// event: partialUsageKnown (usage existed and a positive quote survived
+// the cancel override — billable in enforce mode) and absorbedUpstream
+// (an upstream error whose cost the platform absorbs, observed only).
+func classifyFailedCharge(ev requestEvent, chargeState money.QuoteState) (partialUsageKnown, absorbedUpstream bool) {
+	partialUsageKnown = ev.acct.usageSource != "none" && chargeState == money.QuotePositive
+	absorbedUpstream = ev.termination == TerminationUpstreamErr && ev.acct.usageSource != "none"
+	return partialUsageKnown, absorbedUpstream
+}
+
+// emitAbsorbedUpstreamMetrics exports the would-be charge per scope of a
+// priced upstream failure the platform absorbs (NEXT-18d): the platform
+// cost stays observable while no charge intents are ever created.
+func emitAbsorbedUpstreamMetrics(ev requestEvent, chargeMicro money.MicroUSD, chargeState money.QuoteState) {
+	for _, sc := range scopeChargePlan(ev, chargeMicro, chargeState) {
+		metrics.AbsorbedUpstreamErrorMicroUSD.WithLabelValues(sc.scope).Add(float64(sc.amount))
+	}
+}
+
+// billablePlanForMode resolves the enforce-mode charge plan for a failed
+// request with known partial usage: shadow only observes what enforce
+// WOULD bill (WouldBillPartialMicroUSD), off keeps the legacy behavior
+// (failed requests are never billed). A mode-lookup error bills nothing —
+// the durable settlement path stays authoritative.
+func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEvent, chargeMicro money.MicroUSD, chargeState money.QuoteState) []scopeCharge {
+	mode, modeErr := c.reservationsMode(ctx, ev.orgID)
+	if modeErr != nil {
+		return nil
+	}
+	switch mode {
+	case modeEnforce:
+		return scopeChargePlan(ev, chargeMicro, chargeState)
+	case modeShadow:
+		for _, sc := range scopeChargePlan(ev, chargeMicro, chargeState) {
+			metrics.WouldBillPartialMicroUSD.WithLabelValues(sc.scope).Add(float64(sc.amount))
+		}
+	default: // off — legacy: failed requests are never billed
+	}
+	return nil
+}
+
+// persistFailedDelivery writes one request.failed delivery inside the
+// claimed transaction and commits it: the request log row (raw error text
+// and raw status code — the failed-shape contract), the policy decision
+// verdict, the enforce-mode charge intents, and the pending_price record.
+// After the commit it reports the uncharged-unknown signal exactly once
+// per committed delivery (N06-P04-T08).
+func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, msg redis.XMessage, ev requestEvent, plan []scopeCharge, chargeState money.QuoteState, absorbedUpstream bool, policy deliveryPolicy) error {
 	// request.failed keeps the raw error text and the raw status code: a
 	// failed event with status 0 stores 0, and an absent error stores '' —
 	// the failed-shape contract, unchanged.
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := fullRequestLogRow(ev, sessionIDStr, ev.errorMsg, ev.statusCode)
-	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
+	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 
 	if _, err := tx.Exec(ctx, row.insertSQL(), row.args()...); err != nil {
 		return fmt.Errorf("insert request_log for failed event: %w", err)
