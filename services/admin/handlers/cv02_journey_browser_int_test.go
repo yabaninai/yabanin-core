@@ -540,33 +540,42 @@ func cv02SpecVerdict(spec cv02PWSpec) string {
 // cv02EnforceCaseRegistry applies the FROZEN registry to the parsed
 // results: every required ID exactly once and passed; no unknown, unnamed
 // or duplicate case IDs. Any violation fails the mandatory acceptance.
-func cv02EnforceCaseRegistry(t *testing.T, specs []cv02FlatSpec) []cv02CaseResult {
-	t.Helper()
+// cv02CaseVerdicts enforces the frozen case registry over the flattened
+// specs: every required case exactly once and passed. Problems are returned
+// (not raised) so the caller can write the run receipt FIRST and fail
+// afterwards — a failing run keeps its evidence.
+func cv02CaseVerdicts(specs []cv02FlatSpec) (cases []cv02CaseResult, problems []string) {
 	byID := make(map[string][]cv02FlatSpec)
 	for _, fs := range specs {
 		id := cv02CaseID(fs.Spec.Title)
 		if id == "" {
-			t.Fatalf("cv02: unnamed journey case %q — every spec title must start with its frozen AC-* case ID", fs.Spec.Title)
+			problems = append(problems, fmt.Sprintf("unnamed journey case %q — every spec title must "+
+				"start with its frozen AC-* case ID", fs.Spec.Title))
+			continue
 		}
 		byID[id] = append(byID[id], fs)
 	}
-	var results []cv02CaseResult
 	for _, id := range cv02RequiredJourneyCases {
 		got := byID[id]
-		if len(got) == 0 {
-			t.Fatalf("cv02: required journey case %s is MISSING from the results — the frozen registry "+
-				"(%d cases) requires every case to run and pass; a green run with a dropped case is not acceptance",
-				id, len(cv02RequiredJourneyCases))
-		}
-		if len(got) > 1 {
-			t.Fatalf("cv02: journey case %s appears %d times — exactly one spec per case ID is allowed", id, len(got))
+		switch {
+		case len(got) == 0:
+			cases = append(cases, cv02CaseResult{ID: id, Status: "missing"})
+			problems = append(problems, fmt.Sprintf("required journey case %s is MISSING from the results — "+
+				"the frozen registry (%d cases) requires every case to run and pass; a green run with a "+
+				"dropped case is not acceptance", id, len(cv02RequiredJourneyCases)))
+			continue
+		case len(got) > 1:
+			problems = append(problems, fmt.Sprintf("journey case %s appears %d times — exactly one spec "+
+				"per case ID is allowed", id, len(got)))
+			continue
 		}
 		status := cv02SpecVerdict(got[0].Spec)
+		cases = append(cases, cv02CaseResult{ID: id, Title: got[0].Spec.Title, Status: status})
 		if status != "passed" {
-			t.Fatalf("cv02: required journey case %s did not pass (status %q, suite %q) — skipped or failed "+
-				"cases are not acceptance; see playwright.out for details", id, status, got[0].Suite)
+			problems = append(problems, fmt.Sprintf("required journey case %s did not pass (status %q, "+
+				"suite %q) — skipped or failed cases are not acceptance; see playwright.out for details",
+				id, status, got[0].Suite))
 		}
-		results = append(results, cv02CaseResult{ID: id, Title: got[0].Spec.Title, Status: status})
 		delete(byID, id)
 	}
 	if len(byID) > 0 {
@@ -575,10 +584,10 @@ func cv02EnforceCaseRegistry(t *testing.T, specs []cv02FlatSpec) []cv02CaseResul
 			ids = append(ids, id)
 		}
 		sort.Strings(ids)
-		t.Fatalf("cv02: unknown journey cases %v are not in the frozen registry — extend the registry "+
-			"deliberately, never by silent addition", ids)
+		problems = append(problems, fmt.Sprintf("unknown journey cases %v are not in the frozen registry — "+
+			"extend the registry deliberately, never by silent addition", ids))
 	}
-	return results
+	return cases, problems
 }
 
 // cv02ExtractJSONObject finds the Playwright JSON report inside captured
@@ -607,10 +616,11 @@ func cv02ExtractJSONObject(t *testing.T, out []byte) []byte {
 }
 
 // cv02RunPlaywright runs the REGISTERED npm command (test:journey) with the
-// JSON reporter, saves raw output as evidence and returns the parsed
-// report. A non-zero exit FAILS the acceptance (its output tail is
-// reported and kept at playwright.out).
-func cv02RunPlaywright(t *testing.T, repoRoot, baseURL, fixturePath, artifacts string) cv02PWReport {
+// JSON reporter, saves raw output as evidence and returns the parsed report,
+// the suite error (nil when green) and the raw output. A failed suite still
+// yields its report — the caller writes the receipt before failing. Only
+// broken reporter plumbing (no parsable JSON document) fails here.
+func cv02RunPlaywright(t *testing.T, repoRoot, baseURL, fixturePath, artifacts string) (cv02PWReport, error, []byte) {
 	t.Helper()
 	runCtx, cancel := context.WithTimeout(context.Background(), 8*time.Minute)
 	defer cancel()
@@ -624,13 +634,10 @@ func cv02RunPlaywright(t *testing.T, repoRoot, baseURL, fixturePath, artifacts s
 	out, err := cmd.CombinedOutput()
 	require.NoError(t, os.WriteFile(filepath.Join(artifacts, "playwright.out"), out, 0o644))
 	t.Logf("cv02 playwright run: %d bytes of output kept at %s/playwright.out", len(out), artifacts)
-	if err != nil {
-		t.Fatalf("cv02 browser acceptance suite FAILED (%v) — output tail:\n%s", err, cv02Tail(out, 6000))
-	}
 	var report cv02PWReport
 	require.NoError(t, json.Unmarshal(cv02ExtractJSONObject(t, out), &report),
 		"cv02: Playwright JSON report does not parse")
-	return report
+	return report, err, out
 }
 
 // cv02StandSummary is the run receipt: the verdict bound to the exact
@@ -929,9 +936,9 @@ func TestCV02RequestJourneyBrowserAcceptance(t *testing.T) {
 
 	// Registered command + frozen-registry enforcement (audit repair):
 	// a green run missing a required case is not acceptance.
-	report := cv02RunPlaywright(t, repoRoot, srv.URL, fixturePath, artifacts)
+	report, suiteErr, out := cv02RunPlaywright(t, repoRoot, srv.URL, fixturePath, artifacts)
 	specs := cv02FlattenSpecs(report.Suites, "", nil)
-	cases := cv02EnforceCaseRegistry(t, specs)
+	cases, problems := cv02CaseVerdicts(specs)
 	for _, c := range cases {
 		t.Logf("cv02 case %s: %s", c.ID, c.Status)
 	}
@@ -943,6 +950,17 @@ func TestCV02RequestJourneyBrowserAcceptance(t *testing.T) {
 	}
 	summary.Barrier.Held, summary.Barrier.Released = held, released
 	t.Logf("cv02 stand receipt: %s", cv02WriteStandSummary(t, artifacts, summary))
+	if len(problems) > 0 {
+		for _, p := range problems {
+			t.Errorf("cv02: %s", p)
+		}
+		t.Fatalf("cv02: frozen journey case registry violated by %d problem(s) — see above and %s",
+			len(problems), filepath.Join(artifacts, "playwright.out"))
+	}
+	if suiteErr != nil {
+		t.Fatalf("cv02 browser acceptance suite FAILED (%v) — output tail:\n%s",
+			suiteErr, cv02Tail(out, 6000))
+	}
 }
 
 // cv02Tail returns the last n bytes of a byte slice for failure reporting.
