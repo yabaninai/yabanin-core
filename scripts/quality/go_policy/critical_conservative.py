@@ -184,6 +184,7 @@ def guard_targets(previous, current, build_tags, package, selection):
         return
     for index, mode in enumerate(build_tags):
         guard_target_coverage(previous, current, index, mode, package)
+        guard_relocated_targets(previous, current, index, mode, package)
 
 
 def guard_last_fuzz_target(previous, current, package, selection):
@@ -201,17 +202,47 @@ def guard_target_coverage(previous, current, index, mode, package):
 
     A file renamed or constraint-tagged out of one build mode keeps its
     names visible to parsing; only mode-aware counting exposes the loss.
-    Test loss is tolerated while fuzz targets remain: the fuzz kind owns
-    execution for fuzz-target packages.
     """
     before_fuzz, before_test = mode_targets(previous, index)
     after_fuzz, after_test = mode_targets(current, index)
     if before_fuzz and not after_fuzz:
         raise ValueError('Critical fuzz target coverage loss in build mode "' + mode +
                          '"; gate would be silently not applicable: ' + package)
-    if before_test and not after_test and not after_fuzz:
+    if before_test and not after_test:
         raise ValueError('Critical unit-test coverage loss in build mode "' + mode +
                          '"; gate would be silently not applicable: ' + package)
+
+
+def guard_relocated_targets(previous, current, index, mode, package):
+    """Reject per-build-mode relocation of individual test targets.
+
+    guard_target_coverage only sees total loss; a single target moved
+    verbatim into a differently constrained file keeps every other target
+    applicable to the mode, so its own mode loss is checked per unit.
+    """
+    survivors = {(u['name'], u['hash']) for u in current.test_units()}
+    for unit in previous.test_units():
+        if not unit['name'].startswith(TEST_PREFIXES):
+            continue
+        if (unit['name'], unit['hash']) not in survivors:
+            continue
+        if applies(previous, unit['file'], index) and \
+                not mode_survives(unit, current, index):
+            raise ValueError(relocated_reason(unit, mode, package))
+
+
+def mode_survives(unit, current, index):
+    """Whether a verbatim-surviving test unit still applies to a mode."""
+    return any(u['name'] == unit['name'] and u['hash'] == unit['hash']
+               and applies(current, u['file'], index)
+               for u in current.test_units())
+
+
+def relocated_reason(unit, mode, package):
+    kind = 'fuzz target' if unit['name'].startswith('Fuzz') else 'unit-test'
+    return ('Critical ' + kind + ' coverage loss in build mode "' + mode +
+            '"; gate would be silently not applicable: ' + package +
+            ' (' + unit['name'] + ')')
 
 
 def mode_targets(side, index):

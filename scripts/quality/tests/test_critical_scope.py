@@ -307,6 +307,43 @@ class ConservativeScopeControls(unittest.TestCase):
             critical_scope.targets(self.root, self.base,
                                    {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
 
+    def test_platform_moved_unit_test_fails(self):
+        (self.pkg / 'auth_test.go').rename(self.pkg / 'auth_windows_test.go')
+        with self.assertRaisesRegex(ValueError, 'unit-test coverage loss'):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
+    def test_partial_unit_test_move_fails(self):
+        (self.pkg / 'neighbor_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func TestNeighbor(t *testing.T) { Neighbor() }\n')
+        self.commit('two unit tests')
+        block = 'func TestAllowed(t *testing.T) { if !Allowed(1) { t.Fatal("denied") } }\n'
+        (self.pkg / 'auth_test.go').write_text('package auth\n\nimport "testing"\n\n')
+        (self.pkg / 'auth_windows_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n' + block)
+        with self.assertRaisesRegex(ValueError,
+                                    r'unit-test coverage loss.*TestAllowed'):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
+    def test_build_tagged_out_unit_tests_fail(self):
+        path = self.pkg / 'auth_test.go'
+        path.write_text('//go:build probe_ignore\n\n' + path.read_text())
+        with self.assertRaisesRegex(ValueError, 'unit-test coverage loss'):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
+    def test_partial_fuzz_target_move_fails(self):
+        (self.pkg / 'fuzz_windows_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func FuzzAllowed(f *testing.F) {\n\tf.Add("")\n\tf.Fuzz(func(t *testing.T, in string) { Allowed(len(in)) })\n}\n')
+        (self.pkg / 'fuzz_test.go').unlink()
+        with self.assertRaisesRegex(ValueError,
+                                    r'fuzz target coverage loss.*FuzzAllowed'):
+            critical_scope.targets(self.root, self.base,
+                                   {'critical_paths': ['pkg/auth/**'], 'build_tags': ['']})
+
     def test_changed_test_keeps_baseline_consumers_selected(self):
         (self.pkg / 'auth_test.go').write_text(
             'package auth\n\nimport "testing"\n\n'
