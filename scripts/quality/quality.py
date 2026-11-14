@@ -733,7 +733,23 @@ def evidence_chain(root, manifest):
         path = rerun_prior_path(root, report, path.parent)
 
 
-def verify_evidence(root, manifest, required):
+def base_binding_failure(chain, expected_base):
+    """A verification request that resolved --base R accepts only evidence
+    recorded against exactly R. Reruns inherit the prior manifest's base, so
+    a legitimate chain is uniform; any divergence is evidence for a
+    different request."""
+    if expected_base is None:
+        return False
+    for _path, report in chain:
+        recorded = report.get("base")
+        if recorded != expected_base:
+            print(f"Evidence base differs: manifest records {recorded!r}, "
+                  f"requested base resolves to {expected_base!r}", file=sys.stderr)
+            return True
+    return False
+
+
+def verify_evidence(root, manifest, required, expected_base=None):
     """Validate a quality manifest as evidence for the required gates.
 
     QR-1: a manifest may extend a rerun chain (rerun_of links). The chain is
@@ -743,11 +759,16 @@ def verify_evidence(root, manifest, required):
     run), the gate set is identical along the chain and carried records are
     verbatim copies of their prior records, the effective gate set (union
     along the chain, newest record per gate) passes, and the newest manifest
-    is passed while older links are failed or interrupted."""
+    is passed while older links are failed or interrupted.
+
+    expected_base, when given, is the resolved revision of the requester's
+    explicit --base; every link must have recorded exactly that base."""
     try:
         chain = evidence_chain(root, manifest)
     except ValueError:
         # A broken link or a cycle means the chain itself cannot be trusted.
+        return False
+    if base_binding_failure(chain, expected_base):
         return False
     current = snapshot(root)
     links = []
@@ -1211,7 +1232,7 @@ def main():
     verify.add_argument("manifest", type=Path)
     verify.add_argument("--require", choices=sorted(set(PROFILES) | {"changed"}), default="full",
                         help="Required profile, or gates inferred from the current diff; defaults to full")
-    verify.add_argument("--base", help="With --require changed: include committed changes since merge-base")
+    verify.add_argument("--base", help="With --require changed: include committed changes since merge-base; the manifest must record exactly this resolved base")
     args = parser.parse_args()
     root = repository()
     if args.action in ("run", "changed") and args.base is None \
@@ -1226,12 +1247,18 @@ def main():
     if args.action == "evidence":
         if args.base and args.require != "changed":
             parser.error("evidence --base requires --require changed")
+        expected_base = None
         if args.require == "changed":
-            paths, _ = changed_paths(root, args.base)
+            paths, revision = changed_paths(root, args.base)
             required = list(classify(paths))
+            if args.base:
+                # Only an explicit --base request binds the evidence to that
+                # resolved base; without the flag the manifest's recorded
+                # base is not part of the request.
+                expected_base = revision
         else:
             required = expand([args.require])
-        valid = verify_evidence(root, args.manifest, required)
+        valid = verify_evidence(root, args.manifest, required, expected_base)
         print("Evidence matches current source and logs" if valid else "Evidence failed, stale or modified")
         return 0 if valid else 1
     if args.timeout <= 0:
