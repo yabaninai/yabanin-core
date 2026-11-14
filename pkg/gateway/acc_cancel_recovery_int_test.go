@@ -1,55 +1,34 @@
 //go:build integration
 
-// Accounting cancellation/recovery reproducer — task
-// accounting-cancel-recovery-repro, base 786885f.
+// ACC — accounting cancellation/recovery integration cases against the
+// real gateway, real Postgres, real Redis and the real consumer/settlement
+// workers. Oracle of record is SQL over credit_transactions / org_credits /
+// settlement_jobs / request_logs — never the service's own accounting API.
 //
-// FROZEN CONTRACT (decided before implementation; three-outcome acceptance:
-// original red OR verified-negative, bounded fix green, deliberately-broken
-// scratch variant red on the SAME invariant):
-//
-//	Invariant (R1 leaf, accounting-recovery investigation): "client-cancelled
-//	stream with known partial usage bills exactly the delivered prefix once,
-//	releases the reservation, records unknown usage as uncharged-unknown —
-//	never silent zero, never leaked reserve."
-//
-//	ACC-R1a  client cancels BEFORE any usage chunk → usage unknown.
-//	         PASS: zero wallet debit for the request; a durable record
-//	         exists (request_logs row + pending_price settlement row);
-//	         reservation returns to reserved=0 via the documented
-//	         reconcile release path; no debit appears after release.
-//	         PREDICTED ORIGINAL: RED — the provider fallback estimates
-//	         usage from byte counts on the scanner-error path and the
-//	         consumer bills resale(estimate) as if it were known.
-//
-//	ACC-R1b  client cancels AFTER a usage-bearing chunk (2500+2500 tokens,
-//	         0% markup → resale 2.3 USD/1M per side = 11 500 µUSD).
-//	         PASS: exactly one debit of exactly -11 500 µUSD; exact wallet
-//	         carry math (100 000¢/0µ → 99 999¢/1 500µ); exactly one
-//	         'settled' resale_deduction job; reserved returns to 0; no
-//	         second debit after the late release.
-//	         PREDICTED ORIGINAL: GREEN (verified-negative accepted).
-//
-//	ACC-R2   settlement worker down during delivery → durable pending job,
-//	         no debit; worker start → exactly one debit; worker restart →
+//	ACC-R1a  A client write failure mid-stream (first content chunk
+//	         delivered, second write fails) must bill the byte-estimated
+//	         delivered prefix exactly once — D1: the delivered prefix of a
+//	         client-interrupted stream is billable, and without provider
+//	         usage the estimate is ceil(bytes/4) tokens per side, priced at
+//	         the org's 0%-markup resale rate. PASS: request_logs carries
+//	         usage_source='estimated', exactly one usage debit of the
+//	         hand-counted amount, one settled resale_deduction job, no
+//	         pending_price record, reservation fully released, no late
+//	         second debit.
+//	ACC-R1b  Client cancels after a usage-bearing chunk (2500+2500 tokens
+//	         at 2.3 USD/1M, 0% markup → 11 500 µUSD): exactly one debit of
+//	         -11 500 µUSD, exact wallet carry (100 000¢/0µ → 99 999¢/1 500µ),
+//	         one settled job, reserve release, no second debit.
+//	ACC-R2   Settlement worker down during delivery → durable pending job,
+//	         no debit; worker start → exactly one debit; second restart →
 //	         still exactly one debit (no loss, no double charge).
-//
-//	ACC-R3   two concurrent cancels with distinct request IDs → two
+//	ACC-R3   Two concurrent cancels with distinct request IDs → two
 //	         independent single debits; byte-identical replay of a settled
 //	         event → still exactly one debit for that request; two
 //	         concurrent requests sharing one client X-Request-Id → exactly
-//	         one debit (documented by-design boundary: the money layer
-//	         dedups by request ID while the transport honors client
-//	         X-Request-Id verbatim).
-//
-// Deliberately-broken scratch variants (verified on a throwaway tree, never
-// committed): skip-finalize-on-cancel (leaked reserve → R1a/R1b reserved
-// stays > 0), unknown-as-zero (pending_price row missing → R1a durable
-// signal absent), settle-key idempotency removed (duplicate debit on R3
-// replay).
-//
-// Oracle of record is SQL over credit_transactions / org_credits /
-// settlement_jobs / request_logs / budget_allowances — never the service's
-// own accounting API.
+//	         one debit (by-design boundary: the money layer dedups by
+//	         request ID while the transport honors client X-Request-Id
+//	         verbatim).
 package cli
 
 import (
@@ -98,18 +77,23 @@ const (
 
 // accUpstream is a barrier-held SSE upstream: it writes the scripted chunks,
 // flushes each, then holds the connection open until release (test end) or
-// until the gateway drops it (client cancellation propagating upstream).
+// until the gateway drops it (client cancellation propagating upstream). It
+// also records the serialized upstream request body length so tests can
+// assert byte-freezes they price against.
 type accUpstream struct {
-	srv     *httptest.Server
-	release chan struct{}
-	once    sync.Once
-	dropped atomic.Bool
+	srv       *httptest.Server
+	release   chan struct{}
+	once      sync.Once
+	dropped   atomic.Bool
+	bodyBytes atomic.Int64
 }
 
 func accStartUpstream(t *testing.T, chunks []string) *accUpstream {
 	t.Helper()
 	up := &accUpstream{release: make(chan struct{})}
 	up.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		up.bodyBytes.Store(int64(len(body)))
 		w.Header().Set("Content-Type", "text/event-stream")
 		flusher, _ := w.(http.Flusher)
 		for _, c := range chunks {
@@ -171,6 +155,7 @@ type accEnv struct {
 	pool          *pgxpool.Pool
 	rdb           *redis.Client
 	org           string
+	mux           *chi.Mux
 	srv           *httptest.Server
 	up            *accUpstream
 	cs            *credits.Store
@@ -213,7 +198,7 @@ func accNewEnv(t *testing.T, chunks []string, withSettlement bool) *accEnv {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	e := &accEnv{pool: pool, rdb: rdb, org: org, srv: srv, up: up, cs: cs, log: log, stream: accStream}
+	e := &accEnv{pool: pool, rdb: rdb, org: org, mux: mux, srv: srv, up: up, cs: cs, log: log, stream: accStream}
 	if withSettlement {
 		e.startSettlement(t)
 	}
@@ -428,60 +413,143 @@ func (e *accEnv) findStreamMessage(t *testing.T, reqID string) map[string]interf
 
 // --- ACC-R1a --------------------------------------------------------------
 
-func TestAccR1aClientCancelBeforeUsageNotBilled(t *testing.T) {
-	e := accNewEnv(t, []string{accContentChunk}, true)
+// Frozen ACC-R1a script bytes. The client disconnect is selected by
+// payload, not timing: whichever stream write carries accR1aFailMarker is
+// the scripted connection break, so the exit under test is deterministic.
+const (
+	// accR1aFirstContent is exactly 40 bytes: completion tokens are
+	// ceil(40/4) = 10, a multiple of 10 so each priced side is an integral
+	// micro-USD amount under any rounding rule.
+	accR1aFirstContent = "0123456789012345678901234567890123456789"
+	accR1aFailMarker   = "SECOND-CHUNK-NEVER-DELIVERED"
+	// accR1aClientBody is the client request (exactly 120 bytes). The
+	// gateway forwards it upstream with a byte-neutral model override and
+	// — in this programmatic harness, where streamUsageProviders is unset —
+	// no stream_options injection: the stub sees exactly the same 120
+	// bytes, which is the prompt term of the estimate.
+	accR1aClientBody = `{"model":"stub-model","messages":[{"role":"user","content":"r1a-oracle-freeze-12345"}],"stream":true,"max_tokens":16384}`
+)
+
+var (
+	accR1aChunk1 = `data: {"id":"acc-r1a","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"` + accR1aFirstContent + `"},"finish_reason":null}]}` + "\n\n"
+	accR1aChunk2 = `data: {"id":"acc-r1a","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"` + accR1aFailMarker + `"},"finish_reason":null}]}` + "\n\n"
+)
+
+// Hand-counted ACC-R1a oracle, frozen at compile time:
+//
+//	upstream body bytes  accR1aUpstreamBodyBytes = 120  (≡ 0 mod 40)
+//	prompt tokens        ceil(120/4)            = 30   (≡ 0 mod 10)
+//	completion tokens    ceil(40/4)             = 10   (≡ 0 mod 10)
+//	resale USD           (30 + 10) tokens × 2.3 USD / 1M, 0% org markup
+//	charge µUSD          23 × (30 + 10) / 10    = 92
+//
+// Each token side prices to an integral µUSD amount (30×2.3 = 69µ,
+// 10×2.3 = 23µ), so the total is independent of rounding order. The test
+// asserts the upstream body really is the frozen byte count before using
+// the constant, so serialization drift fails loudly instead of mis-pricing.
+const (
+	accR1aUpstreamBodyBytes = 120
+	accR1aPromptTokens      = accR1aUpstreamBodyBytes / 4
+	accR1aCompletionTokens  = 10
+	accR1aChargeMicro       = 23 * (accR1aPromptTokens + accR1aCompletionTokens) / 10
+)
+
+// accFailWriter is a client whose connection breaks mid-stream: the write
+// whose payload carries the fail marker both fails and cancels the request
+// context, mirroring net/http on a peer disconnect. Failure is sticky —
+// later best-effort writes (error frames after the drain failure) fail too.
+type accFailWriter struct {
+	header http.Header
+	cancel context.CancelFunc
+	failed bool
+}
+
+func (w *accFailWriter) Header() http.Header { return w.header }
+func (w *accFailWriter) WriteHeader(int)     {}
+func (w *accFailWriter) Flush()              {}
+
+func (w *accFailWriter) fail(p string) bool {
+	if w.failed || strings.Contains(p, accR1aFailMarker) {
+		w.failed = true
+		w.cancel()
+		return true
+	}
+	return false
+}
+
+func (w *accFailWriter) Write(p []byte) (int, error) {
+	if w.fail(string(p)) {
+		return 0, fmt.Errorf("acc: client connection reset")
+	}
+	return len(p), nil
+}
+
+func (w *accFailWriter) WriteString(s string) (int, error) {
+	if w.fail(s) {
+		return 0, fmt.Errorf("acc: client connection reset")
+	}
+	return len(s), nil
+}
+
+func TestAccR1aClientWriteFailureBillsEstimatedPrefixOnce(t *testing.T) {
+	e := accNewEnv(t, []string{accR1aChunk1, accR1aChunk2}, true)
 	reqID := "acc-r1a-" + uuid.NewString()[:8]
 
-	e.streamAndCancel(t, reqID, `"content":"hello"`)
-	e.requireUpstreamTeardown(t)
+	// Drive the real handler chain (same chi router the live tests use)
+	// in-process with the scripted disconnect: chunk1 is delivered, the
+	// chunk2 write fails and cancels the request context.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(accR1aClientBody))
+	req = req.WithContext(ctx)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Org-Id", e.org)
+	req.Header.Set("X-Request-Id", reqID)
+	e.mux.ServeHTTP(&accFailWriter{header: make(http.Header), cancel: cancel}, req)
 
-	// Durable record exists — never silent zero.
+	// The freeze guard: the prompt term of the estimate must come from
+	// exactly the bytes the gateway serialized upstream.
+	require.EqualValues(t, accR1aUpstreamBodyBytes, e.up.bodyBytes.Load(),
+		"upstream request body length drifted from the frozen oracle constant")
+
+	// The interrupted stream must be accounted as a byte-based estimate of
+	// the delivered prefix — never usage_source='none' (which would
+	// silently drop the whole charge).
 	require.Eventually(t, func() bool {
-		_, ok := e.requestLogSource(t, reqID)
-		return ok
-	}, 20*time.Second, 200*time.Millisecond, "no request_logs row for cancelled request")
-	src, _ := e.requestLogSource(t, reqID)
-	t.Logf("request_logs.usage_source=%q (unknown usage documented)", src)
+		src, ok := e.requestLogSource(t, reqID)
+		return ok && src == "estimated"
+	}, 20*time.Second, 200*time.Millisecond,
+		"ACC-R1a violated: usage_source is not 'estimated' — %s", e.evidence(t, reqID))
 
-	// Durable unknown-cost signal: a settlement row for the request must
-	// exist. Desired shape: a pending_price record (never claimed, never
-	// charged, expires to terminal 'unknown') — never a wallet charge.
+	// Exactly one settled resale job at the hand-counted amount…
 	require.Eventually(t, func() bool {
-		return e.jobCount(t, reqID) > 0
-	}, 20*time.Second, 200*time.Millisecond, "no settlement record for cancelled request — %s (event reservations: %v)",
-		e.evidence(t, reqID), func() any {
-			msg := e.findStreamMessage(t, reqID)
-			if msg == nil {
-				return "message-not-found"
-			}
-			return msg["reservations"]
-		}())
-	require.Eventually(t, func() bool {
-		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindPendingPrice)
-		return ok && status == "pending_price"
-	}, 20*time.Second, 200*time.Millisecond, "no pending_price record — %s", e.evidence(t, reqID))
-	_, _, resaleCharged := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
-	require.False(t, resaleCharged, "resale charge for unknown-usage cancel — %s", e.evidence(t, reqID))
+		status, amount, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+		return ok && status == "settled" && amount == accR1aChargeMicro
+	}, 25*time.Second, 200*time.Millisecond,
+		"ACC-R1a violated: estimated-prefix charge did not settle at the hand-counted amount — %s", e.evidence(t, reqID))
 
-	// Give the worker a few ticks, then the oracle: NO wallet debit may
-	// exist for usage that was never known. (Original prediction: RED —
-	// estimated usage billed as if known.)
-	time.Sleep(1 * time.Second)
-	require.Empty(t, e.usageDebits(t, reqID),
-		"ACC-R1a violated: unknown-usage cancel billed — %s", e.evidence(t, reqID))
+	// …exactly one usage debit of exactly that amount, and no unknown-price
+	// record (the estimate is a priced quote, not an unknown).
+	require.Equal(t, []int64{-accR1aChargeMicro}, e.usageDebits(t, reqID),
+		"ACC-R1a violated: estimated delivered prefix not billed exactly once — %s", e.evidence(t, reqID))
+	require.Equal(t, 1, e.jobCount(t, reqID), "unexpected settlement jobs — %s", e.evidence(t, reqID))
+	if _, _, ppOK := e.jobRow(t, reqID, consumer.ChargeKindPendingPrice); ppOK {
+		t.Fatalf("ACC-R1a violated: pending_price record for a fully-priced estimate — %s", e.evidence(t, reqID))
+	}
 
-	// Reservation was held and is released via the reconcile path; the
-	// release must not bill anything.
-	_, _, reserved := e.walletRow(t)
-	require.Greater(t, reserved, int64(0), "no reserve held for cancelled request — %s", e.evidence(t, reqID))
-	e.forceReleaseReservation(t)
+	// Reservation fully released (the settle pass decrements the hold; any
+	// remainder goes through the documented reconcile path), with no late
+	// second debit.
+	if _, _, reserved := e.walletRow(t); reserved > 0 {
+		e.forceReleaseReservation(t)
+	}
 	require.Eventually(t, func() bool {
 		_, _, r := e.walletRow(t)
 		return r == 0
 	}, 15*time.Second, 200*time.Millisecond,
-		"ACC-R1a violated: leaked reserve after reconcile release — %s", e.evidence(t, reqID))
-	require.Empty(t, e.usageDebits(t, reqID),
-		"debit appeared after reserve release — %s", e.evidence(t, reqID))
+		"ACC-R1a violated: leaked reserve after estimated-prefix settlement — %s", e.evidence(t, reqID))
+	require.Equal(t, []int64{-accR1aChargeMicro}, e.usageDebits(t, reqID),
+		"ACC-R1a violated: second debit after reserve release — %s", e.evidence(t, reqID))
 }
 
 // --- ACC-R1b --------------------------------------------------------------

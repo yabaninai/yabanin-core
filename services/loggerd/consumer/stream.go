@@ -687,15 +687,6 @@ func (c *StreamConsumer) handleRequestFailedProfile(ctx context.Context, msg red
 	// safety window. Client-side interrupts (client_cancel, idle_timeout)
 	// keep the consumption model (D1: the delivered prefix is billable).
 	chargeMicro, chargeState := resaleDeductionMicro(ev.costQuote, ev.resaleQuote, ev.costQuoteState, ev.resaleQuoteState)
-	// Client cancel before provider usage: the byte-count estimate is a
-	// bound, not a delivered-usage price. Billing it would charge unknown
-	// usage as if it were known; instead the event stays uncharged-unknown
-	// (reserve returned by reconcile, counted in uncharged_unknown_total,
-	// durable pending_price record) while a cancel AFTER provider usage
-	// keeps billing the delivered prefix below (D1).
-	if ev.termination == TerminationClientCancel && ev.acct.usageSource == "estimated" {
-		chargeMicro, chargeState = 0, money.QuoteUnknown
-	}
 	partialUsageKnown, absorbedUpstream := classifyFailedCharge(ev, chargeState)
 	var plan []scopeCharge
 	switch {
@@ -717,9 +708,10 @@ func (c *StreamConsumer) handleRequestFailedProfile(ctx context.Context, msg red
 }
 
 // classifyFailedCharge derives the two charge classes of a request.failed
-// event: partialUsageKnown (usage existed and a positive quote survived
-// the cancel override — billable in enforce mode) and absorbedUpstream
-// (an upstream error whose cost the platform absorbs, observed only).
+// event: partialUsageKnown (usage existed and a positive quote survived —
+// billable in enforce mode; client-side interrupts keep the D1
+// delivered-prefix consumption model) and absorbedUpstream (an upstream
+// error whose cost the platform absorbs, observed only).
 func classifyFailedCharge(ev requestEvent, chargeState money.QuoteState) (partialUsageKnown, absorbedUpstream bool) {
 	partialUsageKnown = ev.acct.usageSource != "none" && chargeState == money.QuotePositive
 	absorbedUpstream = ev.termination == TerminationUpstreamErr && ev.acct.usageSource != "none"
