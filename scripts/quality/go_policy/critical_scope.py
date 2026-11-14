@@ -15,8 +15,9 @@ CONSERVATIVE = 'conservative'
 
 
 def selector_mode():
-    """Selector variant for this run; conservative stays strictly opt-in."""
-    value = os.environ.get(MODE_ENV, LEGACY)
+    """Active selector variant: conservative by default; `legacy` is the
+    explicit emergency override; unknown values fail closed."""
+    value = os.environ.get(MODE_ENV, CONSERVATIVE)
     if value not in (LEGACY, CONSERVATIVE):
         raise ValueError('Unknown ' + MODE_ENV + ' value: ' + value)
     return value

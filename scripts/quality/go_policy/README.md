@@ -50,6 +50,13 @@ explicit coverage decision. Dependency-only edits still run policy/security and
 normal product tests; this runner does not pretend that unchanged functions were
 modified or that their missing historic fuzz tests are new-code violations.
 
+Selection runs through the qualified conservative selector by default: changed
+declarations bind their real consumers — including baseline, relocated and
+cross-package test consumers — and unresolved mapping widens the selection
+instead of running too little. `CRITICAL_SCOPE_SELECTOR=legacy` selects the
+pre-qualification selector as an explicit emergency override; any other value
+fails the gate closed instead of guessing a mode.
+
 Each affected package runs on the approved versioned budget block in
 `critical.json` (`budget.schema_version` 1): 300 seconds per package for the
 unit suite, 420 seconds for fuzzing and 300 seconds for mutation, including

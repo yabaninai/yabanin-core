@@ -26,8 +26,9 @@ class CriticalScopeControls(unittest.TestCase):
         for argv in (['init', '-q'], ['add', '.'], ['-c', 'user.name=Fixture', '-c', 'user.email=fixture@example.invalid', 'commit', '-qm', 'base']):
             subprocess.run(['git', *argv], cwd=self.root, check=True, capture_output=True)
         self.base = subprocess.check_output(['git', 'rev-parse', 'HEAD'], cwd=self.root, text=True).strip()
-        # These controls assert legacy behavior; pin the mode so an ambient
-        # CRITICAL_SCOPE_SELECTOR value cannot change what they verify.
+        # These controls assert the legacy selector reached only through the
+        # explicit CRITICAL_SCOPE_SELECTOR=legacy override; pin the mode so an
+        # ambient value cannot change what they verify.
         self.previous_mode = os.environ.get(critical_scope.MODE_ENV)
         os.environ[critical_scope.MODE_ENV] = critical_scope.LEGACY
         if self.previous_mode is None:
@@ -64,7 +65,7 @@ class CriticalScopeControls(unittest.TestCase):
 
 
 class ConservativeScopeControls(unittest.TestCase):
-    """Opt-in conservative selector: binding over widening, never silent."""
+    """Default conservative selector: binding over widening, never silent."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='critical-conservative-')
@@ -257,8 +258,15 @@ class ConservativeScopeControls(unittest.TestCase):
         self.base = empty_tree
         self.assertEqual(self.names(), {'Allowed', 'Neighbor', 'Guarded'})
 
-    def test_default_mode_stays_legacy(self):
+    def test_default_mode_is_conservative(self):
         os.environ.pop(critical_scope.MODE_ENV, None)
+        (self.pkg / 'neighbor_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func TestNeighbor(t *testing.T) { Neighbor() }\n')
+        self.assertEqual(self.names(), {'Neighbor'})
+
+    def test_explicit_legacy_override_selects_package(self):
+        os.environ[critical_scope.MODE_ENV] = critical_scope.LEGACY
         (self.pkg / 'neighbor_test.go').write_text(
             'package auth\n\nimport "testing"\n\n'
             'func TestNeighbor(t *testing.T) { Neighbor() }\n')
@@ -266,7 +274,7 @@ class ConservativeScopeControls(unittest.TestCase):
 
     def test_invalid_mode_value_fails(self):
         os.environ[critical_scope.MODE_ENV] = 'aggressive'
-        with self.assertRaises(ValueError):
+        with self.assertRaisesRegex(ValueError, 'aggressive'):
             self.selected()
 
     def test_body_swap_selects_both_functions(self):
@@ -376,7 +384,7 @@ class ConservativeScopeControls(unittest.TestCase):
 
 
 class CrossPackageConservativeControls(unittest.TestCase):
-    """Opt-in conservative selector: cross-package consumers are never silent."""
+    """Default conservative selector: cross-package consumers are never silent."""
 
     def setUp(self):
         self.temp = tempfile.TemporaryDirectory(prefix='critical-cross-')
