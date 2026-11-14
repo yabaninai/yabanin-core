@@ -1,6 +1,13 @@
 {
   "schema_version": 2,
-  "seconds_per_package_and_kind": 300,
+  "budget": {
+    "schema_version": 1,
+    "seconds_per_package": {
+      "unit": 300,
+      "fuzz": 420,
+      "mutation": 300
+    }
+  },
   "critical_paths": [
     "pkg/budget/**", "pkg/credits/**", "pkg/auth/**", "pkg/rbac/**",
     "pkg/policy/**", "pkg/toolpolicy/**", "pkg/gateway/**", "pkg/apiformat/**",
