@@ -5,7 +5,9 @@
 #   S1 fresh Community install: exactly the documented services, no hidden
 #      services, published ports bind 127.0.0.1 only
 #   S2 canonical seed + documented first request (smoke.sh) on the clean stack
-#   S3 empty DB: every embedded migration applied on the fresh volume
+#   S3 empty DB: every embedded migration applied on the fresh volume,
+#     against the pinned schema contract (head 0027, 26 pairs, 0023
+#     reserved) — never a derived max()/count
 #   S4 restart (down, no -v): named pg_data volume survives; the same key
 #      serves; seed rerun is a loud no-op
 #   S5 broken-vs-fixed: a pre-fix anonymous-volume fixture must FAIL the
@@ -492,18 +494,49 @@ code401=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $bogu
 [[ "$code401" == "401" ]] || fail "S2: bogus key got HTTP $code401, want 401"
 note "bogus key rejected with 401"
 
+# --- schema contract (pinned; migrations/README.md "Current schema and
+# numbering" + pkg/migrate numbering tests): head version 0027, exactly 26
+# up/down pairs 0001-0022 + 0024-0027, 0023 permanently reserved unused.
+# The expectation is pinned, never derived: deleting the head migration or
+# renumbering must FAIL here instead of silently lowering a max()/count.
+SCHEMA_HEAD=27
+SCHEMA_UP_SET="0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 0021 0022 0024 0025 0026 0027"
+
+migration_versions() { # <up|down>: sorted embedded migration version numbers
+  ls pkg/migrate/migrations/*."$1".sql \
+    | sed 's#.*/\([0-9]\{4\}\)_[^/]*$#\1#' | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+schema_contract_violations() { # <version> <dirty> <up-set> <down-set>
+  local ver=$1 dirty=$2 ups=$3 downs=$4
+  [[ "$ver" == "$SCHEMA_HEAD" ]] || printf 'schema version %s != pinned head %s\n' "$ver" "$SCHEMA_HEAD"
+  [[ "$dirty" == "f" ]] || printf 'schema_migrations.dirty=%s (want f)\n' "$dirty"
+  [[ "$ups" == "$SCHEMA_UP_SET" ]] || printf 'up set mismatch\n  got:    %s\n  pinned: %s\n' "$ups" "$SCHEMA_UP_SET"
+  [[ "$downs" == "$SCHEMA_UP_SET" ]] || printf 'down set mismatch\n  got:    %s\n  pinned: %s\n' "$downs" "$SCHEMA_UP_SET"
+}
+
 # --- S3 empty DB: full schema on the fresh volume ----------------------------
 step "S3 empty DB: all embedded migrations applied"
-expected_ver=$(ls pkg/migrate/migrations/*.up.sql | wc -l | tr -d ' ')
+ups=$(migration_versions up)
+downs=$(migration_versions down)
 dbver=$(dbq "SELECT version FROM schema_migrations")
 dirty=$(dbq "SELECT dirty FROM schema_migrations")
-[[ "$dbver" == "$expected_ver" ]] || fail "S3: schema version $dbver != migration file count $expected_ver"
-[[ "$dirty" == "f" ]] || fail "S3: schema_migrations.dirty=$dirty"
+viol=$(schema_contract_violations "$dbver" "$dirty" "$ups" "$downs")
+[[ -z "$viol" ]] || fail "S3: schema contract violated (pinned head $SCHEMA_HEAD, 26 pairs, 0023 reserved): $viol"
 counts=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
 [[ "$counts" == "1/1/1" ]] || fail "S3: seeded counts $counts != 1/1/1"
 credits=$(dbq "SELECT count(*) FROM org_credits WHERE balance_cents > 0")
 [[ "$credits" -ge 1 ]] || fail "S3: no org credit balance > 0"
-note "schema version=$dbver (=$expected_ver files), dirty=f; orgs/keys/admins=1/1/1; credits funded"
+# Oracle negative controls: each synthetic breach the oracle itself must
+# catch (lowered head, missing head migration file, dirty state) — otherwise
+# the pinned check above could pass vacuously.
+neg_head=$(schema_contract_violations 26 f "$ups" "$downs")
+[[ "$neg_head" == *"26 != pinned head 27"* ]] || fail "S3: oracle missed lowered head: $neg_head"
+neg_missing=$(schema_contract_violations "$dbver" f "$(printf '%s ' $SCHEMA_UP_SET | sed 's/0027 //; s/ $//')" "$downs")
+[[ "$neg_missing" == *"up set mismatch"* ]] || fail "S3: oracle missed missing 0027: $neg_missing"
+neg_dirty=$(schema_contract_violations "$dbver" t "$ups" "$downs")
+[[ "$neg_dirty" == *"dirty=t"* ]] || fail "S3: oracle missed dirty schema_migrations: $neg_dirty"
+note "schema head=$dbver (pinned $SCHEMA_HEAD), dirty=f, 26 up/down pairs (0023 reserved); oracle catches lowered head / missing 0027 / dirty"
 
 # --- S4 restart: named volume survives down (no -v) --------------------------
 step "S4 restart: down (no -v) -> up -> same key serves"
@@ -773,11 +806,12 @@ RUN_BOUNDED_KEEP="$BRK_TMP/make-quickstart-up-s9.log" run_bounded 900 make quick
   || fail "S9: make quickstart-up on the empty DB failed or stalled (failure dump above; full output kept at $BRK_TMP/make-quickstart-up-s9.log)"
 mig_s=$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' "${proj_integ}-migrate-1")
 [[ "$mig_s" == "exited/0" ]] || fail "S9: migrate on the wiped volume: $mig_s, want exited/0"
-expected_ver=$(ls pkg/migrate/migrations/*.up.sql | wc -l | tr -d ' ')
+ups=$(migration_versions up)
+downs=$(migration_versions down)
 dbver=$(idbq "SELECT version FROM schema_migrations")
 dirty=$(idbq "SELECT dirty FROM schema_migrations")
-[[ "$dbver" == "$expected_ver" ]] || fail "S9: schema version $dbver != migration file count $expected_ver"
-[[ "$dirty" == "f" ]] || fail "S9: schema_migrations.dirty=$dirty on the empty DB"
+viol=$(schema_contract_violations "$dbver" "$dirty" "$ups" "$downs")
+[[ -z "$viol" ]] || fail "S9: schema contract violated on the empty DB (pinned head $SCHEMA_HEAD, 26 pairs, 0023 reserved): $viol"
 counts=$(idbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
 [[ "$counts" == "0/0/0" ]] || fail "S9: wiped DB not empty: $counts"
 empty_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" \
