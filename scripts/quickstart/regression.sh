@@ -35,9 +35,10 @@
 #   S0 preflight additions (F2): before touching anything, the suite detects a
 #      FOREIGN stack holding one of its pinned subnets and fails fast naming
 #      the holder (network, compose project, attached containers) with
-#      remedies — evict it, or relocate only the primary project via
-#      QS_PRIMARY_NET (a counted, asserted rewrite in scratch; the shipped
-#      compose file is never edited, so the D-4 production pin stays).
+#      remedies — evict it, or relocate this suite's quickstart projects
+#      (primary and S8-S11 make flow alike) via QS_PRIMARY_NET (a counted,
+#      asserted scratch rewrite honored end-to-end via QS_COMPOSE_FILE; the
+#      shipped compose file is never edited, so the D-4 production pin stays).
 #      QS_FIXTURE_NET already relocates the S5 fixture the same way.
 #   Failure-output capture (F3): the S8-S10 make-flow invocations run under
 #      run_bounded with RUN_BOUNDED_KEEP, so a stalled or failed
@@ -85,14 +86,14 @@ fixture_subnet="$fixture_net.0/24"
 fixture_mock_ip="$fixture_net.9"
 fixture_mock_url="http://${fixture_mock_ip}:8081"
 
-# S8 make-flow networking (F2 escape hatch). The documented five-command flow
-# (S8-S11) always runs the shipped compose, so the integ project claims the
-# production D-4 pin 10.207.0.0/24 regardless of overrides. The S1-S6b
-# primary project pins it too; when a FOREIGN stack already holds the shipped
-# pin, the preflight below names the holder and hard-fails. QS_PRIMARY_NET
-# (first three octets of a /24, like the shipped 10.207 pin) relocates ONLY
-# the primary project to another free /24 — implemented as a counted,
-# asserted rewrite of a scratch copy, never an edit of the shipped file.
+# S8 make-flow networking (F2 escape hatch). The S1-S6b primary project and
+# the S8-S11 make flow share one compose source: the shipped file (claiming
+# the production D-4 pin 10.207.0.0/24) unless QS_PRIMARY_NET relocates both
+# onto another free /24. The override (first three octets of a /24, like the
+# shipped 10.207 pin) is a counted, asserted scratch rewrite exported as
+# QS_COMPOSE_FILE and honored by the Makefile quickstart targets and the
+# quickstart scripts; the shipped file is never edited. Without an override
+# a foreign holder of the shipped pin still fails the preflight below closed.
 shipped_pin="10.207.0.0/24"
 primary_net=${QS_PRIMARY_NET:-}
 if [[ -n "$primary_net" ]]; then
@@ -119,6 +120,7 @@ command -v docker  >/dev/null || fail "docker not found"
 command -v python3 >/dev/null || fail "python3 not found"
 command -v curl    >/dev/null || fail "curl not found"
 command -v openssl >/dev/null || fail "openssl not found"
+command -v sha256sum >/dev/null || fail "sha256sum not found"
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 not available"
 docker info >/dev/null 2>&1         || fail "docker daemon not reachable"
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -171,16 +173,17 @@ net_holders() {
   printf '%s' "$holders"
 }
 step "S0 preflight: pinned-subnet foreign-holder check"
+# Byte-stability oracle: S8 re-checks this digest after the make flow to
+# prove the override path never edited the shipped compose.
+shipped_sha=$(sha256sum "$compose_file" | cut -d' ' -f1)
 if [[ -n "$primary_net" ]]; then
-  # Override active: the primary moves to the override /24, but S8-S11 still
-  # claim the shipped pin via the make flow — a holder there is not fatal
-  # here, it is a loud warning (S8 will demonstrate the exact failure).
+  # Override active: every project in this run — the S1-S6b primary and the
+  # S8-S11 make flow alike — is rewritten onto the override /24, so nothing
+  # here needs the shipped pin; a foreign holder of it stays informational.
   shipped_holders=$(net_holders "$shipped_pin")
   if [[ -n "$shipped_holders" ]]; then
-    echo "WARNING: a foreign stack still holds the shipped pin $shipped_pin:" >&2
+    echo "NOTE: a foreign stack still holds the shipped pin $shipped_pin; this run does not use it (all projects run on $pri_pin_subnet):" >&2
     printf '%s\n' "$shipped_holders" >&2
-    echo "WARNING: the primary project moved to $pri_pin_subnet, but S8-S11 run the" >&2
-    echo "WARNING: shipped make flow and still need $shipped_pin free — expect S8+ to fail." >&2
   fi
   primary_holders=$(net_holders "$pri_pin_subnet")
   if [[ -n "$primary_holders" ]]; then
@@ -196,16 +199,17 @@ else
     echo "REGRESSION FAIL: a foreign stack already holds the primary pin $pri_pin_subnet:" >&2
     printf '%s\n' "$primary_holders" >&2
     cat >&2 <<'EOS'
-This suite runs three isolated projects; the primary one pins 10.207.0.0/24
-(production D-4 posture) and the S8-S11 make flow always claims the same
-subnet. Remedies, in order of preference:
+This suite runs three isolated projects; without an override they all claim
+the production D-4 pin 10.207.0.0/24 through the shipped compose. Remedies,
+in order of preference:
   1. Evict the foreign stack listed above (it is not ours to touch):
        docker compose -p <compose project> down      # if compose-managed
        docker network rm <network>                   # otherwise
-  2. Relocate only the primary project to another free /24 and rerun:
+  2. Relocate this run's quickstart projects — primary and S8-S11 make flow
+     alike — to another free /24 and rerun:
        QS_PRIMARY_NET=10.209.0 bash scripts/quickstart/regression.sh
-     (the shipped compose file is never edited; note S8-S11 still claim the
-      shipped pin itself, so the holder must be gone by then regardless)
+     (a counted, asserted scratch rewrite honored end-to-end; the shipped
+      compose file and its D-4 pin are never edited)
 EOS
     rm -rf "$BRK_TMP"
     exit 1
@@ -258,7 +262,12 @@ PY
     || fail "S0: QS_PRIMARY_NET rewrite does not render as a compose file"
   FX=(docker compose -p "$proj_fixed" -f "$PRI_COMPOSE" \
     --project-directory deploy/quickstart --profile mock)
-  note "QS_PRIMARY_NET active: primary project rewritten onto $pri_pin_subnet (mock at $primary_mock_ip); shipped file untouched"
+  # The S8-S11 make flow (INX, seed/smoke via QS_COMPOSE_FILE) must run the
+  # same rewritten compose as the primary, so the integ project claims the
+  # override /24 — never the possibly foreign-held shipped pin.
+  INX=(docker compose -p "$proj_integ" -f "$PRI_COMPOSE" \
+    --project-directory deploy/quickstart --profile mock)
+  note "QS_PRIMARY_NET active: primary project and S8-S11 make flow rewritten onto $pri_pin_subnet (mock at $primary_mock_ip); shipped file untouched"
 fi
 
 # Set when S12 generates deploy-side secrets in this checkout (they are
@@ -284,7 +293,9 @@ cleanup() {
   docker compose -p "$proj_fixed"  -f "$compose_file" --profile mock down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock --profile seed down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose -p "$proj_broken" -f "$compose_file" --profile mock --profile seed down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose -p "$proj_integ"  -f "$compose_file" --profile mock down -v --remove-orphans >/dev/null 2>&1 || true
+  # INX carries the primary scratch compose under QS_PRIMARY_NET, so the
+  # make-flow project is torn down through the file it was created from.
+  "${INX[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "$proj_fixed-wrongkey" >/dev/null 2>&1 || true
   if [[ "$integ_env_created" == 1 ]]; then
     rm -f deploy/.env
@@ -294,10 +305,16 @@ cleanup() {
 }
 trap cleanup EXIT
 
+# QS_COMPOSE_FILE routes the env-driven paths (seed.sh, smoke.sh, the make
+# flow) at the active compose: the primary scratch rewrite when QS_PRIMARY_NET
+# is set, the shipped file otherwise. use_broken drops it so the fixture
+# project never inherits the primary's compose; use_fixed restores it after
+# use_broken so S6b-onwards scripts keep targeting the primary project.
 use_fixed() {
   export COMPOSE_PROJECT_NAME="$proj_fixed"
   export QS_GATEWAY_PORT="$fixed_gw" QS_ADMIN_PORT="$fixed_adm"
   export QS_BASE="http://127.0.0.1:${fixed_gw}"
+  if [[ -n "$primary_net" ]]; then export QS_COMPOSE_FILE="$PRI_COMPOSE"; else unset QS_COMPOSE_FILE; fi
 }
 use_broken() {
   export COMPOSE_PROJECT_NAME="$proj_broken"
@@ -309,7 +326,7 @@ use_integ() {
   export COMPOSE_PROJECT_NAME="$proj_integ"
   export QS_GATEWAY_PORT="$integ_gw" QS_ADMIN_PORT="$integ_adm"
   export QS_BASE="http://127.0.0.1:${integ_gw}"
-  unset QS_COMPOSE_FILE
+  if [[ -n "$primary_net" ]]; then export QS_COMPOSE_FILE="$PRI_COMPOSE"; else unset QS_COMPOSE_FILE; fi
 }
 
 dbq()  { "${FX[@]}" exec -T postgres psql -U yabanin -d yabanin -tA -c "$1"; }
@@ -390,22 +407,26 @@ run_bounded() {
   return $rc
 }
 
-# inventory_assert PROJECT: fresh Community install surface assertions —
-# exactly the documented service set (no hidden services), only the gateway
-# publishing, 127.0.0.1-only bindings, one-shot services Exited(0).
+# inventory_assert PROJECT [COMPOSE_FILE]: fresh Community install surface
+# assertions — exactly the documented service set (no hidden services), only
+# the gateway publishing, 127.0.0.1-only bindings, one-shot services
+# Exited(0). COMPOSE_FILE defaults to the shipped file; callers under
+# QS_PRIMARY_NET pass the scratch rewrite the project was created from.
 inventory_assert() {
-python3 - "$1" <<'PY'
+local cmp_file=${2:-deploy/quickstart/docker-compose.yml}
+python3 - "$1" "$cmp_file" <<'PY'
 import json, subprocess, sys
-proj = sys.argv[1]
+proj, cmp_file = sys.argv[1], sys.argv[2]
 def run(*args):
     return subprocess.run(args, capture_output=True, text=True)
-services = sorted(run("docker", "compose", "-p", proj, "-f",
-                      "deploy/quickstart/docker-compose.yml", "--profile",
+services = sorted(run("docker", "compose", "-p", proj, "-f", cmp_file,
+                      "--project-directory", "deploy/quickstart", "--profile",
                       "mock", "ps", "--all", "--services").stdout.split())
 expected = ["db-app-role", "migrate", "mock-openai", "postgres", "redis", "yabanin"]
 assert services == expected, f"project services {services} != documented {expected}"
-base = sorted(run("docker", "compose", "-p", proj, "-f",
-                  "deploy/quickstart/docker-compose.yml", "config", "--services").stdout.split())
+base = sorted(run("docker", "compose", "-p", proj, "-f", cmp_file,
+                  "--project-directory", "deploy/quickstart",
+                  "config", "--services").stdout.split())
 assert base == ["db-app-role", "migrate", "postgres", "redis", "yabanin"], \
     f"default profile surface {base} hides or leaks services"
 forbidden = ["prometheus", "grafana", "alertmanager", "dashboard", "classifier",
@@ -444,7 +465,7 @@ use_fixed
 up_wait 1200 "$proj_fixed" build "${FX[@]}" || fail "S1: up --build --wait failed or stalled"
 note "up --build --wait exit 0"
 
-inventory_assert "$proj_fixed" || fail "S1 inventory assertions failed"
+inventory_assert "$proj_fixed" "${QS_COMPOSE_FILE:-$compose_file}" || fail "S1 inventory assertions failed"
 
 # --- S2 canonical seed + documented first request ----------------------------
 step "S2 canonical seed + documented first request (clean environment)"
@@ -615,10 +636,10 @@ note "fixture: re-subnetted to $fixture_subnet (mock at $fixture_mock_ip, litera
 docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart config -q \
   || fail "S5: generated fixture does not render as a compose file"
 BRIX=(docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock)
-# Seed the broken fixture through the BROKEN compose itself. seed.sh is bound
-# to the shipped compose file (-f deploy/quickstart/docker-compose.yml), so
-# under this project name it would recreate postgres onto the named
-# pg_data volume and mask the anonymous-volume defect entirely.
+# Seed the broken fixture through the BROKEN compose itself. seed.sh resolves
+# to the shipped file or the primary scratch override — both declare the
+# named pg_data volume — so under this project name it would recreate
+# postgres onto that volume and mask the anonymous-volume defect entirely.
 BRIXS=(docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock --profile seed)
 brk_seed() {
   local pw_file="$BRK_TMP/brk-seed-pw.$$"
@@ -647,7 +668,9 @@ fixed_subnet=$(docker network inspect "${proj_fixed}_default" \
   --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
 [[ "$fixed_subnet" == "$pri_pin_subnet" ]] \
   || fail "S5: primary network subnet $fixed_subnet != $pri_pin_subnet"
-note "coexistence: ${proj_fixed}_default ($fixed_subnet) + ${proj_broken}_default ($brk_subnet) both up"
+[[ "$fixed_subnet" != "$brk_subnet" ]] \
+  || fail "S5: primary and fixture networks share subnet $fixed_subnet; multi-project isolation did not hold"
+note "coexistence: ${proj_fixed}_default ($fixed_subnet) + ${proj_broken}_default ($brk_subnet) both up, distinct subnets"
 brk_type=$(docker inspect -f '{{range .Mounts}}{{.Type}} {{end}}' "${proj_broken}-postgres-1")
 brk_names=$(docker inspect -f '{{range .Mounts}}{{.Name}} {{end}}' "${proj_broken}-postgres-1")
 [[ "$brk_type" == *"volume"* ]] || fail "S5: fixture postgres has no volume mount: $brk_type"
@@ -689,16 +712,39 @@ note "five-command flow + restart/localhost claims + links: consistent with veri
 # --- S8 documented five-command flow via make targets (consumer entry point) -
 step "S8 documented consumer flow (make targets) on an isolated clean stack"
 use_integ
-# The make-flow project runs the shipped compose unchanged, so it always
-# claims the production D-4 pin (10.207.0.0/24) — QS_PRIMARY_NET never moves
-# it. Nothing reads the fixed stack after S6b, so retire it — volume
-# included, cleanup removes leftovers anyway — to free the fixed stack's
-# pinned subnet ($pri_pin_subnet) for the integ project's network.
+# The make flow honors QS_COMPOSE_FILE (exported by use_integ), so the integ
+# project runs the same compose as the primary: the scratch rewrite under
+# QS_PRIMARY_NET, the shipped file and its D-4 pin otherwise. Nothing reads
+# the fixed stack after S6b, so retire it — volume included, cleanup removes
+# leftovers anyway — to free the fixed stack's pinned subnet ($pri_pin_subnet)
+# for the integ project's network.
 "${FX[@]}" down -v --remove-orphans >/dev/null
 RUN_BOUNDED_KEEP="$BRK_TMP/make-quickstart-up-s8.log" run_bounded 1200 make quickstart-up >/dev/null \
   || fail "S8: make quickstart-up failed or stalled (failure dump above; full output kept at $BRK_TMP/make-quickstart-up-s8.log)"
 note "make quickstart-up exit 0 (init-env idempotence + up --build --wait; output kept at $BRK_TMP/make-quickstart-up-s8.log)"
-inventory_assert "$proj_integ" || fail "S8: make-created stack fails the fresh-install inventory"
+# Executed F2 proof: the make-created project must sit on the primary pin
+# ($pri_pin_subnet — the override /24 or, without one, the shipped pin),
+# never on the fixture subnet; under the override its mock must hold the
+# rewritten upstream address (the same one seed/smoke route through); and
+# the shipped compose must stay byte-identical to the S0 digest.
+integ_subnet=$(docker network inspect "${proj_integ}_default" \
+  --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}') \
+  || fail "S8: no ${proj_integ}_default network after make quickstart-up"
+[[ "$integ_subnet" == "$pri_pin_subnet" ]] \
+  || fail "S8: make-flow network ${proj_integ}_default is ${integ_subnet}, want the primary pin ${pri_pin_subnet} (QS_COMPOSE_FILE not honored by the make flow?)"
+[[ "$integ_subnet" != "$fixture_subnet" ]] \
+  || fail "S8: make-flow network sits on the fixture subnet ${fixture_subnet}; projects are not isolated"
+if [[ -n "$primary_net" ]]; then
+  integ_mock_ip=$(docker inspect "${proj_integ}-mock-openai-1" \
+    -f '{{range .NetworkSettings.Networks}}{{.IPAMConfig.IPv4Address}}{{end}}' 2>/dev/null || true)
+  [[ "$integ_mock_ip" == "$primary_mock_ip" ]] \
+    || fail "S8: make-flow mock-openai is at ${integ_mock_ip:-no static address}, want the rewritten upstream ${primary_mock_ip}"
+fi
+shipped_now=$(sha256sum "$compose_file" | cut -d' ' -f1)
+[[ "$shipped_now" == "$shipped_sha" ]] \
+  || fail "S8: shipped compose bytes changed during the run (${shipped_now} != ${shipped_sha})"
+note "make-flow network ${proj_integ}_default on ${integ_subnet} (fixture keeps ${fixture_subnet}); shipped compose sha256 unchanged (${shipped_now:0:12}…)"
+inventory_assert "$proj_integ" "${QS_COMPOSE_FILE:-$compose_file}" || fail "S8: make-created stack fails the fresh-install inventory"
 note "make-created stack: documented surface only, one-shots Exited(0), 127.0.0.1-only"
 seed_out=$(make quickstart-seed 2>&1)
 key=$(printf '%s' "$seed_out" | extract_key)

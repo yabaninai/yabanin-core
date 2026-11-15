@@ -20,7 +20,10 @@ if [[ -f "$env_file" ]]; then
 fi
 
 model=${QS_MODEL:-mock-model}
-compose=(docker compose -f deploy/quickstart/docker-compose.yml --profile mock)
+# QS_COMPOSE_FILE (regression QS_PRIMARY_NET) redirects to a scratch compose;
+# --project-directory keeps .env resolution anchored to deploy/quickstart.
+compose=(docker compose -f "${QS_COMPOSE_FILE:-deploy/quickstart/docker-compose.yml}" \
+  --project-directory deploy/quickstart --profile mock)
 base=${QS_BASE:-http://127.0.0.1:8082}
 
 if ! curl -fsS "$base/healthz" >/dev/null; then

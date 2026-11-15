@@ -44,7 +44,10 @@ set -a
 source deploy/quickstart/.env
 set +a
 
-compose=(docker compose -f deploy/quickstart/docker-compose.yml --profile mock --profile ui)
+# QS_COMPOSE_FILE (regression QS_PRIMARY_NET) redirects to a scratch compose;
+# --project-directory keeps .env resolution anchored to deploy/quickstart.
+compose=(docker compose -f "${QS_COMPOSE_FILE:-deploy/quickstart/docker-compose.yml}" \
+  --project-directory deploy/quickstart --profile mock --profile ui)
 
 if [[ "$fresh" -eq 1 ]]; then
   # Demo data is disposable by design; -v drops the DB volume so the seed

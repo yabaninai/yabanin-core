@@ -444,7 +444,12 @@ pricing-verify: ## Verify the committed reference pack offline (schema + catalog
 	go run ./cmd/yb pricing verify --pack pkg/pricing/snapshots/reference-pack-v1.json
 
 .PHONY: quickstart-up quickstart-seed quickstart-smoke quickstart-down
-QUICKSTART_COMPOSE = docker compose -f deploy/quickstart/docker-compose.yml --profile mock
+# QS_COMPOSE_FILE (exported by scripts/quickstart/regression.sh's QS_PRIMARY_NET
+# escape hatch) redirects the quickstart targets to a rewritten scratch compose;
+# --project-directory keeps .env/build-context resolution on deploy/quickstart
+# for any file location (a no-op for the shipped default, which lives there).
+QUICKSTART_COMPOSE = docker compose -f $(or $(QS_COMPOSE_FILE),deploy/quickstart/docker-compose.yml) \
+	--project-directory deploy/quickstart --profile mock
 
 quickstart-up: ## Quickstart: init env + compose up --build --wait (mock profile)
 	bash scripts/quickstart/init-env.sh
