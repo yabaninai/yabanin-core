@@ -756,9 +756,11 @@ def base_binding_failure(chain, expected_base):
 
 
 def registry_tampered(root, report):
-    """NEXT-10 tamper evidence: a v2 manifest records the command registry
-    hash; re-deriving it must reproduce the recorded value. An unreadable
-    registry counts as tampered — a v2 run always has one."""
+    """NEXT-10 tamper evidence: a v2 manifest that records a command
+    registry hash must re-derive to that value, and an unreadable registry
+    counts as tampered. An absent registry record is explicit and accepted
+    — the run recorded its absence (absent_reason), so there is nothing to
+    re-derive."""
     rec = (report.get("evidence") or {}).get("command_registry")
     if rec is None:
         return False
