@@ -112,7 +112,13 @@ def snapshot(root):
         if path.is_symlink():
             digest.update(b"link\0" + os.fsencode(os.readlink(path)))
         elif path.is_file():
-            digest.update(str(path.stat().st_mode & 0o777).encode() + b"\0")
+            # Git tracks only the executable bit; every other permission bit
+            # comes from the umask of whoever checked out the tree (CI umask
+            # 022 vs a local 002). Fingerprint Git's semantic so source
+            # identity is checkout-independent, not the raw working-tree
+            # mode that umask noise would alter.
+            executable = path.stat().st_mode & 0o111
+            digest.update((b"x" if executable else b"-") + b"\0")
             # Assets, archives and WASM can change delivered behavior too.
             # Generated QA output belongs in ignored artifacts, not outside
             # the source fingerprint. Stream bytes to bound memory usage.
