@@ -462,8 +462,14 @@ PY
 step "S1 fresh Community install: service inventory"
 use_fixed
 "${FX[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-up_wait 1200 "$proj_fixed" build "${FX[@]}" || fail "S1: up --build --wait failed or stalled"
-note "up --build --wait exit 0"
+# Documented build step (docs step 3 / demo.sh): the Dockerfile's epoch guard
+# fails `up --build` without SOURCE_DATE_EPOCH, so build with the commit
+# timestamp first, then the documented up --no-build --wait.
+run_bounded 1200 "${FX[@]}" build \
+  --build-arg "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" \
+  || fail "S1: reproducible compose build failed or stalled"
+up_wait 1200 "$proj_fixed" nobuild "${FX[@]}" || fail "S1: up --wait failed or stalled"
+note "reproducible build (SOURCE_DATE_EPOCH=commit time) + up -d --no-build --wait exit 0"
 
 inventory_assert "$proj_fixed" "${QS_COMPOSE_FILE:-$compose_file}" || fail "S1 inventory assertions failed"
 
@@ -721,7 +727,7 @@ use_integ
 "${FX[@]}" down -v --remove-orphans >/dev/null
 RUN_BOUNDED_KEEP="$BRK_TMP/make-quickstart-up-s8.log" run_bounded 1200 make quickstart-up >/dev/null \
   || fail "S8: make quickstart-up failed or stalled (failure dump above; full output kept at $BRK_TMP/make-quickstart-up-s8.log)"
-note "make quickstart-up exit 0 (init-env idempotence + up --build --wait; output kept at $BRK_TMP/make-quickstart-up-s8.log)"
+note "make quickstart-up exit 0 (init-env idempotence + reproducible build + up --no-build --wait; output kept at $BRK_TMP/make-quickstart-up-s8.log)"
 # Executed F2 proof: the make-created project must sit on the primary pin
 # ($pri_pin_subnet — the override /24 or, without one, the shipped pin),
 # never on the fixture subnet; under the override its mock must hold the

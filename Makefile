@@ -451,9 +451,13 @@ pricing-verify: ## Verify the committed reference pack offline (schema + catalog
 QUICKSTART_COMPOSE = docker compose -f $(or $(QS_COMPOSE_FILE),deploy/quickstart/docker-compose.yml) \
 	--project-directory deploy/quickstart --profile mock
 
-quickstart-up: ## Quickstart: init env + compose up --build --wait (mock profile)
+# Two-stage like demo.sh/docs step 3: the Dockerfile's reproducibility guard
+# fails a build without an integer SOURCE_DATE_EPOCH, so build with the commit
+# timestamp (SOURCE_DATE_EPOCH ?= above) and then start without rebuilding.
+quickstart-up: ## Quickstart: init env + reproducible build + up --wait (mock profile)
 	bash scripts/quickstart/init-env.sh
-	$(QUICKSTART_COMPOSE) up -d --build --wait
+	$(QUICKSTART_COMPOSE) build --build-arg "SOURCE_DATE_EPOCH=$(SOURCE_DATE_EPOCH)"
+	$(QUICKSTART_COMPOSE) up -d --no-build --wait
 
 quickstart-seed: ## Quickstart: seed demo data
 	bash scripts/quickstart/seed.sh
