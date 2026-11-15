@@ -16,49 +16,98 @@ Preview history is temporary: when the first major version is released, the
 `main` branch will be squashed. Do not base durable forks or branches on
 individual preview commits; track release tags instead.
 
-## Feature highlights
+## Features
 
-- **One API for multiple providers.** OpenAI-compatible and Anthropic-compatible
-  endpoints, streaming, and tool calling; bring your own provider keys with
-  [BYOK](docs/byok.md). See [client compatibility](docs/compatibility.md) for
-  endpoint coverage.
-- **Automatic model routing.** Match prompt complexity to cheap, mid, or premium
-  model pools, balance requests across pool members, and override routing per
-  organization. Inspect the final model choice and routing reasons through
-  `X-Yabanin-Decision`. [Task classifier](docs/classifier.md)
-- **Retries and fallback.** Retry eligible failures, switch to configured fallback
-  models, and use circuit breakers for failing upstreams.
+Everything below ships in this self-hosted Apache-2.0 repository - no hosted
+plan, metered feature flag, or per-seat upgrade, although hosted gateways
+commonly sell comparable capabilities as paid tiers or enterprise add-ons.
+Protocol support and client verification levels are recorded in the
+[compatibility matrix](docs/compatibility.md); a feature's presence in source
+is not a claim of production readiness. The [quickstart](docs/quickstart.md)
+stands up a full local stack with a mock provider - no provider account or
+paid inference needed.
+
+### One API, verified clients
+
+- **OpenAI-compatible routes**: `/v1/chat/completions` with streaming and
+  tool calls, `/v1/completions` (FIM), `/v1/models`, and Batch/Files
+  (`/v1/files`, `/v1/batches`).
+- **Anthropic-compatible route**: `/v1/messages` with streaming and
+  `tool_use`/`tool_result` round-trips - translated to an OpenAI-compatible
+  upstream, or forwarded natively to an Anthropic provider.
+- **Codex-style route**: `/v1/responses` with custom tool calls, verified
+  end-to-end with the real Codex CLI (tools loop, capability errors,
+  mid-stream cancel) against a mock upstream.
+- **Bring your own provider keys** with [BYOK](docs/byok.md): per-organization
+  credentials stored encrypted and masked to the last four characters.
+
+### Routing, resilience and cost control
+
+- **Automatic model routing.** Match prompt complexity to cheap, mid, or
+  premium pools through a deterministic easy/medium/hard classifier with an
+  optional ML service, balance requests across pool members, keep KV-cache
+  session affinity, and override routing per organization. The final model
+  choice and its reasons are exposed through `X-Yabanin-Decision`.
+  [Task classifier](docs/classifier.md)
+- **Retries and fallback.** Retry eligible failures, switch to configured
+  fallback models, and use circuit breakers for failing upstreams.
   [Request path](docs/architecture.md)
-- **Exact and semantic caching.** Reuse cached responses with streaming replay;
-  optional semantic matching uses an embedder and pgvector.
-  [Caching](docs/cache.md)
+- **Exact and semantic caching.** Redis exact cache plus an optional
+  pgvector semantic layer with per-org privacy modes, streaming replay and
+  A/B experiments; semantic reuse needs your embedder and quality
+  evaluation. [Caching](docs/cache.md)
+- **Shadow mode.** Replay a sampled fraction of real traffic to a candidate
+  model and record its actual cost and latency while the client response
+  stays byte-for-byte identical. Off by default.
+  [Shadow mode](docs/shadow-mode.md)
 - **Access and spend controls.** Organization roles, API keys, rate limits,
   credits, and budget caps keep shared model access manageable.
   [Organization setup](docs/organization-setup.md)
-- **Usage beyond dollars.** View recorded USD cost, wallet credits, tokens and
-  factor-based CO₂e estimates in one organization-scoped report. Keep scenario
-  costs separate from recorded spend, with data-quality labels and coverage
-  notices. [Usage and impact accounting](docs/usage-and-impact.md)
-- **Versioned pricing with provenance.** Inspect the active price catalog,
-  preview a replacement and promote a reviewed pricing pack. Catalog versions,
-  digests and source dates make cost calculations traceable.
-  [Pricing and accounting](docs/usage-and-impact.md#prices-and-data-quality)
-- **Programmable guardrails.** Compose YAML policies for PII, secrets, and prompt
-  injection checks, masking, external scanners, and LLM judges. Preview decisions
-  in shadow mode before enforcement; the pipeline is opt-in.
-  [Policy pipeline](docs/pipeline.md)
-- **Agent governance.** Give agents separate identities, daily budgets, task token
-  limits, and delegated keys; control supported tool and MCP calls with
-  [tool policies](docs/tool-policies.md).
-  [Agent governance](docs/agent-governance.md)
-- **Usage visibility and offline audits.** Inspect request history and usage in
-  the React dashboard, manage the gateway through the admin API and `yb` CLI,
-  and simulate cache reuse and cheaper routing from local logs. Export Markdown,
-  JSON or a standalone HTML report without a running gateway or provider calls.
+- **Usage beyond dollars.** Recorded USD cost, wallet credits, tokens and
+  factor-based CO₂e estimates in one organization-scoped report, with
+  scenario costs kept separate from recorded spend. The active price catalog
+  is versioned with digests and source dates, making cost calculations
+  traceable. [Usage and impact accounting](docs/usage-and-impact.md)
+- **Usage visibility and offline audits.** Asynchronous request logging with
+  history and export, the React dashboard, the admin API and `yb` CLI, and
+  an offline spend audit that exports Markdown, JSON or a standalone HTML
+  report without a running gateway or provider calls.
   [Offline spend audit](docs/audit.md)
-- **Signed request records.** Optional Ed25519-signed lineage preserves model
-  and region-related claims in a tamper-evident ledger. Signatures verify record
-  integrity, not the physical location of inference. [Lineage](docs/lineage.md)
+
+### Programmable guardrails and governance
+
+- **Scriptable policy pipeline.** Compose YAML policies with 20 builtin
+  detectors and mutators (national PII across 10 jurisdictions, secrets,
+  prompt injection, regex and JSON-schema checks, redaction, reversible
+  pseudonymization, model rewrite), scriptable `when` conditions in three
+  engines - `expr`, sandboxed `lua`, `starlark` - a `decide` verdict DSL,
+  SSRF-guarded external HTTP callouts, and LLM judges through the gateway's
+  own upstream pool. Shadow-to-enforce rollout, per-step timeouts,
+  fail-closed defaults. [Policy pipeline](docs/pipeline.md)
+- **Policy config-as-code.** Git is the source of truth; `yb policies
+  reconcile` plans and applies changes and reports drift; versions are
+  immutable with atomic activation and rollback. Request-content
+  authorization and offline guard packs fail closed, with staged activation
+  and rollback. [Policy pipeline](docs/pipeline.md)
+- **Agent governance.** Give agents separate identities (`yag_*` keys),
+  daily budgets, task token limits, and delegated time-boxed keys.
+  [Agent governance](docs/agent-governance.md)
+- **Tool and MCP governance.** Allow-listed external MCP servers with
+  agent-only access and an audit trail, deny rules for MCP/A2A and
+  model-declared tool calls, and a server-side `web_fetch` executor.
+  Off by default. [MCP](docs/mcp-gateway.md) -
+  [A2A](docs/a2a-gateway.md) - [tool policies](docs/tool-policies.md)
+- **Admin SSO.** OpenID Connect Authorization Code flow with PKCE and
+  fail-closed user mapping. [OIDC](docs/sso-oidc.md)
+- **Signed request records.** Optional Ed25519-signed lineage preserves
+  model and region-related claims in a tamper-evident per-org hash chain,
+  with verification and export; see also residency packs and the sovereign
+  model registry. Signatures verify record integrity, not the physical
+  location of inference. [Lineage](docs/lineage.md)
+- **Offline operations.** Offline evaluation suites for classifier and guard
+  regressions, and an offline bundle for air-gapped installs with artifact
+  verification. [Evaluation](docs/evaluation.md) -
+  [offline bundle](docs/onprem/offline-bundle.md)
 
 Costs depend on configured prices and recorded usage. The bundled reference
 prices have limited coverage and may be outdated. Configure current prices
@@ -82,82 +131,6 @@ measurement. Carbon-cap status is informational, and this view does not measure
 water or electricity consumption. Monetary accounting remains USD-based; credits
 and tokens are separate units, not foreign-exchange conversion. See the
 [calculation and coverage details](docs/usage-and-impact.md).
-
-## Current Capabilities
-
-Capabilities with automated-test evidence in this release. Per-endpoint
-scope and client-verification levels are recorded in the
-[compatibility matrix](docs/compatibility.md).
-
-- **OpenAI-compatible routes**: `/v1/chat/completions` with streaming and
-  tool calls, `/v1/completions` (FIM), `/v1/models`, and Batch/Files
-  (`/v1/files`, `/v1/batches`).
-- **Anthropic-compatible route**: `/v1/messages` with streaming and
-  `tool_use`/`tool_result` round-trips - translated to an OpenAI-compatible
-  upstream, or forwarded natively to an Anthropic provider.
-- **Codex-style route**: `/v1/responses` with custom tool calls, verified
-  end-to-end with the real Codex CLI (tools loop, capability errors,
-  mid-stream cancel) against a mock upstream; no paid inference needed.
-- **A local stack from source**: the [quickstart](docs/quickstart.md) builds
-  the stack, creates an organization and keys, serves a request through a
-  mock provider, and records it in the request log.
-- **Organization controls**: gateway keys, roles, budgets and credits, and
-  per-organization provider keys (BYOK) stored encrypted and masked to the
-  last four characters.
-- **Policies and guards**: fail-closed request-content authorization and
-  offline guard packs with staged activation and rollback.
-- **Usage and cost insight**: asynchronous request logging with history and
-  export, usage-based cost estimates, and the offline `yb audit` spend
-  report that runs without a gateway or database.
-
-## In the core
-
-These capabilities ship in this self-hosted Apache-2.0 repository - no hosted
-plan, metered feature flag, or per-seat upgrade. Hosted gateways commonly
-sell comparable capabilities as paid tiers or enterprise add-ons.
-
-- **Scriptable policy pipeline** ([pipeline](docs/pipeline.md)): declarative
-  YAML policies over gateway traffic with 20 builtin detectors and mutators
-  (national PII across 10 jurisdictions, secrets, prompt injection, regex and
-  JSON-schema checks, redaction, reversible pseudonymization, model rewrite),
-  scriptable `when` conditions in three engines - `expr`, sandboxed `lua`,
-  `starlark` - a `decide` verdict DSL, SSRF-guarded external HTTP callouts,
-  and LLM-judge steps through the gateway's own upstream pool.
-  Shadow-to-enforce rollout, per-step timeouts, fail-closed defaults.
-- **Policy config-as-code** ([pipeline](docs/pipeline.md)): git is the source
-  of truth; `yb policies reconcile` plans and applies changes and reports
-  drift; versions are immutable with atomic activation and rollback.
-- **Agent governance** ([agent governance](docs/agent-governance.md)):
-  agent keys (`yag_*`), per-agent daily budgets, task tags with token caps,
-  guard hooks, delegated time-boxed child keys, and the `X-Yabanin-Decision`
-  header explaining every routing decision.
-- **Classifier-driven routing** ([classifier](docs/classifier.md)): a
-  deterministic easy/medium/hard classifier routes simple tasks to cheap
-  models, with an optional ML classifier service and KV-cache-aware session
-  affinity.
-- **Exact + semantic caching** ([cache](docs/cache.md)): Redis exact cache
-  plus an optional pgvector semantic layer with per-org privacy modes and A/B
-  experiments; semantic reuse needs your embedder and quality evaluation.
-- **Shadow mode** ([shadow mode](docs/shadow-mode.md)): replay a sampled
-  fraction of real traffic to a candidate model and record its actual cost
-  and latency while the client response stays byte-for-byte identical. Off by
-  default.
-- **Signed lineage** ([lineage](docs/lineage.md)): Ed25519-signed per-request
-  attestations of model and region evidence in a tamper-evident per-org hash
-  chain, with verification and export; see also
-  [residency packs](docs/residency-packs.md) and the
-  [sovereign model registry](docs/sovereign-models.md).
-- **Tool and MCP governance** ([MCP](docs/mcp-gateway.md) -
-  [A2A](docs/a2a-gateway.md) - [tool policies](docs/tool-policies.md)):
-  allow-listed external MCP servers with agent-only access and an audit
-  trail, deny rules for MCP/A2A and model-declared tool calls, and a
-  server-side `web_fetch` executor. Off by default.
-- **Admin SSO** ([OIDC](docs/sso-oidc.md)): Authorization Code flow with
-  PKCE and fail-closed user mapping - no per-seat enterprise plan required.
-- **Offline operations**: the [offline spend audit](docs/audit.md) and
-  [evaluation suites](docs/evaluation.md) run without a gateway or provider;
-  an [offline bundle](docs/onprem/offline-bundle.md) supports air-gapped
-  installs with artifact verification.
 
 ## Quickstart with Docker Compose
 
