@@ -1,11 +1,20 @@
 # Yabanin Core
 
+![img.png](img.png)
+
+**Website:** <https://yabanin.ai>
 Yabanin Core is a self-hosted AI gateway. Connect applications through
 OpenAI-compatible or Anthropic-compatible APIs, route requests to model
 providers, manage access and budgets, and inspect request logs and usage.
 
 This is a **Developer Preview**. Read the release notes before deploying it
-with production traffic.
+with production traffic. Protocol support and client verification levels are
+recorded in the [compatibility matrix](docs/compatibility.md); a feature's
+presence in source is not a claim of production readiness.
+
+Preview history is temporary: when the first major version is released, the
+`main` branch will be squashed. Do not base durable forks or branches on
+individual preview commits; track release tags instead.
 
 ## Feature highlights
 
@@ -73,6 +82,82 @@ measurement. Carbon-cap status is informational, and this view does not measure
 water or electricity consumption. Monetary accounting remains USD-based; credits
 and tokens are separate units, not foreign-exchange conversion. See the
 [calculation and coverage details](docs/usage-and-impact.md).
+
+## Current Capabilities
+
+Capabilities with automated-test evidence in this release. Per-endpoint
+scope and client-verification levels are recorded in the
+[compatibility matrix](docs/compatibility.md).
+
+- **OpenAI-compatible routes**: `/v1/chat/completions` with streaming and
+  tool calls, `/v1/completions` (FIM), `/v1/models`, and Batch/Files
+  (`/v1/files`, `/v1/batches`).
+- **Anthropic-compatible route**: `/v1/messages` with streaming and
+  `tool_use`/`tool_result` round-trips - translated to an OpenAI-compatible
+  upstream, or forwarded natively to an Anthropic provider.
+- **Codex-style route**: `/v1/responses` with custom tool calls, verified
+  end-to-end with the real Codex CLI (tools loop, capability errors,
+  mid-stream cancel) against a mock upstream; no paid inference needed.
+- **A local stack from source**: the [quickstart](docs/quickstart.md) builds
+  the stack, creates an organization and keys, serves a request through a
+  mock provider, and records it in the request log.
+- **Organization controls**: gateway keys, roles, budgets and credits, and
+  per-organization provider keys (BYOK) stored encrypted and masked to the
+  last four characters.
+- **Policies and guards**: fail-closed request-content authorization and
+  offline guard packs with staged activation and rollback.
+- **Usage and cost insight**: asynchronous request logging with history and
+  export, usage-based cost estimates, and the offline `yb audit` spend
+  report that runs without a gateway or database.
+
+## In the core
+
+These capabilities ship in this self-hosted Apache-2.0 repository - no hosted
+plan, metered feature flag, or per-seat upgrade. Hosted gateways commonly
+sell comparable capabilities as paid tiers or enterprise add-ons.
+
+- **Scriptable policy pipeline** ([pipeline](docs/pipeline.md)): declarative
+  YAML policies over gateway traffic with 20 builtin detectors and mutators
+  (national PII across 10 jurisdictions, secrets, prompt injection, regex and
+  JSON-schema checks, redaction, reversible pseudonymization, model rewrite),
+  scriptable `when` conditions in three engines - `expr`, sandboxed `lua`,
+  `starlark` - a `decide` verdict DSL, SSRF-guarded external HTTP callouts,
+  and LLM-judge steps through the gateway's own upstream pool.
+  Shadow-to-enforce rollout, per-step timeouts, fail-closed defaults.
+- **Policy config-as-code** ([pipeline](docs/pipeline.md)): git is the source
+  of truth; `yb policies reconcile` plans and applies changes and reports
+  drift; versions are immutable with atomic activation and rollback.
+- **Agent governance** ([agent governance](docs/agent-governance.md)):
+  agent keys (`yag_*`), per-agent daily budgets, task tags with token caps,
+  guard hooks, delegated time-boxed child keys, and the `X-Yabanin-Decision`
+  header explaining every routing decision.
+- **Classifier-driven routing** ([classifier](docs/classifier.md)): a
+  deterministic easy/medium/hard classifier routes simple tasks to cheap
+  models, with an optional ML classifier service and KV-cache-aware session
+  affinity.
+- **Exact + semantic caching** ([cache](docs/cache.md)): Redis exact cache
+  plus an optional pgvector semantic layer with per-org privacy modes and A/B
+  experiments; semantic reuse needs your embedder and quality evaluation.
+- **Shadow mode** ([shadow mode](docs/shadow-mode.md)): replay a sampled
+  fraction of real traffic to a candidate model and record its actual cost
+  and latency while the client response stays byte-for-byte identical. Off by
+  default.
+- **Signed lineage** ([lineage](docs/lineage.md)): Ed25519-signed per-request
+  attestations of model and region evidence in a tamper-evident per-org hash
+  chain, with verification and export; see also
+  [residency packs](docs/residency-packs.md) and the
+  [sovereign model registry](docs/sovereign-models.md).
+- **Tool and MCP governance** ([MCP](docs/mcp-gateway.md) -
+  [A2A](docs/a2a-gateway.md) - [tool policies](docs/tool-policies.md)):
+  allow-listed external MCP servers with agent-only access and an audit
+  trail, deny rules for MCP/A2A and model-declared tool calls, and a
+  server-side `web_fetch` executor. Off by default.
+- **Admin SSO** ([OIDC](docs/sso-oidc.md)): Authorization Code flow with
+  PKCE and fail-closed user mapping - no per-seat enterprise plan required.
+- **Offline operations**: the [offline spend audit](docs/audit.md) and
+  [evaluation suites](docs/evaluation.md) run without a gateway or provider;
+  an [offline bundle](docs/onprem/offline-bundle.md) supports air-gapped
+  installs with artifact verification.
 
 ## Quickstart with Docker Compose
 
