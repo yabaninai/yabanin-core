@@ -5,9 +5,19 @@
 #   S1 fresh Community install: exactly the documented services, no hidden
 #      services, published ports bind 127.0.0.1 only
 #   S2 canonical seed + documented first request (smoke.sh) on the clean stack
-#   S3 empty DB: every embedded migration applied on the fresh volume
+#   S3 empty DB: every embedded migration applied on the fresh volume,
+#     against the pinned schema contract (head 0027, 26 pairs, 0023
+#     reserved) — never a derived max()/count
+#   S3b/S3c managed beta views (frozen): exactly the seven views with
+#     content-minimized columns; per-org values pinned independently
+#     (fixture 3 requests/1 error, DAU 3/3, ttfq 90s, byok provider,
+#     p50/p95 200/290, cache 1/3) + org1 against raw rows; app-role reads
+#     and a real 42501 negative; a revoked/dropped view is named degraded
+#     readiness while the gateway serves; the migrate boundary self-heals
+#     all seven and a fresh startup is ready
 #   S4 restart (down, no -v): named pg_data volume survives; the same key
-#      serves; seed rerun is a loud no-op
+#      serves; seed rerun is a loud no-op; the seven views and the frozen
+#      fixture survive
 #   S5 broken-vs-fixed: a pre-fix anonymous-volume fixture must FAIL the
 #      same restart-survival check the shipped stack passes. The fixture is
 #      rewritten onto its own /24 (QS_FIXTURE_NET, default 10.208.0) so it
@@ -21,23 +31,26 @@
 #      isolated project; fresh-install service-surface assertions re-checked on
 #      the make-created stack
 #   S9 empty DB through the same boundary: documented reset (down -v -> up),
-#      migrate re-applies the full schema, old key -> 401, reseed -> first
-#      request 200 with a new key
+#      migrate re-applies the full schema, old key -> 401, the seven beta
+#      views exist before reseed, reseed -> first request 200 with a new key
 #   S10 restart through the same boundary: make quickstart-down keeps pg_data;
 #      up re-runs migrate as a no-op; the same key serves
 #   S11 wrong secrets through the same boundary: half-set license env refuses
 #      the dev process; admin plane rejects a wrong password and accepts the
 #      seed-printed one (CSRF-protected POST /auth/login)
-#   S12 linked deploy paths: dev/prod/prod+e2e compose configs render; a
-#      missing required secret is rejected at config time; every compose
-#      yabanin subcommand and env var is known to the binary/config layer
+#   S12 linked deploy paths: the actual dev compose and the supported simple
+#      offline path (deploy/onprem/airgap-compose.yml) render; required secrets
+#      are rejected by name with no default values; deploy.sh refuses the
+#      absent production compose before any effect; every compose yabanin
+#      subcommand and env var is known to the binary/config layer
 #
 #   S0 preflight additions (F2): before touching anything, the suite detects a
 #      FOREIGN stack holding one of its pinned subnets and fails fast naming
 #      the holder (network, compose project, attached containers) with
-#      remedies — evict it, or relocate only the primary project via
-#      QS_PRIMARY_NET (a counted, asserted rewrite in scratch; the shipped
-#      compose file is never edited, so the D-4 production pin stays).
+#      remedies — evict it, or relocate this suite's quickstart projects
+#      (primary and S8-S11 make flow alike) via QS_PRIMARY_NET (a counted,
+#      asserted scratch rewrite honored end-to-end via QS_COMPOSE_FILE; the
+#      shipped compose file is never edited, so the D-4 production pin stays).
 #      QS_FIXTURE_NET already relocates the S5 fixture the same way.
 #   Failure-output capture (F3): the S8-S10 make-flow invocations run under
 #      run_bounded with RUN_BOUNDED_KEEP, so a stalled or failed
@@ -85,14 +98,14 @@ fixture_subnet="$fixture_net.0/24"
 fixture_mock_ip="$fixture_net.9"
 fixture_mock_url="http://${fixture_mock_ip}:8081"
 
-# S8 make-flow networking (F2 escape hatch). The documented five-command flow
-# (S8-S11) always runs the shipped compose, so the integ project claims the
-# production D-4 pin 10.207.0.0/24 regardless of overrides. The S1-S6b
-# primary project pins it too; when a FOREIGN stack already holds the shipped
-# pin, the preflight below names the holder and hard-fails. QS_PRIMARY_NET
-# (first three octets of a /24, like the shipped 10.207 pin) relocates ONLY
-# the primary project to another free /24 — implemented as a counted,
-# asserted rewrite of a scratch copy, never an edit of the shipped file.
+# S8 make-flow networking (F2 escape hatch). The S1-S6b primary project and
+# the S8-S11 make flow share one compose source: the shipped file (claiming
+# the production D-4 pin 10.207.0.0/24) unless QS_PRIMARY_NET relocates both
+# onto another free /24. The override (first three octets of a /24, like the
+# shipped 10.207 pin) is a counted, asserted scratch rewrite exported as
+# QS_COMPOSE_FILE and honored by the Makefile quickstart targets and the
+# quickstart scripts; the shipped file is never edited. Without an override
+# a foreign holder of the shipped pin still fails the preflight below closed.
 shipped_pin="10.207.0.0/24"
 primary_net=${QS_PRIMARY_NET:-}
 if [[ -n "$primary_net" ]]; then
@@ -119,6 +132,7 @@ command -v docker  >/dev/null || fail "docker not found"
 command -v python3 >/dev/null || fail "python3 not found"
 command -v curl    >/dev/null || fail "curl not found"
 command -v openssl >/dev/null || fail "openssl not found"
+command -v sha256sum >/dev/null || fail "sha256sum not found"
 docker compose version >/dev/null 2>&1 || fail "docker compose v2 not available"
 docker info >/dev/null 2>&1         || fail "docker daemon not reachable"
 port_busy() { (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null; }
@@ -171,16 +185,17 @@ net_holders() {
   printf '%s' "$holders"
 }
 step "S0 preflight: pinned-subnet foreign-holder check"
+# Byte-stability oracle: S8 re-checks this digest after the make flow to
+# prove the override path never edited the shipped compose.
+shipped_sha=$(sha256sum "$compose_file" | cut -d' ' -f1)
 if [[ -n "$primary_net" ]]; then
-  # Override active: the primary moves to the override /24, but S8-S11 still
-  # claim the shipped pin via the make flow — a holder there is not fatal
-  # here, it is a loud warning (S8 will demonstrate the exact failure).
+  # Override active: every project in this run — the S1-S6b primary and the
+  # S8-S11 make flow alike — is rewritten onto the override /24, so nothing
+  # here needs the shipped pin; a foreign holder of it stays informational.
   shipped_holders=$(net_holders "$shipped_pin")
   if [[ -n "$shipped_holders" ]]; then
-    echo "WARNING: a foreign stack still holds the shipped pin $shipped_pin:" >&2
+    echo "NOTE: a foreign stack still holds the shipped pin $shipped_pin; this run does not use it (all projects run on $pri_pin_subnet):" >&2
     printf '%s\n' "$shipped_holders" >&2
-    echo "WARNING: the primary project moved to $pri_pin_subnet, but S8-S11 run the" >&2
-    echo "WARNING: shipped make flow and still need $shipped_pin free — expect S8+ to fail." >&2
   fi
   primary_holders=$(net_holders "$pri_pin_subnet")
   if [[ -n "$primary_holders" ]]; then
@@ -196,16 +211,17 @@ else
     echo "REGRESSION FAIL: a foreign stack already holds the primary pin $pri_pin_subnet:" >&2
     printf '%s\n' "$primary_holders" >&2
     cat >&2 <<'EOS'
-This suite runs three isolated projects; the primary one pins 10.207.0.0/24
-(production D-4 posture) and the S8-S11 make flow always claims the same
-subnet. Remedies, in order of preference:
+This suite runs three isolated projects; without an override they all claim
+the production D-4 pin 10.207.0.0/24 through the shipped compose. Remedies,
+in order of preference:
   1. Evict the foreign stack listed above (it is not ours to touch):
        docker compose -p <compose project> down      # if compose-managed
        docker network rm <network>                   # otherwise
-  2. Relocate only the primary project to another free /24 and rerun:
+  2. Relocate this run's quickstart projects — primary and S8-S11 make flow
+     alike — to another free /24 and rerun:
        QS_PRIMARY_NET=10.209.0 bash scripts/quickstart/regression.sh
-     (the shipped compose file is never edited; note S8-S11 still claim the
-      shipped pin itself, so the holder must be gone by then regardless)
+     (a counted, asserted scratch rewrite honored end-to-end; the shipped
+      compose file and its D-4 pin are never edited)
 EOS
     rm -rf "$BRK_TMP"
     exit 1
@@ -258,12 +274,17 @@ PY
     || fail "S0: QS_PRIMARY_NET rewrite does not render as a compose file"
   FX=(docker compose -p "$proj_fixed" -f "$PRI_COMPOSE" \
     --project-directory deploy/quickstart --profile mock)
-  note "QS_PRIMARY_NET active: primary project rewritten onto $pri_pin_subnet (mock at $primary_mock_ip); shipped file untouched"
+  # The S8-S11 make flow (INX, seed/smoke via QS_COMPOSE_FILE) must run the
+  # same rewritten compose as the primary, so the integ project claims the
+  # override /24 — never the possibly foreign-held shipped pin.
+  INX=(docker compose -p "$proj_integ" -f "$PRI_COMPOSE" \
+    --project-directory deploy/quickstart --profile mock)
+  note "QS_PRIMARY_NET active: primary project and S8-S11 make flow rewritten onto $pri_pin_subnet (mock at $primary_mock_ip); shipped file untouched"
 fi
 
-# Set when S12 generates deploy-side secrets in this checkout (they are
-# removed again on exit; pre-existing files are never touched).
-integ_env_created=0 integ_secrets_created=0
+# Set when S12 creates a synthetic deploy/.env for the dev-compose render (it
+# is removed again on exit; a pre-existing file is never touched).
+s12_env_created=0
 
 REG_FAILED=0
 cleanup() {
@@ -284,20 +305,29 @@ cleanup() {
   docker compose -p "$proj_fixed"  -f "$compose_file" --profile mock down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock --profile seed down -v --remove-orphans >/dev/null 2>&1 || true
   docker compose -p "$proj_broken" -f "$compose_file" --profile mock --profile seed down -v --remove-orphans >/dev/null 2>&1 || true
-  docker compose -p "$proj_integ"  -f "$compose_file" --profile mock down -v --remove-orphans >/dev/null 2>&1 || true
+  # INX carries the primary scratch compose under QS_PRIMARY_NET, so the
+  # make-flow project is torn down through the file it was created from.
+  "${INX[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "$proj_fixed-wrongkey" >/dev/null 2>&1 || true
-  if [[ "$integ_env_created" == 1 ]]; then
-    rm -f deploy/.env
-    if [[ "$integ_secrets_created" == 1 ]]; then rm -rf deploy/secrets; fi
+  if [[ "$s12_env_created" == 1 ]]; then
+    # Remove only the synthetic regular file we created; never a replacement
+    # file or a symlink (pre-existing material is untouchable).
+    [[ -f deploy/.env && ! -L deploy/.env ]] && rm -f deploy/.env
   fi
   rm -rf "$BRK_TMP"
 }
 trap cleanup EXIT
 
+# QS_COMPOSE_FILE routes the env-driven paths (seed.sh, smoke.sh, the make
+# flow) at the active compose: the primary scratch rewrite when QS_PRIMARY_NET
+# is set, the shipped file otherwise. use_broken drops it so the fixture
+# project never inherits the primary's compose; use_fixed restores it after
+# use_broken so S6b-onwards scripts keep targeting the primary project.
 use_fixed() {
   export COMPOSE_PROJECT_NAME="$proj_fixed"
   export QS_GATEWAY_PORT="$fixed_gw" QS_ADMIN_PORT="$fixed_adm"
   export QS_BASE="http://127.0.0.1:${fixed_gw}"
+  if [[ -n "$primary_net" ]]; then export QS_COMPOSE_FILE="$PRI_COMPOSE"; else unset QS_COMPOSE_FILE; fi
 }
 use_broken() {
   export COMPOSE_PROJECT_NAME="$proj_broken"
@@ -309,7 +339,7 @@ use_integ() {
   export COMPOSE_PROJECT_NAME="$proj_integ"
   export QS_GATEWAY_PORT="$integ_gw" QS_ADMIN_PORT="$integ_adm"
   export QS_BASE="http://127.0.0.1:${integ_gw}"
-  unset QS_COMPOSE_FILE
+  if [[ -n "$primary_net" ]]; then export QS_COMPOSE_FILE="$PRI_COMPOSE"; else unset QS_COMPOSE_FILE; fi
 }
 
 dbq()  { "${FX[@]}" exec -T postgres psql -U yabanin -d yabanin -tA -c "$1"; }
@@ -318,6 +348,120 @@ idbq() { "${INX[@]}" exec -T postgres psql -U yabanin -d yabanin -tA -c "$1"; }
 
 extract_key() { sed -n 's/.*API key (shown once, store it now): \(yb_[0-9a-fA-F]*\).*/\1/p'; }
 extract_admin_password() { sed -n 's/.*Admin password (shown once, store it now): \([0-9a-fA-F]*\).*/\1/p'; }
+
+# App-role (yabanin_app) psql for the fixed and integ projects. ON_ERROR_STOP
+# + verbose make a permission denial fail nonzero with SQLSTATE 42501 in the
+# output, so the 42501 negative below is a real behavioral denial.
+adbq()     { "${FX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
+idbq_app() { "${INX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
+
+# The seven managed beta views (pkg/feedback MetricsViewNames), pinned sorted.
+BETA_VIEWS="beta_cache_hit_rate_daily beta_dau_daily beta_latency_daily beta_onboarding_ttfq beta_provider_distribution beta_provider_errors beta_requests_daily"
+
+# gw_restart_wait: restart the fixed gateway and wait for /healthz (bounded).
+gw_restart_wait() {
+  "${FX[@]}" restart yabanin >/dev/null
+  local i
+  for i in $(seq 1 60); do
+    curl -fsS "$QS_BASE/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# gw_log_wait TIMEOUT_SECS MARKER PATTERN...: bounded wait until the gateway
+# container has logged every fixed-string PATTERN since MARKER. /healthz
+# alone is not sufficient evidence — the readiness wiring logs after the
+# listener is up, so a one-shot grep can race the message and false-fail.
+# Prints the matched log window on stdout; on timeout dumps the actual log
+# tail and returns nonzero.
+gw_log_wait() {
+  local timeout_secs=$1 marker=$2; shift 2
+  local i log p ok
+  for i in $(seq 1 "$timeout_secs"); do
+    log=$(docker logs --since "$marker" "${proj_fixed}-yabanin-1" 2>&1)
+    ok=1
+    for p in "$@"; do
+      grep -qF -- "$p" <<<"$log" || ok=0
+    done
+    if [[ $ok -eq 1 ]]; then
+      printf '%s' "$log"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "---- gw_log_wait: expected log state not reached in ${timeout_secs}s (since $marker) ----" >&2
+  docker logs --since "$marker" "${proj_fixed}-yabanin-1" 2>&1 | tail -40 >&2
+  return 1
+}
+
+# gw_serve_200 PAYLOAD: bounded wait until the gateway answers a chat
+# completion with 200 — degraded view readiness must never stop serving.
+gw_serve_200() {
+  local i code=000
+  for i in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" \
+      -H 'Content-Type: application/json' -d "$1" "$QS_BASE/v1/chat/completions")
+    [[ "$code" == "200" ]] && return 0
+    sleep 1
+  done
+  echo "gw_serve_200: last HTTP status $code" >&2
+  return 1
+}
+
+# beta_views_check QFN: exactly the seven managed views exist — no unexpected
+# beta views, no beta materialized views.
+beta_views_check() {
+  local got mats
+  got=$("$1" "SELECT COALESCE(string_agg(viewname, ' ' ORDER BY viewname), '') FROM pg_views WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+  [[ "$got" == "$BETA_VIEWS" ]] || fail "beta views are [$got], want exactly the seven managed names"
+  mats=$("$1" "SELECT count(*) FROM pg_matviews WHERE schemaname = 'public' AND matviewname LIKE 'beta\\_%'")
+  [[ "$mats" == "0" ]] || fail "$mats unexpected beta materialized views present"
+}
+
+# beta_columns_check QFN: every managed view is content-minimized — exactly
+# the pinned column set in pinned order (counts/percentiles/timestamps and
+# org scoping only; any payload column fails here).
+beta_columns_check() {
+  local v got exp
+  for v in $BETA_VIEWS; do
+    got=$("$1" "SELECT COALESCE(string_agg(column_name, '|' ORDER BY ordinal_position), '') FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '$v'")
+    case "$v" in
+      beta_dau_daily)             exp='day|org_id|active_users|requests' ;;
+      beta_requests_daily)        exp='day|org_id|requests|errors' ;;
+      beta_onboarding_ttfq)       exp='org_id|onboarded_at|first_request_at|seconds_to_first_request' ;;
+      beta_provider_distribution) exp='day|org_id|provider|byok|requests' ;;
+      beta_provider_errors)       exp='day|org_id|provider|byok|requests|errors|error_rate' ;;
+      beta_latency_daily)         exp='day|org_id|p50_ms|p95_ms|requests' ;;
+      beta_cache_hit_rate_daily)  exp='day|org_id|hits|requests|hit_rate' ;;
+    esac
+    [[ "$got" == "$exp" ]] || fail "$v exposes [$got], want the content-minimized set [$exp]"
+  done
+}
+
+# beta_fixture_values_check QFN: frozen fixture-org expectations — 3 requests/
+# 1 error, DAU 3/3, onboarding pinned to FIX_T0/+90s/90s, BYOK provider
+# attribution, p50/p95 200/290 (durations 200/200/300 under percentile_cont),
+# cache 1/3. Numbers are pinned here, never derived from the implementation.
+beta_fixture_values_check() {
+  local q=$1 got
+  got=$($q "SELECT active_users || '/' || requests FROM beta_dau_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/3" ]] || fail "fixture beta_dau_daily [$got] != 3/3"
+  got=$($q "SELECT requests || '/' || errors FROM beta_requests_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/1" ]] || fail "fixture beta_requests_daily [$got] != 3/1"
+  got=$($q "SELECT (onboarded_at - '$FIX_T0'::timestamptz) = interval '0' AND (first_request_at - ('$FIX_T0'::timestamptz + interval '90 seconds')) = interval '0' AND round(seconds_to_first_request::numeric) = 90 FROM beta_onboarding_ttfq WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "t" ]] || fail "fixture beta_onboarding_ttfq [$got] != pinned t0/+90s/90s"
+  got=$($q "SELECT provider || '/' || byok::int || '/' || requests FROM beta_provider_distribution WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "qs-fixture-provider/1/3" ]] || fail "fixture beta_provider_distribution [$got] != qs-fixture-provider/1/3 (byok=true)"
+  got=$($q "SELECT requests || '/' || errors || '/' || round(error_rate::numeric, 4)::text FROM beta_provider_errors WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/1/0.3333" ]] || fail "fixture beta_provider_errors [$got] != 3/1/0.3333"
+  got=$($q "SELECT p50_ms::int || '/' || p95_ms::int || '/' || requests FROM beta_latency_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "200/290/3" ]] || fail "fixture beta_latency_daily [$got] != 200/290/3"
+  got=$($q "SELECT hits || '/' || requests || '/' || round(hit_rate::numeric, 4)::text FROM beta_cache_hit_rate_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "1/3/0.3333" ]] || fail "fixture beta_cache_hit_rate_daily [$got] != 1/3/0.3333"
+  got=$($q "SELECT count(*) FROM beta_requests_daily WHERE org_id = '$FIX_ORG' AND day = date_trunc('day', '$FIX_T0'::timestamptz AT TIME ZONE 'UTC')")
+  [[ "$got" == "1" ]] || fail "fixture rows grouped into [$got] days, want the single pinned UTC day"
+}
 
 # up_wait TIMEOUT_SECS PROJECT build|nobuild COMPOSE_CMD...
 # `compose up -d --wait` under a hard bound: compose v2.18 can poll a
@@ -390,22 +534,26 @@ run_bounded() {
   return $rc
 }
 
-# inventory_assert PROJECT: fresh Community install surface assertions —
-# exactly the documented service set (no hidden services), only the gateway
-# publishing, 127.0.0.1-only bindings, one-shot services Exited(0).
+# inventory_assert PROJECT [COMPOSE_FILE]: fresh Community install surface
+# assertions — exactly the documented service set (no hidden services), only
+# the gateway publishing, 127.0.0.1-only bindings, one-shot services
+# Exited(0). COMPOSE_FILE defaults to the shipped file; callers under
+# QS_PRIMARY_NET pass the scratch rewrite the project was created from.
 inventory_assert() {
-python3 - "$1" <<'PY'
+local cmp_file=${2:-deploy/quickstart/docker-compose.yml}
+python3 - "$1" "$cmp_file" <<'PY'
 import json, subprocess, sys
-proj = sys.argv[1]
+proj, cmp_file = sys.argv[1], sys.argv[2]
 def run(*args):
     return subprocess.run(args, capture_output=True, text=True)
-services = sorted(run("docker", "compose", "-p", proj, "-f",
-                      "deploy/quickstart/docker-compose.yml", "--profile",
+services = sorted(run("docker", "compose", "-p", proj, "-f", cmp_file,
+                      "--project-directory", "deploy/quickstart", "--profile",
                       "mock", "ps", "--all", "--services").stdout.split())
 expected = ["db-app-role", "migrate", "mock-openai", "postgres", "redis", "yabanin"]
 assert services == expected, f"project services {services} != documented {expected}"
-base = sorted(run("docker", "compose", "-p", proj, "-f",
-                  "deploy/quickstart/docker-compose.yml", "config", "--services").stdout.split())
+base = sorted(run("docker", "compose", "-p", proj, "-f", cmp_file,
+                  "--project-directory", "deploy/quickstart",
+                  "config", "--services").stdout.split())
 assert base == ["db-app-role", "migrate", "postgres", "redis", "yabanin"], \
     f"default profile surface {base} hides or leaks services"
 forbidden = ["prometheus", "grafana", "alertmanager", "dashboard", "classifier",
@@ -441,10 +589,16 @@ PY
 step "S1 fresh Community install: service inventory"
 use_fixed
 "${FX[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
-up_wait 1200 "$proj_fixed" build "${FX[@]}" || fail "S1: up --build --wait failed or stalled"
-note "up --build --wait exit 0"
+# Documented build step (docs step 3 / demo.sh): the Dockerfile's epoch guard
+# fails `up --build` without SOURCE_DATE_EPOCH, so build with the commit
+# timestamp first, then the documented up --no-build --wait.
+run_bounded 1200 "${FX[@]}" build \
+  --build-arg "SOURCE_DATE_EPOCH=$(git log -1 --format=%ct)" \
+  || fail "S1: reproducible compose build failed or stalled"
+up_wait 1200 "$proj_fixed" nobuild "${FX[@]}" || fail "S1: up --wait failed or stalled"
+note "reproducible build (SOURCE_DATE_EPOCH=commit time) + up -d --no-build --wait exit 0"
 
-inventory_assert "$proj_fixed" || fail "S1 inventory assertions failed"
+inventory_assert "$proj_fixed" "${QS_COMPOSE_FILE:-$compose_file}" || fail "S1 inventory assertions failed"
 
 # --- S2 canonical seed + documented first request ----------------------------
 step "S2 canonical seed + documented first request (clean environment)"
@@ -465,18 +619,157 @@ code401=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $bogu
 [[ "$code401" == "401" ]] || fail "S2: bogus key got HTTP $code401, want 401"
 note "bogus key rejected with 401"
 
+# --- schema contract (pinned; migrations/README.md "Current schema and
+# numbering" + pkg/migrate numbering tests): head version 0027, exactly 26
+# up/down pairs 0001-0022 + 0024-0027, 0023 permanently reserved unused.
+# The expectation is pinned, never derived: deleting the head migration or
+# renumbering must FAIL here instead of silently lowering a max()/count.
+SCHEMA_HEAD=27
+SCHEMA_UP_SET="0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 0021 0022 0024 0025 0026 0027"
+
+migration_versions() { # <up|down>: sorted embedded migration version numbers
+  ls pkg/migrate/migrations/*."$1".sql \
+    | sed 's#.*/\([0-9]\{4\}\)_[^/]*$#\1#' | sort | tr '\n' ' ' | sed 's/ $//'
+}
+
+schema_contract_violations() { # <version> <dirty> <up-set> <down-set>
+  local ver=$1 dirty=$2 ups=$3 downs=$4
+  [[ "$ver" == "$SCHEMA_HEAD" ]] || printf 'schema version %s != pinned head %s\n' "$ver" "$SCHEMA_HEAD"
+  [[ "$dirty" == "f" ]] || printf 'schema_migrations.dirty=%s (want f)\n' "$dirty"
+  [[ "$ups" == "$SCHEMA_UP_SET" ]] || printf 'up set mismatch\n  got:    %s\n  pinned: %s\n' "$ups" "$SCHEMA_UP_SET"
+  [[ "$downs" == "$SCHEMA_UP_SET" ]] || printf 'down set mismatch\n  got:    %s\n  pinned: %s\n' "$downs" "$SCHEMA_UP_SET"
+}
+
 # --- S3 empty DB: full schema on the fresh volume ----------------------------
 step "S3 empty DB: all embedded migrations applied"
-expected_ver=$(ls pkg/migrate/migrations/*.up.sql | wc -l | tr -d ' ')
+ups=$(migration_versions up)
+downs=$(migration_versions down)
 dbver=$(dbq "SELECT version FROM schema_migrations")
 dirty=$(dbq "SELECT dirty FROM schema_migrations")
-[[ "$dbver" == "$expected_ver" ]] || fail "S3: schema version $dbver != migration file count $expected_ver"
-[[ "$dirty" == "f" ]] || fail "S3: schema_migrations.dirty=$dirty"
+viol=$(schema_contract_violations "$dbver" "$dirty" "$ups" "$downs")
+[[ -z "$viol" ]] || fail "S3: schema contract violated (pinned head $SCHEMA_HEAD, 26 pairs, 0023 reserved): $viol"
 counts=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
 [[ "$counts" == "1/1/1" ]] || fail "S3: seeded counts $counts != 1/1/1"
 credits=$(dbq "SELECT count(*) FROM org_credits WHERE balance_cents > 0")
 [[ "$credits" -ge 1 ]] || fail "S3: no org credit balance > 0"
-note "schema version=$dbver (=$expected_ver files), dirty=f; orgs/keys/admins=1/1/1; credits funded"
+# Oracle negative controls: each synthetic breach the oracle itself must
+# catch (lowered head, missing head migration file, dirty state) — otherwise
+# the pinned check above could pass vacuously.
+neg_head=$(schema_contract_violations 26 f "$ups" "$downs")
+[[ "$neg_head" == *"26 != pinned head 27"* ]] || fail "S3: oracle missed lowered head: $neg_head"
+neg_missing=$(schema_contract_violations "$dbver" f "$(printf '%s ' $SCHEMA_UP_SET | sed 's/0027 //; s/ $//')" "$downs")
+[[ "$neg_missing" == *"up set mismatch"* ]] || fail "S3: oracle missed missing 0027: $neg_missing"
+neg_dirty=$(schema_contract_violations "$dbver" t "$ups" "$downs")
+[[ "$neg_dirty" == *"dirty=t"* ]] || fail "S3: oracle missed dirty schema_migrations: $neg_dirty"
+note "schema head=$dbver (pinned $SCHEMA_HEAD), dirty=f, 26 up/down pairs (0023 reserved); oracle catches lowered head / missing 0027 / dirty"
+
+# --- S3b managed beta views: seven names, content-minimized columns,
+# frozen per-org values, app-role reads (expectations pinned, never
+# derived from the implementation) ------------------------------------------
+step "S3b beta views: exactly seven, content-minimized, frozen per-org values"
+beta_views_check dbq
+beta_columns_check dbq
+note "seven managed views present (no extras, no materialized); columns content-minimized"
+
+# Deterministic fixture org (fixed uuids/bigint ids; timestamps pinned to one
+# UTC hour so day grouping is stable). Durations 200/200/300 yield the pinned
+# p50/p95 200/290 under percentile_cont; row 2 is the only cache hit, row 3
+# the only >=400. BYOK attribution is pinned via an org_custom_models row
+# (its id is GENERATED ALWAYS AS IDENTITY, so PostgreSQL assigns it).
+FIX_ORG='66666666-6666-4666-8666-666666666666'
+FIX_T0=$(dbq "SELECT date_trunc('hour', now())::text")
+dbq "DELETE FROM request_logs WHERE org_id = '$FIX_ORG';
+DELETE FROM org_custom_models WHERE org_id = '$FIX_ORG';
+DELETE FROM organizations WHERE id = '$FIX_ORG';
+INSERT INTO organizations (id, name, slug, created_at) VALUES ('$FIX_ORG', 'qs-fixture-org', 'qs-fixture-org', '$FIX_T0');
+INSERT INTO org_custom_models (org_id, model_name, provider, upstream_url) VALUES ('$FIX_ORG', 'mock-model', 'qs-fixture-provider', 'http://fixture.invalid');
+INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, duration_ms, error, created_at, updated_at, request_id, cache_hit_type, user_id, home_region) VALUES
+  (987650101, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '90 seconds', '$FIX_T0'::timestamptz + interval '90 seconds', 'qs-fixture-req-1', NULL, '66666666-6666-4666-8666-000000000001', 'qs'),
+  (987650102, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '150 seconds', '$FIX_T0'::timestamptz + interval '150 seconds', 'qs-fixture-req-2', 'exact', '66666666-6666-4666-8666-000000000002', 'qs'),
+  (987650103, '$FIX_ORG', 'mock-model', 'mock-model', 500, 300, 'fixture error', '$FIX_T0'::timestamptz + interval '180 seconds', '$FIX_T0'::timestamptz + interval '180 seconds', 'qs-fixture-req-3', NULL, '66666666-6666-4666-8666-000000000003', 'qs')" >/dev/null
+beta_fixture_values_check dbq
+note "fixture org pinned: 3 requests/1 error, DAU 3/3, ttfq t0/+90s/90s, byok provider, p50/p95 200/290, cache 1/3"
+
+# org1 pinned to the actual S2 smoke rows: view aggregates must equal
+# aggregates computed independently over raw request_logs for the seeded org.
+org1=$(dbq "SELECT id FROM organizations WHERE id <> '$FIX_ORG' ORDER BY created_at LIMIT 1")
+[[ -n "$org1" ]] || fail "S3b: seeded org missing"
+raw_reqs=$(dbq "SELECT count(*) FROM request_logs WHERE org_id = '$org1'")
+raw_errs=$(dbq "SELECT count(*) FROM request_logs WHERE org_id = '$org1' AND status_code >= 400")
+raw_users=$(dbq "SELECT count(DISTINCT COALESCE(user_id::text, api_key_id::text, 'anon')) FROM request_logs WHERE org_id = '$org1'")
+[[ "$raw_errs" == "0" ]] || fail "S3b: org1 smoke traffic unexpectedly has $raw_errs error rows"
+got=$(dbq "SELECT requests || '/' || errors FROM beta_requests_daily WHERE org_id = '$org1'")
+[[ "$got" == "$raw_reqs/0" ]] || fail "S3b: org1 beta_requests_daily [$got] != raw $raw_reqs/0"
+got=$(dbq "SELECT active_users || '/' || requests FROM beta_dau_daily WHERE org_id = '$org1'")
+[[ "$got" == "$raw_users/$raw_reqs" ]] || fail "S3b: org1 beta_dau_daily [$got] != raw $raw_users/$raw_reqs"
+note "org1 view rows equal raw request_logs aggregates ($raw_reqs requests, 0 errors)"
+
+# The app role reads every view (bootstrap grants; provisioning re-grants).
+for v in $BETA_VIEWS; do
+  got=$(adbq "SELECT count(*) FROM $v WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "1" ]] || fail "S3b: app-role read of $v returned [$got], want 1 fixture row"
+done
+note "app role reads all seven views (1 fixture row each)"
+
+# --- S3c degraded readiness: a revoked/dropped view is named degraded while
+# the gateway still serves; the documented migrate boundary self-heals all
+# seven; a fresh startup reports ready ---------------------------------------
+step "S3c revoked view: app read denied 42501, named degraded readiness, gateway serves"
+dbq "REVOKE SELECT ON public.beta_latency_daily FROM yabanin_app" >/dev/null
+set +e
+deny_out=$(adbq "SELECT count(*) FROM public.beta_latency_daily WHERE org_id = '$FIX_ORG'" 2>&1)
+deny_rc=$?
+set -e
+if [[ $deny_rc -eq 0 ]] || ! grep -q '42501' <<<"$deny_out" || ! grep -q 'permission denied' <<<"$deny_out"; then
+  fail "S3c: revoked-view read as yabanin_app rc=$deny_rc, want nonzero with SQLSTATE 42501: $deny_out"
+fi
+deg0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (revoked view)"
+deg_log=$(gw_log_wait 90 "$deg0" "beta metrics views not ready" "beta_latency_daily") \
+  || fail "S3c: named degraded readiness for beta_latency_daily not logged (dump above)"
+if grep -qF 'msg="beta metrics views ready"' <<<"$deg_log"; then
+  fail "S3c: ready line logged while beta_latency_daily is unreadable"
+fi
+gw_serve_200 '{"model":"mock-model","stream":false,"messages":[{"role":"user","content":"degraded"}]}' \
+  || fail "S3c: gateway did not serve while degraded (status above)"
+note "named degraded (unreadable beta_latency_daily) while still serving 200"
+
+step "S3c migrate boundary self-heals the revoked view; fresh startup ready"
+"${FX[@]}" run --rm migrate >/dev/null 2>&1 || fail "S3c: migrate re-run failed (revoked view)"
+got=$(adbq "SELECT count(*) FROM public.beta_latency_daily WHERE org_id = '$FIX_ORG'")
+[[ "$got" == "1" ]] || fail "S3c: app-role read not healed after migrate: [$got]"
+heal0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (healed)"
+heal_log=$(gw_log_wait 90 "$heal0" 'msg="beta metrics views ready"') \
+  || fail "S3c: fresh startup did not report ready after heal (dump above)"
+if grep -qF "beta metrics views not ready" <<<"$heal_log"; then
+  fail "S3c: stale degraded line after heal"
+fi
+note "re-grant via migrate; fresh startup reports ready"
+
+step "S3c dropped view: named degraded while serving; migrate recreates all seven"
+dbq "DROP VIEW public.beta_cache_hit_rate_daily" >/dev/null
+drop_views=$(dbq "SELECT count(*) FROM pg_views WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+[[ "$drop_views" == "6" ]] || fail "S3c: expected 6 beta views after drop, got $drop_views"
+deg1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (dropped view)"
+deg_log=$(gw_log_wait 90 "$deg1" "beta metrics views not ready" "beta_cache_hit_rate_daily") \
+  || fail "S3c: named degraded readiness for the dropped view not logged (dump above)"
+if grep -qF 'msg="beta metrics views ready"' <<<"$deg_log"; then
+  fail "S3c: ready line logged while beta_cache_hit_rate_daily is dropped"
+fi
+gw_serve_200 '{"model":"mock-model","stream":false,"messages":[{"role":"user","content":"degraded2"}]}' \
+  || fail "S3c: gateway did not serve while view dropped (status above)"
+"${FX[@]}" run --rm migrate >/dev/null 2>&1 || fail "S3c: migrate re-run failed (dropped view)"
+beta_views_check dbq
+beta_fixture_values_check dbq
+got=$(adbq "SELECT count(*) FROM public.beta_cache_hit_rate_daily WHERE org_id = '$FIX_ORG'")
+[[ "$got" == "1" ]] || fail "S3c: app-role read of recreated view [$got] != 1"
+ready0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (recreated view)"
+ready_log=$(gw_log_wait 90 "$ready0" 'msg="beta metrics views ready"') \
+  || fail "S3c: fresh startup did not report ready after recreate (dump above)"
+note "dropped view recreated + re-granted by migrate; fresh startup ready"
 
 # --- S4 restart: named volume survives down (no -v) --------------------------
 step "S4 restart: down (no -v) -> up -> same key serves"
@@ -494,10 +787,17 @@ if grep -q "shown once, store it now" <<<"$seed_rerun"; then
 fi
 note "seed rerun: loud no-op, plaintext not reprinted"
 counts2=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
-[[ "$counts2" == "1/1/1" ]] || fail "S4: counts after restart $counts2 != 1/1/1"
+[[ "$counts2" == "2/1/1" ]] || fail "S4: counts after restart $counts2 != 2/1/1 (seeded org + FIX_ORG, one key, one admin)"
+org_split=$(dbq "SELECT (SELECT count(*) FROM organizations WHERE id = '$FIX_ORG')||'/'||(SELECT count(*) FROM organizations WHERE id <> '$FIX_ORG')")
+[[ "$org_split" == "1/1" ]] || fail "S4: org split $org_split != 1/1 (exactly FIX_ORG plus exactly one other org)"
 smoke_out2=$(bash scripts/quickstart/smoke.sh "$key")
 grep -q "^smoke ok (" <<<"$smoke_out2" || fail "S4: smoke with same key after restart failed: $smoke_out2"
 note "$smoke_out2 (same key as S2)"
+
+# The seven managed views and the frozen fixture rows ride the named volume.
+beta_views_check dbq
+beta_fixture_values_check dbq
+note "seven views + frozen fixture values intact after down/up"
 
 # --- S6 wrong secrets (fixed stack still up) ---------------------------------
 step "S6a wrong secret: weak session key refuses production startup"
@@ -615,10 +915,10 @@ note "fixture: re-subnetted to $fixture_subnet (mock at $fixture_mock_ip, litera
 docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart config -q \
   || fail "S5: generated fixture does not render as a compose file"
 BRIX=(docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock)
-# Seed the broken fixture through the BROKEN compose itself. seed.sh is bound
-# to the shipped compose file (-f deploy/quickstart/docker-compose.yml), so
-# under this project name it would recreate postgres onto the named
-# pg_data volume and mask the anonymous-volume defect entirely.
+# Seed the broken fixture through the BROKEN compose itself. seed.sh resolves
+# to the shipped file or the primary scratch override — both declare the
+# named pg_data volume — so under this project name it would recreate
+# postgres onto that volume and mask the anonymous-volume defect entirely.
 BRIXS=(docker compose -p "$proj_broken" -f "$BRK_COMPOSE" --project-directory deploy/quickstart --profile mock --profile seed)
 brk_seed() {
   local pw_file="$BRK_TMP/brk-seed-pw.$$"
@@ -647,7 +947,9 @@ fixed_subnet=$(docker network inspect "${proj_fixed}_default" \
   --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}')
 [[ "$fixed_subnet" == "$pri_pin_subnet" ]] \
   || fail "S5: primary network subnet $fixed_subnet != $pri_pin_subnet"
-note "coexistence: ${proj_fixed}_default ($fixed_subnet) + ${proj_broken}_default ($brk_subnet) both up"
+[[ "$fixed_subnet" != "$brk_subnet" ]] \
+  || fail "S5: primary and fixture networks share subnet $fixed_subnet; multi-project isolation did not hold"
+note "coexistence: ${proj_fixed}_default ($fixed_subnet) + ${proj_broken}_default ($brk_subnet) both up, distinct subnets"
 brk_type=$(docker inspect -f '{{range .Mounts}}{{.Type}} {{end}}' "${proj_broken}-postgres-1")
 brk_names=$(docker inspect -f '{{range .Mounts}}{{.Name}} {{end}}' "${proj_broken}-postgres-1")
 [[ "$brk_type" == *"volume"* ]] || fail "S5: fixture postgres has no volume mount: $brk_type"
@@ -689,16 +991,39 @@ note "five-command flow + restart/localhost claims + links: consistent with veri
 # --- S8 documented five-command flow via make targets (consumer entry point) -
 step "S8 documented consumer flow (make targets) on an isolated clean stack"
 use_integ
-# The make-flow project runs the shipped compose unchanged, so it always
-# claims the production D-4 pin (10.207.0.0/24) — QS_PRIMARY_NET never moves
-# it. Nothing reads the fixed stack after S6b, so retire it — volume
-# included, cleanup removes leftovers anyway — to free the fixed stack's
-# pinned subnet ($pri_pin_subnet) for the integ project's network.
+# The make flow honors QS_COMPOSE_FILE (exported by use_integ), so the integ
+# project runs the same compose as the primary: the scratch rewrite under
+# QS_PRIMARY_NET, the shipped file and its D-4 pin otherwise. Nothing reads
+# the fixed stack after S6b, so retire it — volume included, cleanup removes
+# leftovers anyway — to free the fixed stack's pinned subnet ($pri_pin_subnet)
+# for the integ project's network.
 "${FX[@]}" down -v --remove-orphans >/dev/null
 RUN_BOUNDED_KEEP="$BRK_TMP/make-quickstart-up-s8.log" run_bounded 1200 make quickstart-up >/dev/null \
   || fail "S8: make quickstart-up failed or stalled (failure dump above; full output kept at $BRK_TMP/make-quickstart-up-s8.log)"
-note "make quickstart-up exit 0 (init-env idempotence + up --build --wait; output kept at $BRK_TMP/make-quickstart-up-s8.log)"
-inventory_assert "$proj_integ" || fail "S8: make-created stack fails the fresh-install inventory"
+note "make quickstart-up exit 0 (init-env idempotence + reproducible build + up --no-build --wait; output kept at $BRK_TMP/make-quickstart-up-s8.log)"
+# Executed F2 proof: the make-created project must sit on the primary pin
+# ($pri_pin_subnet — the override /24 or, without one, the shipped pin),
+# never on the fixture subnet; under the override its mock must hold the
+# rewritten upstream address (the same one seed/smoke route through); and
+# the shipped compose must stay byte-identical to the S0 digest.
+integ_subnet=$(docker network inspect "${proj_integ}_default" \
+  --format '{{range .IPAM.Config}}{{.Subnet}}{{end}}') \
+  || fail "S8: no ${proj_integ}_default network after make quickstart-up"
+[[ "$integ_subnet" == "$pri_pin_subnet" ]] \
+  || fail "S8: make-flow network ${proj_integ}_default is ${integ_subnet}, want the primary pin ${pri_pin_subnet} (QS_COMPOSE_FILE not honored by the make flow?)"
+[[ "$integ_subnet" != "$fixture_subnet" ]] \
+  || fail "S8: make-flow network sits on the fixture subnet ${fixture_subnet}; projects are not isolated"
+if [[ -n "$primary_net" ]]; then
+  integ_mock_ip=$(docker inspect "${proj_integ}-mock-openai-1" \
+    -f '{{range .NetworkSettings.Networks}}{{.IPAMConfig.IPv4Address}}{{end}}' 2>/dev/null || true)
+  [[ "$integ_mock_ip" == "$primary_mock_ip" ]] \
+    || fail "S8: make-flow mock-openai is at ${integ_mock_ip:-no static address}, want the rewritten upstream ${primary_mock_ip}"
+fi
+shipped_now=$(sha256sum "$compose_file" | cut -d' ' -f1)
+[[ "$shipped_now" == "$shipped_sha" ]] \
+  || fail "S8: shipped compose bytes changed during the run (${shipped_now} != ${shipped_sha})"
+note "make-flow network ${proj_integ}_default on ${integ_subnet} (fixture keeps ${fixture_subnet}); shipped compose sha256 unchanged (${shipped_now:0:12}…)"
+inventory_assert "$proj_integ" "${QS_COMPOSE_FILE:-$compose_file}" || fail "S8: make-created stack fails the fresh-install inventory"
 note "make-created stack: documented surface only, one-shots Exited(0), 127.0.0.1-only"
 seed_out=$(make quickstart-seed 2>&1)
 key=$(printf '%s' "$seed_out" | extract_key)
@@ -721,11 +1046,12 @@ RUN_BOUNDED_KEEP="$BRK_TMP/make-quickstart-up-s9.log" run_bounded 900 make quick
   || fail "S9: make quickstart-up on the empty DB failed or stalled (failure dump above; full output kept at $BRK_TMP/make-quickstart-up-s9.log)"
 mig_s=$(docker inspect -f '{{.State.Status}}/{{.State.ExitCode}}' "${proj_integ}-migrate-1")
 [[ "$mig_s" == "exited/0" ]] || fail "S9: migrate on the wiped volume: $mig_s, want exited/0"
-expected_ver=$(ls pkg/migrate/migrations/*.up.sql | wc -l | tr -d ' ')
+ups=$(migration_versions up)
+downs=$(migration_versions down)
 dbver=$(idbq "SELECT version FROM schema_migrations")
 dirty=$(idbq "SELECT dirty FROM schema_migrations")
-[[ "$dbver" == "$expected_ver" ]] || fail "S9: schema version $dbver != migration file count $expected_ver"
-[[ "$dirty" == "f" ]] || fail "S9: schema_migrations.dirty=$dirty on the empty DB"
+viol=$(schema_contract_violations "$dbver" "$dirty" "$ups" "$downs")
+[[ -z "$viol" ]] || fail "S9: schema contract violated on the empty DB (pinned head $SCHEMA_HEAD, 26 pairs, 0023 reserved): $viol"
 counts=$(idbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
 [[ "$counts" == "0/0/0" ]] || fail "S9: wiped DB not empty: $counts"
 empty_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" \
@@ -734,6 +1060,15 @@ empty_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $k
   "$QS_BASE/v1/chat/completions")
 [[ "$empty_code" == "401" ]] || fail "S9: key from the wiped DB got HTTP $empty_code, want 401"
 note "empty DB boundary: migrate applied version $dbver (dirty=f); wiped key refused 401"
+
+# The documented reset provisions the seven managed views on the empty
+# database before any seed runs, and the app role can read them.
+beta_views_check idbq
+got=$(idbq "SELECT (SELECT count(*) FROM beta_requests_daily) || '/' || (SELECT count(*) FROM beta_dau_daily) || '/' || (SELECT count(*) FROM beta_onboarding_ttfq)")
+[[ "$got" == "0/0/0" ]] || fail "S9: beta views not empty on the fresh DB: $got"
+got=$(idbq_app "SELECT count(*) FROM beta_requests_daily")
+[[ "$got" == "0" ]] || fail "S9: app role cannot read the fresh beta views: [$got]"
+note "seven views exist and are app-readable on the empty DB before seed"
 seed_out=$(make quickstart-seed 2>&1)
 key9=$(printf '%s' "$seed_out" | extract_key)
 [[ -n "$key9" && "$key9" != "$key" ]] || fail "S9: reseed did not mint a fresh key: $seed_out"
@@ -798,28 +1133,80 @@ grep -q "yabanin_admin_session=" "$BRK_TMP/login-ok.hdr" \
   || fail "S11b: no admin session cookie on the successful login"
 note "wrong password 401; seed-printed password 302 + yabanin_admin_session cookie"
 
-# --- S12 linked deploy paths: configs render, secrets fail-closed, dispatch ---
-step "S12 linked deploy paths: config renders + required-secret rejection + binary dispatch"
-if [[ ! -f deploy/.env ]]; then
-  integ_env_created=1
-  [[ -d deploy/secrets ]] || integ_secrets_created=1
-  bash scripts/deploy/init-secrets.sh >/dev/null
+# --- S12 linked deploy paths: public render contracts, fail-closed secrets ---
+step "S12 linked deploy paths: dev + supported offline render; named required-secret rejection; deploy.sh public boundary; dispatch"
+# The production Compose file is maintainer material, NOT in the public export
+# (docs/runbooks/production.md; tests/load/README.md likewise excludes the
+# prod/e2e runners). The public render contracts are the actual dev compose and
+# the supported simple offline path (docs/onprem/offline-bundle.md).
+# A pre-existing deploy/.env (regular file, or a symlink — even a dangling one)
+# is never overwritten or removed.
+if [[ ! -e deploy/.env && ! -L deploy/.env ]]; then
+  s12_env_created=1
+  # Synthetic, non-secret, render-only: config just needs the env_file to
+  # exist; secret files are not read at config time.
+  printf 'POSTGRES_PASSWORD=s12-synthetic-render-nonsecret\n' > deploy/.env
 fi
 docker compose -f deploy/docker-compose.yml config -q \
   || fail "S12: dev stack deploy/docker-compose.yml does not render"
-docker compose -f deploy/docker-compose.prod.yml config -q \
-  || fail "S12: prod stack deploy/docker-compose.prod.yml does not render"
-docker compose -f deploy/docker-compose.prod.yml -f deploy/docker-compose.e2e.yml config -q \
-  || fail "S12: prod+e2e overlay does not render"
-note "dev / prod / prod+e2e compose configs render (documented prerequisite init-secrets.sh)"
+AIRGAP=deploy/onprem/airgap-compose.yml
+POSTGRES_PASSWORD=s12-synthetic-render-nonsecret \
+YABANIN_CACHE_HMAC_SECRET=s12-synthetic-render-nonsecret \
+  docker compose -f "$AIRGAP" config -q \
+  || fail "S12: supported offline compose $AIRGAP does not render with synthetic non-secret values"
+note "dev + supported offline (airgap) composes render; secrets stay operator-supplied"
+
+# Required secrets fail closed BY NAME with no default values (documented at
+# deploy/onprem/airgap-compose.yml:7-16,27-30,80).
+grep -q 'POSTGRES_PASSWORD:?set POSTGRES_PASSWORD' "$AIRGAP" \
+  || fail "S12: airgap compose no longer requires POSTGRES_PASSWORD via :? (no default)"
+grep -q 'YABANIN_CACHE_HMAC_SECRET:?set YABANIN_CACHE_HMAC_SECRET' "$AIRGAP" \
+  || fail "S12: airgap compose no longer requires YABANIN_CACHE_HMAC_SECRET via :? (no default)"
 set +e
-neg_err=$(docker compose --env-file /dev/null -f deploy/docker-compose.prod.yml config -q 2>&1)
+neg_err=$(env -u POSTGRES_PASSWORD -u YABANIN_CACHE_HMAC_SECRET docker compose -f "$AIRGAP" config -q 2>&1)
 neg_code=$?
+neg_err2=$(env -u YABANIN_CACHE_HMAC_SECRET POSTGRES_PASSWORD=s12-synthetic-render-nonsecret docker compose -f "$AIRGAP" config -q 2>&1)
+neg_code2=$?
 set -e
-[[ "$neg_code" -ne 0 ]] || fail "S12: prod compose accepted a stack missing GRAFANA_ADMIN_PASSWORD"
-grep -q "GRAFANA_ADMIN_PASSWORD is required" <<<"$neg_err" \
-  || fail "S12: rejection does not name the missing secret: $neg_err"
-note "missing required secret rejected at config time (contract §6)"
+[[ "$neg_code" -ne 0 ]] || fail "S12: airgap compose rendered without POSTGRES_PASSWORD"
+grep -q "required variable POSTGRES_PASSWORD is missing a value" <<<"$neg_err" \
+  || fail "S12: POSTGRES_PASSWORD rejection is not named: $neg_err"
+[[ "$neg_code2" -ne 0 ]] || fail "S12: airgap compose rendered without YABANIN_CACHE_HMAC_SECRET"
+grep -q "required variable YABANIN_CACHE_HMAC_SECRET is missing a value" <<<"$neg_err2" \
+  || fail "S12: YABANIN_CACHE_HMAC_SECRET rejection is not named: $neg_err2"
+note "missing POSTGRES_PASSWORD / YABANIN_CACHE_HMAC_SECRET each rejected by name at render time"
+
+# Public boundary of deploy.sh, exercised ONLY from a disposable public-export
+# fixture: the byte-identical script must refuse (nonzero, naming the boundary
+# and the supported paths) BEFORE any pull/build/deploy effect when no
+# maintainer production Compose exists. The live working copy is never invoked,
+# so a maintainer-supplied Compose in this checkout cannot cause a real deploy,
+# and the absent-Compose case is still exercised regardless of private material.
+S12_FIX="$BRK_TMP/s12-public-export"
+mkdir -p "$S12_FIX/scripts" "$S12_FIX/deploy"
+cp scripts/deploy.sh "$S12_FIX/scripts/deploy.sh"
+[[ "$(sha256sum scripts/deploy.sh | cut -d' ' -f1)" == "$(sha256sum "$S12_FIX/scripts/deploy.sh" | cut -d' ' -f1)" ]] \
+  || fail "S12: fixture deploy.sh is not byte-identical to the real script"
+[[ ! -e "$S12_FIX/deploy/docker-compose.prod.yml" ]] \
+  || fail "S12: fixture unexpectedly contains a maintainer production Compose"
+set +e
+dep_out=$(bash "$S12_FIX/scripts/deploy.sh" s12-fixture-refusal 2>&1)
+dep_code=$?
+set -e
+[[ "$dep_code" -ne 0 ]] || fail "S12: deploy.sh succeeded without a production Compose file"
+grep -q "not included in the public Core export" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not state the public-export boundary: $dep_out"
+grep -q "docs/onprem/offline-bundle.md" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not point to the offline-bundle path: $dep_out"
+grep -q "docs/onprem/install-guide.md" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not point to the install guide: $dep_out"
+if grep -q "\[1/7\] Pulling latest" <<<"$dep_out"; then
+  fail "S12: deploy.sh pulled code before refusing (side effect)"
+fi
+if grep -qE "\[[2-7]/7\]" <<<"$dep_out"; then
+  fail "S12: deploy.sh reached a deploy step before refusing (side effect): $dep_out"
+fi
+note "deploy.sh (byte-identical fixture copy) refuses before any effect; supported paths named"
 for c in gateway admin loggerd mcp migrate seed; do
   grep -q "case \"$c\":" cmd/yabanin/main.go \
     || fail "S12: subcommand $c is not dispatched by the unified binary"

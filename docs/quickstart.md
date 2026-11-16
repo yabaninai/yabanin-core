@@ -18,7 +18,7 @@ applicable prices; a missing price means unknown cost, not free inference. See
 This guide is for the **Developer Preview**. It starts PostgreSQL, Redis,
 a mock provider, one Yabanin process containing the gateway, admin API, and
 log consumer, and (with the `ui` profile) the containerized React dashboard.
-Published ports bind to `127.0.0.1`.
+Nothing listens on `0.0.0.0`: published ports bind to `127.0.0.1`.
 
 ## Before you start
 
@@ -134,9 +134,9 @@ the timing notes in the repository README. `postgres`, `redis`,
 `migrate` and `db-app-role` services should finish with exit code **0**; an
 exited migration container is expected. The seed service has not run yet.
 
-Do not replace these two steps with `make quickstart-up` in this preview:
-that target performs a build without forwarding the required timestamp.
-The explicit build followed by `--no-build` is the supported sequence here.
+`make quickstart-up` runs this same sequence: it builds with the checked-out
+commit timestamp as `SOURCE_DATE_EPOCH` and then starts with `--no-build`,
+so the shortcut and the explicit commands above are interchangeable here.
 
 Check the gateway independently:
 
@@ -153,6 +153,8 @@ yet prove that a model request can succeed.
 ```bash
 bash scripts/quickstart/seed.sh
 ```
+
+`make quickstart-seed` runs the same script.
 
 The command creates the bootstrap organization, team, model, budget, credits,
 a gateway API key, and a root admin. It prints:
@@ -199,6 +201,8 @@ and asynchronous PostgreSQL request logging together, run:
 ```bash
 bash scripts/quickstart/smoke.sh "$YABANIN_API_KEY"
 ```
+
+`make quickstart-smoke KEY="$YABANIN_API_KEY"` runs the same check.
 
 Expected final line: `smoke ok (N request log rows)`, where `N` is at least 1.
 The check waits for the log consumer, so it takes several seconds. On a fresh
@@ -295,8 +299,11 @@ docker compose -f deploy/quickstart/docker-compose.yml \
   --profile mock --profile ui down
 ```
 
-This retains the named PostgreSQL volume and your configuration file. To
-restart the same checkout without rebuilding:
+`make quickstart-down` is the `mock`-profile shortcut (`down --remove-orphans`);
+use the explicit command above when the dashboard profile also runs.
+
+This keeps the database volume: the named PostgreSQL volume and your
+configuration file are retained. To restart the same checkout without rebuilding:
 
 ```bash
 docker compose -f deploy/quickstart/docker-compose.yml \
