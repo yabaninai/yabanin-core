@@ -784,7 +784,9 @@ if grep -q "shown once, store it now" <<<"$seed_rerun"; then
 fi
 note "seed rerun: loud no-op, plaintext not reprinted"
 counts2=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
-[[ "$counts2" == "1/1/1" ]] || fail "S4: counts after restart $counts2 != 1/1/1"
+[[ "$counts2" == "2/1/1" ]] || fail "S4: counts after restart $counts2 != 2/1/1 (seeded org + FIX_ORG, one key, one admin)"
+org_split=$(dbq "SELECT (SELECT count(*) FROM organizations WHERE id = '$FIX_ORG')||'/'||(SELECT count(*) FROM organizations WHERE id <> '$FIX_ORG')")
+[[ "$org_split" == "1/1" ]] || fail "S4: org split $org_split != 1/1 (exactly FIX_ORG plus exactly one other org)"
 smoke_out2=$(bash scripts/quickstart/smoke.sh "$key")
 grep -q "^smoke ok (" <<<"$smoke_out2" || fail "S4: smoke with same key after restart failed: $smoke_out2"
 note "$smoke_out2 (same key as S2)"
