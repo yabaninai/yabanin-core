@@ -8,8 +8,16 @@
 #   S3 empty DB: every embedded migration applied on the fresh volume,
 #     against the pinned schema contract (head 0027, 26 pairs, 0023
 #     reserved) — never a derived max()/count
+#   S3b/S3c managed beta views (frozen): exactly the seven views with
+#     content-minimized columns; per-org values pinned independently
+#     (fixture 3 requests/1 error, DAU 3/3, ttfq 90s, byok provider,
+#     p50/p95 200/290, cache 1/3) + org1 against raw rows; app-role reads
+#     and a real 42501 negative; a revoked/dropped view is named degraded
+#     readiness while the gateway serves; the migrate boundary self-heals
+#     all seven and a fresh startup is ready
 #   S4 restart (down, no -v): named pg_data volume survives; the same key
-#      serves; seed rerun is a loud no-op
+#      serves; seed rerun is a loud no-op; the seven views and the frozen
+#      fixture survive
 #   S5 broken-vs-fixed: a pre-fix anonymous-volume fixture must FAIL the
 #      same restart-survival check the shipped stack passes. The fixture is
 #      rewritten onto its own /24 (QS_FIXTURE_NET, default 10.208.0) so it
@@ -23,8 +31,8 @@
 #      isolated project; fresh-install service-surface assertions re-checked on
 #      the make-created stack
 #   S9 empty DB through the same boundary: documented reset (down -v -> up),
-#      migrate re-applies the full schema, old key -> 401, reseed -> first
-#      request 200 with a new key
+#      migrate re-applies the full schema, old key -> 401, the seven beta
+#      views exist before reseed, reseed -> first request 200 with a new key
 #   S10 restart through the same boundary: make quickstart-down keeps pg_data;
 #      up re-runs migrate as a no-op; the same key serves
 #   S11 wrong secrets through the same boundary: half-set license env refuses
@@ -338,6 +346,120 @@ idbq() { "${INX[@]}" exec -T postgres psql -U yabanin -d yabanin -tA -c "$1"; }
 extract_key() { sed -n 's/.*API key (shown once, store it now): \(yb_[0-9a-fA-F]*\).*/\1/p'; }
 extract_admin_password() { sed -n 's/.*Admin password (shown once, store it now): \([0-9a-fA-F]*\).*/\1/p'; }
 
+# App-role (yabanin_app) psql for the fixed and integ projects. ON_ERROR_STOP
+# + verbose make a permission denial fail nonzero with SQLSTATE 42501 in the
+# output, so the 42501 negative below is a real behavioral denial.
+adbq()     { "${FX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 --verbosity=verbose -tA -c "$1"; }
+idbq_app() { "${INX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 --verbosity=verbose -tA -c "$1"; }
+
+# The seven managed beta views (pkg/feedback MetricsViewNames), pinned sorted.
+BETA_VIEWS="beta_cache_hit_rate_daily beta_dau_daily beta_latency_daily beta_onboarding_ttfq beta_provider_distribution beta_provider_errors beta_requests_daily"
+
+# gw_restart_wait: restart the fixed gateway and wait for /healthz (bounded).
+gw_restart_wait() {
+  "${FX[@]}" restart yabanin >/dev/null
+  local i
+  for i in $(seq 1 60); do
+    curl -fsS "$QS_BASE/healthz" >/dev/null 2>&1 && return 0
+    sleep 1
+  done
+  return 1
+}
+
+# gw_log_wait TIMEOUT_SECS MARKER PATTERN...: bounded wait until the gateway
+# container has logged every fixed-string PATTERN since MARKER. /healthz
+# alone is not sufficient evidence — the readiness wiring logs after the
+# listener is up, so a one-shot grep can race the message and false-fail.
+# Prints the matched log window on stdout; on timeout dumps the actual log
+# tail and returns nonzero.
+gw_log_wait() {
+  local timeout_secs=$1 marker=$2; shift 2
+  local i log p ok
+  for i in $(seq 1 "$timeout_secs"); do
+    log=$(docker logs --since "$marker" "${proj_fixed}-yabanin-1" 2>&1)
+    ok=1
+    for p in "$@"; do
+      grep -qF -- "$p" <<<"$log" || ok=0
+    done
+    if [[ $ok -eq 1 ]]; then
+      printf '%s' "$log"
+      return 0
+    fi
+    sleep 1
+  done
+  echo "---- gw_log_wait: expected log state not reached in ${timeout_secs}s (since $marker) ----" >&2
+  docker logs --since "$marker" "${proj_fixed}-yabanin-1" 2>&1 | tail -40 >&2
+  return 1
+}
+
+# gw_serve_200 PAYLOAD: bounded wait until the gateway answers a chat
+# completion with 200 — degraded view readiness must never stop serving.
+gw_serve_200() {
+  local i code=000
+  for i in $(seq 1 30); do
+    code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $key" \
+      -H 'Content-Type: application/json' -d "$1" "$QS_BASE/v1/chat/completions")
+    [[ "$code" == "200" ]] && return 0
+    sleep 1
+  done
+  echo "gw_serve_200: last HTTP status $code" >&2
+  return 1
+}
+
+# beta_views_check QFN: exactly the seven managed views exist — no unexpected
+# beta views, no beta materialized views.
+beta_views_check() {
+  local got mats
+  got=$("$1" "SELECT COALESCE(string_agg(viewname, ' ' ORDER BY viewname), '') FROM pg_views WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+  [[ "$got" == "$BETA_VIEWS" ]] || fail "beta views are [$got], want exactly the seven managed names"
+  mats=$("$1" "SELECT count(*) FROM pg_matviews WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+  [[ "$mats" == "0" ]] || fail "$mats unexpected beta materialized views present"
+}
+
+# beta_columns_check QFN: every managed view is content-minimized — exactly
+# the pinned column set in pinned order (counts/percentiles/timestamps and
+# org scoping only; any payload column fails here).
+beta_columns_check() {
+  local v got exp
+  for v in $BETA_VIEWS; do
+    got=$("$1" "SELECT COALESCE(string_agg(column_name, '|' ORDER BY ordinal_position), '') FROM information_schema.columns WHERE table_schema = 'public' AND table_name = '$v'")
+    case "$v" in
+      beta_dau_daily)             exp='day|org_id|active_users|requests' ;;
+      beta_requests_daily)        exp='day|org_id|requests|errors' ;;
+      beta_onboarding_ttfq)       exp='org_id|onboarded_at|first_request_at|seconds_to_first_request' ;;
+      beta_provider_distribution) exp='day|org_id|provider|byok|requests' ;;
+      beta_provider_errors)       exp='day|org_id|provider|byok|requests|errors|error_rate' ;;
+      beta_latency_daily)         exp='day|org_id|p50_ms|p95_ms|requests' ;;
+      beta_cache_hit_rate_daily)  exp='day|org_id|hits|requests|hit_rate' ;;
+    esac
+    [[ "$got" == "$exp" ]] || fail "$v exposes [$got], want the content-minimized set [$exp]"
+  done
+}
+
+# beta_fixture_values_check QFN: frozen fixture-org expectations — 3 requests/
+# 1 error, DAU 3/3, onboarding pinned to FIX_T0/+90s/90s, BYOK provider
+# attribution, p50/p95 200/290 (durations 200/200/300 under percentile_cont),
+# cache 1/3. Numbers are pinned here, never derived from the implementation.
+beta_fixture_values_check() {
+  local q=$1 got
+  got=$($q "SELECT active_users || '/' || requests FROM beta_dau_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/3" ]] || fail "fixture beta_dau_daily [$got] != 3/3"
+  got=$($q "SELECT requests || '/' || errors FROM beta_requests_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/1" ]] || fail "fixture beta_requests_daily [$got] != 3/1"
+  got=$($q "SELECT (onboarded_at - '$FIX_T0'::timestamptz) = interval '0' AND (first_request_at - ('$FIX_T0'::timestamptz + interval '90 seconds')) = interval '0' AND round(seconds_to_first_request::numeric) = 90 FROM beta_onboarding_ttfq WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "t" ]] || fail "fixture beta_onboarding_ttfq [$got] != pinned t0/+90s/90s"
+  got=$($q "SELECT provider || '/' || byok || '/' || requests FROM beta_provider_distribution WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "qs-fixture-provider/t/3" ]] || fail "fixture beta_provider_distribution [$got] != qs-fixture-provider/t/3"
+  got=$($q "SELECT requests || '/' || errors || '/' || round(error_rate::numeric, 4)::text FROM beta_provider_errors WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "3/1/0.3333" ]] || fail "fixture beta_provider_errors [$got] != 3/1/0.3333"
+  got=$($q "SELECT p50_ms::int || '/' || p95_ms::int || '/' || requests FROM beta_latency_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "200/290/3" ]] || fail "fixture beta_latency_daily [$got] != 200/290/3"
+  got=$($q "SELECT hits || '/' || requests || '/' || round(hit_rate::numeric, 4)::text FROM beta_cache_hit_rate_daily WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "1/3/0.3333" ]] || fail "fixture beta_cache_hit_rate_daily [$got] != 1/3/0.3333"
+  got=$($q "SELECT count(*) FROM beta_requests_daily WHERE org_id = '$FIX_ORG' AND day = date_trunc('day', '$FIX_T0'::timestamptz AT TIME ZONE 'UTC')")
+  [[ "$got" == "1" ]] || fail "fixture rows grouped into [$got] days, want the single pinned UTC day"
+}
+
 # up_wait TIMEOUT_SECS PROJECT build|nobuild COMPOSE_CMD...
 # `compose up -d --wait` under a hard bound: compose v2.18 can poll a
 # completed one-shot forever when the service_completed_successfully event
@@ -538,6 +660,113 @@ neg_dirty=$(schema_contract_violations "$dbver" t "$ups" "$downs")
 [[ "$neg_dirty" == *"dirty=t"* ]] || fail "S3: oracle missed dirty schema_migrations: $neg_dirty"
 note "schema head=$dbver (pinned $SCHEMA_HEAD), dirty=f, 26 up/down pairs (0023 reserved); oracle catches lowered head / missing 0027 / dirty"
 
+# --- S3b managed beta views: seven names, content-minimized columns,
+# frozen per-org values, app-role reads (expectations pinned, never
+# derived from the implementation) ------------------------------------------
+step "S3b beta views: exactly seven, content-minimized, frozen per-org values"
+beta_views_check dbq
+beta_columns_check dbq
+note "seven managed views present (no extras, no materialized); columns content-minimized"
+
+# Deterministic fixture org (fixed uuids/bigint ids; timestamps pinned to one
+# UTC hour so day grouping is stable). Durations 200/200/300 yield the pinned
+# p50/p95 200/290 under percentile_cont; row 2 is the only cache hit, row 3
+# the only >=400. BYOK attribution is pinned via an org_custom_models row.
+FIX_ORG='66666666-6666-4666-8666-666666666666'
+FIX_T0=$(dbq "SELECT date_trunc('hour', now())::text")
+dbq "DELETE FROM request_logs WHERE org_id = '$FIX_ORG';
+DELETE FROM org_custom_models WHERE org_id = '$FIX_ORG';
+DELETE FROM organizations WHERE id = '$FIX_ORG';
+INSERT INTO organizations (id, name, slug, created_at) VALUES ('$FIX_ORG', 'qs-fixture-org', 'qs-fixture-org', '$FIX_T0');
+INSERT INTO org_custom_models (id, org_id, model_name, provider, upstream_url) VALUES (987650001, '$FIX_ORG', 'mock-model', 'qs-fixture-provider', 'http://fixture.invalid');
+INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, duration_ms, error, created_at, updated_at, request_id, cache_hit_type, user_id, home_region) VALUES
+  (987650101, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '90 seconds', '$FIX_T0'::timestamptz + interval '90 seconds', 'qs-fixture-req-1', NULL, '66666666-6666-4666-8666-000000000001', 'qs'),
+  (987650102, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '150 seconds', '$FIX_T0'::timestamptz + interval '150 seconds', 'qs-fixture-req-2', 'exact', '66666666-6666-4666-8666-000000000002', 'qs'),
+  (987650103, '$FIX_ORG', 'mock-model', 'mock-model', 500, 300, 'fixture error', '$FIX_T0'::timestamptz + interval '180 seconds', '$FIX_T0'::timestamptz + interval '180 seconds', 'qs-fixture-req-3', NULL, '66666666-6666-4666-8666-000000000003', 'qs')" >/dev/null
+beta_fixture_values_check dbq
+note "fixture org pinned: 3 requests/1 error, DAU 3/3, ttfq t0/+90s/90s, byok provider, p50/p95 200/290, cache 1/3"
+
+# org1 pinned to the actual S2 smoke rows: view aggregates must equal
+# aggregates computed independently over raw request_logs for the seeded org.
+org1=$(dbq "SELECT id FROM organizations WHERE id <> '$FIX_ORG' ORDER BY created_at LIMIT 1")
+[[ -n "$org1" ]] || fail "S3b: seeded org missing"
+raw_reqs=$(dbq "SELECT count(*) FROM request_logs WHERE org_id = '$org1'")
+raw_errs=$(dbq "SELECT count(*) FROM request_logs WHERE org_id = '$org1' AND status_code >= 400")
+raw_users=$(dbq "SELECT count(DISTINCT COALESCE(user_id::text, api_key_id::text, 'anon')) FROM request_logs WHERE org_id = '$org1'")
+[[ "$raw_errs" == "0" ]] || fail "S3b: org1 smoke traffic unexpectedly has $raw_errs error rows"
+got=$(dbq "SELECT requests || '/' || errors FROM beta_requests_daily WHERE org_id = '$org1'")
+[[ "$got" == "$raw_reqs/0" ]] || fail "S3b: org1 beta_requests_daily [$got] != raw $raw_reqs/0"
+got=$(dbq "SELECT active_users || '/' || requests FROM beta_dau_daily WHERE org_id = '$org1'")
+[[ "$got" == "$raw_users/$raw_reqs" ]] || fail "S3b: org1 beta_dau_daily [$got] != raw $raw_users/$raw_reqs"
+note "org1 view rows equal raw request_logs aggregates ($raw_reqs requests, 0 errors)"
+
+# The app role reads every view (bootstrap grants; provisioning re-grants).
+for v in $BETA_VIEWS; do
+  got=$(adbq "SELECT count(*) FROM $v WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "1" ]] || fail "S3b: app-role read of $v returned [$got], want 1 fixture row"
+done
+note "app role reads all seven views (1 fixture row each)"
+
+# --- S3c degraded readiness: a revoked/dropped view is named degraded while
+# the gateway still serves; the documented migrate boundary self-heals all
+# seven; a fresh startup reports ready ---------------------------------------
+step "S3c revoked view: app read denied 42501, named degraded readiness, gateway serves"
+dbq "REVOKE SELECT ON public.beta_latency_daily FROM yabanin_app" >/dev/null
+set +e
+deny_out=$(adbq "SELECT count(*) FROM public.beta_latency_daily WHERE org_id = '$FIX_ORG'" 2>&1)
+deny_rc=$?
+set -e
+if [[ $deny_rc -eq 0 ]] || ! grep -q '42501' <<<"$deny_out" || ! grep -q 'permission denied' <<<"$deny_out"; then
+  fail "S3c: revoked-view read as yabanin_app rc=$deny_rc, want nonzero with SQLSTATE 42501: $deny_out"
+fi
+deg0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (revoked view)"
+deg_log=$(gw_log_wait 90 "$deg0" "beta metrics views not ready" "beta_latency_daily") \
+  || fail "S3c: named degraded readiness for beta_latency_daily not logged (dump above)"
+if grep -qF 'msg="beta metrics views ready"' <<<"$deg_log"; then
+  fail "S3c: ready line logged while beta_latency_daily is unreadable"
+fi
+gw_serve_200 '{"model":"mock-model","stream":false,"messages":[{"role":"user","content":"degraded"}]}' \
+  || fail "S3c: gateway did not serve while degraded (status above)"
+note "named degraded (unreadable beta_latency_daily) while still serving 200"
+
+step "S3c migrate boundary self-heals the revoked view; fresh startup ready"
+"${FX[@]}" run --rm migrate >/dev/null 2>&1 || fail "S3c: migrate re-run failed (revoked view)"
+got=$(adbq "SELECT count(*) FROM public.beta_latency_daily WHERE org_id = '$FIX_ORG'")
+[[ "$got" == "1" ]] || fail "S3c: app-role read not healed after migrate: [$got]"
+heal0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (healed)"
+heal_log=$(gw_log_wait 90 "$heal0" 'msg="beta metrics views ready"') \
+  || fail "S3c: fresh startup did not report ready after heal (dump above)"
+if grep -qF "beta metrics views not ready" <<<"$heal_log"; then
+  fail "S3c: stale degraded line after heal"
+fi
+note "re-grant via migrate; fresh startup reports ready"
+
+step "S3c dropped view: named degraded while serving; migrate recreates all seven"
+dbq "DROP VIEW public.beta_cache_hit_rate_daily" >/dev/null
+drop_views=$(dbq "SELECT count(*) FROM pg_views WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+[[ "$drop_views" == "6" ]] || fail "S3c: expected 6 beta views after drop, got $drop_views"
+deg1=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (dropped view)"
+deg_log=$(gw_log_wait 90 "$deg1" "beta metrics views not ready" "beta_cache_hit_rate_daily") \
+  || fail "S3c: named degraded readiness for the dropped view not logged (dump above)"
+if grep -qF 'msg="beta metrics views ready"' <<<"$deg_log"; then
+  fail "S3c: ready line logged while beta_cache_hit_rate_daily is dropped"
+fi
+gw_serve_200 '{"model":"mock-model","stream":false,"messages":[{"role":"user","content":"degraded2"}]}' \
+  || fail "S3c: gateway did not serve while view dropped (status above)"
+"${FX[@]}" run --rm migrate >/dev/null 2>&1 || fail "S3c: migrate re-run failed (dropped view)"
+beta_views_check dbq
+beta_fixture_values_check dbq
+got=$(adbq "SELECT count(*) FROM public.beta_cache_hit_rate_daily WHERE org_id = '$FIX_ORG'")
+[[ "$got" == "1" ]] || fail "S3c: app-role read of recreated view [$got] != 1"
+ready0=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+gw_restart_wait || fail "S3c: gateway did not come back after restart (recreated view)"
+ready_log=$(gw_log_wait 90 "$ready0" 'msg="beta metrics views ready"') \
+  || fail "S3c: fresh startup did not report ready after recreate (dump above)"
+note "dropped view recreated + re-granted by migrate; fresh startup ready"
+
 # --- S4 restart: named volume survives down (no -v) --------------------------
 step "S4 restart: down (no -v) -> up -> same key serves"
 "${FX[@]}" down --remove-orphans
@@ -558,6 +787,11 @@ counts2=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*
 smoke_out2=$(bash scripts/quickstart/smoke.sh "$key")
 grep -q "^smoke ok (" <<<"$smoke_out2" || fail "S4: smoke with same key after restart failed: $smoke_out2"
 note "$smoke_out2 (same key as S2)"
+
+# The seven managed views and the frozen fixture rows ride the named volume.
+beta_views_check dbq
+beta_fixture_values_check dbq
+note "seven views + frozen fixture values intact after down/up"
 
 # --- S6 wrong secrets (fixed stack still up) ---------------------------------
 step "S6a wrong secret: weak session key refuses production startup"
@@ -820,6 +1054,15 @@ empty_code=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $k
   "$QS_BASE/v1/chat/completions")
 [[ "$empty_code" == "401" ]] || fail "S9: key from the wiped DB got HTTP $empty_code, want 401"
 note "empty DB boundary: migrate applied version $dbver (dirty=f); wiped key refused 401"
+
+# The documented reset provisions the seven managed views on the empty
+# database before any seed runs, and the app role can read them.
+beta_views_check idbq
+got=$(idbq "SELECT (SELECT count(*) FROM beta_requests_daily) || '/' || (SELECT count(*) FROM beta_dau_daily) || '/' || (SELECT count(*) FROM beta_onboarding_ttfq)")
+[[ "$got" == "0/0/0" ]] || fail "S9: beta views not empty on the fresh DB: $got"
+got=$(idbq_app "SELECT count(*) FROM beta_requests_daily")
+[[ "$got" == "0" ]] || fail "S9: app role cannot read the fresh beta views: [$got]"
+note "seven views exist and are app-readable on the empty DB before seed"
 seed_out=$(make quickstart-seed 2>&1)
 key9=$(printf '%s' "$seed_out" | extract_key)
 [[ -n "$key9" && "$key9" != "$key" ]] || fail "S9: reseed did not mint a fresh key: $seed_out"
