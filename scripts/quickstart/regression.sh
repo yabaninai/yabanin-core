@@ -38,9 +38,11 @@
 #   S11 wrong secrets through the same boundary: half-set license env refuses
 #      the dev process; admin plane rejects a wrong password and accepts the
 #      seed-printed one (CSRF-protected POST /auth/login)
-#   S12 linked deploy paths: dev/prod/prod+e2e compose configs render; a
-#      missing required secret is rejected at config time; every compose
-#      yabanin subcommand and env var is known to the binary/config layer
+#   S12 linked deploy paths: the actual dev compose and the supported simple
+#      offline path (deploy/onprem/airgap-compose.yml) render; required secrets
+#      are rejected by name with no default values; deploy.sh refuses the
+#      absent production compose before any effect; every compose yabanin
+#      subcommand and env var is known to the binary/config layer
 #
 #   S0 preflight additions (F2): before touching anything, the suite detects a
 #      FOREIGN stack holding one of its pinned subnets and fails fast naming
@@ -280,9 +282,9 @@ PY
   note "QS_PRIMARY_NET active: primary project and S8-S11 make flow rewritten onto $pri_pin_subnet (mock at $primary_mock_ip); shipped file untouched"
 fi
 
-# Set when S12 generates deploy-side secrets in this checkout (they are
-# removed again on exit; pre-existing files are never touched).
-integ_env_created=0 integ_secrets_created=0
+# Set when S12 creates a synthetic deploy/.env for the dev-compose render (it
+# is removed again on exit; a pre-existing file is never touched).
+s12_env_created=0
 
 REG_FAILED=0
 cleanup() {
@@ -307,9 +309,10 @@ cleanup() {
   # make-flow project is torn down through the file it was created from.
   "${INX[@]}" down -v --remove-orphans >/dev/null 2>&1 || true
   docker rm -f "$proj_fixed-wrongkey" >/dev/null 2>&1 || true
-  if [[ "$integ_env_created" == 1 ]]; then
-    rm -f deploy/.env
-    if [[ "$integ_secrets_created" == 1 ]]; then rm -rf deploy/secrets; fi
+  if [[ "$s12_env_created" == 1 ]]; then
+    # Remove only the synthetic regular file we created; never a replacement
+    # file or a symlink (pre-existing material is untouchable).
+    [[ -f deploy/.env && ! -L deploy/.env ]] && rm -f deploy/.env
   fi
   rm -rf "$BRK_TMP"
 }
@@ -1130,28 +1133,80 @@ grep -q "yabanin_admin_session=" "$BRK_TMP/login-ok.hdr" \
   || fail "S11b: no admin session cookie on the successful login"
 note "wrong password 401; seed-printed password 302 + yabanin_admin_session cookie"
 
-# --- S12 linked deploy paths: configs render, secrets fail-closed, dispatch ---
-step "S12 linked deploy paths: config renders + required-secret rejection + binary dispatch"
-if [[ ! -f deploy/.env ]]; then
-  integ_env_created=1
-  [[ -d deploy/secrets ]] || integ_secrets_created=1
-  bash scripts/deploy/init-secrets.sh >/dev/null
+# --- S12 linked deploy paths: public render contracts, fail-closed secrets ---
+step "S12 linked deploy paths: dev + supported offline render; named required-secret rejection; deploy.sh public boundary; dispatch"
+# The production Compose file is maintainer material, NOT in the public export
+# (docs/runbooks/production.md; tests/load/README.md likewise excludes the
+# prod/e2e runners). The public render contracts are the actual dev compose and
+# the supported simple offline path (docs/onprem/offline-bundle.md).
+# A pre-existing deploy/.env (regular file, or a symlink — even a dangling one)
+# is never overwritten or removed.
+if [[ ! -e deploy/.env && ! -L deploy/.env ]]; then
+  s12_env_created=1
+  # Synthetic, non-secret, render-only: config just needs the env_file to
+  # exist; secret files are not read at config time.
+  printf 'POSTGRES_PASSWORD=s12-synthetic-render-nonsecret\n' > deploy/.env
 fi
 docker compose -f deploy/docker-compose.yml config -q \
   || fail "S12: dev stack deploy/docker-compose.yml does not render"
-docker compose -f deploy/docker-compose.prod.yml config -q \
-  || fail "S12: prod stack deploy/docker-compose.prod.yml does not render"
-docker compose -f deploy/docker-compose.prod.yml -f deploy/docker-compose.e2e.yml config -q \
-  || fail "S12: prod+e2e overlay does not render"
-note "dev / prod / prod+e2e compose configs render (documented prerequisite init-secrets.sh)"
+AIRGAP=deploy/onprem/airgap-compose.yml
+POSTGRES_PASSWORD=s12-synthetic-render-nonsecret \
+YABANIN_CACHE_HMAC_SECRET=s12-synthetic-render-nonsecret \
+  docker compose -f "$AIRGAP" config -q \
+  || fail "S12: supported offline compose $AIRGAP does not render with synthetic non-secret values"
+note "dev + supported offline (airgap) composes render; secrets stay operator-supplied"
+
+# Required secrets fail closed BY NAME with no default values (documented at
+# deploy/onprem/airgap-compose.yml:7-16,27-30,80).
+grep -q 'POSTGRES_PASSWORD:?set POSTGRES_PASSWORD' "$AIRGAP" \
+  || fail "S12: airgap compose no longer requires POSTGRES_PASSWORD via :? (no default)"
+grep -q 'YABANIN_CACHE_HMAC_SECRET:?set YABANIN_CACHE_HMAC_SECRET' "$AIRGAP" \
+  || fail "S12: airgap compose no longer requires YABANIN_CACHE_HMAC_SECRET via :? (no default)"
 set +e
-neg_err=$(docker compose --env-file /dev/null -f deploy/docker-compose.prod.yml config -q 2>&1)
+neg_err=$(env -u POSTGRES_PASSWORD -u YABANIN_CACHE_HMAC_SECRET docker compose -f "$AIRGAP" config -q 2>&1)
 neg_code=$?
+neg_err2=$(env -u YABANIN_CACHE_HMAC_SECRET POSTGRES_PASSWORD=s12-synthetic-render-nonsecret docker compose -f "$AIRGAP" config -q 2>&1)
+neg_code2=$?
 set -e
-[[ "$neg_code" -ne 0 ]] || fail "S12: prod compose accepted a stack missing GRAFANA_ADMIN_PASSWORD"
-grep -q "GRAFANA_ADMIN_PASSWORD is required" <<<"$neg_err" \
-  || fail "S12: rejection does not name the missing secret: $neg_err"
-note "missing required secret rejected at config time (contract §6)"
+[[ "$neg_code" -ne 0 ]] || fail "S12: airgap compose rendered without POSTGRES_PASSWORD"
+grep -q "required variable POSTGRES_PASSWORD is missing a value" <<<"$neg_err" \
+  || fail "S12: POSTGRES_PASSWORD rejection is not named: $neg_err"
+[[ "$neg_code2" -ne 0 ]] || fail "S12: airgap compose rendered without YABANIN_CACHE_HMAC_SECRET"
+grep -q "required variable YABANIN_CACHE_HMAC_SECRET is missing a value" <<<"$neg_err2" \
+  || fail "S12: YABANIN_CACHE_HMAC_SECRET rejection is not named: $neg_err2"
+note "missing POSTGRES_PASSWORD / YABANIN_CACHE_HMAC_SECRET each rejected by name at render time"
+
+# Public boundary of deploy.sh, exercised ONLY from a disposable public-export
+# fixture: the byte-identical script must refuse (nonzero, naming the boundary
+# and the supported paths) BEFORE any pull/build/deploy effect when no
+# maintainer production Compose exists. The live working copy is never invoked,
+# so a maintainer-supplied Compose in this checkout cannot cause a real deploy,
+# and the absent-Compose case is still exercised regardless of private material.
+S12_FIX="$BRK_TMP/s12-public-export"
+mkdir -p "$S12_FIX/scripts" "$S12_FIX/deploy"
+cp scripts/deploy.sh "$S12_FIX/scripts/deploy.sh"
+[[ "$(sha256sum scripts/deploy.sh | cut -d' ' -f1)" == "$(sha256sum "$S12_FIX/scripts/deploy.sh" | cut -d' ' -f1)" ]] \
+  || fail "S12: fixture deploy.sh is not byte-identical to the real script"
+[[ ! -e "$S12_FIX/deploy/docker-compose.prod.yml" ]] \
+  || fail "S12: fixture unexpectedly contains a maintainer production Compose"
+set +e
+dep_out=$(bash "$S12_FIX/scripts/deploy.sh" s12-fixture-refusal 2>&1)
+dep_code=$?
+set -e
+[[ "$dep_code" -ne 0 ]] || fail "S12: deploy.sh succeeded without a production Compose file"
+grep -q "not included in the public Core export" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not state the public-export boundary: $dep_out"
+grep -q "docs/onprem/offline-bundle.md" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not point to the offline-bundle path: $dep_out"
+grep -q "docs/onprem/install-guide.md" <<<"$dep_out" \
+  || fail "S12: deploy.sh refusal does not point to the install guide: $dep_out"
+if grep -q "\[1/7\] Pulling latest" <<<"$dep_out"; then
+  fail "S12: deploy.sh pulled code before refusing (side effect)"
+fi
+if grep -qE "\[[2-7]/7\]" <<<"$dep_out"; then
+  fail "S12: deploy.sh reached a deploy step before refusing (side effect): $dep_out"
+fi
+note "deploy.sh (byte-identical fixture copy) refuses before any effect; supported paths named"
 for c in gateway admin loggerd mcp migrate seed; do
   grep -q "case \"$c\":" cmd/yabanin/main.go \
     || fail "S12: subcommand $c is not dispatched by the unified binary"
