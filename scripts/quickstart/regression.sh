@@ -349,8 +349,8 @@ extract_admin_password() { sed -n 's/.*Admin password (shown once, store it now)
 # App-role (yabanin_app) psql for the fixed and integ projects. ON_ERROR_STOP
 # + verbose make a permission denial fail nonzero with SQLSTATE 42501 in the
 # output, so the 42501 negative below is a real behavioral denial.
-adbq()     { "${FX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 --verbosity=verbose -tA -c "$1"; }
-idbq_app() { "${INX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 --verbosity=verbose -tA -c "$1"; }
+adbq()     { "${FX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
+idbq_app() { "${INX[@]}" exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
 
 # The seven managed beta views (pkg/feedback MetricsViewNames), pinned sorted.
 BETA_VIEWS="beta_cache_hit_rate_daily beta_dau_daily beta_latency_daily beta_onboarding_ttfq beta_provider_distribution beta_provider_errors beta_requests_daily"
