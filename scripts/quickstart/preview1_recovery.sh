@@ -166,6 +166,46 @@ chat_ok() {
   await_reqid "$1" "$4" || fail "$5: row for request_id $4 never appeared — X-Request-ID propagation broken"
 }
 
+assert_pg_runtime() {
+  # assert_pg_runtime QFN LABEL EXPECTED_MAJOR: verify the LIVE server binary
+  # and the migrated extension catalog after each actual startup.
+  # SHOW server_version_num must sit in the compose-recorded supported family
+  # and must equal EXPECTED_MAJOR when given (empty only for the UP1 baseline
+  # call that defines it). pg_extension.extversion for 'vector' must be
+  # nonempty: migration 0001_init creates the extension, so availability alone
+  # would mask a broken migration (recorded only as supplementary evidence).
+  # A failed query is a failure, never absence. Prints the observed major.
+  local qf="$1" label="$2" want="$3" v major ext avail
+  v=$("$qf" "SHOW server_version_num") || fail "$label: SHOW server_version_num query failed"
+  [[ "$v" =~ ^[0-9]{6}$ ]] || fail "$label: server_version_num not parseable [$v]"
+  major=${v:0:2}
+  [[ "$major" == "$PG_MAJ" ]] || fail "$label: live server major $major != compose pg${PG_MAJ} family"
+  if [[ -n "$want" ]]; then
+    [[ "$major" == "$want" ]] || fail "$label: live server major $major != preview1's recorded $want (cross-major binary/data mixing)"
+  fi
+  ext=$("$qf" "SELECT extversion FROM pg_extension WHERE extname = 'vector'") \
+    || fail "$label: vector extversion query failed"
+  [[ -n "$ext" ]] \
+    || fail "$label: vector extension NOT installed in the migrated database (0001_init creates it; availability is not installation)"
+  avail=$("$qf" "SELECT default_version FROM pg_available_extensions WHERE name = 'vector'") \
+    || fail "$label: vector availability query failed"
+  printf '   %s\n' "$label: live postgres server_version_num $v (pg${major}); vector extversion ${ext} (available ${avail:-none})" >&2
+  echo "pg_${label}_server_version_num $v" >> "$RECORD"
+  echo "pg_${label}_vector_extversion $ext" >> "$RECORD"
+  echo "pg_${label}_vector_available ${avail:-none}" >> "$RECORD"
+  printf '%s' "$major"
+}
+
+assert_container_image() {
+  # assert_container_image CONTAINER EXPECTED_ID LABEL: the RUNNING container
+  # must be the exact recorded image — inspecting a reference before `up`
+  # does not prove what actually runs. A failed inspect is a failure, not a
+  # mismatch verdict.
+  local img
+  img=$(docker inspect "$1" --format '{{.Image}}') || fail "$3: docker inspect $1 failed"
+  [[ "$img" == "$2" ]] || fail "$3: container $1 image $img != expected $2"
+}
+
 # Compose invocations for the two phases of the SAME project (same project
 # name => same retained <project>_pg_data volume). Each phase file is paired
 # with the instrumented-mock override (same reviewed harness-commit mock image
@@ -357,7 +397,7 @@ fi
 MODE=${1:-all}
 RESUME="${QS_RECOVERY_RESUME:-0}"
 
-for t in docker ss curl sha256sum timeout sed grep awk comm stat tar date head od git; do
+for t in docker ss curl sha256sum timeout sed grep awk comm stat tar date head od git python3; do
   command -v "$t" >/dev/null 2>&1 || fail "required tool missing: $t (port/subnet checks must fail, not silently skip)"
 done
 
@@ -466,9 +506,21 @@ EOF
   chmod 600 "$RUNTMP/$phase/mock-instrumented.yml"
   note "$phase compose sha256 $(sha_file "$RUNTMP/$phase/docker-compose.yml") bootstrap sha256 $(sha_file "$RUNTMP/$phase/bootstrap-app-role.sql") override sha256 $(sha_file "$RUNTMP/$phase/mock-instrumented.yml")"
 done
-pgline1=$(grep -m1 'image: pgvector' "$RUNTMP/preview1/docker-compose.yml")
-pgline2=$(grep -m1 'image: pgvector' "$RUNTMP/candidate/docker-compose.yml")
-[[ "$pgline1" == "$pgline2" ]] || fail "phases use different postgres images (same PG major/extensions required)"
+# Postgres image references: the SAME supported major family (pg16) is
+# required across phases; immutable digests MAY differ (an ordinary pin
+# refresh between the two commits is exactly what this rehearsal must
+# exercise). The helper rejects pg15/other majors, non-pgvector images,
+# unpinned or malformed references and ambiguous families BEFORE any volume
+# exists. Never a convenience tag, never a retag.
+pgref1=$(grep -m1 'image: pgvector' "$RUNTMP/preview1/docker-compose.yml" | awk '{print $2}')
+pgref2=$(grep -m1 'image: pgvector' "$RUNTMP/candidate/docker-compose.yml" | awk '{print $2}')
+PGREF_OUT=$(python3 "$root/scripts/quality/pg_image_refs.py" "$pgref1" "$pgref2" 2>"$RUNTMP/pf3-pgref.err") \
+  || fail "postgres image references not compatible: $(cat "$RUNTMP/pf3-pgref.err")"
+PG_MAJ=$(sed -n 's/^major=//p' <<<"$PGREF_OUT")
+[[ -n "$PG_MAJ" ]] || fail "pg image refs helper returned no major"
+{ echo "postgres_ref_preview1 $pgref1"; echo "postgres_ref_candidate $pgref2"
+  echo "postgres_major $PG_MAJ"; } >> "$IDENTITY"
+note "postgres refs share supported major pg${PG_MAJ}; distinct immutable digests allowed (pin refresh rehearsed)"
 
 cs PF4
 step "preflight: build both isolated app images from the archives + the instrumented mock from the harness commit"
@@ -487,6 +539,17 @@ CAND_IMAGE_ID=$(docker image inspect "$TAG_CAND" --format '{{.Id}}')
 MOCK_IMAGE_ID=$(docker image inspect "$TAG_MOCK" --format '{{.Id}}')
 { echo "preview1_image_id $PRE_IMAGE_ID"; echo "candidate_image_id $CAND_IMAGE_ID"
   echo "mock_image_id $MOCK_IMAGE_ID"; echo "mock_provider_tree $MOCK_TREE_SHA"; } >> "$IDENTITY"
+# Obtain the EXACT immutable postgres images (pull by full reference only);
+# record their actual image IDs as identity evidence for both phases.
+for pgref in "$pgref1" "$pgref2"; do
+  docker image inspect "$pgref" --format '{{.Id}}' >/dev/null 2>&1 \
+    || docker pull --quiet "$pgref" >/dev/null \
+    || fail "could not obtain the immutable postgres image $pgref (never a convenience tag)"
+done
+PG1_IMAGE_ID=$(docker image inspect "$pgref1" --format '{{.Id}}')
+PG2_IMAGE_ID=$(docker image inspect "$pgref2" --format '{{.Id}}')
+{ echo "postgres_image_id_preview1 $PG1_IMAGE_ID"; echo "postgres_image_id_candidate $PG2_IMAGE_ID"; } >> "$IDENTITY"
+note "postgres image ids: preview1 ${PG1_IMAGE_ID} candidate ${PG2_IMAGE_ID}"
 note "image ids: preview1 ${PRE_IMAGE_ID} candidate ${CAND_IMAGE_ID} mock ${MOCK_IMAGE_ID} (mock tree ${MOCK_TREE_SHA})"
 
 export QS_GATEWAY_PORT="$GW_PORT" QS_ADMIN_PORT="$ADM_PORT" QS_UPSTREAM_URL="http://${MOCK_IP}:8081"
@@ -507,6 +570,8 @@ case_upgrade() {
   wait_healthz || fail "preview1 gateway never became healthy"
   run_image=$(docker inspect "$GW_CONTAINER" --format '{{.Image}}')
   [[ "$run_image" == "$PRE_IMAGE_ID" ]] || fail "preview1 container is not the archived image ($run_image != $PRE_IMAGE_ID)"
+  P1_PG_MAJOR=$(assert_pg_runtime p1q up1 "")
+  assert_container_image "${PROJECT}-postgres-1" "$PG1_IMAGE_ID" "UP1 preview1 postgres"
   P1_MIGRATE_HEAD=$(p1q "SELECT max(version) FROM schema_migrations")
   [[ -n "$P1_MIGRATE_HEAD" ]] || fail "preview1 schema_migrations empty"
   p1_views=$(view_names p1q)
@@ -612,6 +677,8 @@ INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, 
   [[ "$run_image" == "$CAND_IMAGE_ID" ]] || fail "candidate container is not the archived image ($run_image != $CAND_IMAGE_ID)"
   cand_head=$(cndq "SELECT max(version) FROM schema_migrations")
   [[ -n "$cand_head" ]] || fail "candidate schema_migrations empty"
+  assert_pg_runtime cndq up8 "$P1_PG_MAJOR" >/dev/null
+  assert_container_image "${PROJECT}-postgres-1" "$PG2_IMAGE_ID" "UP8 candidate postgres"
   note "candidate migrate head $cand_head (preview1 recorded $P1_MIGRATE_HEAD)"
   echo "candidate_migrate_head $cand_head" >> "$RECORD"
 
@@ -707,6 +774,13 @@ case_rollback() {
   run_image=$(docker inspect "$GW_CONTAINER" --format '{{.Image}}')
   [[ "$run_image" == "$PRE_IMAGE_ID" ]] || fail "restored stack is not the Preview1 image ($run_image != $PRE_IMAGE_ID)"
   P1_MIGRATE_HEAD=${P1_MIGRATE_HEAD:-$(sed -n 's/^preview1_migrate_head //p' "$RECORD" | head -1)}
+  P1_PG_MAJOR=${P1_PG_MAJOR:-$(sed -n 's/^pg_up1_server_version_num //p' "$RECORD" | head -1 | cut -c1-2)}
+  [[ -n "$P1_PG_MAJOR" ]] || fail "resume: preview1 postgres major missing from $RECORD"
+  PG_MAJ=${PG_MAJ:-$(sed -n 's/^postgres_major //p' "$IDENTITY" | head -1)}
+  PG1_IMAGE_ID=${PG1_IMAGE_ID:-$(sed -n 's/^postgres_image_id_preview1 //p' "$IDENTITY" | head -1)}
+  [[ -n "$PG_MAJ" && -n "$PG1_IMAGE_ID" ]] || fail "resume: postgres identity missing from $IDENTITY"
+  assert_pg_runtime p1q rb4 "$P1_PG_MAJOR" >/dev/null
+  assert_container_image "${PROJECT}-postgres-1" "$PG1_IMAGE_ID" "RB4 rollback postgres"
   rb_head=$(p1q "SELECT max(version) FROM schema_migrations")
   [[ "$rb_head" == "$P1_MIGRATE_HEAD" ]] || fail "restored migrate head [$rb_head] != preview1's [$P1_MIGRATE_HEAD]"
 
