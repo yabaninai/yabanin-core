@@ -24,6 +24,8 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/jackc/pgx/v5/stdlib"
+
+	"github.com/reireirei/yabanin/pkg/feedback"
 )
 
 //go:embed migrations/*.sql
@@ -95,6 +97,8 @@ func connect(ctx context.Context, pgURI, region string, tcpOnly bool) (*pgxpool.
 
 // Run applies all embedded migrations using the configured pgx connection.
 // Migrations always use the public schema, login role, and supplied region.
+// A successful up-migration also provisions the beta metrics views on the
+// same owner pool (pkg/feedback); a provisioning failure fails the run.
 func Run(ctx context.Context, pgURI, region string) (Result, error) {
 	return runDirection(ctx, pgURI, region, nil)
 }
@@ -105,6 +109,87 @@ func Down(ctx context.Context, pgURI, region string, target int) (Result, error)
 	return runDirection(ctx, pgURI, region, &target)
 }
 
+// applyDirection runs the requested migration direction on the session's
+// pinned connection. The MAX(version) probe must use that connection:
+// querying the pool here deadlocks when its sole connection is held by the
+// migration driver.
+func applyDirection(ctx context.Context, session *migrationSession, target *int) error {
+	switch {
+	case target == nil:
+		return session.m.Up()
+	case *target <= 0:
+		return session.m.Down()
+	default:
+		var current int64
+		err := session.conn.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM public.schema_migrations").Scan(&current)
+		if err != nil || current <= int64(*target) {
+			return err
+		}
+		return session.m.Migrate(uint(*target))
+	}
+}
+
+// runMigrations extracts and applies the embedded migration set for the
+// requested direction, then releases the driver acquisition so the pool is
+// usable again (also for maxconns=1). The returned duration covers the
+// applied migrations only.
+func runMigrations(ctx context.Context, pool *pgxpool.Pool, target *int) (time.Duration, error) {
+	tmpDir, err := extractMigrationsToTemp()
+	if err != nil {
+		return 0, err
+	}
+	defer func() {
+		if err := os.RemoveAll(tmpDir); err != nil {
+			fmt.Fprintf(os.Stderr, "warning: cleanup migrations temp dir: %v\n", err)
+		}
+	}()
+	session, err := openMigrationSession(ctx, pool, "file://"+tmpDir)
+	if err != nil {
+		return 0, fmt.Errorf("create migrator: %w", err)
+	}
+	start := time.Now()
+	err = applyDirection(ctx, session, target)
+	duration := time.Since(start)
+	if errors.Is(err, migrate.ErrNoChange) {
+		err = nil
+	}
+	if err = session.close(err); err != nil {
+		return 0, fmt.Errorf("migrations failed: %w", err)
+	}
+	return duration, nil
+}
+
+// provisionBetaMetricsViews runs at the up-migration boundary: this pool's
+// login is the schema owner, and neither the app role (NO CREATE in public)
+// nor a migration file may create the beta metrics views. Idempotent
+// (CREATE OR REPLACE); a provisioning failure fails the whole run so a
+// successful result never leaves the views missing.
+func provisionBetaMetricsViews(ctx context.Context, pool *pgxpool.Pool, target *int) error {
+	if target != nil {
+		return nil
+	}
+	if err := feedback.EnsureMetricsViews(ctx, pool); err != nil {
+		return fmt.Errorf("beta metrics views bootstrap: %w", err)
+	}
+	return nil
+}
+
+// readResult reads the ledger outcome of the completed run.
+func readResult(ctx context.Context, pool *pgxpool.Pool, region string, duration time.Duration) (Result, error) {
+	res := Result{Region: region, Duration: duration}
+	err := pool.QueryRow(ctx, "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM public.schema_migrations").Scan(&res.Applied, &res.Version)
+	if err != nil {
+		return Result{}, fmt.Errorf("read migration result: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return Result{}, err
+	}
+	return res, nil
+}
+
+// runDirection executes one bounded migration run in phases: connect and
+// validate, apply the requested direction, provision the beta metrics views
+// at the up-migration boundary, then read the ledger result.
 func runDirection(ctx context.Context, pgURI, region string, target *int) (Result, error) {
 	pool, err := connect(ctx, pgURI, region, true)
 	if err != nil {
@@ -114,51 +199,14 @@ func runDirection(ctx context.Context, pgURI, region string, target *int) (Resul
 	if err := pool.Ping(ctx); err != nil {
 		return Result{}, fmt.Errorf("database ping failed: %w", err)
 	}
-	tmpDir, err := extractMigrationsToTemp()
+	duration, err := runMigrations(ctx, pool, target)
 	if err != nil {
 		return Result{}, err
 	}
-	defer func() {
-		if err := os.RemoveAll(tmpDir); err != nil {
-			fmt.Fprintf(os.Stderr, "warning: cleanup migrations temp dir: %v\n", err)
-		}
-	}()
-	session, err := openMigrationSession(ctx, pool, "file://"+tmpDir)
-	if err != nil {
-		return Result{}, fmt.Errorf("create migrator: %w", err)
-	}
-	start := time.Now()
-	switch {
-	case target == nil:
-		err = session.m.Up()
-	case *target <= 0:
-		err = session.m.Down()
-	default:
-		// Use the pinned connection: querying the pool here deadlocks when its
-		// sole connection is held by the migration driver.
-		var current int64
-		err = session.conn.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) FROM public.schema_migrations").Scan(&current)
-		if err == nil && current > int64(*target) {
-			err = session.m.Migrate(uint(*target))
-		}
-	}
-	duration := time.Since(start)
-	if errors.Is(err, migrate.ErrNoChange) {
-		err = nil
-	}
-	// Release the driver acquisition before metadata reads, also for maxconns=1.
-	if err = session.close(err); err != nil {
-		return Result{}, fmt.Errorf("migrations failed: %w", err)
-	}
-	res := Result{Region: region, Duration: duration}
-	err = pool.QueryRow(ctx, "SELECT COUNT(*), COALESCE(MAX(version), 0) FROM public.schema_migrations").Scan(&res.Applied, &res.Version)
-	if err != nil {
-		return Result{}, fmt.Errorf("read migration result: %w", err)
-	}
-	if err := ctx.Err(); err != nil {
+	if err := provisionBetaMetricsViews(ctx, pool, target); err != nil {
 		return Result{}, err
 	}
-	return res, nil
+	return readResult(ctx, pool, region, duration)
 }
 
 // requireTCP retains the migration command's explicit socket refusal without

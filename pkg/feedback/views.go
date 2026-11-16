@@ -5,14 +5,17 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // Beta metrics SQL views (card W-FEED).
 //
-// idempotently (CREATE OR REPLACE VIEW) by the admin starter at startup —
-// never by a migration file. Every statement is safe to re-run.
+// created/replaced idempotently (CREATE OR REPLACE VIEW) by the migration
+// runner after a successful up-migration (pkg/migrate.Run) — never by a
+// migration file and never by the app role, which PG16 bars from CREATE on
+// the public schema. Every statement is safe to re-run.
 //
 // Scoping model (mirrors the card's clarification): the consumers are the
 // root-only owner surfaces (Grafana beta dashboard, admin plane), so the
@@ -158,7 +161,9 @@ func MetricsViewNames() []string {
 
 // EnsureMetricsViews creates or replaces the beta metrics views. Idempotent:
 // every statement is CREATE OR REPLACE / a guarded grant, so re-running on an
-// already-provisioned database is a no-op.
+// already-provisioned database is a no-op. Called on the migration-owner pool
+// by pkg/migrate.Run (the provisioning boundary); the error must propagate —
+// a failed provisioning fails the migration run.
 func EnsureMetricsViews(ctx context.Context, db Execer) error {
 	if db == nil {
 		return fmt.Errorf("feedback metrics views: database is not configured")
@@ -170,11 +175,11 @@ func EnsureMetricsViews(ctx context.Context, db Execer) error {
 }
 
 // EnsureMetricsViewsURI runs EnsureMetricsViews over a dedicated short-lived
-// pool for the given DSN. The admin pool downgrades every connection to the
-// NOBYPASSRLS app role (SET ROLE), which cannot CREATE in the public schema —
-// the bootstrap therefore connects as the DSN login (the migration owner)
-// exactly once and closes the pool. Bounded by bootstrapTimeout: a database
-// that cannot provision the views must not stall the admin startup.
+// pool for the given DSN. The DSN login must be the migration owner (as in
+// pkg/migrate.Run): an application DSN runs as the NOBYPASSRLS yabanin_app
+// role, which cannot CREATE in the public schema and fails with 42501 —
+// application startup uses the read-only CheckMetricsViews instead of this
+// function. Bounded by bootstrapTimeout.
 func EnsureMetricsViewsURI(ctx context.Context, uri string) error {
 	const bootstrapTimeout = 15 * time.Second
 	ctx, cancel := context.WithTimeout(ctx, bootstrapTimeout)
@@ -186,4 +191,104 @@ func EnsureMetricsViewsURI(ctx context.Context, uri string) error {
 	}
 	defer pool.Close()
 	return EnsureMetricsViews(ctx, pool)
+}
+
+// Querier is the read surface the beta metrics views readiness check runs
+// against (*pgxpool.Pool satisfies it).
+type Querier interface {
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// enumeratePresentViews reports which of names currently exist as views in
+// the public schema.
+func enumeratePresentViews(ctx context.Context, q Querier, names []string) (map[string]bool, error) {
+	rows, err := q.Query(ctx,
+		`SELECT viewname FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = ANY($1)`, names)
+	if err != nil {
+		return nil, fmt.Errorf("feedback metrics views presence check: %w", err)
+	}
+	present := make(map[string]bool, len(names))
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("feedback metrics views presence scan: %w", err)
+		}
+		present[name] = true
+	}
+	rerr := rows.Err()
+	rows.Close()
+	if rerr != nil {
+		return nil, fmt.Errorf("feedback metrics views presence iterate: %w", rerr)
+	}
+	return present, nil
+}
+
+// canSelectView reports whether the current role holds SELECT on the view.
+func canSelectView(ctx context.Context, q Querier, name string) (bool, error) {
+	var canSelect bool
+	err := q.QueryRow(ctx,
+		`SELECT has_table_privilege(current_user, 'public.'||viewname, 'SELECT')
+		   FROM pg_catalog.pg_views WHERE schemaname = 'public' AND viewname = $1`, name,
+	).Scan(&canSelect)
+	if err != nil {
+		return false, fmt.Errorf("feedback metrics views privilege check for %s: %w", name, err)
+	}
+	return canSelect, nil
+}
+
+// probeView executes one row-returning SELECT against the view, fully
+// drained: it actually executes the view and surfaces server-side errors.
+// Query results stream, so a denial can arrive during the read — an
+// undrained Close() silently drops it, and a constant-false SELECT
+// additionally risks elided-scan permission checks. Both would falsely
+// report a denied view ready.
+func probeView(ctx context.Context, q Querier, name string) error {
+	prows, perr := q.Query(ctx, "SELECT 1 FROM public."+name+" LIMIT 1")
+	if perr == nil {
+		for prows.Next() {
+		}
+		perr = prows.Err()
+		prows.Close()
+	}
+	return perr
+}
+
+// CheckMetricsViews reports the beta metrics views as seen from the supplied
+// (typically application) pool, without any DDL or role elevation: missing
+// lists views absent from pg_views, unreadable lists present views the
+// current role cannot actually read. Readability is verified behaviorally —
+// one privilege check plus one row-returning SELECT per view — so a broken
+// view definition (no longer plannable) and a denied execution path are both
+// caught. Ready iff err is nil and both slices are empty; degradation must
+// stay an explicit result, never a silent pass and never a second elevation
+// attempt.
+func CheckMetricsViews(ctx context.Context, q Querier) (missing, unreadable []string, err error) {
+	if q == nil {
+		return nil, nil, fmt.Errorf("feedback metrics views: readiness Querier is nil")
+	}
+	names := MetricsViewNames()
+	present, err := enumeratePresentViews(ctx, q, names)
+	if err != nil {
+		return nil, nil, err
+	}
+	for _, name := range names {
+		if !present[name] {
+			missing = append(missing, name)
+			continue
+		}
+		granted, err := canSelectView(ctx, q, name)
+		if err != nil {
+			return nil, nil, err
+		}
+		if !granted {
+			unreadable = append(unreadable, name)
+			continue
+		}
+		if err := probeView(ctx, q, name); err != nil {
+			unreadable = append(unreadable, name)
+		}
+	}
+	return missing, unreadable, nil
 }

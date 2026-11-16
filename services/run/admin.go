@@ -312,17 +312,21 @@ func adminWireAccessKeys(h *handlers.AdminHandlers, cfg config.All, logger *slog
 // adminWireFeedback mounts the feedback plane: the collector authenticates
 // /v1/feedback callers and attributes the org server-side with no cache
 // (feedback is low-QPS; revocation freshness of the key state matters more
-// than latency), plus the root-only list/export routes. The beta metrics SQL
-// views bootstrap idempotently over a short-lived DSN-login pool (the app
-// pool runs as the NOBYPASSRLS role and cannot CREATE in the public
-// schema); failure is non-fatal — the owner page and Grafana panels answer
-// empty until the next start.
-func adminWireFeedback(ctx context.Context, h *handlers.AdminHandlers, pool *pgxpool.Pool, adminCfg config.AdminAdmin, logger *slog.Logger) *feedback.Collector {
+// than latency), plus the root-only list/export routes. The beta metrics
+// views are provisioned by the migrate boundary (pkg/migrate.Run); this
+// wiring performs zero DDL and no role elevation — it only verifies
+// readiness from the application pool (CheckMetricsViews) and reports the
+// degraded state explicitly, naming the missing and unreadable views.
+// Dashboards answer empty until the next migrate run provisions them.
+func adminWireFeedback(ctx context.Context, h *handlers.AdminHandlers, pool *pgxpool.Pool, logger *slog.Logger) *feedback.Collector {
 	feedbackCollector := feedback.NewCollector(pool, logger.With("component", "feedback"))
 	h.SetFeedbackCollector(feedbackCollector, auth.NewResolver(pool, nil, 0, nil))
 	h.SetFeedbackLister(feedback.NewLister(pool))
-	if err := feedback.EnsureMetricsViewsURI(ctx, adminCfg.PGURI); err != nil {
-		logger.Warn("beta metrics views bootstrap failed; dashboards stay empty until next start", "error", err)
+	if missing, unreadable, err := feedback.CheckMetricsViews(ctx, pool); err != nil {
+		logger.Warn("beta metrics views readiness check failed", "error", err)
+	} else if len(missing) > 0 || len(unreadable) > 0 {
+		logger.Warn("beta metrics views not ready; dashboards answer empty until the migrate boundary provisions them",
+			"missing", missing, "unreadable", unreadable)
 	} else {
 		logger.Info("beta metrics views ready", "views", len(feedback.MetricsViewNames()))
 	}
@@ -772,7 +776,7 @@ func AdminServer(ctx context.Context) error {
 	defer stopEntitlementDiag()
 
 	adminWireAccessKeys(h, s.cfg, logger)
-	feedbackCollector := adminWireFeedback(ctx, h, pool, s.admin, logger)
+	feedbackCollector := adminWireFeedback(ctx, h, pool, logger)
 	adminWireBilling(h, store, pool, s.cfg, logger)
 	adminWireRegistries(h, store, pool, s.cfg, logger)
 	adminWireOIDC(ctx, h, s.cfg, logger)

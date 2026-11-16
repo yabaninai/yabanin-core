@@ -112,7 +112,7 @@ Route → nav gate: each view's header below cites its gate line in
 | `admin_audit_logs` | Durable journal (seq-keyed table); no production purge path exists (verified by search — only test fixtures delete) | `migrations/0001_init.up.sql:149` |
 | `classifier_feedback` | No purge path; entries persist (CSV export rides the same rows) | `pkg/feedback/collector.go:40` |
 | `analytics_rollup_hourly` / `label_rollup_hourly` | Deleted only inside the recomputed window (idempotent refresh), no age cutoff | `services/loggerd/consumer/rollup.go:166, 169-170` |
-| `beta_*` metrics views | SQL views over `request_logs` created/replaced at admin startup (not migrations); retention rides `request_logs` | `pkg/feedback/views.go` (see field-matrix audit) |
+| `beta_*` metrics views | SQL views over `request_logs` created/replaced by the migration runner after up-migrations (never a migration file; app startup only verifies app-role readability and reports missing/unreadable views explicitly); retention rides `request_logs` | `pkg/feedback/views.go`, `pkg/migrate/migrate.go` (see field-matrix audit) |
 | Credit ledger | Append-only transactions; wallet balance derives from the ledger, ledger consistency surfaced (`ledger_consistent`) | `web/dashboard/src/api/currencies.ts:96-105` |
 | Rates catalog | Sealed versioned packs (version + digest + generated_at); promotion is durable and audited | `web/dashboard/src/api/currencies.ts:107-160, 182-201` |
 
