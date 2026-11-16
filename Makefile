@@ -228,7 +228,7 @@ quality-prune: ## Prune old artifacts/quality runs (helper not in public export)
 quality-fast quality-static quality-security quality-security-code quality-security-runtime quality-security-release quality-tests quality-web quality-sdk quality-full quality-eval quality-integration quality-self quality-licenses quality-plan quality-go-complexity quality-ts-complexity: ## Quality gate profile via scripts/quality (see make quality-help)
 	@python3 scripts/quality/quality.py run $(patsubst quality-%,%,$@) --jobs "$(QUALITY_JOBS)"
 
-.PHONY: _quality-self _quality-fast _quality-static _quality-go-complexity _quality-ts-complexity _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-package
+.PHONY: _quality-self _quality-fast _quality-static _quality-go-complexity _quality-ts-complexity _quality-security _quality-tests _quality-dashboard _quality-site _quality-design _quality-browser _quality-journey _quality-node-sdk _quality-python-sdk _quality-bridge _quality-routing _quality-guards _quality-integration _quality-docs _quality-go-sdk _quality-nested-go _quality-int-modules _quality-secrets _quality-commit-secrets _quality-history-secrets _quality-image-scan _quality-deps _quality-licenses _quality-policy _quality-package _quality-alerts _quality-dr _quality-package
 _quality-self:
 	bash -n scripts/quality/run.sh scripts/quality/changed.sh scripts/ci/run-with-report.sh scripts/security/govulncheck-classify.sh
 	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
@@ -318,6 +318,22 @@ _quality-design:
 
 _quality-browser:
 	bash scripts/quality/browser.sh
+
+# CV-02 journey browser acceptance: the registered preflight for the
+# MANDATORY acceptance command — builds/verifies the
+# dashboard artifact first (same fingerprint contract as the browser gate),
+# then runs the Go stand, which itself FAILS on a missing/stale artifact and
+# enforces the frozen journey case registry (11 cases; no skips, no missing
+# cases, no unknown IDs; receipt at <artifacts>/stand-summary.json). The
+# mandatory command alone (e.g. from CI or another harness):
+#   go test -tags integration -run TestCV02RequestJourneyBrowserAcceptance \
+#     ./services/admin/handlers/ -count=1 -timeout 15m
+# Selected by the quality changed-run for changes under
+# web/dashboard/e2e-journey/**, web/dashboard/playwright.journey.config.ts and
+# services/admin/handlers/cv02* (see scripts/quality/quality.py classify).
+_quality-journey:
+	bash scripts/quality/browser-build.sh dashboard
+	go test -tags integration -run TestCV02RequestJourneyBrowserAcceptance ./services/admin/handlers/ -count=1 -timeout 15m
 
 _quality-node-sdk:
 	npm --prefix sdks/node run build

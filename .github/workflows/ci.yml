@@ -286,6 +286,9 @@ jobs:
           npm ci --prefix web/dashboard --no-audit --no-fund
           npm ci --prefix web/site --no-audit --no-fund
           npm ci --prefix sdks/node --no-audit --no-fund
+          # Journey browser acceptance (part of the changed-gate selection):
+          # idempotent — a no-op while the runner cache holds the browser.
+          npx --prefix web/dashboard playwright install chromium
           python3 -m pip install --disable-pip-version-check pyyaml
           python3 -m pip install --disable-pip-version-check -e "sdks/python[test]"
           make install-analysis-tools install-critical-tools security-tools-install security-db-update
