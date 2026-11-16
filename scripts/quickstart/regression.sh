@@ -671,14 +671,15 @@ note "seven managed views present (no extras, no materialized); columns content-
 # Deterministic fixture org (fixed uuids/bigint ids; timestamps pinned to one
 # UTC hour so day grouping is stable). Durations 200/200/300 yield the pinned
 # p50/p95 200/290 under percentile_cont; row 2 is the only cache hit, row 3
-# the only >=400. BYOK attribution is pinned via an org_custom_models row.
+# the only >=400. BYOK attribution is pinned via an org_custom_models row
+# (its id is GENERATED ALWAYS AS IDENTITY, so PostgreSQL assigns it).
 FIX_ORG='66666666-6666-4666-8666-666666666666'
 FIX_T0=$(dbq "SELECT date_trunc('hour', now())::text")
 dbq "DELETE FROM request_logs WHERE org_id = '$FIX_ORG';
 DELETE FROM org_custom_models WHERE org_id = '$FIX_ORG';
 DELETE FROM organizations WHERE id = '$FIX_ORG';
 INSERT INTO organizations (id, name, slug, created_at) VALUES ('$FIX_ORG', 'qs-fixture-org', 'qs-fixture-org', '$FIX_T0');
-INSERT INTO org_custom_models (id, org_id, model_name, provider, upstream_url) VALUES (987650001, '$FIX_ORG', 'mock-model', 'qs-fixture-provider', 'http://fixture.invalid');
+INSERT INTO org_custom_models (org_id, model_name, provider, upstream_url) VALUES ('$FIX_ORG', 'mock-model', 'qs-fixture-provider', 'http://fixture.invalid');
 INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, duration_ms, error, created_at, updated_at, request_id, cache_hit_type, user_id, home_region) VALUES
   (987650101, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '90 seconds', '$FIX_T0'::timestamptz + interval '90 seconds', 'qs-fixture-req-1', NULL, '66666666-6666-4666-8666-000000000001', 'qs'),
   (987650102, '$FIX_ORG', 'mock-model', 'mock-model', 200, 200, NULL, '$FIX_T0'::timestamptz + interval '150 seconds', '$FIX_T0'::timestamptz + interval '150 seconds', 'qs-fixture-req-2', 'exact', '66666666-6666-4666-8666-000000000002', 'qs'),
