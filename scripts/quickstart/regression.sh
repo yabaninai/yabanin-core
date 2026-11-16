@@ -448,8 +448,8 @@ beta_fixture_values_check() {
   [[ "$got" == "3/1" ]] || fail "fixture beta_requests_daily [$got] != 3/1"
   got=$($q "SELECT (onboarded_at - '$FIX_T0'::timestamptz) = interval '0' AND (first_request_at - ('$FIX_T0'::timestamptz + interval '90 seconds')) = interval '0' AND round(seconds_to_first_request::numeric) = 90 FROM beta_onboarding_ttfq WHERE org_id = '$FIX_ORG'")
   [[ "$got" == "t" ]] || fail "fixture beta_onboarding_ttfq [$got] != pinned t0/+90s/90s"
-  got=$($q "SELECT provider || '/' || byok || '/' || requests FROM beta_provider_distribution WHERE org_id = '$FIX_ORG'")
-  [[ "$got" == "qs-fixture-provider/t/3" ]] || fail "fixture beta_provider_distribution [$got] != qs-fixture-provider/t/3"
+  got=$($q "SELECT provider || '/' || byok::int || '/' || requests FROM beta_provider_distribution WHERE org_id = '$FIX_ORG'")
+  [[ "$got" == "qs-fixture-provider/1/3" ]] || fail "fixture beta_provider_distribution [$got] != qs-fixture-provider/1/3 (byok=true)"
   got=$($q "SELECT requests || '/' || errors || '/' || round(error_rate::numeric, 4)::text FROM beta_provider_errors WHERE org_id = '$FIX_ORG'")
   [[ "$got" == "3/1/0.3333" ]] || fail "fixture beta_provider_errors [$got] != 3/1/0.3333"
   got=$($q "SELECT p50_ms::int || '/' || p95_ms::int || '/' || requests FROM beta_latency_daily WHERE org_id = '$FIX_ORG'")
