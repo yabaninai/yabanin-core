@@ -412,7 +412,7 @@ beta_views_check() {
   local got mats
   got=$("$1" "SELECT COALESCE(string_agg(viewname, ' ' ORDER BY viewname), '') FROM pg_views WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
   [[ "$got" == "$BETA_VIEWS" ]] || fail "beta views are [$got], want exactly the seven managed names"
-  mats=$("$1" "SELECT count(*) FROM pg_matviews WHERE schemaname = 'public' AND viewname LIKE 'beta\\_%'")
+  mats=$("$1" "SELECT count(*) FROM pg_matviews WHERE schemaname = 'public' AND matviewname LIKE 'beta\\_%'")
   [[ "$mats" == "0" ]] || fail "$mats unexpected beta materialized views present"
 }
 
