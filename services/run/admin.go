@@ -322,7 +322,9 @@ func adminWireFeedback(ctx context.Context, h *handlers.AdminHandlers, pool *pgx
 	feedbackCollector := feedback.NewCollector(pool, logger.With("component", "feedback"))
 	h.SetFeedbackCollector(feedbackCollector, auth.NewResolver(pool, nil, 0, nil))
 	h.SetFeedbackLister(feedback.NewLister(pool))
-	if missing, unreadable, err := feedback.CheckMetricsViews(ctx, pool); err != nil {
+	readinessCtx, cancelReadiness := context.WithTimeout(ctx, 15*time.Second)
+	defer cancelReadiness()
+	if missing, unreadable, err := feedback.CheckMetricsViews(readinessCtx, pool); err != nil {
 		logger.Warn("beta metrics views readiness check failed", "error", err)
 	} else if len(missing) > 0 || len(unreadable) > 0 {
 		logger.Warn("beta metrics views not ready; dashboards answer empty until the migrate boundary provisions them",
