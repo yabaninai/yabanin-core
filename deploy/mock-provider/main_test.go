@@ -1,10 +1,13 @@
 package main
 
 import (
+	"bytes"
 	"encoding/json"
 	"io"
+	"log"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"strings"
 	"testing"
 )
@@ -155,5 +158,56 @@ func TestStreamingHTTPResponse(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func captureLogs(t *testing.T) *bytes.Buffer {
+	t.Helper()
+	var buf bytes.Buffer
+	log.SetOutput(&buf)
+	t.Cleanup(func() { log.SetOutput(os.Stderr) })
+	return &buf
+}
+
+// postChat issues one provider request carrying a secret header and a
+// distinctive body so tests can prove neither leaks into observation logs.
+func postChat(secret, body string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+secret)
+	rec := httptest.NewRecorder()
+	chatCompletions(rec, req)
+	return rec
+}
+
+func TestRequestLogDisabledByDefault(t *testing.T) {
+	// Pin the environment so an operator/CI shell with MOCK_REQUEST_LOG=1
+	// cannot make the default-off assertion depend on external state.
+	t.Setenv("MOCK_REQUEST_LOG", "")
+	buf := captureLogs(t)
+	rec := postChat("sk-secret-default", `{"model":"gpt-4o","messages":[{"role":"user","content":"hello"}]}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if strings.Contains(buf.String(), "mock-request") {
+		t.Fatalf("request logging leaked while disabled: %q", buf.String())
+	}
+}
+
+func TestRequestLogOneEntryPerRequestAndNoSecretLeak(t *testing.T) {
+	t.Setenv("MOCK_REQUEST_LOG", "1")
+	buf := captureLogs(t)
+	body := `{"model":"gpt-4o","messages":[{"role":"user","content":"distinctive-body-marker"}]}`
+	if rec := postChat("sk-secret-enabled", body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	if rec := postChat("sk-secret-enabled", body); rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200", rec.Code)
+	}
+	logs := buf.String()
+	if got := strings.Count(logs, "mock-request POST /v1/chat/completions"); got != 2 {
+		t.Fatalf("got %d request entries for 2 requests, want exactly 2: %q", got, logs)
+	}
+	if strings.Contains(logs, "sk-secret-enabled") || strings.Contains(logs, "distinctive-body-marker") {
+		t.Fatalf("observation log leaked secrets or body: %q", logs)
 	}
 }
