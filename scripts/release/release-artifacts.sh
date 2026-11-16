@@ -174,6 +174,15 @@ EOF
     fi
 }
 
+# `go version -m` echoes its argument path as the manifest header line; invoke
+# it with the bare binary name from inside the release dir so the fallback
+# .buildinfo bytes are identical across RELEASE_DIR locations (C-3).
+write_buildinfo() { # write_buildinfo <binary>: go version -m -> <binary>.buildinfo
+    local name
+    name=$(basename "$1")
+    (cd "$(dirname "$1")" && go version -m "$name") > "$1.buildinfo"
+}
+
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
@@ -253,7 +262,7 @@ else
     fi
     echo "syft not installed — writing go version -m build manifests instead"
     for bin in "$RELEASE_DIR/yabanin" "$RELEASE_DIR"/yabanin-*; do
-        go version -m "$bin" > "$bin.buildinfo" || exit 1
+        write_buildinfo "$bin" || exit 1
     done
     echo "go-version-m buildinfo fallback (syft not installed; NOT a full SPDX SBOM)" > "$RELEASE_DIR/sbom.source"
 fi
