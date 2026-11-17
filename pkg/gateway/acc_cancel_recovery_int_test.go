@@ -29,11 +29,21 @@
 //	         one debit (by-design boundary: the money layer dedups by
 //	         request ID while the transport honors client X-Request-Id
 //	         verbatim).
+//
+// Controls (isolated discriminator checks for the assertions above):
+//
+//	ACC-CTL-S Claim-starved live worker: durable pending charge, zero
+//	         debits across five completed observed backlog passes.
+//	ACC-CTL-D One injected post-debit settle failure forces the
+//	         duplicate-settlement window (attempts >= 2) — still one debit.
+//	ACC-CTL-O Backlog publishing down, claims live and settling — the
+//	         observer counts zero completed backlog observations.
 package cli
 
 import (
 	"bufio"
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -49,6 +59,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/go-chi/chi/v5/middleware"
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/require"
@@ -162,8 +174,130 @@ type accEnv struct {
 	log           *slog.Logger
 	stream        string
 	settleCancel  context.CancelFunc
+	settleDone    chan error
 	settleMu      sync.Mutex
 	settleCleanup bool
+	tickDB        *accTickDB
+	// settleDB is the seam the per-test real worker runs on; controls
+	// replace it with a fault-injecting wrapper before startSettlement.
+	settleDB consumer.SettlementDB
+}
+
+// accTickDB observes COMPLETED backlog passes of the real settlement
+// worker by wrapping the consumer.SettlementDB seam production
+// dependency-injects (the real pool). One observation = the worker's
+// per-tick backlog aggregation consumed in full (Next exhausted, terminal
+// Err nil, Close done) — not a Query call, a claim query or a log line.
+// publishBacklog runs after lease recovery and the bounded claim/execute
+// batches, so a completed observation proves that pass's claims and
+// executions already ran. All methods forward unchanged; only backlog
+// rows come back wrapped, so the real worker still settles against real
+// Postgres.
+type accTickDB struct {
+	consumer.SettlementDB
+	obs atomic.Int64
+	sig chan struct{} // coalescing wake-up; the counter is the truth
+}
+
+// Compile-time proof the wrapper still satisfies the seam's interface.
+var _ consumer.SettlementDB = (*accTickDB)(nil)
+
+// The settlement worker issues exactly two Query shapes through the
+// SettlementDB seam — the claim (claimReadyJobsQuery, $1 = lease TTL
+// seconds, $2 = batch limit) and the per-tick backlog aggregation — and
+// one advisory-lock Exec per settle transaction ($1 = org ID). The
+// prefixes identify them without coupling to the full statement text.
+const (
+	accSettlementClaimPrefix   = "WITH claimed AS ("
+	accSettlementBacklogPrefix = "SELECT status, count(*) FROM settlement_jobs"
+)
+
+func newAccTickDB(pool *pgxpool.Pool) *accTickDB {
+	return &accTickDB{SettlementDB: pool, sig: make(chan struct{}, 1)}
+}
+
+// accObservedRows wraps ONLY the backlog query's rows and fires obs once,
+// after the real rows consumer completed the full pass: Next() exhausted,
+// terminal error nil, Close() done. It forwards every rows method
+// unchanged via embedding.
+type accObservedRows struct {
+	pgx.Rows
+	obs       func()
+	once      sync.Once
+	exhausted bool
+	termErr   error
+}
+
+func (r *accObservedRows) Next() bool {
+	if r.Rows.Next() {
+		return true
+	}
+	r.exhausted = true
+	r.termErr = r.Rows.Err()
+	return false
+}
+
+func (r *accObservedRows) Close() {
+	r.Rows.Close()
+	r.once.Do(func() {
+		if r.exhausted && r.termErr == nil {
+			r.obs()
+		}
+	})
+}
+
+// Query forwards the real pool's Query unchanged. Only the backlog
+// query's rows come back wrapped; everything else is the pool's own
+// result, untouched.
+func (d *accTickDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	rows, err := d.SettlementDB.Query(ctx, query, args...)
+	if err != nil || !strings.HasPrefix(query, accSettlementBacklogPrefix) {
+		return rows, err
+	}
+	return &accObservedRows{Rows: rows, obs: d.observe}, nil
+}
+
+// observe counts one completed settlement/backlog observation and sends
+// the one-shot coalescing signal.
+func (d *accTickDB) observe() {
+	d.obs.Add(1)
+	select {
+	case d.sig <- struct{}{}:
+	default:
+	}
+}
+
+// requireDeliveryAcked proves COMPLETED delivery: the consumer group has
+// no pending (unacked) messages, so the request's event was processed and
+// acked by the real consumer — the precondition for deciding settlement
+// absence without a blind timeout.
+func (e *accEnv) requireDeliveryAcked(t *testing.T, reqID string) {
+	t.Helper()
+	require.Eventually(t, func() bool { return e.groupPending(t) == 0 },
+		10*time.Second, 100*time.Millisecond,
+		"delivered event never acked (group_pending>0) — %s", e.evidence(t, reqID))
+}
+
+// awaitSettlementObservations blocks until need MORE completed backlog
+// observations occurred since the entry baseline (the atomic counter is
+// the truth; the channel is a coalescing wake-up), within a one-shot
+// named bound — never a wall-clock sleep as proof. Two post-delivery
+// completed observations mean a full claim+execute opportunity ran
+// strictly after the durable intent existed, making "settled or never"
+// decidable immediately.
+func (e *accEnv) awaitSettlementObservations(t *testing.T, reqID string, need int64) {
+	t.Helper()
+	baseline := e.tickDB.obs.Load()
+	timer := time.NewTimer(10 * time.Second)
+	defer timer.Stop()
+	for e.tickDB.obs.Load()-baseline < need {
+		select {
+		case <-e.tickDB.sig:
+		case <-timer.C:
+			t.Fatalf("real settlement worker completed too few settlement/backlog observations (need +%d, got +%d) within bound — %s",
+				need, e.tickDB.obs.Load()-baseline, e.evidence(t, reqID))
+		}
+	}
 }
 
 func accLogger() *slog.Logger {
@@ -198,7 +332,8 @@ func accNewEnv(t *testing.T, chunks []string, withSettlement bool) *accEnv {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 
-	e := &accEnv{pool: pool, rdb: rdb, org: org, mux: mux, srv: srv, up: up, cs: cs, log: log, stream: accStream}
+	tick := newAccTickDB(pool)
+	e := &accEnv{pool: pool, rdb: rdb, org: org, mux: mux, srv: srv, up: up, cs: cs, log: log, stream: accStream, tickDB: tick, settleDB: tick}
 	if withSettlement {
 		e.startSettlement(t)
 	}
@@ -220,7 +355,9 @@ func (e *accEnv) startSettlement(t *testing.T) {
 		e.settleCleanup = true
 		t.Cleanup(func() { e.stopSettlement(t) })
 	}
-	w := consumer.NewSettlementWorker(e.pool, e.cs, nil, e.log)
+	// Real worker on the real pool; wrapped only at the SettlementDB
+	// dependency seam (accTickDB, or a control's wrapper of it).
+	w := consumer.NewSettlementWorker(e.settleDB, e.cs, nil, e.log)
 	w = w.WithConfig(consumer.SettlementConfig{
 		Interval:           50 * time.Millisecond,
 		BatchSize:          25,
@@ -236,19 +373,34 @@ func (e *accEnv) startSettlement(t *testing.T) {
 	})
 	ctx, cancel := context.WithCancel(context.Background())
 	e.settleCancel = cancel
-	go w.Run(ctx)
+	done := make(chan error, 1)
+	e.settleDone = done
+	go func() { done <- w.Run(ctx) }()
 }
 
-// stopSettlement cancels the worker and waits out any in-flight tick.
+// stopSettlement cancels the worker and waits for that start's Run
+// goroutine to actually return (bounded, named), so a restart cannot
+// overlap the old Run — and post-stop observation increments are
+// impossible, since obs fires only inside Run's tick call stack.
+// Idempotent; lifecycle under settleMu is unchanged.
 func (e *accEnv) stopSettlement(t *testing.T) {
 	t.Helper()
 	e.settleMu.Lock()
 	cancel := e.settleCancel
+	done := e.settleDone
 	e.settleCancel = nil
+	e.settleDone = nil
 	e.settleMu.Unlock()
-	if cancel != nil {
-		cancel()
-		time.Sleep(300 * time.Millisecond)
+	if cancel == nil {
+		return
+	}
+	cancel()
+	timer := time.NewTimer(5 * time.Second)
+	defer timer.Stop()
+	select {
+	case <-done:
+	case <-timer.C:
+		t.Fatalf("settlement worker Run did not exit after cancel within bound — leaked worker")
 	}
 }
 
@@ -343,6 +495,18 @@ func (e *accEnv) jobCount(t *testing.T, reqID string) int {
 	var n int
 	require.NoError(t, e.pool.QueryRow(context.Background(),
 		`SELECT count(*) FROM settlement_jobs WHERE org_id = $1 AND request_id = $2`, e.org, reqID).Scan(&n))
+	return n
+}
+
+// jobAttempts reads the resale job's attempt counter — the terminal-row
+// proof that a claimed job's charge path executed N times.
+func (e *accEnv) jobAttempts(t *testing.T, reqID string) int {
+	t.Helper()
+	var n int
+	require.NoError(t, e.pool.QueryRow(context.Background(),
+		`SELECT attempts FROM settlement_jobs
+		 WHERE org_id = $1 AND request_id = $2 AND charge_kind = $3`,
+		e.org, reqID, consumer.ChargeKindResaleDeduction).Scan(&n))
 	return n
 }
 
@@ -521,11 +685,12 @@ func TestAccR1aClientWriteFailureBillsEstimatedPrefixOnce(t *testing.T) {
 	}, 20*time.Second, 200*time.Millisecond,
 		"ACC-R1a violated: usage_source is not 'estimated' — %s", e.evidence(t, reqID))
 
-	// Exactly one settled resale job at the hand-counted amount…
-	require.Eventually(t, func() bool {
-		status, amount, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
-		return ok && status == "settled" && amount == accR1aChargeMicro
-	}, 25*time.Second, 200*time.Millisecond,
+	// Settled at the hand-counted amount, decided after ack + two
+	// observed completed backlog passes.
+	e.requireDeliveryAcked(t, reqID)
+	e.awaitSettlementObservations(t, reqID, 2)
+	gotStatus, gotAmount, settledOK := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+	require.True(t, settledOK && gotStatus == "settled" && gotAmount == accR1aChargeMicro,
 		"ACC-R1a violated: estimated-prefix charge did not settle at the hand-counted amount — %s", e.evidence(t, reqID))
 
 	// …exactly one usage debit of exactly that amount, and no unknown-price
@@ -561,11 +726,13 @@ func TestAccR1bClientCancelAfterUsageBillsDeliveredPrefixOnce(t *testing.T) {
 	e.streamAndCancel(t, reqID, `"completion_tokens":2500`)
 	e.requireUpstreamTeardown(t)
 
-	// Exactly one wallet settlement, terminal.
-	require.Eventually(t, func() bool {
-		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
-		return ok && status == "settled"
-	}, 25*time.Second, 200*time.Millisecond, "resale job never settled — %s", e.evidence(t, reqID))
+	// Terminal settled state, decided after ack + two observed completed
+	// backlog passes.
+	e.requireDeliveryAcked(t, reqID)
+	e.awaitSettlementObservations(t, reqID, 2)
+	r1bStatus, _, r1bOK := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+	require.True(t, r1bOK && r1bStatus == "settled",
+		"resale job never settled — %s", e.evidence(t, reqID))
 
 	// Exactly the delivered prefix, exactly once: 11 500 µUSD debit.
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqID),
@@ -609,18 +776,21 @@ func TestAccR2SettlementRestartNoLossNoDouble(t *testing.T) {
 	}, 20*time.Second, 200*time.Millisecond, "no durable pending charge — %s", e.evidence(t, reqID))
 	require.Empty(t, e.usageDebits(t, reqID), "premature debit — %s", e.evidence(t, reqID))
 
-	// …worker start converges to exactly one debit…
+	// …worker start converges to exactly one debit, decided after two
+	// newly observed completed backlog passes…
 	e.startSettlement(t)
-	require.Eventually(t, func() bool {
-		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
-		return ok && status == "settled"
-	}, 25*time.Second, 200*time.Millisecond, "restart did not settle — %s", e.evidence(t, reqID))
+	e.awaitSettlementObservations(t, reqID, 2)
+	r2Status, _, r2OK := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+	require.True(t, r2OK && r2Status == "settled",
+		"restart did not settle — %s", e.evidence(t, reqID))
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqID),
 		"ACC-R2 violated: post-restart charge not exact-once — %s", e.evidence(t, reqID))
 
-	// …and a SECOND worker restart does not double-charge.
+	// …and a SECOND worker restart does not double-charge — decided after
+	// two newly observed completed backlog passes.
 	e.restartSettlement(t)
-	time.Sleep(1 * time.Second)
+	e.requireDeliveryAcked(t, reqID)
+	e.awaitSettlementObservations(t, reqID, 2)
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqID),
 		"ACC-R2 violated: double charge after second restart — %s", e.evidence(t, reqID))
 	require.Equal(t, 1, e.jobCount(t, reqID), "duplicate jobs after restart — %s", e.evidence(t, reqID))
@@ -644,10 +814,13 @@ func TestAccR3ConcurrentAndReplaySingleDebitPerRequest(t *testing.T) {
 		}(id)
 	}
 	wg.Wait()
-	require.Eventually(t, func() bool {
-		return len(e.usageDebits(t, reqA)) == 1 && len(e.usageDebits(t, reqB)) == 1
-	}, 30*time.Second, 200*time.Millisecond, "concurrent pair did not settle — %s / %s",
-		e.evidence(t, reqA), e.evidence(t, reqB))
+	// Completed delivery (group_pending==0 covers both events) plus two
+	// observed completed backlog passes make the pair's settlement
+	// decidable.
+	e.requireDeliveryAcked(t, reqA)
+	e.awaitSettlementObservations(t, reqA, 2)
+	require.True(t, len(e.usageDebits(t, reqA)) == 1 && len(e.usageDebits(t, reqB)) == 1,
+		"concurrent pair did not settle — %s / %s", e.evidence(t, reqA), e.evidence(t, reqB))
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqA), "A — %s", e.evidence(t, reqA))
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqB), "B — %s", e.evidence(t, reqB))
 
@@ -661,7 +834,9 @@ func TestAccR3ConcurrentAndReplaySingleDebitPerRequest(t *testing.T) {
 	require.Eventually(t, func() bool {
 		return e.groupPending(t) == 0
 	}, 30*time.Second, 200*time.Millisecond, "replayed message never drained — %s", e.evidence(t, reqA))
-	time.Sleep(1 * time.Second)
+	// The replay had two observed completed backlog passes in which a
+	// duplicate charge could have landed.
+	e.awaitSettlementObservations(t, reqA, 2)
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqA),
 		"ACC-R3 violated: replay double-charged — %s", e.evidence(t, reqA))
 
@@ -677,9 +852,10 @@ func TestAccR3ConcurrentAndReplaySingleDebitPerRequest(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	require.Eventually(t, func() bool {
-		return len(e.usageDebits(t, reqC)) == 1
-	}, 30*time.Second, 200*time.Millisecond, "shared-ID pair never converged — %s", e.evidence(t, reqC))
+	e.requireDeliveryAcked(t, reqC)
+	e.awaitSettlementObservations(t, reqC, 2)
+	require.True(t, len(e.usageDebits(t, reqC)) == 1,
+		"shared-ID pair never converged — %s", e.evidence(t, reqC))
 	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqC),
 		"ACC-R3 violated: shared-ID pair charged twice — %s", e.evidence(t, reqC))
 
@@ -687,4 +863,185 @@ func TestAccR3ConcurrentAndReplaySingleDebitPerRequest(t *testing.T) {
 	total := append(append(e.usageDebits(t, reqA), e.usageDebits(t, reqB)...), e.usageDebits(t, reqC)...)
 	require.Len(t, total, 3, "org totals — A:%s B:%s C:%s",
 		e.evidence(t, reqA), e.evidence(t, reqB), e.evidence(t, reqC))
+}
+
+// --- ACC controls ---------------------------------------------------------
+//
+// Each control injects a fault ONLY at the SettlementDB seam its own
+// worker runs on; every other test keeps the plain pool-backed accTickDB.
+// Workers claim jobs globally, so a fault that must survive test-order
+// shuffles binds to its org — via the advisory lock's org argument —
+// instead of firing on the first matching statement from any org.
+
+var (
+	errAccCtlBlindBacklog = errors.New("acc ctl: backlog publish unavailable")
+	errAccCtlSettleTx     = errors.New("acc ctl: injected settle-transaction failure")
+)
+
+// Compile-time proof the control wrappers satisfy the seam's interface.
+var (
+	_ consumer.SettlementDB = (*accCtlStuckDB)(nil)
+	_ consumer.SettlementDB = (*accCtlRetryDB)(nil)
+	_ consumer.SettlementDB = (*accCtlBlindDB)(nil)
+)
+
+// accCtlStuckDB starves claims while keeping the worker otherwise live:
+// the real claim query runs with a zero batch limit, so nothing is ever
+// claimed or debited and backlog passes keep completing. This is the
+// stuck-before-settlement state R1b/R2's decision procedure must
+// recognize instead of passing vacuously.
+type accCtlStuckDB struct {
+	*accTickDB
+}
+
+func (d *accCtlStuckDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	if strings.HasPrefix(query, accSettlementClaimPrefix) {
+		return d.accTickDB.SettlementDB.Query(ctx, query, args[0], 0)
+	}
+	return d.accTickDB.Query(ctx, query, args...)
+}
+
+// accCtlRetryDB forces exactly one settle-transaction failure for its
+// org AFTER the debit committed: the first advisory-lock Exec for that
+// org fails, beginMoneyTx unwinds, and lease recovery re-queues the job
+// for a real second execution of the charge path — the
+// duplicate-settlement window the exact-once guarantee must survive.
+type accCtlRetryDB struct {
+	*accTickDB
+	org       string
+	failState atomic.Bool // armed = true; fires once, then disarms
+}
+
+// accCtlRetryTx is the worker-visible transaction whose only deviation
+// is that single org-bound advisory-lock failure; everything else
+// delegates to the real transaction untouched.
+type accCtlRetryTx struct {
+	pgx.Tx
+	org string
+	db  *accCtlRetryDB
+}
+
+func (d *accCtlRetryDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := d.accTickDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &accCtlRetryTx{Tx: tx, org: d.org, db: d}, nil
+}
+
+func (x *accCtlRetryTx) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(query, "pg_advisory_xact_lock") && len(args) == 1 && args[0] == x.org &&
+		x.db.failState.CompareAndSwap(true, false) {
+		return pgconn.CommandTag{}, errAccCtlSettleTx
+	}
+	return x.Tx.Exec(ctx, query, args...)
+}
+
+// accCtlBlindDB takes backlog publishing down for its worker while
+// claims keep passing: every backlog Query errors, and claim rows come
+// back wrapped so fully consumed claim passes are counted. Settlement
+// still completes; the backlog observation counter must stay zero.
+type accCtlBlindDB struct {
+	*accTickDB
+	claims atomic.Int64
+}
+
+func (d *accCtlBlindDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	if strings.HasPrefix(query, accSettlementBacklogPrefix) {
+		return nil, errAccCtlBlindBacklog
+	}
+	if strings.HasPrefix(query, accSettlementClaimPrefix) {
+		rows, err := d.accTickDB.SettlementDB.Query(ctx, query, args...)
+		if err != nil {
+			return nil, err
+		}
+		return &accObservedRows{Rows: rows, obs: func() { d.claims.Add(1) }}, nil
+	}
+	return d.accTickDB.Query(ctx, query, args...)
+}
+
+// TestAccCtlStuckBeforeSettlementStaysPendingNoDebit (ACC-CTL-S): with
+// the worker alive, ticking and observable but claim-starved, the durable
+// charge stays pending and NO debit ever lands — across five completed
+// observed backlog passes, a strictly stronger barrier than the R-tests'
+// two. If an R-test's observation barrier were vacuous (counting Query
+// calls, claims or log lines), this control would see money move.
+func TestAccCtlStuckBeforeSettlementStaysPendingNoDebit(t *testing.T) {
+	e := accNewEnv(t, []string{accContentChunk, accUsageChunk}, false)
+	e.settleDB = &accCtlStuckDB{accTickDB: e.tickDB}
+	e.startSettlement(t)
+	reqID := "acc-ctl-s-" + uuid.NewString()[:8]
+
+	e.streamAndCancel(t, reqID, `"completion_tokens":2500`)
+	e.requireUpstreamTeardown(t)
+	require.Eventually(t, func() bool {
+		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+		return ok && status == "pending"
+	}, 20*time.Second, 200*time.Millisecond, "ACC-CTL-S: no durable pending charge — %s", e.evidence(t, reqID))
+	e.requireDeliveryAcked(t, reqID)
+
+	e.awaitSettlementObservations(t, reqID, 5)
+	status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+	require.True(t, ok && status == "pending",
+		"ACC-CTL-S violated: claim-starved worker settled or lost the charge — %s", e.evidence(t, reqID))
+	require.Empty(t, e.usageDebits(t, reqID),
+		"ACC-CTL-S violated: debit without a claim — %s", e.evidence(t, reqID))
+}
+
+// TestAccCtlForcedSettleRetryStillSingleDebit (ACC-CTL-D): the debit
+// commits, the settle transaction fails exactly once, lease recovery
+// re-queues the charge and the second execution runs (attempts >= 2 is
+// the terminal-row proof). The money oracle must still see exactly one
+// debit — the duplicate-settlement window traversed for real.
+func TestAccCtlForcedSettleRetryStillSingleDebit(t *testing.T) {
+	e := accNewEnv(t, []string{accContentChunk, accUsageChunk}, false)
+	ctl := &accCtlRetryDB{accTickDB: e.tickDB, org: e.org}
+	ctl.failState.Store(true)
+	e.settleDB = ctl
+	e.startSettlement(t)
+	reqID := "acc-ctl-d-" + uuid.NewString()[:8]
+
+	e.streamAndCancel(t, reqID, `"completion_tokens":2500`)
+	e.requireUpstreamTeardown(t)
+	e.requireDeliveryAcked(t, reqID)
+
+	// Lease expiry (2s) plus recovery plus the retry's settle: bounded by
+	// the terminal-row oracle, not a sleep.
+	require.Eventually(t, func() bool {
+		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+		return ok && status == "settled"
+	}, 25*time.Second, 200*time.Millisecond, "ACC-CTL-D: settle retry did not converge — %s", e.evidence(t, reqID))
+
+	require.GreaterOrEqual(t, e.jobAttempts(t, reqID), 2,
+		"ACC-CTL-D: the injected failure never produced a second execution — %s", e.evidence(t, reqID))
+	require.Equal(t, []int64{-accResaleMicro}, e.usageDebits(t, reqID),
+		"ACC-CTL-D violated: forced settle retry double-charged — %s", e.evidence(t, reqID))
+	require.Equal(t, 1, e.jobCount(t, reqID),
+		"ACC-CTL-D: duplicate jobs — %s", e.evidence(t, reqID))
+}
+
+// TestAccCtlObserverBlindToClaimsCountsZero (ACC-CTL-O): backlog
+// publishing is down while claims pass and settlement completes; claim
+// passes accrue but the backlog observation counter stays at zero — the
+// observer cannot be confused by claim queries or failed backlog
+// queries.
+func TestAccCtlObserverBlindToClaimsCountsZero(t *testing.T) {
+	e := accNewEnv(t, []string{accContentChunk, accUsageChunk}, false)
+	blind := &accCtlBlindDB{accTickDB: e.tickDB}
+	e.settleDB = blind
+	e.startSettlement(t)
+	reqID := "acc-ctl-o-" + uuid.NewString()[:8]
+
+	e.streamAndCancel(t, reqID, `"completion_tokens":2500`)
+	e.requireUpstreamTeardown(t)
+	e.requireDeliveryAcked(t, reqID)
+
+	require.Eventually(t, func() bool {
+		status, _, ok := e.jobRow(t, reqID, consumer.ChargeKindResaleDeduction)
+		return ok && status == "settled"
+	}, 25*time.Second, 200*time.Millisecond, "ACC-CTL-O: settlement did not converge without backlog — %s", e.evidence(t, reqID))
+	require.Eventually(t, func() bool { return blind.claims.Load() >= 3 },
+		10*time.Second, 100*time.Millisecond, "ACC-CTL-O: no completed claim passes observed")
+	require.Zero(t, e.tickDB.obs.Load(),
+		"ACC-CTL-O violated: observer counted non-backlog or failed queries — %s", e.evidence(t, reqID))
 }
