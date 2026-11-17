@@ -1198,6 +1198,34 @@ class StaticWiringTests(unittest.TestCase):
                 "stat tar date head od git python3 openssl cmp cp; do"):
             self.assertIn(needle, h)
 
+    def test_snapshot_acl_ownership_uses_owner_aware_catalog(self):
+        """snapshot_acl must read ownership from the real catalog contract:
+        pg_class joined to pg_namespace, public schema, relkind-limited,
+        owner resolved via pg_get_userbyid, relkind mapped to the familiar
+        table_type strings, ordered by table name. information_schema.tables
+        has NO owner column (the R6 failure); grants/policies/RLS must stay."""
+        h = extract("snapshot_acl")
+        owner_line = [l for l in h.splitlines() if "'owner'," in l]
+        self.assertEqual(len(owner_line), 1, "exactly one ownership SELECT")
+        o = owner_line[0]
+        for needle in (  # the actual catalog contract, positively asserted
+                "FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace",
+                "n.nspname = 'public'",
+                "c.relkind IN ('r','v','m','p')",
+                "pg_get_userbyid(c.relowner) AS owner",
+                "CASE c.relkind WHEN 'r' THEN 'BASE TABLE'",
+                "WHEN 'v' THEN 'VIEW'",
+                "WHEN 'm' THEN 'MATERIALIZED VIEW'",
+                "WHEN 'p' THEN 'PARTITIONED TABLE'",
+                "ORDER BY 2"):
+            self.assertIn(needle, o)
+        # the failed source (no owner column exists in that view) is gone
+        # from the ownership SELECT while the other snapshots are preserved
+        self.assertNotIn("information_schema.tables", o)
+        for preserved in ("pg_roles", "information_schema.role_table_grants",
+                          "pg_policies", "pg_tables", "rowsecurity"):
+            self.assertIn(preserved, h)
+
 
 if __name__ == "__main__":
     unittest.main()

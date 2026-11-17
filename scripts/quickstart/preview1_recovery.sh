@@ -395,13 +395,14 @@ assert_history_retained() {
 
 snapshot_acl() {
   # Canonical roles/grants/policies/ownership snapshot with stable ordering.
-  # Grants include grantor; ownership covers tables AND views via
-  # information_schema.tables so a restore that changed owners cannot pass.
+  # Grants include grantor; ownership covers tables AND views via the
+  # owner-aware catalog (pg_class/pg_namespace — information_schema.tables
+  # exposes no owner column) so a restore that changed owners cannot pass.
   local q=$1 out=$2
   {
     "$q" "SELECT 'role', rolname FROM pg_roles WHERE rolname IN ('yabanin','yabanin_app') ORDER BY 2"
     "$q" "SELECT 'grant', grantor, grantee, table_name, privilege_type FROM information_schema.role_table_grants WHERE grantee IN ('yabanin','yabanin_app') ORDER BY 2,3,4,5"
-    "$q" "SELECT 'owner', table_name, table_type, coalesce(table_owner,'') FROM information_schema.tables WHERE table_schema = 'public' ORDER BY 2"
+    "$q" "SELECT 'owner', c.relname AS table_name, CASE c.relkind WHEN 'r' THEN 'BASE TABLE' WHEN 'v' THEN 'VIEW' WHEN 'm' THEN 'MATERIALIZED VIEW' WHEN 'p' THEN 'PARTITIONED TABLE' ELSE c.relkind::text END AS table_type, pg_get_userbyid(c.relowner) AS owner FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace WHERE n.nspname = 'public' AND c.relkind IN ('r','v','m','p') ORDER BY 2"
     "$q" "SELECT 'policy', tablename, policyname FROM pg_policies WHERE schemaname = 'public' ORDER BY 2,3"
     "$q" "SELECT 'rls', tablename, rowsecurity::int FROM pg_tables WHERE schemaname = 'public' AND rowsecurity ORDER BY 2";
   } > "$out"
