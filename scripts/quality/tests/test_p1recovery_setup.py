@@ -1284,6 +1284,90 @@ class StaticWiringTests(unittest.TestCase):
                 "chmod 600"):
             self.assertIn(preserved, h)
 
+    def test_up1_records_view_set_bytewise_canonically(self):
+        """UP1 must serialize the ACTUAL managed-view set exactly as RB6
+        reads it back: direct redirection through the REAL view_names. The
+        previous UP1 form (empty command substitution + printf '%s\\n')
+        manufactured a blank line for an empty set (1 byte vs 0 bytes), so
+        RB6's diff reported a nonexistent set difference — a harness
+        serialization artifact, not a schema difference. Executed
+        three-outcome proof on the REAL extracted function: the corrected
+        form is canonical for zero and multiple ordered rows; the original
+        frozen form and an isolated variant restoring it both fail the
+        empty-set byte-equivalence invariant."""
+        h = REAL_H.read_text()
+        direct = 'view_names p1q > "$VIEWS_P1_SET"; chmod 600 "$VIEWS_P1_SET"'
+        # wiring: UP1's snapshot statement IS the direct canonical form,
+        # before the identity record, with the manufactured-line form gone
+        self.assertIn(direct, h)
+        self.assertNotIn("p1_views=$(view_names p1q)", h)
+        self.assertLess(h.find(direct),
+                        h.find('preview1_view_set_sha256 $(sha_file '
+                               '"$VIEWS_P1_SET")'))
+        # the nonempty candidate seven-view assertion is untouched
+        self.assertIn(
+            'diff <(printf \'%s\\n\' "$EXP_VIEWS") '
+            '<(printf \'%s\\n\' "$cand_views") || fail "candidate view set '
+            'differs from the seven managed views"', h)
+
+        # frozen original artifact: the exact R9A harness bytes carrying the
+        # old two-line UP1 form. HEAD is NOT a stable original — once the
+        # corrected commit lands, HEAD becomes the corrected harness, the
+        # extraction finds nothing and the test would rot. Bind the full
+        # immutable R9A commit, like the other archived-source tests.
+        R9A_HARNESS_COMMIT = "714169aa2eea8db753ce476b3e4dd3f9489c8a41"
+        head = subprocess.run(
+            ["git", "-C", REPO, "show",
+             f"{R9A_HARNESS_COMMIT}:scripts/quickstart/preview1_recovery.sh"],
+            capture_output=True, text=True, check=True).stdout
+        self.assertIn("p1_views=$(view_names p1q)", head)  # old form exists
+        old_lines = [l for l in head.splitlines()
+                     if "p1_views=" in l
+                     or ('"$VIEWS_P1_SET"' in l and "printf" in l)]
+        self.assertEqual(len(old_lines), 2, old_lines)  # capture + printf
+        old_form = "\n".join(old_lines) + "\n"
+
+        def run_form(form, rows_file):
+            tmp2 = pathlib.Path(tempfile.mkdtemp(prefix="p1r-vw-"))
+            self.addCleanup(lambda: shutil.rmtree(tmp2, ignore_errors=True))
+            out = tmp2 / "view-set.txt"
+            script = (
+                extract("view_names")
+                + f'p1q() {{ cat "{rows_file}"; }}\n'
+                + f'VIEWS_P1_SET="{out}"\n'
+                + form)
+            r = run_bash(script)
+            self.assertEqual(r.returncode, 0, r.stderr)
+            return out
+
+        empty = pathlib.Path(tempfile.mkdtemp(prefix="p1r-vw-src-")) / "none"
+        empty.write_text("")  # zero query rows
+        self.addCleanup(lambda: shutil.rmtree(empty.parent, ignore_errors=True))
+        two = pathlib.Path(tempfile.mkdtemp(prefix="p1r-vw-src-")) / "two"
+        two.write_text("beta_alpha\nbeta_beta\n")  # ordered multiple rows
+        self.addCleanup(lambda: shutil.rmtree(two.parent, ignore_errors=True))
+
+        for rows_file, want in ((empty, b""), (two, b"beta_alpha\nbeta_beta\n")):
+            with self.subTest(rows="zero" if want == b"" else "two"):
+                corrected = run_form(direct + "\n", rows_file)
+                self.assertEqual(corrected.read_bytes(), want)
+                self.assertEqual(
+                    stat.S_IMODE(corrected.stat().st_mode), 0o600)
+                old = run_form(old_form, rows_file)
+                self.assertEqual(old.read_bytes(), want if want else b"\n")
+                # isolated variant: the old behavior restored INTO the
+                # corrected flow (last write wins) must break the same
+                # byte-equivalence invariant for the empty set, not merely
+                # trip a setup regex
+                variant = run_form(direct + "\n" + old_form, rows_file)
+                self.assertEqual(variant.read_bytes(),
+                                 want if want else b"\n")
+                if want == b"":
+                    self.assertNotEqual(variant.read_bytes(),
+                                        corrected.read_bytes())
+                    self.assertNotEqual(old.read_bytes(),
+                                        corrected.read_bytes())
+
 
 if __name__ == "__main__":
     unittest.main()

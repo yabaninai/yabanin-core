@@ -849,8 +849,7 @@ case_upgrade() {
   assert_container_image "${PROJECT}-migrate-1" "$PRE_IMAGE_ID" "UP1 preview1 migrate"
   P1_MIGRATE_HEAD=$(p1q "SELECT max(version) FROM schema_migrations")
   [[ -n "$P1_MIGRATE_HEAD" ]] || fail "preview1 schema_migrations empty"
-  p1_views=$(view_names p1q)
-  printf '%s\n' "$p1_views" > "$VIEWS_P1_SET"; chmod 600 "$VIEWS_P1_SET"
+  view_names p1q > "$VIEWS_P1_SET"; chmod 600 "$VIEWS_P1_SET"
   p1_view_n=$(grep -c . "$VIEWS_P1_SET" || true)
   note "preview1 migrate head $P1_MIGRATE_HEAD; actual managed-view count ${p1_view_n} (recorded as the rollback baseline — shipping views.go does not prove this stack provisioned them)"
   { echo "preview1_migrate_head $P1_MIGRATE_HEAD"
