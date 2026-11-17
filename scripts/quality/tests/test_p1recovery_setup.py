@@ -652,6 +652,118 @@ class ArchivedComposeContractTests(unittest.TestCase):
             self.assertGreaterEqual(found, 3, commit)  # gateway/admin/pg
 
 
+class PhaseImageRewriteTests(unittest.TestCase):
+    """PF3 app-image rewrite against the REAL archived compose sources.
+
+    The r3 run proved the failure mechanism: compose kept the shared mutable
+    yabanin-quickstart:local ref, so UP1 ran fleet-built bytes (6998f57d)
+    instead of the archived Preview1 image (3171a922). These cases qualify
+    the correction on the real frozen compose text, including the invariant
+    failure for a partially rewritten file.
+    """
+
+    TAG = "qs-fxt-p1:preview1"
+    SHARED = "image: yabanin-quickstart:local"
+
+    @staticmethod
+    def _archived_compose(commit):
+        return subprocess.run(
+            ["git", "-C", str(REPO), "show",
+             f"{commit}:deploy/quickstart/docker-compose.yml"],
+            capture_output=True, text=True, check=True).stdout
+
+    def _run(self, fn, script_tail):
+        # mkdtemp + addCleanup (not a with-block): the caller must read the
+        # rewritten compose after run_bash returns, so the directory must
+        # outlive this method.
+        td = tempfile.mkdtemp(prefix="p1r-setup-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        f = pathlib.Path(td) / "docker-compose.yml"
+        f.write_text(self._archived_compose(PREVIEW1_COMMIT))
+        script = (
+            extract("fail") + extract("require_phase_images")
+            + extract("rewrite_phase_images")
+            + "CURRENT_CASE=t; CURRENT_STEP=t\n"
+            + script_tail.format(f=f, tag=self.TAG, fn=fn) + "\n")
+        return run_bash(script), f
+
+    def test_original_archived_composes_have_exactly_three_shared_app_refs(self):
+        # the r3 proof: both frozen composes really do carry the three shared
+        # refs (migrate, seed, yabanin) that PF3 must pin per phase
+        for commit in (PREVIEW1_COMMIT, CANDIDATE_COMMIT):
+            n = self._archived_compose(commit).count(self.SHARED)
+            self.assertEqual(n, 3, commit)
+
+    def test_rewrite_pins_all_three_app_refs_and_leaves_immutable_refs_alone(self):
+        r, f = self._run(
+            "rewrite_phase_images",
+            'rewrite_phase_images "{tag}" "{f}" "tst"\necho REWRITE-OK')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(r.stdout.strip(), "REWRITE-OK")
+        after = f.read_text()
+        self.assertEqual(after.count(f"image: {self.TAG}"), 3)
+        self.assertNotIn(self.SHARED, after)
+        # immutable postgres/redis digest refs and total image count unchanged
+        before = self._archived_compose(PREVIEW1_COMMIT)
+        immut = [ln for ln in before.splitlines()
+                 if ln.strip().startswith("image:")
+                 and "yabanin-quickstart:local" not in ln]
+        self.assertTrue(immut)
+        for ln in immut:
+            self.assertIn(ln, after.splitlines(), ln)
+        self.assertEqual(
+            before.count("image:"), after.count("image:"))
+
+    def test_partial_rewrite_fails_the_shared_image_invariant_not_a_setup_error(self):
+        with tempfile.TemporaryDirectory(prefix="p1r-setup-") as td:
+            f = pathlib.Path(td) / "docker-compose.yml"
+            # replace only TWO of the three shared refs, as a defective
+            # correction would leave the file
+            seen = 0
+            out = []
+            for ln in self._archived_compose(PREVIEW1_COMMIT).splitlines():
+                if ln.strip() == self.SHARED and seen < 2:
+                    out.append(ln.replace(
+                        self.SHARED, f"image: {self.TAG}"))
+                    seen += 1
+                else:
+                    out.append(ln)
+            f.write_text("\n".join(out) + "\n")
+            script = (
+                extract("fail") + extract("require_phase_images")
+                + "CURRENT_CASE=t; CURRENT_STEP=t\n"
+                + f'require_phase_images "{self.TAG}" "{f}" "tst"\n')
+            r = run_bash(script)
+            self.assertEqual(r.returncode, 1)
+            # the shared-image INVARIANT fires — not the archive-shape/setup
+            # precheck message
+            self.assertIn("shared yabanin-quickstart:local ref(s) remain",
+                          r.stderr)
+            self.assertIn("shared-image invariant violated", r.stderr)
+            self.assertNotIn("expected 3 shared", r.stderr)
+
+    def test_shape_guard_rejects_wrong_shared_ref_count(self):
+        with tempfile.TemporaryDirectory(prefix="p1r-setup-") as td:
+            f = pathlib.Path(td) / "docker-compose.yml"
+            lines = [ln for ln in
+                     self._archived_compose(PREVIEW1_COMMIT).splitlines()]
+            # drop one shared ref: only two remain -> shape precheck failure
+            for i, ln in enumerate(lines):
+                if ln.strip() == self.SHARED:
+                    del lines[i]
+                    break
+            f.write_text("\n".join(lines) + "\n")
+            script = (
+                extract("fail") + extract("require_phase_images")
+                + extract("rewrite_phase_images")
+                + "CURRENT_CASE=t; CURRENT_STEP=t\n"
+                + f'rewrite_phase_images "{self.TAG}" "{f}" "tst"\n')
+            r = run_bash(script)
+            self.assertEqual(r.returncode, 1)
+            self.assertIn("expected 3 shared yabanin-quickstart:local app "
+                          "refs, found 2", r.stderr)
+
+
 class StaticWiringTests(unittest.TestCase):
     """Supplementary static checks; executable proof lives above."""
 
@@ -665,6 +777,14 @@ class StaticWiringTests(unittest.TestCase):
                 'echo "phase_env_sha256 $PHASE_ENV_SHA" >> "$IDENTITY"',
                 'require_phase_env "$RUNTMP/preview1" "$RUNTMP/candidate" '
                 '"$IDENTITY"',
+                'rewrite_phase_images "$phase_tag" "$RUNTMP/$phase/'
+                'docker-compose.yml" "$phase"',
+                'assert_container_image "${PROJECT}-migrate-1" '
+                '"$PRE_IMAGE_ID" "UP1 preview1 migrate"',
+                'assert_container_image "${PROJECT}-migrate-1" '
+                '"$CAND_IMAGE_ID" "UP8 candidate migrate"',
+                'assert_container_image "${PROJECT}-migrate-1" '
+                '"$PRE_IMAGE_ID" "RB4 rollback migrate"',
                 "for t in docker ss curl sha256sum timeout sed grep awk comm "
                 "stat tar date head od git python3 openssl cmp cp; do"):
             self.assertIn(needle, h)

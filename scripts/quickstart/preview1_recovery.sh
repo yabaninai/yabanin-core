@@ -262,6 +262,37 @@ require_phase_env() {
   printf '%s' "$got"
 }
 
+require_phase_images() {
+  # require_phase_images TAG COMPOSEFILE LABEL: invariant half of the PF3
+  # app-image rewrite — zero shared yabanin-quickstart:local refs remain
+  # (checked FIRST: any surviving shared ref would run fleet-built bytes and
+  # is the actual safety violation), then exactly three TAG refs. Validates
+  # partially rewritten files too, so a defective correction fails as a
+  # shared-image invariant violation, never as a silent pass.
+  local tag="$1" f="$2" lbl="$3" tagged shared
+  shared=$(grep -c 'image: yabanin-quickstart:local' "$f" || true)
+  [[ "$shared" -eq 0 ]] || fail "$lbl compose: $shared shared yabanin-quickstart:local ref(s) remain (shared-image invariant violated)"
+  tagged=$(grep -c "image: ${tag}\$" "$f" || true)
+  [[ "$tagged" -eq 3 ]] || fail "$lbl compose: expected 3 refs to $tag, found $tagged"
+}
+
+rewrite_phase_images() {
+  # rewrite_phase_images TAG COMPOSEFILE LABEL: the archived quickstart
+  # compose references the shared mutable yabanin-quickstart:local image for
+  # exactly three services (migrate, seed, yabanin). Preflight pins all three
+  # to THIS phase's source-rebuilt tag so compose can never silently run
+  # whatever the fleet last built under the shared tag (the r3 UP1 failure:
+  # container 6998f57d != archived 3171a922). Immutable postgres/redis refs
+  # and the mock override are never touched. Precheck: exactly three shared
+  # refs (archive shape guard); postcheck: the invariant above.
+  local tag="$1" f="$2" lbl="$3" n
+  n=$(grep -c 'image: yabanin-quickstart:local' "$f" || true)
+  [[ "$n" -eq 3 ]] \
+    || fail "$lbl compose: expected 3 shared yabanin-quickstart:local app refs, found $n (archive shape changed; refusing to guess)"
+  sed -i "s#image: yabanin-quickstart:local\$#image: ${tag}#" "$f"
+  require_phase_images "$tag" "$f" "$lbl"
+}
+
 # Compose invocations for the two phases of the SAME project (same project
 # name => same retained <project>_pg_data volume). Each phase file is paired
 # with the instrumented-mock override (same reviewed harness-commit mock image
@@ -550,9 +581,10 @@ note "images are source-rebuilt from these exact trees; the module zip identity 
 cs PF3
 step "preflight: phase compose copies rewritten onto the scratch subnet + instrumented mock override"
 for phase in preview1 candidate; do
-  if [[ "$phase" == preview1 ]]; then src_commit=$PREVIEW1_COMMIT; else src_commit=$CANDIDATE_COMMIT; fi
+  if [[ "$phase" == preview1 ]]; then src_commit=$PREVIEW1_COMMIT; phase_tag=$TAG_P1; else src_commit=$CANDIDATE_COMMIT; phase_tag=$TAG_CAND; fi
   git -C "$root" show "${src_commit}:deploy/quickstart/docker-compose.yml" > "$RUNTMP/$phase/docker-compose.yml"
   git -C "$root" show "${src_commit}:deploy/quickstart/bootstrap-app-role.sql" > "$RUNTMP/$phase/bootstrap-app-role.sql"
+  rewrite_phase_images "$phase_tag" "$RUNTMP/$phase/docker-compose.yml" "$phase"
   sed -i "s#10\.207\.0\.0/24#${SUBNET}#g; s#10\.207\.0\.9#${MOCK_IP}#g" "$RUNTMP/$phase/docker-compose.yml"
   if grep -q '10\.207\.0\.' "$RUNTMP/$phase/docker-compose.yml"; then
     fail "$phase compose still references the occupied 10.207.0.0/24 after rewrite"
@@ -640,6 +672,7 @@ case_upgrade() {
   [[ "$run_image" == "$PRE_IMAGE_ID" ]] || fail "preview1 container is not the archived image ($run_image != $PRE_IMAGE_ID)"
   P1_PG_MAJOR=$(assert_pg_runtime p1q up1 "")
   assert_container_image "${PROJECT}-postgres-1" "$PG1_IMAGE_ID" "UP1 preview1 postgres"
+  assert_container_image "${PROJECT}-migrate-1" "$PRE_IMAGE_ID" "UP1 preview1 migrate"
   P1_MIGRATE_HEAD=$(p1q "SELECT max(version) FROM schema_migrations")
   [[ -n "$P1_MIGRATE_HEAD" ]] || fail "preview1 schema_migrations empty"
   p1_views=$(view_names p1q)
@@ -747,6 +780,7 @@ INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, 
   [[ -n "$cand_head" ]] || fail "candidate schema_migrations empty"
   assert_pg_runtime cndq up8 "$P1_PG_MAJOR" >/dev/null
   assert_container_image "${PROJECT}-postgres-1" "$PG2_IMAGE_ID" "UP8 candidate postgres"
+  assert_container_image "${PROJECT}-migrate-1" "$CAND_IMAGE_ID" "UP8 candidate migrate"
   note "candidate migrate head $cand_head (preview1 recorded $P1_MIGRATE_HEAD)"
   echo "candidate_migrate_head $cand_head" >> "$RECORD"
 
@@ -849,6 +883,7 @@ case_rollback() {
   [[ -n "$PG_MAJ" && -n "$PG1_IMAGE_ID" ]] || fail "resume: postgres identity missing from $IDENTITY"
   assert_pg_runtime p1q rb4 "$P1_PG_MAJOR" >/dev/null
   assert_container_image "${PROJECT}-postgres-1" "$PG1_IMAGE_ID" "RB4 rollback postgres"
+  assert_container_image "${PROJECT}-migrate-1" "$PRE_IMAGE_ID" "RB4 rollback migrate"
   rb_head=$(p1q "SELECT max(version) FROM schema_migrations")
   [[ "$rb_head" == "$P1_MIGRATE_HEAD" ]] || fail "restored migrate head [$rb_head] != preview1's [$P1_MIGRATE_HEAD]"
 
