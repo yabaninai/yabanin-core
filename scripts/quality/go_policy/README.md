@@ -50,11 +50,22 @@ explicit coverage decision. Dependency-only edits still run policy/security and
 normal product tests; this runner does not pretend that unchanged functions were
 modified or that their missing historic fuzz tests are new-code violations.
 
-Each affected package has at most 300 seconds per check kind (unit suite,
-fuzzing, mutation), including subprocess startup and its supported build modes.
-Missing coverage, timeout or an unfinished run blocks. Extended campaigns
-belong in separate runs; never raise this budget secretly or interpret an
-exhausted budget as success.
+Selection runs through the qualified conservative selector by default: changed
+declarations bind their real consumers — including baseline, relocated and
+cross-package test consumers — and unresolved mapping widens the selection
+instead of running too little. `CRITICAL_SCOPE_SELECTOR=legacy` selects the
+pre-qualification selector as an explicit emergency override; any other value
+fails the gate closed instead of guessing a mode.
+
+Each affected package runs on the approved versioned budget block in
+`critical.json` (`budget.schema_version` 1): 300 seconds per package for the
+unit suite, 420 seconds for fuzzing and 300 seconds for mutation, including
+subprocess startup and shared across the package's supported build modes. The
+runner rejects any other budget instead of silently guessing; a legacy flat
+`seconds_per_package_and_kind` field is an error, not a fallback. Missing
+coverage, timeout or an unfinished run blocks. Extended campaigns belong in
+separate runs; never raise this budget secretly or interpret an exhausted
+budget as success.
 
 Applicability is per package and build mode, decided from real evidence and
 versioned in `critical.json` (schema 2):
@@ -74,9 +85,12 @@ versioned in `critical.json` (schema 2):
   `skipped: no gremlins-qualified unit mode (N/A)` explicitly.
 - Where fuzz targets are absent but the package has unit tests, the gate
   requires that unit suite to pass in each configured build mode — the real
-  requirement that exists there. A package with no tests at all reports
-  `skipped: no unit tests in package (N/A)` and enforces nothing else here;
-  normal build, vet, lint and test gates still apply outside this runner.
+  requirement that exists there. A package whose fuzz or unit-test targets
+  disappear from a build mode (renamed or constraint-tagged out) blocks the
+  gate loudly instead of turning every check not-applicable; a package with no
+  tests at all reports `skipped: no unit tests in package (N/A)` and enforces
+  nothing else here; normal build, vet, lint and test gates still apply
+  outside this runner.
 
 Not-applicable entries are printed with their reasons and stored in
 `report.json`; they never fabricate fuzz executions, mutation kills or
