@@ -98,7 +98,9 @@ case "$cmd" in
           printf 'STATE-OP %s\n' "$*" >> "$CANARY"; exit 3 ;;
   network)
     if [ "$2" = "ls" ]; then echo "yabanin-quickstart_default"; exit 0; fi
-    if [ "$2" = "inspect" ]; then echo "10.207.0.0/24 "; exit 0; fi
+    if [ "$2" = "inspect" ]; then
+      printf '%s\n' "${HELD_SUBNETS:-10.207.0.0/24 }"; exit 0
+    fi
     printf 'STATE-OP %s\n' "$*" >> "$CANARY"; exit 3 ;;
   image)
     if [ "$2" = "inspect" ]; then
@@ -564,7 +566,8 @@ class FullHarnessOrchestrationTests(unittest.TestCase):
     compose call (the stub fails it), which is exactly the ordering oracle.
     """
 
-    def _run_harness(self, inject_initenv_fail=False, project=None):
+    def _run_harness(self, inject_initenv_fail=False, project=None,
+                     held_subnets=None):
         tmp = pathlib.Path(tempfile.mkdtemp(prefix="p1r-orch-"))
         self.addCleanup(lambda: shutil.rmtree(tmp, ignore_errors=True))
         bindir = tmp / "bin-stub"
@@ -593,6 +596,8 @@ class FullHarnessOrchestrationTests(unittest.TestCase):
             "LOG": str(log),
             "CANARY": str(canary),
         })
+        if held_subnets is not None:
+            env["HELD_SUBNETS"] = held_subnets
         r = subprocess.run(
             [BASH, str(REAL_H)], capture_output=True, text=True,
             env=env, cwd=REPO, timeout=180)
@@ -610,6 +615,32 @@ class FullHarnessOrchestrationTests(unittest.TestCase):
         self.assertFalse((tmp / "runtmp" / "preview1" / ".env").exists())
         self.assertFalse((tmp / "runtmp" / "candidate" / ".env").exists())
         self.assertFalse(canary.exists())
+
+    def test_pf1_selects_first_free_later_subnet_when_201_204_held(self):
+        # R7 reality: 10.207.201-204 are held by earlier runs and the shared
+        # 10.207.0.0/24 is always reported held. The deterministic candidate
+        # order must select 10.207.205.0/24 (mock .9) and proceed to UP1.
+        held = ("10.207.0.0/24 10.207.201.0/24 10.207.202.0/24 "
+                "10.207.203.0/24 10.207.204.0/24 ")
+        project = "p1r-fxt-subnet205"
+        r, tmp, canary = self._run_harness(project=project, held_subnets=held)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("QS-UPGRADE-P1/UP1", r.stderr)
+        self.assertIn("scratch subnet 10.207.205.0/24 mock ip 10.207.205.9",
+                      r.stdout)
+        self.assertTrue(canary.is_file())  # a compose up was reached
+
+    def test_pf1_fails_closed_when_all_candidate_subnets_held(self):
+        # every scratch candidate (201-208) plus the shared subnet is held:
+        # PF1 must refuse BEFORE any compose call, staying fail-closed
+        # rather than touching an occupied network.
+        held = "10.207.0.0/24 " + " ".join(
+            f"10.207.{n}.0/24" for n in range(201, 209)) + " "
+        r, tmp, canary = self._run_harness(held_subnets=held)
+        self.assertEqual(r.returncode, 1)
+        self.assertIn("no free scratch subnet available "
+                      "(10.207.201-208 all held)", r.stderr)
+        self.assertFalse(canary.exists())  # no compose call ever attempted
 
     def test_first_compose_call_observes_ready_phase_envs(self):
         project = "p1r-fxt-firstup"

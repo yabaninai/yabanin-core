@@ -727,12 +727,12 @@ else
     docker network inspect "$nid" --format '{{range .IPAM.Config}}{{.Subnet}} {{end}}' 2>/dev/null
   done)
   SUBNET='' MOCK_IP=''
-  for cand in 10.207.201.0/24 10.207.202.0/24 10.207.203.0/24 10.207.204.0/24; do
+  for cand in 10.207.201.0/24 10.207.202.0/24 10.207.203.0/24 10.207.204.0/24 10.207.205.0/24 10.207.206.0/24 10.207.207.0/24 10.207.208.0/24; do
     if ! grep -qF "$cand" <<<"$held_subnets"; then
       SUBNET=$cand; MOCK_IP="${cand%0/*}9"; break
     fi
   done
-  [[ -n "$SUBNET" ]] || fail "no free scratch subnet available (10.207.201-204 all held)"
+  [[ -n "$SUBNET" ]] || fail "no free scratch subnet available (10.207.201-208 all held)"
   note "scratch subnet $SUBNET mock ip $MOCK_IP (existing 10.207.0.0/24 stack untouched)"
 fi
 
