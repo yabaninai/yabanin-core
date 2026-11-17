@@ -817,13 +817,14 @@ class SeedCommandBoundaryTests(unittest.TestCase):
     holding a function name fails the same executable-command invariant.
     """
 
-    OLD_COMMIT = "3aba1fa"
+    OLD_COMMIT = "05154e1bcf1d26422b030b11183cd3cd866a11fc"
 
     @staticmethod
     def _old_harness():
         return subprocess.run(
             ["git", "-C", str(REPO), "show",
-             "3aba1fa:scripts/quickstart/preview1_recovery.sh"],
+             f"{SeedCommandBoundaryTests.OLD_COMMIT}:"
+             "scripts/quickstart/preview1_recovery.sh"],
             capture_output=True, text=True, check=True).stdout
 
     def _fixture(self):
@@ -1315,7 +1316,7 @@ class StaticWiringTests(unittest.TestCase):
         # corrected commit lands, HEAD becomes the corrected harness, the
         # extraction finds nothing and the test would rot. Bind the full
         # immutable R9A commit, like the other archived-source tests.
-        R9A_HARNESS_COMMIT = "714169aa2eea8db753ce476b3e4dd3f9489c8a41"
+        R9A_HARNESS_COMMIT = "135ac5ebe3067af3bccec00315c5e00637a704f0"
         head = subprocess.run(
             ["git", "-C", REPO, "show",
              f"{R9A_HARNESS_COMMIT}:scripts/quickstart/preview1_recovery.sh"],
