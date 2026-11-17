@@ -296,11 +296,18 @@ rewrite_phase_images() {
 # Compose invocations for the two phases of the SAME project (same project
 # name => same retained <project>_pg_data volume). Each phase file is paired
 # with the instrumented-mock override (same reviewed harness-commit mock image
-# for both phases; only the application images differ). psql helpers always
-# run with ON_ERROR_STOP so a failed statement is a nonzero exit,
-# multi-statement fixture SQL included.
-p1c()   { docker compose --project-name "$PROJECT" --project-directory "$RUNTMP/preview1" -f "$RUNTMP/preview1/docker-compose.yml" -f "$RUNTMP/preview1/mock-instrumented.yml" "$@"; }
-cdc()   { docker compose --project-name "$PROJECT" --project-directory "$RUNTMP/candidate" -f "$RUNTMP/candidate/docker-compose.yml" -f "$RUNTMP/candidate/mock-instrumented.yml" "$@"; }
+# for both phases; only the application images differ). P1C/CDC are FULL
+# executable command arrays — external tools like timeout(1) cannot exec a
+# shell function (the r4 seed failure) — and always carry --profile mock so
+# the instrumented provider mock runs with every phase invocation. The seed
+# profile is NEVER default: it is added only at the explicit seed_run so no
+# unintended seed service runs during ordinary UP/rollback and changes
+# org/key/provider facts. psql helpers always run with ON_ERROR_STOP so a
+# failed statement is a nonzero exit, multi-statement fixture SQL included.
+P1C=(docker compose --project-name "$PROJECT" --project-directory "$RUNTMP/preview1" --profile mock -f "$RUNTMP/preview1/docker-compose.yml" -f "$RUNTMP/preview1/mock-instrumented.yml")
+CDC=(docker compose --project-name "$PROJECT" --project-directory "$RUNTMP/candidate" --profile mock -f "$RUNTMP/candidate/docker-compose.yml" -f "$RUNTMP/candidate/mock-instrumented.yml")
+p1c()   { "${P1C[@]}" "$@"; }
+cdc()   { "${CDC[@]}" "$@"; }
 p1q()   { p1c exec -T postgres psql -U yabanin -d yabanin -v ON_ERROR_STOP=1 -tA -c "$1"; }
 cndq()  { cdc exec -T postgres psql -U yabanin -d yabanin -v ON_ERROR_STOP=1 -tA -c "$1"; }
 p1adm() { p1c exec -T postgres psql -U yabanin -d postgres -v ON_ERROR_STOP=1 -tA -c "$1"; }
@@ -308,8 +315,6 @@ cdcadm(){ cdc exec -T postgres psql -U yabanin -d postgres -v ON_ERROR_STOP=1 -t
 p1app() { p1c exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
 cndapp(){ cdc exec -T postgres psql -U yabanin_app -d yabanin -v ON_ERROR_STOP=1 -v VERBOSITY=verbose -tA -c "$1"; }
 
-P1C=(p1c)
-CDC=(cdc)
 MOCK_CONTAINER="${PROJECT}-mock-openai-1"
 GW_CONTAINER="${PROJECT}-yabanin-1"
 
@@ -446,7 +451,7 @@ seed_run() {
   # the minting line contains the plaintext key and must never reach a log.
   # Parse failures reference the file's sha256, not its content.
   local out=$1; shift
-  if ! timeout 300 p1c run --rm -T seed "$@" < "$RUNTMP/admin-password" > "$out" 2>&1; then
+  if ! timeout 300 "${P1C[@]}" --profile seed run --rm -T seed "$@" < "$RUNTMP/admin-password" > "$out" 2>&1; then
     fail "seed run failed; transcript kept protected at $out (sha256 $(sha_file "$out"))"
   fi
   chmod 600 "$out"

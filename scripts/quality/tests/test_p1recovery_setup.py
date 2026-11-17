@@ -76,7 +76,7 @@ case "$cmd" in
       if [ $skip -eq 1 ]; then skip=0
       else
         case "$t" in
-          --project-name|--project-directory|-f|--file) skip=1 ;;
+          --project-name|--project-directory|-f|--file|--profile) skip=1 ;;
           -*) ;;
           *) if [ -z "$sub" ]; then sub=$t; fi ;;
         esac
@@ -143,19 +143,15 @@ exec "$REAL_GIT" "$@"
 '''
 
 
-def extract(fn: str) -> str:
-    """Deterministic exact-boundary extraction of a harness function.
-
-    The returned text is REAL harness source: the exact `fn() {` line through
-    the next column-zero `}` line. A single-line `fn() { ...; }` function
-    returns just that line. Fails loudly if any boundary is missing so a
-    mis-extraction can never silently pull unrelated main-flow text in.
-    """
-    lines = REAL_H.read_text().splitlines()
-    prefix = fn + "() {"
-    if not any(ln.startswith(prefix) for ln in lines):
+def _extract_from(text: str, fn: str) -> str:
+    """Shared exact-boundary function extraction over given harness text."""
+    lines = text.splitlines()
+    prefix = fn + "()"
+    cand = [k for k, ln in enumerate(lines)
+            if ln.startswith(prefix) and ln[len(prefix):].lstrip().startswith("{")]
+    if not cand:
         raise AssertionError(f"harness function not found: {fn}")
-    i = next(k for k, ln in enumerate(lines) if ln.startswith(prefix))
+    i = cand[0]
     if lines[i].rstrip().endswith("}"):
         return lines[i] + "\n"
     j = i + 1
@@ -164,6 +160,18 @@ def extract(fn: str) -> str:
     if j >= len(lines):
         raise AssertionError(f"harness function boundary not found: {fn}")
     return "\n".join(lines[i:j + 1]) + "\n"
+
+
+def extract(fn: str) -> str:
+    """Deterministic exact-boundary extraction of a harness function.
+
+    The returned text is REAL harness source: the exact `fn() {` line (extra
+    spacing between `()` and `{` tolerated) through the next column-zero `}`
+    line. A single-line `fn() { ...; }` function returns just that line. Fails
+    loudly if any boundary is missing so a mis-extraction can never silently
+    pull unrelated main-flow text in.
+    """
+    return _extract_from(REAL_H.read_text(), fn)
 
 
 # Import-time extraction sanity: sha_file is a single-line function whose
@@ -762,6 +770,146 @@ class PhaseImageRewriteTests(unittest.TestCase):
             self.assertEqual(r.returncode, 1)
             self.assertIn("expected 3 shared yabanin-quickstart:local app "
                           "refs, found 2", r.stderr)
+
+
+class SeedCommandBoundaryTests(unittest.TestCase):
+    """Executable command-boundary qualification for P1C/CDC and seed_run.
+
+    External timeout(1) execs an EXECUTABLE command — it can never invoke a
+    bash function. The r4 seed transcript (sha256 d8fde5af…, path and hash
+    only; contents never read by tests) proved the original
+    `timeout 300 p1c …` shape fails with "failed to run command 'p1c'".
+    These cases qualify the real wiring under a recording docker stub (no
+    daemon): the full arrays carry --profile mock on every phase call,
+    --profile seed appears ONLY at the explicit seed_run, and an array
+    holding a function name fails the same executable-command invariant.
+    """
+
+    OLD_COMMIT = "3aba1fa"
+
+    @staticmethod
+    def _old_harness():
+        return subprocess.run(
+            ["git", "-C", str(REPO), "show",
+             "3aba1fa:scripts/quickstart/preview1_recovery.sh"],
+            capture_output=True, text=True, check=True).stdout
+
+    def _fixture(self):
+        td = tempfile.mkdtemp(prefix="p1r-setup-")
+        self.addCleanup(shutil.rmtree, td, ignore_errors=True)
+        root = pathlib.Path(td)
+        bindir = root / "bin"
+        bindir.mkdir()
+        log = root / "docker.log"
+        stub = bindir / "docker"
+        stub.write_text(
+            "#!/usr/bin/env bash\n"
+            # emit to BOTH the invocation log and stdout: the transcript then
+            # carries a non-secret record of the command transport
+            'printf "docker %s\\n" "$*" | tee -a "$LOG"\n'
+            "exit 0\n")
+        stub.chmod(0o700)
+        runtmp = root / "runtmp"
+        (runtmp / "preview1").mkdir(parents=True)
+        (runtmp / "candidate").mkdir(parents=True)
+        pw = runtmp / "admin-password"
+        pw.write_bytes(b"fixture-password-only\n")
+        out = runtmp / "seed-org1.out"
+        return root, bindir, log, runtmp, out
+
+    def _run(self, script, bindir, log):
+        r = run_bash(script, {
+            "PATH": f"{bindir}:{os.environ['PATH']}",
+            "LOG": str(log)})
+        docker_calls = (log.read_text().splitlines()
+                        if log.exists() else [])
+        return r, docker_calls
+
+    def test_original_shape_fails_the_executable_command_boundary(self):
+        old = self._old_harness()
+        root, bindir, log, runtmp, out = self._fixture()
+        script = (
+            _extract_from(old, "fail") + _extract_from(old, "sha_file")
+            + _extract_from(old, "p1c") + _extract_from(old, "seed_run")
+            + "CURRENT_CASE=t; CURRENT_STEP=t\n"
+            + f'PROJECT=fxt-p1; RUNTMP="{runtmp}"\n'
+            + f'seed_run "{out}" --admin-email a@example.invalid\n')
+        r, calls = self._run(script, bindir, log)
+        self.assertNotEqual(r.returncode, 0)
+        # the wrapper failure surfaces on stderr; the REAL external-timeout
+        # error is captured in the protected transcript, exactly as r4 proved
+        self.assertIn("seed run failed", r.stderr)
+        self.assertIn("transcript kept protected", r.stderr)
+        transcript = out.read_text()
+        self.assertIn("failed to run command", transcript)
+        self.assertIn("p1c", transcript)
+        # the external timeout never reached any docker invocation
+        self.assertEqual(calls, [])
+        self.assertTrue(out.exists())  # transcript preserved for diagnosis
+
+    def test_corrected_seed_run_uses_full_array_with_seed_profile_only_there(self):
+        root, bindir, log, runtmp, out = self._fixture()
+        arrays = "\n".join(
+            re.search(rf"^{name}=\(.*\)$", REAL_H.read_text(), re.M).group(0)
+            for name in ("P1C", "CDC"))
+        # PROJECT/RUNTMP first: bash expands them INTO the arrays at the
+        # assignment, so arrays-before-project would embed empty values.
+        script = (
+            extract("fail") + extract("sha_file")
+            + "CURRENT_CASE=t; CURRENT_STEP=t\n"
+            + f'PROJECT=fxt-p1; RUNTMP="{runtmp}"\n'
+            + arrays + "\n"
+            + extract("p1c") + extract("cdc") + extract("seed_run")
+            + f'seed_run "{out}" --admin-email a@example.invalid\n'
+            + "echo SEED-OK\n")
+        r, calls = self._run(script, bindir, log)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("SEED-OK", r.stdout)
+        self.assertEqual(len(calls), 1)
+        line = calls[0]
+        for needle in ("compose", "--project-name fxt-p1",
+                       f"--project-directory {runtmp}/preview1",
+                       "--profile mock", "--profile seed",
+                       "run --rm -T seed"):
+            self.assertIn(needle, line)
+        # the password never leaks into non-protected output surfaces
+        self.assertNotIn("fixture-password-only", r.stdout + r.stderr)
+        # transcript is mode 600 and captured the stub transport only
+        self.assertEqual(stat.S_IMODE(out.stat().st_mode), 0o600)
+        self.assertIn("docker compose", out.read_text())
+
+    def test_phase_calls_carry_mock_profile_and_never_seed(self):
+        root, bindir, log, runtmp, out = self._fixture()
+        arrays = "\n".join(
+            re.search(rf"^{name}=\(.*\)$", REAL_H.read_text(), re.M).group(0)
+            for name in ("P1C", "CDC"))
+        script = (
+            f'PROJECT=fxt-p1; RUNTMP="{runtmp}"\n'  # before arrays (see above)
+            + arrays + "\n" + extract("p1c") + extract("cdc")
+            + "p1c up -d\ncdc ps\n")
+        r, calls = self._run(script, bindir, log)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(len(calls), 2)
+        for line in calls:
+            self.assertIn("--profile mock", line)
+            self.assertNotIn("--profile seed", line)
+        self.assertIn(f"--project-directory {runtmp}/preview1", calls[0])
+        self.assertIn(f"--project-directory {runtmp}/candidate", calls[1])
+
+    def test_function_name_array_fails_the_same_executable_invariant(self):
+        root, bindir, log, runtmp, out = self._fixture()
+        script = (
+            "p1c() { :; }\nP1C=(p1c)\n"
+            'timeout 5 "${P1C[@]}" run --rm -T seed'
+            f' < "{runtmp}/admin-password" > "{out}" 2>&1\n')
+        r, calls = self._run(script, bindir, log)
+        self.assertEqual(r.returncode, 127)
+        # the external-timeout error goes to the redirected transcript, not
+        # the harness stderr (same evidence shape as the r4 failure)
+        transcript = out.read_text()
+        self.assertIn("failed to run command", transcript)
+        self.assertIn("p1c", transcript)
+        self.assertEqual(calls, [])  # never reached docker
 
 
 class StaticWiringTests(unittest.TestCase):
