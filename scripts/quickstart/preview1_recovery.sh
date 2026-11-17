@@ -371,7 +371,7 @@ snapshot_history() {
     echo "count|org1|$("$q" "SELECT count(*) FROM request_logs WHERE org_id = '$o1'")"
     echo "count|org2|$("$q" "SELECT count(*) FROM request_logs WHERE org_id = '$o2'")"
     echo "count|fixture|$("$q" "SELECT count(*) FROM request_logs WHERE org_id = '$FIX_ORG'")"
-    "$q" "SELECT org_id::text || '|' || request_id FROM request_logs WHERE org_id IN ('$o1','$o2','$FIX_ORG') ORDER BY 1,2";
+    "$q" "SELECT org_id::text || '|' || request_id FROM request_logs WHERE org_id IN ('$o1','$o2','$FIX_ORG') ORDER BY org_id, request_id";
   } > "$out"
   chmod 600 "$out"
   ids=$(grep -cE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\|..*$' "$out" || true)

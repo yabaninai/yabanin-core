@@ -1257,6 +1257,33 @@ class StaticWiringTests(unittest.TestCase):
                           "pg_policies", "pg_tables", "rowsecurity"):
             self.assertIn(preserved, h)
 
+    def test_snapshot_history_orders_by_source_columns_not_ordinals(self):
+        """snapshot_history projects ONE concatenated identity column, so an
+        ordinal `ORDER BY 1,2` is invalid on the real database (the R8 UP7
+        failure). The sort must name the two SOURCE columns; the single
+        projection, org scope and the identity/completeness fail gate all
+        stay intact."""
+        h = extract("snapshot_history")
+        idsel = [l for l in h.splitlines()
+                 if "FROM request_logs" in l and "ORDER BY" in l]
+        self.assertEqual(len(idsel), 1, "exactly one identity SELECT")
+        s = idsel[0]
+        self.assertIn(
+            "SELECT org_id::text || '|' || request_id FROM request_logs", s)
+        self.assertIn("ORDER BY org_id, request_id", s)  # source columns
+        self.assertNotIn("ORDER BY 1,2", s)  # ordinal 2 has no column (R8)
+        # existing identity/completeness contract remains
+        self.assertIn("IN ('$o1','$o2','$FIX_ORG')", s)
+        for preserved in (
+                "count(*) FROM request_logs WHERE org_id = '$o1'",
+                "count(*) FROM request_logs WHERE org_id = '$o2'",
+                "count(*) FROM request_logs WHERE org_id = '$FIX_ORG'",
+                "grep -cE '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-"
+                "[0-9a-f]{4}-[0-9a-f]{12}\\|..*$'",
+                "history snapshot invalid",
+                "chmod 600"):
+            self.assertIn(preserved, h)
+
 
 if __name__ == "__main__":
     unittest.main()
