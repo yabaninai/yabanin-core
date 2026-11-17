@@ -40,10 +40,14 @@ package consumer
 
 import (
 	"context"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/reireirei/yabanin/pkg/budget"
@@ -444,10 +448,13 @@ func TestN06P05T09Live_OldAndNewRecoveryInteropExactOnce(t *testing.T) {
 	require.NoError(t, ferr, "the fenced verdict must succeed under the race")
 	require.NoError(t, rerr, "the release pass must succeed under the race")
 
-	// Every row is released exactly once across the two recovery doors —
-	// each writer counts only the rows it actually released.
-	assert.Equal(t, int64(4), rsum.Released+fsum.Closed+fsum.AlreadyReleased,
-		"release pass + fenced verdict must cover all four rows exactly once")
+	// Every row is released exactly once across the two recovery doors:
+	// only actual release transitions count — the release pass's Released
+	// and the fenced verdict's Closed. AlreadyReleased is the verdict's
+	// exactly-once OBSERVATION of rows the other door released, never a
+	// transition of its own, so it must never be summed into one.
+	assert.Equal(t, int64(4), rsum.Released+fsum.Closed,
+		"release pass + fenced verdict must flip all four rows exactly once")
 	assert.Zero(t, fsum.SkippedLive, "nothing is live once the §14 window has passed")
 	// The returned µUSD across both doors plus the settle's decrements
 	// equals the whole escrow exactly once.
@@ -507,4 +514,342 @@ func TestN06P05T09Live_OldAndNewRecoveryInteropExactOnce(t *testing.T) {
 	reconciler.Tick(ctx)
 	snap2 := n06p5T09Snapshot(ctx, t, pool, n18dOrgEnf)
 	assert.Equal(t, snap, snap2, "the converged world is inert under every trailing pass")
+}
+
+// n06p5T09GateDB wraps the real pool as a budget reservationDB for ONE
+// recovery door: Begin returns the real transaction embedded in a gatedTx
+// whose Exec parks the door's FIRST per-org advisory-lock statement
+// (reservations.go:1042/:1375) on a channel until the test releases it.
+// Parking there — not at the guarded release UPDATE (:1085/:1397) — is the
+// load-bearing choice: by the time that UPDATE runs, its transaction
+// already holds the per-org advisory lock and the allowance row lock, so
+// parking after it would wedge the other door on the same advisory lock
+// forever. Parking before the advisory Exec leaves the gated door holding
+// nothing in PostgreSQL, so the other door and the live worker run against
+// the real database unimpeded; after the unblock the gated door walks its
+// full real path and lands in its exactly-once losing-side branch
+// (AlreadyReleased for the fenced verdict, the silent skip at
+// reservations.go:1060-1062 for the release pass). This is a test
+// transport seam around the production constructors — no production hook.
+type n06p5T09GateDB struct {
+	pool    *pgxpool.Pool
+	hit     chan struct{}
+	release chan struct{}
+	parked  atomic.Bool
+}
+
+func newN06p5T09GateDB(pool *pgxpool.Pool) *n06p5T09GateDB {
+	return &n06p5T09GateDB{
+		pool:    pool,
+		hit:     make(chan struct{}),
+		release: make(chan struct{}),
+	}
+}
+
+func (g *n06p5T09GateDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	tx, err := g.pool.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &n06p5T09GatedTx{Tx: tx, gate: g}, nil
+}
+
+func (g *n06p5T09GateDB) Exec(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error) {
+	return g.pool.Exec(ctx, query, args...)
+}
+
+func (g *n06p5T09GateDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	return g.pool.Query(ctx, query, args...)
+}
+
+func (g *n06p5T09GateDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	return g.pool.QueryRow(ctx, query, args...)
+}
+
+// n06p5T09GatedTx embeds the real pgx.Tx and gates only Exec: the first
+// advisory-lock statement signals hit and blocks on release BEFORE the
+// statement is sent to PostgreSQL; every other call delegates untouched.
+type n06p5T09GatedTx struct {
+	pgx.Tx
+	gate *n06p5T09GateDB
+}
+
+func (tx *n06p5T09GatedTx) Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
+	if strings.Contains(sql, "pg_advisory_xact_lock") && tx.gate.parked.CompareAndSwap(false, true) {
+		close(tx.gate.hit)
+		select {
+		case <-tx.gate.release:
+		case <-ctx.Done():
+			return pgconn.CommandTag{}, ctx.Err()
+		}
+	}
+	return tx.Tx.Exec(ctx, sql, args...)
+}
+
+// n06p5T09AwaitGate blocks until the gated door reaches its first money
+// statement, failing fast if the door exits (error) before parking.
+func n06p5T09AwaitGate(t *testing.T, gate *n06p5T09GateDB, doorDone chan struct{}) {
+	t.Helper()
+	select {
+	case <-gate.hit:
+	case <-doorDone:
+		t.Fatal("the gated door exited before reaching its first money statement")
+	}
+}
+
+// n06p5T09RequireUndrained proves the world is untouched at park time: no
+// settlement effects exist yet and the live worker has not even started —
+// every settlement effect in this scenario will be produced while the
+// losing door is parked.
+func n06p5T09RequireUndrained(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	var settled, nonTerminal int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM settlement_jobs WHERE org_id = $1 AND status = 'settled'`, n18dOrgEnf).Scan(&settled))
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM settlement_jobs
+		 WHERE org_id = $1 AND status IN ('pending','retry','processing')`, n18dOrgEnf).Scan(&nonTerminal))
+	require.Zero(t, settled, "no settlement effects may exist when the gated window opens")
+	require.Equal(t, int64(4), nonTerminal, "the crashed world must be fully unsettled at the park")
+}
+
+// n06p5T09StartWorker launches the live settlement worker against real
+// PostgreSQL; it ticks until the queue is drained or cancelled.
+func n06p5T09StartWorker(ctx context.Context, pool *pgxpool.Pool, creditStore *credits.Store) (context.CancelFunc, chan struct{}) {
+	wctx, cancel := context.WithCancel(ctx)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		w := n06p5T09Worker(pool, creditStore)
+		for i := 0; i < 300; i++ {
+			w.tick(wctx)
+			var left int64
+			if err := pool.QueryRow(wctx,
+				`SELECT count(*) FROM settlement_jobs
+				 WHERE org_id = $1 AND status IN ('pending','retry','processing')`, n18dOrgEnf).Scan(&left); err != nil {
+				return
+			}
+			if left == 0 {
+				return
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+	}()
+	return cancel, done
+}
+
+// n06p5T09RequireDrained waits (positive-state observation only — the park
+// already fixed the door order) until the live worker has produced ALL
+// settlement effects while the losing door is still parked.
+func n06p5T09RequireDrained(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
+	t.Helper()
+	require.Eventually(t, func() bool {
+		var left int64
+		require.NoError(t, pool.QueryRow(ctx,
+			`SELECT count(*) FROM settlement_jobs
+			 WHERE org_id = $1 AND status IN ('pending','retry','processing')`, n18dOrgEnf).Scan(&left))
+		return left == 0
+	}, 30*time.Second, 50*time.Millisecond,
+		"the live worker must produce all settlement effects while the losing door is parked")
+	var settled int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM settlement_jobs WHERE org_id = $1 AND status = 'settled'`, n18dOrgEnf).Scan(&settled))
+	require.Equal(t, int64(4), settled, "all four settlement effects must land inside the gated window")
+}
+
+// n06p5T09ReleasedRows counts terminal released allowance rows.
+func n06p5T09ReleasedRows(ctx context.Context, t *testing.T, pool *pgxpool.Pool) int64 {
+	t.Helper()
+	var released int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM budget_allowances WHERE org_id = $1 AND status = 'released'`, n18dOrgEnf).Scan(&released))
+	return released
+}
+
+// n06p5T09AssertExactOnceWorld is the shared money/row/tail oracle of the
+// concurrent race above, verbatim: the union of both doors' returns plus
+// the settle decrements equals the granted escrow exactly once per scope,
+// every row is terminal, the world converges, and every trailing pass —
+// fenced verdict, release pass, worker tick — is a no-op.
+func n06p5T09AssertExactOnceWorld(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
+	creditStore *credits.Store, bound int64, rsum budget.ReconcileSummary, fsum budget.AbandonedReplicaSummary) {
+	t.Helper()
+	decs := n06p5KindDecrement(ctx, t, pool, n18dOrgEnf)
+	var settledTotal int64
+	for _, dec := range decs {
+		settledTotal += dec
+	}
+	assert.Equal(t, bound*4, fsum.ReturnedMicroUSD+rsum.ReturnedMicroUSD+settledTotal,
+		"returned (%d+%d) + settled (%d) == granted (4 × %d) exactly once",
+		fsum.ReturnedMicroUSD, rsum.ReturnedMicroUSD, settledTotal, bound)
+
+	for _, pair := range []struct{ scope, kind string }{
+		{"wallet", ChargeKindResaleDeduction},
+		{"team_month", ChargeKindTeamSpend},
+		{"agent_day", ChargeKindAgentSpend},
+		{"session", ChargeKindSessionSpend},
+	} {
+		granted, returned, status := n06p5AllowanceScope(ctx, t, pool, n18dOrgEnf, pair.scope)
+		assert.Equal(t, "released", status, "scope %s must reach the terminal state", pair.scope)
+		assert.Equal(t, granted, returned+decs[pair.kind],
+			"scope %s: returned (%d) + settled (%d) == granted (%d)",
+			pair.scope, returned, decs[pair.kind], granted)
+	}
+
+	snap := n06p5T09Snapshot(ctx, t, pool, n18dOrgEnf)
+	assert.Zero(t, snap.ReserveTotal)
+	assert.Equal(t, bound, snap.TeamSpend)
+	assert.Equal(t, bound, snap.AgentCost)
+	assert.Equal(t, bound, snap.SessionSpend)
+	assert.Equal(t, int64(1), snap.LedgerRows, "exactly one ledger row across all three writers")
+	assert.Equal(t, -bound, snap.LedgerMicro)
+	assert.Zero(t, snap.JobsNonTerminal)
+	assert.Equal(t, int64(4), snap.JobsSettled)
+
+	store := budget.NewReservationStore(pool, silentLogger())
+	fence := budget.NewRecoveryFence(pool, silentLogger())
+	reconciler := budget.NewReconcileWorker(pool, silentLogger(), budget.DefaultReconcileConfig())
+	lease2, err := fence.Acquire(ctx, "replica-"+n18dOrgEnf, "t09-gated-tail", 5*time.Minute)
+	require.NoError(t, err)
+	fsum2, err := store.CloseAbandonedReplicaFenced(ctx, lease2, 30*time.Minute)
+	require.NoError(t, err)
+	assert.Equal(t, int64(4), fsum2.AlreadyReleased, "the trailing verdict is the losing side everywhere")
+	assert.Zero(t, fsum2.Closed)
+	assert.Zero(t, fsum2.ReturnedMicroUSD)
+	require.NoError(t, lease2.Release(ctx))
+	relSum, err := reconciler.ReleasePass(ctx)
+	require.NoError(t, err)
+	assert.Zero(t, relSum.Released)
+	assert.Zero(t, relSum.ReturnedMicroUSD)
+	n06p5T09Worker(pool, creditStore).tick(ctx)
+	reconciler.Tick(ctx)
+	snap2 := n06p5T09Snapshot(ctx, t, pool, n18dOrgEnf)
+	assert.Equal(t, snap, snap2, "the converged world is inert under every trailing pass")
+}
+
+// TestN06P05T09Live_GatedDoorOverlapDeterministic: the old/new recovery
+// doors overlap the LIVE settlement worker — never drained, never
+// sequential — with each door's winner forced deterministically through the
+// n06p5T09GateDB transport gate parked on the losing door's first per-org
+// advisory-lock statement, while it holds nothing in PostgreSQL. Expected
+// event sequence per subtest, with explicit barriers:
+//
+//	gated loser starts     → parks before its first money statement (hit)
+//	world proved undrained → settled==0, non-terminal==4 at the park
+//	live worker starts     → ticks against real PostgreSQL for the window
+//	winner door (real PG)  → flips all four rows, runs to completion
+//	worker drain observed  → all four settlement effects land in-window
+//	loser unblocked        → walks its real path → losing-side counters
+//
+// Deterministic per-door counters, the same actual-transition oracle as the
+// concurrent race (rsum.Released+fsum.Closed==4), and the full money/row/
+// tail battery. No sleep-as-ordering: the park fixes the order; every wait
+// observes positive database state.
+func TestN06P05T09Live_GatedDoorOverlapDeterministic(t *testing.T) {
+	t.Run("old_release_pass_wins", func(t *testing.T) {
+		n06p5T09GatedOverlap(t, false)
+	})
+	t.Run("fenced_verdict_wins", func(t *testing.T) {
+		n06p5T09GatedOverlap(t, true)
+	})
+}
+
+// n06p5T09GatedOverlap runs one deterministic overlap ordering: fenceWins
+// parks the §7.1 release pass and lets the fenced verdict win; otherwise
+// the fenced verdict is parked and the release pass wins.
+func n06p5T09GatedOverlap(t *testing.T, fenceWins bool) {
+	ctx, pool, rdb := newNext18dEnv(t)
+	creditStore, bound := n06p5T09CrashedWorld(ctx, t, pool, rdb,
+		"events:n06p5-t09-gated", "n06p5-t09-g-1", "req-n06p5-t09-gated")
+	n06p5T09Backdate(ctx, t, pool, n18dOrgEnf, 3)
+	n06p5JointAwaitExpiredLeases(ctx, t, pool, n18dOrgEnf, 4)
+
+	gate := newN06p5T09GateDB(pool)
+	doorDone := make(chan struct{})
+	var (
+		rsum budget.ReconcileSummary
+		fsum budget.AbandonedReplicaSummary
+		derr error
+	)
+
+	if fenceWins {
+		// Loser: the OLD §7.1 release pass through the gate.
+		gatedReconciler := budget.NewReconcileWorker(gate, silentLogger(), budget.DefaultReconcileConfig())
+		go func() {
+			defer close(doorDone)
+			rsum, derr = gatedReconciler.ReleasePass(ctx)
+		}()
+		n06p5T09AwaitGate(t, gate, doorDone)
+		n06p5T09RequireUndrained(ctx, t, pool)
+		cancelWorker, workerDone := n06p5T09StartWorker(ctx, pool, creditStore)
+		defer func() {
+			cancelWorker()
+			<-workerDone
+		}()
+
+		// Winner: the fenced verdict against real PostgreSQL to completion.
+		store := budget.NewReservationStore(pool, silentLogger())
+		fence := budget.NewRecoveryFence(pool, silentLogger())
+		lease, err := fence.Acquire(ctx, "replica-"+n18dOrgEnf, "t09-gated-verdict", 5*time.Minute)
+		require.NoError(t, err)
+		fsum, derr = store.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
+		require.NoError(t, derr, "the winning fenced verdict must succeed over real PostgreSQL")
+		require.NoError(t, lease.Release(ctx))
+
+		assert.Equal(t, int64(4), fsum.Closed, "fenced-verdict-wins: the verdict flips all four rows")
+		assert.Zero(t, fsum.AlreadyReleased, "fenced-verdict-wins: nothing was released before the verdict ran")
+		assert.Equal(t, int64(4), n06p5T09ReleasedRows(ctx, t, pool),
+			"all four rows terminal while the loser is still parked")
+		n06p5T09RequireDrained(ctx, t, pool)
+
+		close(gate.release)
+		<-doorDone
+		require.NoError(t, derr, "the gated release pass must succeed after the unblock")
+		assert.Zero(t, rsum.Released, "the gated release pass is the silent losing side")
+		assert.Zero(t, rsum.ReturnedMicroUSD)
+
+		assert.Zero(t, fsum.SkippedLive, "nothing is live once the §14 window has passed")
+		n06p5T09AssertExactOnceWorld(t, ctx, pool, creditStore, bound, rsum, fsum)
+		return
+	}
+
+	// Loser: the NEW fenced verdict through the gate.
+	gatedStore := budget.NewReservationStoreWithConfig(gate, silentLogger(), budget.DefaultReservationConfig())
+	gatedFence := budget.NewRecoveryFence(gate, silentLogger())
+	go func() {
+		defer close(doorDone)
+		lease, err := gatedFence.Acquire(ctx, "replica-"+n18dOrgEnf, "t09-gated-verdict", 5*time.Minute)
+		if err != nil {
+			derr = err
+			return
+		}
+		defer func() { _ = lease.Release(ctx) }()
+		fsum, derr = gatedStore.CloseAbandonedReplicaFenced(ctx, lease, 30*time.Minute)
+	}()
+	n06p5T09AwaitGate(t, gate, doorDone)
+	n06p5T09RequireUndrained(ctx, t, pool)
+	cancelWorker, workerDone := n06p5T09StartWorker(ctx, pool, creditStore)
+	defer func() {
+		cancelWorker()
+		<-workerDone
+	}()
+
+	// Winner: the production release pass against real PostgreSQL.
+	reconciler := budget.NewReconcileWorker(pool, silentLogger(), budget.DefaultReconcileConfig())
+	rsum, derr = reconciler.ReleasePass(ctx)
+	require.NoError(t, derr, "the winning release pass must succeed over real PostgreSQL")
+
+	assert.Equal(t, int64(4), rsum.Released, "old-release-wins: the pass flips all four rows")
+	assert.Equal(t, int64(4), n06p5T09ReleasedRows(ctx, t, pool),
+		"all four rows terminal while the loser is still parked")
+	n06p5T09RequireDrained(ctx, t, pool)
+
+	close(gate.release)
+	<-doorDone
+	require.NoError(t, derr, "the gated fenced verdict must succeed after the unblock")
+	assert.Zero(t, fsum.Closed, "the gated verdict flips nothing after the unblock")
+	assert.Equal(t, int64(4), fsum.AlreadyReleased, "the gated verdict observes the pass's four flips")
+	assert.Zero(t, fsum.SkippedLive, "nothing is live once the §14 window has passed")
+
+	n06p5T09AssertExactOnceWorld(t, ctx, pool, creditStore, bound, rsum, fsum)
 }
