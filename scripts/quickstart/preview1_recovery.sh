@@ -5,18 +5,32 @@
 # FROZEN CASE REGISTRY (stable IDs; do not renumber without owner review):
 #   QS-UPGRADE-P1   actual Preview1 source (7b85b18963ce764aea1f9631a7d47104b09550aa)
 #                   on an isolated retained volume: two seeded orgs with
-#                   distinct real API keys, per-org model routing, real request
-#                   history (explicit X-Request-ID identities), S3b-shaped
+#                   distinct real API keys, per-org API-key ownership plus
+#                   GLOBAL-registry model routing, real request
+#                   history (explicit X-Request-ID identities), a positive
+#                   GLOBAL-registry routing control (the seed service inserts
+#                   BOTH model names into the GLOBAL models_registry — not
+#                   org_custom_models — so a request for the other org's
+#                   seeded name is served by global routing; model_used is
+#                   NOT asserted because global routing may select any
+#                   enabled global model), a third org1 API key minted
+#                   locally and stored INACTIVE through the real api_keys
+#                   table with its CORRECT sha256 hash (so only the inactive
+#                   state can cause its denial), S3b-shaped
 #                   fixture rows inserted through Preview1's real tables, the
 #                   ACTUAL Preview1 view set and values recorded as the
 #                   baseline (not assumed), protected pre-upgrade backup taken
 #                   after writers are stopped, then candidate
 #                   3a73e8e08b532df2b51a5fb47f19fbdbdff2f045 migrate/start on
-#                   the SAME volume; old keys keep working, frozen identities,
-#                   routing and the two-org denial (observed at the provider
-#                   through an instrumented mock: MOCK_REQUEST_LOG=1, one
-#                   method/path entry per received request, never headers,
-#                   bodies or secrets) are retained, and the seven managed
+#                   the SAME volume; old keys keep working, frozen identities
+#                   and routing are retained, the inactive key stays denied
+#                   with exact HTTP 401, zero provider hits and zero ledger
+#                   effects (observed at the provider through an instrumented
+#                   mock: MOCK_REQUEST_LOG=1, one method/path entry per
+#                   received request, never headers, bodies or secrets), an
+#                   expected-negative control re-runs the SAME denial oracle
+#                   with an ACTIVE key and must fail with HTTP 200, and the
+#                   seven managed
 #                   beta views (pkg/feedback MetricsViewNames) show the frozen
 #                   fixture values computed from retained rows.
 #   QS-ROLLBACK-P1  protected backup restore: post-backup marker request with
@@ -51,9 +65,11 @@
 # LEAVES the candidate stack up on the retained volume; `rollback` resumes
 # against a prior `upgrade` run's protected state and REQUIRES
 # QS_RECOVERY_RESUME=1 plus QS_RECOVERY_KEY1/QS_RECOVERY_KEY2 from that run
-# (the protected seed transcripts hold the minted-once lines). Keys are never
-# printed or written outside 0600 files. A fresh run requires a nonexistent
-# RUNTMP so prior evidence can never be overwritten silently.
+# (the protected seed transcripts hold the minted-once lines; the locally
+# minted inactive control key is re-read from its own 0600 protected file).
+# Keys are never printed or written outside 0600 files; the inactive control
+# key is logged only as its sha256 fingerprint. A fresh run requires a
+# nonexistent RUNTMP so prior evidence can never be overwritten silently.
 #
 # EXECUTION GATE: this file is committed in a source-only phase. The Docker
 # legs require QS_RECOVERY_EXECUTE=1 AND (per owner instruction) a full green
@@ -457,23 +473,170 @@ seed_run() {
   chmod 600 "$out"
 }
 
-deny_ok() {
-  # deny_ok QFN KEY MODEL LABEL: cross-org request is denied with NO provider
-  # hit (observed at the instrumented mock), NO ledger change for org1 and no
-  # cross-model row. The provider observation is the oracle; the ledger is
-  # secondary product-surface evidence.
-  local code h0 h1 led0 led1 cross
+global_model_ok() {
+  # global_model_ok QFN KEY MODEL LABEL: POSITIVE global-registry routing
+  # control. The seed service inserts both model names into the GLOBAL
+  # models_registry (not org_custom_models), so this is NOT a private-model
+  # isolation probe and is never described as a denial: ordinary global
+  # routing may legitimately select a different enabled global model, so
+  # model_used is NOT asserted. Observed contract: HTTP 200 with a unique
+  # explicit request ID that lands in the ledger exactly once, exactly one
+  # provider hit, exactly one new org1 ledger row, org2 ledger unchanged.
+  local code h0 h1 l1_0 l1_1 l2_0 l2_1 reqid
+  reqid="qs-p1r-glb-$(date +%s%N)"
+  h0=$(mock_hits)
+  l1_0=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
+  l2_0=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG2_ID}'")
+  code=$(send_chat "$2" "$3" "$reqid") || fail "$4: send failed"
+  [[ "$code" == "200" ]] || fail "$4: global-registry request not served (HTTP $code)"
+  await_reqid "$1" "$reqid" || fail "$4: row for request_id $reqid never appeared — X-Request-ID propagation broken"
+  h1=$(mock_hits)
+  l1_1=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
+  l2_1=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG2_ID}'")
+  [[ "$h1" == "$((h0 + 1))" ]] || fail "$4: provider hits $h0 -> $h1 (expected exactly +1)"
+  [[ "$l1_1" == "$((l1_0 + 1))" ]] || fail "$4: org1 ledger $l1_0 -> $l1_1 (expected exactly +1)"
+  [[ "$l2_1" == "$l2_0" ]] || fail "$4: org2 ledger changed ($l2_0 -> $l2_1)"
+  note "$4: served by global routing, provider hit +1, org1 ledger +1, org2 unchanged (global registry control, not private-model isolation)"
+}
+
+load_inactive_key() {
+  # Read-or-create the locally minted inactive control key. The plaintext is
+  # stored ONLY in the 0600 protected file (resume re-reads it), never
+  # printed, never written to the DB, and logged only as its sha256
+  # fingerprint, which is recorded once and verified against drift on resume.
+  # The file's mode is verified to be 0600 BEFORE it is read — a protected
+  # fixture that loosened its mode is refused rather than trusted.
+  local fp rec mode
+  if [[ -e "$INACTIVE_KEY_FILE" ]]; then
+    mode=$(stat -c%a "$INACTIVE_KEY_FILE")
+    [[ "$mode" == "600" ]] \
+      || fail "inactive control key file is mode $mode, not 0600 — refusing to read it"
+    [[ -s "$INACTIVE_KEY_FILE" ]] || fail "inactive control key file is empty"
+    key3=$(<"$INACTIVE_KEY_FILE")
+  else
+    key3="yb_$(od -An -N16 -tx1 /dev/urandom | tr -d ' \n')"
+    printf '%s' "$key3" > "$INACTIVE_KEY_FILE"
+    chmod 600 "$INACTIVE_KEY_FILE"
+  fi
+  [[ "$key3" =~ ^yb_[0-9a-f]{32}$ ]] \
+    || fail "inactive control key malformed in $INACTIVE_KEY_FILE (sha256 $(sha_file "$INACTIVE_KEY_FILE"))"
+  fp=$(fingerprint "$key3")
+  rec=$(sed -n 's/^inactive_key_fingerprint //p' "$RECORD" | head -1)
+  if [[ -n "$rec" ]]; then
+    [[ "$rec" == "$fp" ]] || fail "inactive control key fingerprint drift vs the recorded upgrade-run value"
+  else
+    echo "inactive_key_fingerprint $fp" >> "$RECORD"
+  fi
+}
+
+assert_inactive_key() {
+  # assert_inactive_key QFN LABEL: the fixture row exists exactly once AND
+  # the full binding is intact — deterministic id, the CORRECT sha256 hash of
+  # the protected plaintext, org1 ownership, an org1-owned team and
+  # active=false. Only with every binding column correct can the 401 observed
+  # by denied_key_ok have exactly one cause: the inactive state. A wrong
+  # hash/org/team would also 401 (unknown or foreign key) and would prove
+  # nothing, so each is asserted separately with its own diagnostic. Checked
+  # on preview1 (UP4), after the candidate migrate (UP9) and after the
+  # rollback restore (RB5).
+  local n row hash_ok org_ok act team_ok
+  n=$("$1" "SELECT count(*) FROM api_keys WHERE id = '${INACTIVE_KEY_ID}'")
+  [[ "$n" == 1 ]] || fail "$2: inactive api_keys row missing or duplicated [$n]"
+  row=$("$1" "SELECT (key_hash = '$(fingerprint "$key3")'), (org_id = '${ORG1_ID}'::uuid), active,
+    (team_id IN (SELECT id FROM organizations_teams WHERE org_id = '${ORG1_ID}'::uuid))
+    FROM api_keys WHERE id = '${INACTIVE_KEY_ID}'")
+  IFS='|' read -r hash_ok org_ok act team_ok <<<"$row"
+  [[ "$hash_ok" == "t" ]] || fail "$2: inactive api_keys key_hash is not the correct hash of the protected plaintext"
+  [[ "$org_ok" == "t" ]] || fail "$2: inactive api_keys row is not owned by org1"
+  [[ "$act" == "f" ]] || fail "$2: inactive api_keys row is not active=false [$act]"
+  [[ "$team_ok" == "t" ]] || fail "$2: inactive api_keys team is not an org1-owned team"
+}
+
+install_inactive_key() {
+  # install_inactive_key QFN: insert the inactive control row through the
+  # REAL api_keys table — deterministic id, only the sha256 hash of the
+  # protected plaintext, org1 ownership and one of org1's REAL teams from
+  # organizations_teams — with active=false. Callers must run
+  # assert_inactive_key immediately afterwards: ON CONFLICT DO NOTHING could
+  # otherwise leave a stale conflicting row that the full binding check
+  # rejects loudly instead of silently proving the wrong thing.
+  local team
+  team=$("$1" "SELECT id::text FROM organizations_teams WHERE org_id = '${ORG1_ID}' ORDER BY created_at LIMIT 1")
+  [[ -n "$team" ]] || fail "inactive fixture: org1 has no team in organizations_teams"
+  "$1" "INSERT INTO api_keys (id, key_hash, org_id, team_id, name, active)
+    VALUES ('${INACTIVE_KEY_ID}', '$(fingerprint "$key3")', '${ORG1_ID}'::uuid, '${team}'::uuid,
+            'p1 recovery inactive control key', false)
+    ON CONFLICT (id) DO NOTHING" >/dev/null \
+    || fail "inactive fixture: insert into api_keys failed"
+}
+
+denied_key_ok() {
+  # denied_key_ok QFN KEY MODEL LABEL: real authorization negative. The key's
+  # api_keys row carries its CORRECT sha256 hash, org1 ownership and an
+  # org1-owned team but active=false, and it has never been used positively
+  # (no cache can vouch for it), so the observed contract — exact HTTP 401,
+  # zero provider hits, zero org1 ledger change and zero rows carrying the
+  # denied request's exact ID — is behavioral evidence of the inactive-state
+  # denial, not a DB-flag or source-text check.
+  local code h0 h1 led0 led1 rid rows
+  rid="qs-p1r-deny-$(date +%s%N)"
+  # the request ID is emitted BEFORE the send: request IDs are not secrets,
+  # and on the intentional HTTP 200 path of the active-key control this is
+  # the only place the ID is recorded for the effect accounting below.
+  note "$4: request_id $rid"
   h0=$(mock_hits)
   led0=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
-  code=$(send_chat "$2" "$3" "qs-p1r-deny-$(date +%s%N)") || fail "$4: send failed"
-  [[ "$code" =~ ^4[0-9][0-9]$ ]] || fail "$4: cross-org request not denied (HTTP $code)"
+  code=$(send_chat "$2" "$3" "$rid") || fail "$4: send failed"
+  [[ "$code" == "401" ]] || fail "$4: inactive key not denied (HTTP $code)"
   h1=$(mock_hits)
   led1=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
-  [[ "$h1" == "$h0" ]] || fail "$4: provider saw $((h1 - h0)) extra requests despite the $code denial"
+  [[ "$h1" == "$h0" ]] || fail "$4: provider saw $((h1 - h0)) extra requests despite the 401 denial"
   [[ "$led1" == "$led0" ]] || fail "$4: org1 ledger changed across the denial ($led0 -> $led1)"
-  cross=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}' AND model_used = '$3'")
-  [[ "$cross" == 0 ]] || fail "$4: org1 ledger contains $cross cross-model rows"
-  note "$4: denied (HTTP $code), provider hits $h0 -> $h1, org1 ledger unchanged"
+  rows=$("$1" "SELECT count(*) FROM request_logs WHERE request_id = '${rid}'")
+  [[ "$rows" == 0 ]] || fail "$4: $rows ledger rows carry the denied request ID"
+  note "$4: denied (HTTP 401), provider hits $h0 -> $h1, org1 ledger unchanged, no row for the denied request"
+}
+
+run_active_key_negative() {
+  # run_active_key_negative QFN KEY MODEL LOGFILE LABEL: isolated
+  # expected-negative control proving the denial oracle itself has teeth.
+  # The SAME denied_key_ok runs in a subshell with an ACTIVE key and MUST
+  # fail with HTTP 200 in its captured log — failing for any other reason
+  # (e.g. setup breakage) is rejected. The control's OWN effect is then
+  # MEASURED, not assumed: provider hits and the org1 ledger are captured
+  # before the subshell and must each have grown by exactly one afterwards,
+  # and exactly one request_logs row must carry the rid the helper emitted
+  # before its send (parsed back from the protected log; a missing, ambiguous
+  # or empty rid is rejected; the row is AWAITED via await_reqid before the
+  # +1 assertions because the ledger write is asynchronous). The log is kept
+  # as expected-negative evidence. An unexpected inactive-key failure
+  # elsewhere is never swallowed here.
+  local h0 h1 l0 l1 rid rows nrid
+  h0=$(mock_hits)
+  l0=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
+  if ( denied_key_ok "$1" "$2" "$3" "$5 (expected-negative: ACTIVE key must fail this oracle)" ) >"$4" 2>&1; then
+    fail "$5: active-key control unexpectedly PASSED the inactive-key oracle"
+  fi
+  grep -q 'HTTP 200' "$4" \
+    || fail "$5: active-key control failed for the wrong reason: $(head -c 200 "$4")"
+  rid=$(sed -n 's/.*request_id \(qs-p1r-deny-[0-9]\{1,\}\).*/\1/p' "$4" | head -1)
+  [[ "$rid" =~ ^qs-p1r-deny-[0-9]+$ ]] \
+    || fail "$5: no parseable request ID in the expected-negative log"
+  nrid=$(grep -c 'request_id qs-p1r-deny-[0-9]\{1,\}' "$4")
+  [[ "$nrid" == 1 ]] || fail "$5: expected exactly one request ID in the log, found $nrid (ambiguous control)"
+  await_reqid "$1" "$rid" \
+    || fail "$5: the active key's row for request_id $rid never appeared — X-Request-ID propagation broken"
+  h1=$(mock_hits)
+  l1=$("$1" "SELECT count(*) FROM request_logs WHERE org_id = '${ORG1_ID}'")
+  [[ "$h1" == "$((h0 + 1))" ]] \
+    || fail "$5: active-key control did not make exactly one provider hit ($h0 -> $h1)"
+  [[ "$l1" == "$((l0 + 1))" ]] \
+    || fail "$5: active-key control did not add exactly one org1 ledger row ($l0 -> $l1)"
+  rows=$("$1" "SELECT count(*) FROM request_logs WHERE request_id = '${rid}'")
+  [[ "$rows" == 1 ]] \
+    || fail "$5: expected exactly one ledger row carrying the control's request_id $rid, found $rows"
+  chmod 600 "$4"
+  note "$5: expected-negative OK, measured: HTTP 200, provider hits $h0 -> $h1, org1 ledger $l0 -> $l1, exactly one row for request_id $rid"
 }
 
 # ---------------------------------------------------------------- gate + guards
@@ -513,6 +676,11 @@ VIEWS_P1="$RUNTMP/protected/view-values-preview1.txt"
 VIEWS_P1_SET="$RUNTMP/protected/view-set-preview1.txt"
 VIEWS_P1_APP="$RUNTMP/protected/view-appread-preview1.txt"
 RECOVERY_POINT="$RUNTMP/protected/recovery-point.txt"
+# Inactive-key authorization fixture: plaintext lives ONLY in this 0600 file
+# (read back on rollback resume), the DB stores only its sha256 hash, and the
+# deterministic id keeps the row identifiable across backup/migrate/restore.
+INACTIVE_KEY_FILE="$RUNTMP/protected/inactive-key.txt"
+INACTIVE_KEY_ID="77777777-7777-4777-8777-777777770004"
 ORG1_ID='' ORG2_ID='' FIX_T0=''
 
 if [[ "$RESUME" == "1" ]]; then
@@ -713,7 +881,7 @@ case_upgrade() {
   echo "key2_fingerprint $(fingerprint "$key2")" >> "$RECORD"; echo "org2 $ORG2_ID" >> "$RECORD"
 
   cs UP4
-  step "real request history (explicit request IDs, provider-observed) and cross-org denial"
+  step "real request history (explicit request IDs, provider-observed), global-registry routing control and inactive-key denial"
   h=$(mock_hits)
   chat_ok p1q "$key1" "$ORG1_MODEL" qs-p1r-up1-a "UP4 org1 request 1"
   mock_delta_one "$h" "UP4 org1 request 1"
@@ -726,7 +894,19 @@ case_upgrade() {
   chat_ok p1q "$key2" "$ORG2_MODEL" qs-p1r-up2-a "UP4 org2 request"
   mock_delta_one "$h" "UP4 org2 request"
   [[ $(count_req p1q "$ORG2_ID") == 1 ]] || fail "org2 ledger not exactly 1 after its request"
-  deny_ok p1q "$key1" "$ORG2_MODEL" "UP4 cross-org denial"
+  # POSITIVE control: both seeded names live in the GLOBAL models_registry,
+  # so org1's key requesting ORG2_MODEL is served by global routing (this is
+  # not a private-model isolation probe; see global_model_ok).
+  global_model_ok p1q "$key1" "$ORG2_MODEL" "UP4 global-registry routing"
+  # Inactive-key fixture: minted locally (never used positively), stored
+  # through the real api_keys table with the CORRECT hash so only the
+  # inactive state can deny it; binding asserted immediately after insert.
+  load_inactive_key
+  install_inactive_key p1q
+  assert_inactive_key p1q "UP4 inactive fixture"
+  note "inactive control key fingerprint sha256:$(fingerprint "$key3") id ${INACTIVE_KEY_ID} (active=false; plaintext never printed)"
+  denied_key_ok p1q "$key3" "$ORG1_MODEL" "UP4 inactive-key denial"
+  run_active_key_negative p1q "$key1" "$ORG1_MODEL" "$RUNTMP/protected/negctl-up4.log" "UP4 active-key negative control"
 
   cs UP5
   step "fixture rows inserted through preview1's real tables (S3b-frozen shape)"
@@ -790,12 +970,15 @@ INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, 
   echo "candidate_migrate_head $cand_head" >> "$RECORD"
 
   cs UP9
-  step "frozen identities retained (before any new request); routing + denial retained; old keys still work"
+  step "frozen identities retained (before any new request); routing + inactive-key denial retained; old keys still work"
   assert_history_retained cndq "$HIST_PRE" "UP9" || fail "frozen request identities not retained across the upgrade"
   snapshot_routing cndq "$ORG1_ID" "$ORG2_ID" "$RUNTMP/protected/routing-post-upgrade.txt"
   diff "$ROUTING_PRE" "$RUNTMP/protected/routing-post-upgrade.txt" \
     || fail "routing rows changed across the upgrade"
-  deny_ok cndq "$key1" "$ORG2_MODEL" "UP9 cross-org denial"
+  # the revoked state must survive the candidate migrate: full binding intact,
+  # the SAME behavioral denial, then the oracle's own expected-negative proof.
+  assert_inactive_key cndq "UP9 inactive fixture retained"
+  denied_key_ok cndq "$key3" "$ORG1_MODEL" "UP9 inactive-key denial (candidate)"
   n1=$(sed -n 's/^count|org1|//p' "$HIST_PRE"); n2=$(sed -n 's/^count|org2|//p' "$HIST_PRE")
   h=$(mock_hits)
   chat_ok cndq "$key1" "$ORG1_MODEL" qs-p1r-post1-a "UP9 old key1"
@@ -805,6 +988,9 @@ INSERT INTO request_logs (id, org_id, model_requested, model_used, status_code, 
   mock_delta_one "$h" "UP9 old key2"
   [[ $(count_req cndq "$ORG1_ID") == $((n1 + 1)) ]] || fail "org1 ledger not exactly backup+1 after one new request"
   [[ $(count_req cndq "$ORG2_ID") == $((n2 + 1)) ]] || fail "org2 ledger not exactly backup+1 after one new request"
+  # expected-negative AFTER the exact-count checks: this control adds one
+  # real org1 provider hit + ledger row (intentionally accepted here).
+  run_active_key_negative cndq "$key1" "$ORG1_MODEL" "$RUNTMP/protected/negctl-up9.log" "UP9 active-key negative control"
 
   cs UP10
   step "seven managed views with the frozen fixture values (candidate contract)"
@@ -845,6 +1031,9 @@ case_rollback() {
     key1="${QS_RECOVERY_KEY1:?mode rollback needs QS_RECOVERY_KEY1 (the org1 key minted once in the upgrade run; see the protected seed transcript)}"
     key2="${QS_RECOVERY_KEY2:?mode rollback needs QS_RECOVERY_KEY2 (the org2 key minted once in the upgrade run)}"
   fi
+  # the inactive control key is re-read from its 0600 protected file (mode
+  # verified before reading; fingerprint checked against the recorded value)
+  load_inactive_key
 
   cs RB1
   step "post-backup marker: one more real org1 request with an explicit awaited request ID"
@@ -902,6 +1091,11 @@ case_rollback() {
   marker=$(p1q "SELECT count(*) FROM request_logs WHERE request_id = '${MARKER_ID}' AND org_id = '$ORG1_ID'")
   [[ "$marker" == 0 ]] || fail "post-backup marker $MARKER_ID present after restore"
   assert_history_retained p1q "$HIST_PRE" "RB5" || fail "backup-time request identities not restored"
+  # the revoked state must ALSO survive backup + restore: full binding intact
+  # on the restored preview1 data, and the SAME behavioral denial (zero-delta
+  # checks, so the exact ledger counts below remain valid).
+  assert_inactive_key p1q "RB5 inactive fixture restored"
+  denied_key_ok p1q "$key3" "$ORG1_MODEL" "RB5 inactive-key denial (restored preview1)"
   h=$(mock_hits)
   R1_ID="qs-p1r-rbk1-$(date +%s)"
   chat_ok p1q "$key1" "$ORG1_MODEL" "$R1_ID" "RB5 old key1"

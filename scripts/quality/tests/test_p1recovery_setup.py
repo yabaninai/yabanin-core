@@ -38,6 +38,7 @@ import re
 import shutil
 import stat
 import subprocess
+import textwrap
 import tempfile
 import unittest
 
@@ -910,6 +911,266 @@ class SeedCommandBoundaryTests(unittest.TestCase):
         self.assertIn("failed to run command", transcript)
         self.assertIn("p1c", transcript)
         self.assertEqual(calls, [])  # never reached docker
+
+
+class InactiveKeyControlTests(unittest.TestCase):
+    """Executable controls for the inactive-key authorization fixture and its
+    expected-negative oracle: the inactive denial must be behavioral (exact
+    401 with zero provider/ledger effect and no row for its rid), the fixture
+    binding must be complete before any denied request, and the active-key
+    negative control must MEASURE its own intentional effect (exactly one
+    provider hit, one org1 row, one row for the rid it emitted pre-send)."""
+
+    KEY3 = "yb_" + "a1b2c3d4" * 4
+    KEY3_FP = hashlib.sha256(KEY3.encode()).hexdigest()
+
+    def _fixture(self, curl_code, effect="1", bindrow="t|t|f|t", ncount="1",
+                 await_stub=False, fast_await=False):
+        """Assemble the extracted harness helpers plus recording stubs.
+        curl_code: HTTP code the stub curl returns. effect: '1' = a 200 also
+        makes exactly one provider hit + one org1 row carrying the parsed
+        X-Request-ID; '2' = the row appears but the provider hit stays zero
+        (independent provider-delta negative); '0' = no simulated effect.
+        fast_await replaces the extracted await_reqid with a 2-iteration
+        equivalent (same poll-and-return semantics) so row-never-appears
+        cases fail in bounded time instead of the real 30s."""
+        tmp = tempfile.mkdtemp(prefix="p1r-ik-")
+        self.addCleanup(shutil.rmtree, tmp)
+        bindir = os.path.join(tmp, "bin")
+        os.makedirs(bindir)
+        hits, rows, sqllog, code = (os.path.join(tmp, n) for n in
+                                    ("hits", "rows", "sql.log", "code"))
+        for p, val in ((hits, "0"), (rows, ""), (sqllog, ""), (code, curl_code)):
+            with open(p, "w") as fh:
+                fh.write(val)
+        curl = os.path.join(bindir, "curl")
+        with open(curl, "w") as fh:
+            fh.write(
+                "#!/usr/bin/env bash\n"
+                "rid=''\n"
+                'for a in "$@"; do case "$a" in "X-Request-ID: "*) '
+                'rid=${a#X-Request-ID: };; esac; done\n'
+                'c=$(cat "$STATE/code")\n'
+                'if [ "$c" = "200" ]; then\n'
+                '  if [ "$EFFECT" = "1" ]; then '
+                'echo $(( $(cat "$STATE/hits") + 1 )) > "$STATE/hits"; fi\n'
+                '  if [ "$EFFECT" = "1" ] || [ "$EFFECT" = "2" ]; then '
+                'echo "$rid" >> "$STATE/rows"; fi\n'
+                "fi\n"
+                "printf '%s' \"$c\"\n")
+        os.chmod(curl, 0o755)
+        record = os.path.join(tmp, "record")
+        keyfile = os.path.join(tmp, "inactive-key.txt")
+        await_override = ""
+        if await_stub:
+            await_override = "await_reqid() { return 1; }\n"
+        elif fast_await:
+            await_override = (
+                "await_reqid() {\n"
+                "  for i in 1 2; do\n"
+                '    [ "$("$1" "SELECT count(*) FROM request_logs '
+                "WHERE request_id = '$2'\")\" = \"1\" ] && return 0\n"
+                "    sleep 0.1\n"
+                "  done\n"
+                "  return 1\n"
+                "}\n")
+        qfunc = textwrap.dedent('''\
+            q() {
+              printf "SQL|%s\\n" "$1" >> "$STATE/sql.log"
+              case "$1" in
+                *"count(*) FROM request_logs WHERE org_id"*)
+                  wc -l < "$STATE/rows" | tr -d " " ;;
+                *"count(*) FROM request_logs WHERE request_id"*)
+                  rid=$(sed -n "s/.*request_id = '\\([^']*\\)'.*/\\1/p" <<<"$1")
+                  grep -c "^$rid$" "$STATE/rows" 2>/dev/null || true ;;
+                *"SELECT (key_hash ="*) printf "%s" "$BINDROW" ;;
+                *"SELECT id::text FROM organizations_teams"*)
+                  printf "%s" "$TEAMID" ;;
+                *"count(*) FROM api_keys WHERE id"*)
+                  printf "%s" "$NCOUNT" ;;
+                *"INSERT INTO api_keys"*) echo INSERT-RECORDED ;;
+                *) echo 0 ;;
+              esac
+            }
+            ''')
+        script = (
+            extract("fail") + extract("note") + extract("fingerprint")
+            + extract("sha_file") + extract("await_reqid")
+            + extract("send_chat") + extract("denied_key_ok")
+            + extract("run_active_key_negative") + extract("load_inactive_key")
+            + extract("install_inactive_key") + extract("assert_inactive_key")
+            + await_override + qfunc
+            + f'STATE="{tmp}"\nEFFECT={effect}\n'
+            + "export STATE EFFECT\n"  # the curl child process reads these
+            + 'mock_hits() { cat "$STATE/hits"; }\n'
+            + f'BINDROW="{bindrow}"\nNCOUNT={ncount}\n'
+            + "TEAMID=11111111-1111-4111-8111-111111111111\n"
+            + "ORG1_ID=00000000-0000-4000-8000-000000000001\n"
+            + 'INACTIVE_KEY_ID="77777777-7777-4777-8777-777777770004"\n'
+            + f'INACTIVE_KEY_FILE="{keyfile}"\nRECORD="{record}"\n'
+            + "CURRENT_CASE=t; CURRENT_STEP=t\n")
+        self.script = script
+        self.state = {"tmp": tmp, "bindir": bindir, "hits": hits,
+                      "rows": rows, "sqllog": sqllog, "record": record,
+                      "keyfile": keyfile}
+
+    def _run(self, body, key3=True):
+        env_path = self.state["bindir"] + ":" + os.environ["PATH"]
+        script = self.script
+        if key3:
+            script += f'key3="{self.KEY3}"\n'
+        return run_bash(script + body, env_extra={"PATH": env_path})
+
+    # ---- denied_key_ok: behavioral inactive denial + pre-send rid emission
+
+    def test_inactive_denial_is_behavioral_401_with_zero_effect(self):
+        self._fixture("401")
+        r = self._run('denied_key_ok q "$key3" m "T deny"\necho DENIED-OK\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("denied (HTTP 401)", r.stdout)
+        self.assertIn("provider hits 0 -> 0", r.stdout)
+        self.assertIn("no row for the denied request", r.stdout)
+        self.assertIn("request_id qs-p1r-deny-", r.stdout)  # emitted pre-send
+        self.assertEqual(
+            pathlib.Path(self.state["hits"]).read_text().strip(), "0")
+        self.assertEqual(pathlib.Path(self.state["rows"]).read_text(), "")
+
+    def test_rid_emitted_even_when_send_does_not_return_401(self):
+        self._fixture("500")
+        r = self._run('denied_key_ok q "$key3" m "T deny"\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("inactive key not denied (HTTP 500)", r.stderr)
+        self.assertIn("request_id qs-p1r-deny-", r.stdout)  # before the send
+
+    # ---- run_active_key_negative: measured effect, wrong/missing evidence
+
+    def test_active_negative_measures_its_own_effect(self):
+        self._fixture("200", effect="1")
+        neglog = os.path.join(self.state["tmp"], "negctl.log")
+        r = self._run(f'run_active_key_negative q "yk-active" m "{neglog}" '
+                      '"T neg"\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("measured: HTTP 200, provider hits 0 -> 1", r.stdout)
+        self.assertIn("org1 ledger 0 -> 1", r.stdout)
+        self.assertIn("exactly one row for request_id", r.stdout)
+        self.assertEqual(
+            pathlib.Path(self.state["hits"]).read_text().strip(), "1")
+        self.assertEqual(
+            len(pathlib.Path(self.state["rows"]).read_text().splitlines()), 1)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(neglog).st_mode), 0o600)
+
+    def test_active_negative_missing_effect_fails_at_the_await_barrier(self):
+        # no row ever lands: the control must fail loudly at the bounded
+        # await, never silently pass with an unobserved effect.
+        self._fixture("200", effect="0", fast_await=True)
+        neglog = os.path.join(self.state["tmp"], "negctl.log")
+        r = self._run(f'run_active_key_negative q "yk-active" m "{neglog}" '
+                      '"T neg"\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("never appeared", r.stderr)
+
+    def test_active_negative_provider_delta_is_measured_not_assumed(self):
+        # distinct fixture: the row IS observable (await passes) but the
+        # provider hit stays zero — the measured +1 must fail, proving the
+        # control does not accept asserted-only effect evidence.
+        self._fixture("200", effect="2")
+        neglog = os.path.join(self.state["tmp"], "negctl.log")
+        r = self._run(f'run_active_key_negative q "yk-active" m "{neglog}" '
+                      '"T neg"\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("did not make exactly one provider hit (0 -> 0)",
+                      r.stderr)
+
+    def test_active_negative_rejects_non_200_failure_reason(self):
+        self._fixture("500")
+        neglog = os.path.join(self.state["tmp"], "negctl.log")
+        r = self._run(f'run_active_key_negative q "yk-active" m "{neglog}" '
+                      '"T neg"\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("failed for the wrong reason", r.stderr)
+
+    def test_active_negative_fails_when_await_cannot_observe_the_row(self):
+        # effect fully present but the await barrier fails: still a loud
+        # failure, never a pass (independent of the missing-effect case).
+        self._fixture("200", effect="1", await_stub=True)
+        neglog = os.path.join(self.state["tmp"], "negctl.log")
+        r = self._run(f'run_active_key_negative q "yk-active" m "{neglog}" '
+                      '"T neg"\n')
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("never appeared", r.stderr)
+
+    # ---- fixture binding: complete before any denied request
+
+    def test_assert_inactive_key_requires_every_binding_column(self):
+        cases = {"f|t|f|t": "key_hash", "t|f|f|t": "not owned by org1",
+                 "t|t|t|t": "not active=false", "t|t|f|f": "org1-owned team"}
+        for bind, msg in cases.items():
+            with self.subTest(bind=bind):
+                self._fixture("401", bindrow=bind)
+                r = self._run('assert_inactive_key q "T assert"\n')
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn(msg, r.stderr)
+        self._fixture("401")
+        r = self._run('assert_inactive_key q "T assert"\necho BIND-OK\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertIn("BIND-OK", r.stdout)
+
+    def test_assert_inactive_key_rejects_missing_or_duplicate_row(self):
+        for n in ("0", "2"):
+            with self.subTest(n=n):
+                self._fixture("401", ncount=n)
+                r = self._run('assert_inactive_key q "T assert"\n')
+                self.assertNotEqual(r.returncode, 0)
+                self.assertIn("missing or duplicated", r.stderr)
+
+    def test_install_uses_real_team_table_correct_hash_and_inactive(self):
+        self._fixture("401")
+        r = self._run('install_inactive_key q\necho INSTALL-OK\n')
+        self.assertEqual(r.returncode, 0, r.stderr)
+        sql = pathlib.Path(self.state["sqllog"]).read_text()
+        self.assertIn("SELECT id::text FROM organizations_teams "
+                      "WHERE org_id = ", sql)  # org1's REAL team table
+        self.assertIn("INSERT INTO api_keys", sql)
+        self.assertIn(self.KEY3_FP, sql)  # correct sha256, not the plaintext
+        self.assertNotIn(self.KEY3, sql)
+        self.assertIn("'p1 recovery inactive control key', false", sql)
+
+    # ---- protected key file: 0600 gate before reading, fingerprint-only log
+
+    def test_load_inactive_key_refuses_loose_file_mode(self):
+        self._fixture("401")
+        with open(self.state["keyfile"], "w") as fh:
+            fh.write(self.KEY3)
+        os.chmod(self.state["keyfile"], 0o644)
+        r = self._run("load_inactive_key\necho LOADED\n", key3=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("not 0600", r.stderr)
+        self.assertNotIn("LOADED", r.stdout)
+
+    def test_load_inactive_key_creates_protected_and_logs_fingerprint_only(self):
+        self._fixture("401")
+        r = self._run("load_inactive_key\necho LOADED\n", key3=False)
+        self.assertEqual(r.returncode, 0, r.stderr)
+        self.assertEqual(
+            stat.S_IMODE(os.stat(self.state["keyfile"]).st_mode), 0o600)
+        rec = pathlib.Path(self.state["record"]).read_text()
+        self.assertIn("inactive_key_fingerprint ", rec)
+        leaked = self.KEY3.encode()
+        self.assertNotIn(leaked, r.stdout.encode() + r.stderr.encode())
+        self.assertNotIn(leaked, rec.encode())
+
+    def test_load_inactive_key_detects_fingerprint_drift_on_resume(self):
+        self._fixture("401")
+        with open(self.state["keyfile"], "w") as fh:
+            fh.write(self.KEY3)
+        os.chmod(self.state["keyfile"], 0o600)
+        with open(self.state["record"], "w") as fh:
+            fh.write("inactive_key_fingerprint %s\n" % ("0" * 64))
+        r = self._run("load_inactive_key\necho LOADED\n", key3=False)
+        self.assertNotEqual(r.returncode, 0)
+        self.assertIn("fingerprint drift", r.stderr)
+        self.assertNotIn("LOADED", r.stdout)
 
 
 class StaticWiringTests(unittest.TestCase):
