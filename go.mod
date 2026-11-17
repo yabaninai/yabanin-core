@@ -8,7 +8,7 @@ go 1.27.4
 
 require (
 	github.com/aws/aws-sdk-go-v2 v1.47.8
-	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.26
+	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.27
 	github.com/aws/aws-sdk-go-v2/config v1.33.17
 	github.com/aws/aws-sdk-go-v2/service/bedrockruntime v1.63.12
 	github.com/aws/aws-sdk-go-v2/service/s3 v1.114.9
