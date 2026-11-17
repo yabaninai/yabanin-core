@@ -77,7 +77,7 @@ umask 077
 
 CANDIDATE_COMMIT=3a73e8e08b532df2b51a5fb47f19fbdbdff2f045
 PREVIEW1_COMMIT=7b85b18963ce764aea1f9631a7d47104b09550aa
-PROJECT=qs-p1recovery
+PROJECT="${QS_RECOVERY_PROJECT:-qs-p1recovery}"
 RETAINED_VOLUME="${PROJECT}_pg_data"
 TAG_P1="${PROJECT}:preview1"
 TAG_CAND="${PROJECT}:candidate"
@@ -119,6 +119,14 @@ note() { printf '   %s\n' "$*"; }
 
 sha_file() { sha256sum "$1" | cut -d' ' -f1; }
 fingerprint() { printf '%s' "$1" | sha256sum | cut -d' ' -f1; }
+
+project_name_ok() {
+  # project_name_ok NAME: recovery project names become docker objects
+  # (volume, network, containers, image tags); only this strict lowercase
+  # subset is accepted so a bad QS_RECOVERY_PROJECT fails before ANY docker
+  # object is named or created. Default remains qs-p1recovery.
+  [[ "$1" =~ ^[a-z0-9][a-z0-9_-]*$ ]]
+}
 
 wait_healthz() {
   local i
@@ -204,6 +212,54 @@ assert_container_image() {
   local img
   img=$(docker inspect "$1" --format '{{.Image}}') || fail "$3: docker inspect $1 failed"
   [[ "$img" == "$2" ]] || fail "$3: container $1 image $img != expected $2"
+}
+
+provision_phase_env() {
+  # provision_phase_env SRCARCHIVE PHASE1DIR PHASE2DIR: the quickstart compose
+  # files declare env_file: .env (project-directory relative); preflight must
+  # exist before the first compose call. Secrets are generated ONCE through
+  # the REAL product init-env.sh inside the extracted Preview1 archive and
+  # installed with IDENTICAL bytes into BOTH phase dirs — identical bytes are
+  # what make retained-key behavior observable; differing phase secrets would
+  # rehearse a silent re-key instead of the upgrade. If phase envs already
+  # exist (resume re-runs preflight) they are the authority and are NEVER
+  # regenerated or overwritten — a missing archive env must not re-key the
+  # retained volume. Secret values are never printed; the sha256 fingerprint
+  # on stdout is the identity evidence.
+  local src="$1" envf="$1/deploy/quickstart/.env"
+  if [[ -s "$2/.env" || -s "$3/.env" ]]; then
+    [[ -s "$2/.env" && -s "$3/.env" ]] || fail "phase env: only one phase .env exists (refusing to invent the missing half)"
+    cmp -s "$2/.env" "$3/.env" || fail "phase env: phase .env bytes differ (retained-key rehearsal invalid)"
+    [[ ! -s "$envf" ]] || cmp -s "$envf" "$2/.env" \
+      || fail "phase env: archive .env differs from the installed phase .env"
+    chmod 600 "$2/.env" "$3/.env"
+    sha_file "$2/.env"; return 0
+  fi
+  bash "$src/scripts/quickstart/init-env.sh" >&2 || fail "phase env: init-env.sh failed inside $src"
+  [[ -s "$envf" ]] || fail "phase env: init-env.sh left no $envf"
+  cp "$envf" "$2/.env" || fail "phase env: could not install $2/.env"
+  cp "$envf" "$3/.env" || fail "phase env: could not install $3/.env"
+  chmod 600 "$2/.env" "$3/.env"
+  cmp -s "$2/.env" "$3/.env" || fail "phase env: phase .env bytes differ (retained-key rehearsal invalid)"
+  sha_file "$2/.env"
+}
+
+require_phase_env() {
+  # require_phase_env PHASE1DIR PHASE2DIR IDENTITYFILE: rollback resume must
+  # REUSE the prior upgrade run's phase .env verbatim — the retained volume's
+  # data was encrypted/session-keyed with exactly those secrets. Both files
+  # must exist, be byte-identical, and match the fingerprint recorded at
+  # upgrade time. Never regenerates, never rewrites; prints the fingerprint.
+  local f1="$1/.env" f2="$2/.env" want got m1 m2
+  [[ -s "$f1" && -s "$f2" ]] || fail "resume: phase .env missing under $1 or $2 (secrets are never regenerated on resume)"
+  m1=$(stat -c %a "$f1"); m2=$(stat -c %a "$f2")
+  [[ "$m1$m2" == "600600" ]] || fail "resume: phase .env mode drift (${m1}/${m2}, want 600/600)"
+  cmp -s "$f1" "$f2" || fail "resume: phase .env bytes differ"
+  want=$(sed -n 's/^phase_env_sha256 //p' "$3" | head -1)
+  [[ -n "$want" ]] || fail "resume: no phase_env_sha256 recorded in $3"
+  got=$(sha_file "$f1")
+  [[ "$got" == "$want" ]] || fail "resume: phase .env differs from the upgrade run's recorded secrets ($got != $want)"
+  printf '%s' "$got"
 }
 
 # Compose invocations for the two phases of the SAME project (same project
@@ -396,8 +452,10 @@ fi
 [[ $# -le 1 && "${1:-all}" =~ ^(all|upgrade|rollback)$ ]] || fail "usage: $0 [all|upgrade|rollback]"
 MODE=${1:-all}
 RESUME="${QS_RECOVERY_RESUME:-0}"
+project_name_ok "$PROJECT" \
+  || fail "invalid QS_RECOVERY_PROJECT [$PROJECT] (want ^[a-z0-9][a-z0-9_-]*\$)"
 
-for t in docker ss curl sha256sum timeout sed grep awk comm stat tar date head od git python3; do
+for t in docker ss curl sha256sum timeout sed grep awk comm stat tar date head od git python3 openssl cmp cp; do
   command -v "$t" >/dev/null 2>&1 || fail "required tool missing: $t (port/subnet checks must fail, not silently skip)"
 done
 
@@ -426,6 +484,9 @@ if [[ "$RESUME" == "1" ]]; then
   [[ -d "$RUNTMP" && -s "$BACKUP" && -s "$RECORD" ]] \
     || fail "resume: no prior upgrade evidence under $RUNTMP (need $BACKUP and $RECORD)"
   note "resume from protected state under $RUNTMP (prior evidence read-only; new lines go to $IDENTITY)"
+  require_phase_env "$RUNTMP/preview1" "$RUNTMP/candidate" "$IDENTITY" >/dev/null \
+    || fail "resume: phase .env reuse check failed (never regenerated)"
+  note "resume: phase .env verified against the upgrade run's recorded fingerprint"
 else
   [[ "$MODE" != rollback ]] || fail "mode rollback requires QS_RECOVERY_RESUME=1 (a prior upgrade run's protected state)"
   [[ ! -e "$RUNTMP" ]] \
@@ -551,6 +612,13 @@ PG2_IMAGE_ID=$(docker image inspect "$pgref2" --format '{{.Id}}')
 { echo "postgres_image_id_preview1 $PG1_IMAGE_ID"; echo "postgres_image_id_candidate $PG2_IMAGE_ID"; } >> "$IDENTITY"
 note "postgres image ids: preview1 ${PG1_IMAGE_ID} candidate ${PG2_IMAGE_ID}"
 note "image ids: preview1 ${PRE_IMAGE_ID} candidate ${CAND_IMAGE_ID} mock ${MOCK_IMAGE_ID} (mock tree ${MOCK_TREE_SHA})"
+
+cs PF5
+step "preflight: phase .env secrets via the real Preview1 init-env.sh (identical bytes across phases)"
+PHASE_ENV_SHA=$(provision_phase_env "$RUNTMP/src-preview1" "$RUNTMP/preview1" "$RUNTMP/candidate") \
+  || fail "phase env provisioning failed"
+echo "phase_env_sha256 $PHASE_ENV_SHA" >> "$IDENTITY"
+note "phase .env installed into both project dirs (mode 600, identical bytes; contents never printed)"
 
 export QS_GATEWAY_PORT="$GW_PORT" QS_ADMIN_PORT="$ADM_PORT" QS_UPSTREAM_URL="http://${MOCK_IP}:8081"
 
