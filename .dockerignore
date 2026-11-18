@@ -40,3 +40,8 @@ profile.out
 # Exact .env names only; public .env.example templates remain available.
 .env
 **/.env
+
+# Build dependencies inside the images. Keep host installs and check logs out.
+**/node_modules
+artifacts/
+**/__pycache__

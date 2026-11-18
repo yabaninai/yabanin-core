@@ -196,11 +196,10 @@ def configure_stack(state, args):
                 [(m, u, hashlib.sha256(k).hexdigest()) for m, u, k in rows]]
     frozen = state / "inputs.json"
     encoded = json.dumps(identity)
-    if frozen.exists() and frozen.read_text() != encoded:
+    if not args.fresh and frozen.exists() and frozen.read_text() != encoded:
         raise ValueError("different stand inputs; use the original inputs or a new state directory")
     overlay = configure_gateway(state, rows, args)
-    write(frozen, encoded)
-    return rows, overlay
+    return rows, overlay, encoded
 
 
 def prepare_samples(state, cmd, args, gateway_key):
@@ -234,12 +233,13 @@ def main():
     state = private_state(cmd)
     lock = (state / "lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    rows, overlay, inputs = configure_stack(state, args)
     if args.fresh:
         run(*cmd, "--profile", "*", "down", "-v")
         for name in ("inputs.json", "admin-password", "gateway-key", "seed-output",
                      "sample-run", "traffic-verified", "providers-ready"):
             (state / name).unlink(missing_ok=True)
-    rows, overlay = configure_stack(state, args)
+    write(state / "inputs.json", inputs)
     cmd.extend(["-f", str(overlay)])
     epoch = run("git", "-C", ROOT, "log", "-1", "--format=%ct", capture_output=True, text=True).stdout.strip()
     services = [*cmd, "--profile", "mock", "--profile", "ui"]
