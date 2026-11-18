@@ -7,7 +7,7 @@ import unittest
 from unittest.mock import patch
 
 from console import Console
-from stand import base_url, providers
+from stand import base_url, providers, validate_topology
 
 
 class ProviderSetupTest(unittest.TestCase):
@@ -52,6 +52,26 @@ class ProviderSetupTest(unittest.TestCase):
                     manifest.write_text(json.dumps([{"model": "one", "base_url": "https://one/v1", "key_file": path}]))
                     with self.assertRaisesRegex(ValueError, "inside"):
                         providers(manifest)
+
+    def test_parent_manifest_cannot_import_checkout_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            directory = Path(tmp)
+            checkout = directory / "core"
+            checkout.mkdir()
+            manifest = directory / "models.json"
+            manifest.write_text(json.dumps([{"model": "one", "base_url": "https://one/v1", "key_file": "core/secret"}]))
+            with patch("stand.ROOT", checkout), self.assertRaisesRegex(ValueError, "build context"):
+                providers(manifest)
+
+    def test_reset_refuses_an_additional_volume(self):
+        services = dict.fromkeys(("postgres", "redis", "migrate", "db-app-role", "yabanin", "dashboard"))
+        services.update({"seed": {"environment": {"SEED_UPSTREAM_URL": "http://10.0.0.9:8081"}},
+                         "mock-openai": {"networks": {"default": {"ipv4_address": "10.0.0.9"}}}})
+        spec = {"name": "demo", "services": services, "volumes": {"pg_data": {"name": "demo_pg_data"}}}
+        validate_topology(spec, True)
+        spec["volumes"]["shared"] = {"name": "shared"}
+        with self.assertRaisesRegex(ValueError, "unrecognized"):
+            validate_topology(spec, True)
 
     def test_substituted_model_fails_probe(self):
         console = Console(3000)

@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 """Provision the disposable demo via the same authenticated API as the dashboard."""
+from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from http.cookies import SimpleCookie
 import json
@@ -57,11 +58,18 @@ class Console:
         if user not in {m["user_id"] for m in self.get(members)["data"] or []}:
             self.request("POST", members, {"user_id": user, "role": "reader"}, expected=(200, 201))
 
-    def verify_requests(self, run_id):
+    def requests_link(self, run_id):
+        times = []
         for job in ("docs", "tools", "review", "support"):
             row = self.get(f"/api/organizations/{self.org}/requests/{run_id}-{job}")
             if row["status_code"] != 200 or row["labels"].get("ci.job_name") != job:
                 raise ValueError("dashboard request details did not match the sample traffic")
+            times.append(datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")))
+        # Explorer time controls use minutes. Include the entire last sample minute.
+        start = min(times).replace(second=0, microsecond=0)
+        end = max(times).replace(second=0, microsecond=0) + timedelta(minutes=1)
+        params = urlencode({"org": self.org, "from": start.isoformat(), "to": end.isoformat()})
+        return f"http://127.0.0.1:{self.port}/#requests-explorer?{params}"
 
     def verify_route(self, request_id, model):
         for _ in range(35):

@@ -27,7 +27,7 @@ WSL2 with Docker integration. The commands below run from the repository
 root. You need:
 
 - Git, Docker Engine or Docker Desktop, and Docker Compose v2 with `--wait`.
-- Bash, `make`, OpenSSL, `curl`, and Python 3 (used by the smoke check).
+- Bash, `make`, OpenSSL, `curl`, and Python 3.9+ (used by the one-command setup and smoke check).
 - Internet access for container base images and Go modules during the first
   build. Go itself is installed inside the build image; host Go is optional.
 - Enough Docker memory and disk space to compile the gateway and run

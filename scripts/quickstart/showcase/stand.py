@@ -67,6 +67,8 @@ def provider(row, directory):
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,159}", model):
         raise ValueError("invalid provider model ID")
     key_path = (directory / row["key_file"]).resolve()
+    if ROOT in key_path.parents:
+        raise ValueError("keep provider key files outside the Docker build context")
     if directory.resolve() not in key_path.parents:
         raise ValueError("keep provider key files inside the manifest directory")
     return model, base_url(row["base_url"]), read_key(key_path)
@@ -146,8 +148,25 @@ def arguments():
     return args
 
 
-def private_state(cmd):
-    spec = json.loads(run(*cmd, "config", "--format", "json", "--no-env-resolution", capture_output=True).stdout)
+def validate_topology(spec, fresh):
+    services = spec["services"]
+    mock_ip = services["mock-openai"]["networks"]["default"]["ipv4_address"]
+    mock_url = services["seed"]["environment"]["SEED_UPSTREAM_URL"]
+    if mock_url.rstrip("/") != f"http://{mock_ip}:8081":
+        raise ValueError("sample traffic requires the bundled mock service as the seed upstream")
+    if fresh:
+        expected = {"postgres", "redis", "migrate", "db-app-role", "seed", "yabanin", "mock-openai", "dashboard"}
+        volumes = spec.get("volumes", {})
+        if set(services) != expected or set(volumes) != {"pg_data"}:
+            raise ValueError("refusing to reset an unrecognized Compose project")
+        volume = volumes["pg_data"]
+        if volume.get("external") or volume["name"] != spec["name"] + "_pg_data":
+            raise ValueError("refusing to reset a shared or externally named volume")
+
+
+def private_state(cmd, fresh):
+    spec = json.loads(run(*cmd, "--profile", "*", "config", "--format", "json", capture_output=True).stdout)
+    validate_topology(spec, fresh)
     data = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     state = (data / "yabanin" / "quickstart" / spec["name"]).resolve()
     if state == ROOT or ROOT in state.parents:
@@ -203,17 +222,15 @@ def configure_stack(state, args):
 
 
 def prepare_samples(state, cmd, args, gateway_key):
-    if not (state / "traffic-verified").exists():
+    marker = state / "sample-run"
+    if not marker.exists():
         restrict_catalog(cmd, [MOCK])
-        marker = state / "sample-run"
-        if not marker.exists():
-            write(marker, "demo-" + secrets.token_hex(6))
-        run_id = marker.read_text()
-        if not re.fullmatch(r"demo-[a-f0-9]{12}", run_id):
-            raise ValueError("invalid sample run ID in private state")
-        demonstrate(cmd, args.gateway_port, gateway_key, MOCK, run_id)
-        write(state / "traffic-verified", run_id)
-    return (state / "traffic-verified").read_text()
+        write(marker, "demo-" + secrets.token_hex(6))
+    run_id = marker.read_text()
+    if not re.fullmatch(r"demo-[a-f0-9]{12}", run_id):
+        raise ValueError("invalid sample run ID in private state")
+    demonstrate(cmd, args.gateway_port, gateway_key, MOCK, run_id)
+    return run_id
 
 
 def prepare_providers(state, cmd, console, rows):
@@ -230,7 +247,7 @@ def main():
     args = arguments()
     os.umask(0o077)
     cmd = compose_cmd()
-    state = private_state(cmd)
+    state = private_state(cmd, args.fresh)
     lock = (state / "lock").open("a")
     fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     rows, overlay, inputs = configure_stack(state, args)
@@ -249,12 +266,12 @@ def main():
     run_id = prepare_samples(state, cmd, args, gateway_key)
     console = Console(args.dashboard_port)
     console.sign_in((state / "admin-password").read_text().strip(), EMAIL)
-    console.verify_requests(run_id)
+    requests_url = console.requests_link(run_id)
     prepare_providers(state, cmd, console, rows)
     check_catalog(args, rows, gateway_key, console)
     print(f"Dashboard http://127.0.0.1:{args.dashboard_port} | {EMAIL} | private credentials: {state}")
     print(f"Gateway http://127.0.0.1:{args.gateway_port}")
-    print(f"Requests: http://127.0.0.1:{args.dashboard_port}/#requests-explorer?org={console.org}")
+    print(f"Requests: {requests_url}")
     print(f"Mock traffic verified. External models configured: {len(rows)}. External requests are opt-in.")
 
 
