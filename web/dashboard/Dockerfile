@@ -10,7 +10,7 @@ WORKDIR /src/web/dashboard
 COPY web/dashboard/package*.json ./
 RUN npm ci
 COPY web/dashboard .
-COPY design /design
+COPY design /src/design
 COPY scripts/web/bundle_budget.mjs ../../scripts/web/bundle_budget.mjs
 RUN npm run build
 

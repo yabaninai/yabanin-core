@@ -78,19 +78,33 @@ prebuilt Yabanin release. Third-party Compose images are pinned by digest.
 
 ## One-command demo
 
-From a verified checkout, one script runs steps 2 to 4 (configuration,
-build and start, and seed) and prints where the API key and admin
-password appear:
+From the root of the checked-out Core revision run:
 
 ```bash
 bash scripts/quickstart/demo.sh
 ```
 
-Rerunning it is safe: the running stack and existing credentials are
-reused, and the summary notes that the password was issued on the first
-run. `--fresh` wipes the disposable demo database and keys and issues new
-ones (destructive). The numbered steps below are the manual path; each one
-explains what the script chains.
+The command builds this checkout, starts the gateway and dashboard, creates
+the Seed organization and sends four requests through the mock model. Open
+the printed Requests link and sign in with the displayed login. The private
+state directory printed on completion holds `admin-password` and `gateway-key`.
+The four entries show code review, support, documentation and tool planning,
+with their actual request IDs, status and token usage.
+
+To include multiple OpenAI-compatible models at installation, pass the provider
+manifest in the same command. Each entry has a distinct model ID, HTTPS base
+URL and private key file. Registration alone makes no external inference calls.
+Use `--probe-providers` to send one potentially billable chat per model.
+See [the two-provider example](demo.md#optional-provider-endpoints-at-installation).
+
+```bash
+bash scripts/quickstart/demo.sh --providers /path/to/providers.json
+```
+
+Rerun with the same inputs to resume. Keep the private state, Compose volume
+and `deploy/quickstart/.env` together. The explicit `--fresh` option wipes
+the disposable database, sample history and credentials and provisions new ones.
+The numbered steps below describe manual installation.
 
 ## 2. Generate local configuration
 

@@ -1,9 +1,38 @@
 # Local demonstration
 
-Use the **[quickstart](quickstart.md)** for a reproducible local demonstration.
-It builds Yabanin from your checkout, starts PostgreSQL, Redis, a mock
-provider, and (with the `ui` profile) the containerized dashboard, creates
-credentials, and verifies a chat request and persisted request logs.
+From the root of your Core checkout run `bash scripts/quickstart/demo.sh`.
+It builds the gateway and dashboard from that checkout. On completion open
+the printed Requests link and sign in using the private `admin-password`
+file. In the Seed organization compare the review, support, documentation and
+tool-planning rows. The mock returns a grep/read plan for the tools example.
+Each row has its own request ID, job label and recorded token usage.
+
+### Optional provider endpoints at installation
+
+Keep a JSON manifest and its private key files in a directory outside the Core
+checkout. Protect each key file with mode 600. Use the model IDs accepted by
+the upstreams. The manifest may contain several distinct models:
+
+```json
+[
+  {"model":"model-a","base_url":"https://provider-a.example/v1","key_file":"a.key"},
+  {"model":"model-b","base_url":"https://provider-b.example/v1","key_file":"b.key"}
+]
+```
+
+```bash
+bash scripts/quickstart/demo.sh --providers /path/to/providers.json
+```
+
+The quickstart registers each model through the authenticated admin API and
+verifies its URL, credential presence and catalog entry. The demo organization
+uses explicit model selection. Automatic sample traffic always targets the mock.
+Add `--probe-providers` to send one potentially billable chat to each model
+and check its recorded route. Use `--ca-bundle /path/to/ca.pem` for private
+HTTPS endpoints. Repeat the original setup options when resuming the stand.
+The default state is under `~/.local/share/yabanin/quickstart/<compose-project>`
+or the equivalent `XDG_DATA_HOME` path. Retain this directory with the
+database volume and the quickstart environment file.
 
 ## A useful demonstration sequence
 
