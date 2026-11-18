@@ -5,6 +5,7 @@ from pathlib import Path
 import tempfile
 import unittest
 from unittest.mock import patch
+from urllib.parse import parse_qs, urlsplit
 
 from console import Console
 from stand import base_url, providers, validate_topology
@@ -72,6 +73,18 @@ class ProviderSetupTest(unittest.TestCase):
         spec["volumes"]["shared"] = {"name": "shared"}
         with self.assertRaisesRegex(ValueError, "unrecognized"):
             validate_topology(spec, True)
+
+    def test_request_link_includes_first_and_last_sample_minutes(self):
+        console = Console(3000)
+        rows = [{"status_code": 200, "labels": {"ci.job_name": job}, "created_at": timestamp}
+                for job, timestamp in zip(("docs", "tools", "review", "support"),
+                                          ("2026-11-18T12:34:59.4Z", "2026-11-18T12:35:00Z",
+                                           "2026-11-18T12:35:01.0047+00:00", "2026-11-18T12:35:02.01Z"))]
+        with patch.object(console, "get", side_effect=rows):
+            fragment = urlsplit(console.requests_link("demo")).fragment
+        query = parse_qs(fragment.split("?", 1)[1])
+        self.assertEqual(query["from"], ["2026-11-18T12:34:00+00:00"])
+        self.assertEqual(query["to"], ["2026-11-18T12:36:00+00:00"])
 
     def test_substituted_model_fails_probe(self):
         console = Console(3000)

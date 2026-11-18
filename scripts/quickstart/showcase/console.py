@@ -4,6 +4,7 @@ from datetime import datetime, timedelta
 from http.client import HTTPConnection
 from http.cookies import SimpleCookie
 import json
+import re
 import time
 from urllib.parse import quote, urlencode
 
@@ -64,7 +65,8 @@ class Console:
             row = self.get(f"/api/organizations/{self.org}/requests/{run_id}-{job}")
             if row["status_code"] != 200 or row["labels"].get("ci.job_name") != job:
                 raise ValueError("dashboard request details did not match the sample traffic")
-            times.append(datetime.fromisoformat(row["created_at"].replace("Z", "+00:00")))
+            timestamp = re.sub(r"(?<=:\d{2})\.\d+", "", row["created_at"])
+            times.append(datetime.fromisoformat(timestamp.replace("Z", "+00:00")))
         # Explorer time controls use minutes. Include the entire last sample minute.
         start = min(times).replace(second=0, microsecond=0)
         end = max(times).replace(second=0, microsecond=0) + timedelta(minutes=1)
