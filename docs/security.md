@@ -101,6 +101,19 @@ this layer covers and what it does not.
   gates as code changes; the scanner classifies findings by reachability, and
   "not called" findings are recorded with that justification rather than
   silenced.
+- **Known issue: CVE-2026-112366 in `picomatch@2.3.2`
+  (`web/site/package-lock.json`).** The Docusaurus site build tree carries a
+  `picomatch` version with an advisory (`GHSA-fc5q-39xc-vjpf`); npm reports
+  no fix available, and upstream PR 194 does not repair the affected `+(*a)`
+  glob handling. The vulnerable input is a crafted glob *pattern*, not a
+  filename: the release build feeds picomatch only static, repository-owned
+  patterns and has no external or user-provided pattern input, so exposure
+  is limited to the build step. A time-bounded owner-approved exception
+  records this in `scripts/quality/security-exceptions.yaml` (scanner
+  `dep_audit`, expires 2026-11-30). This is not a general waiver for the
+  CVE and is not evidence that runtime or user-supplied glob patterns are
+  safe. The exception must be removed as soon as an upstream fix is adopted
+  or reachability changes.
 - **Runtime supply chain.** Container restrictions and listener exposure depend
   on the chosen Compose or Helm profile. Review the rendered configuration
   for read-only filesystems, privilege restrictions, network isolation and
