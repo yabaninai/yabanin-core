@@ -11,6 +11,8 @@ import (
 	"net"
 	"net/http"
 	"time"
+
+	"github.com/reireirei/yabanin/internal/retryclock"
 )
 
 // Result captures one attempt's outcome. Headers are surfaced so callers can
@@ -126,15 +128,25 @@ func Do(ctx context.Context, p Policy, fn func(ctx context.Context) Result) Resu
 			break
 		}
 
-		delay := p.delayFor(attempt, last)
-		select {
-		case <-ctx.Done():
-			last.Err = ctx.Err()
-			return last
-		case <-time.After(delay):
-		}
+		wait(ctx, p.delayFor(attempt, last))
 	}
 	return last
+}
+
+// wait suspends the loop between attempts for delay or until ctx ends. A
+// sleeper carried on ctx (internal/retryclock) replaces the real wait as a
+// deterministic test seam; without one the context-aware real-time wait
+// runs. ctx death during the wait surfaces as the context error on the
+// next loop iteration's context check.
+func wait(ctx context.Context, delay time.Duration) {
+	if sleep, ok := retryclock.From(ctx); ok {
+		sleep(ctx, delay)
+		return
+	}
+	select {
+	case <-ctx.Done():
+	case <-time.After(delay):
+	}
 }
 
 // DefinitelyNotSent reports only errors that prove the HTTP transport failed
