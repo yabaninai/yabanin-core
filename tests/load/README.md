@@ -13,30 +13,66 @@ set the base URL and a valid key for your test organization. The three
 `k6_*.js` scripts retain the historical `TOKENROUTER_*` variable names; setting
 `YABANIN_*` does not configure them.
 
+`k6_chat.js` and `k6_mixed_models.js` take no implicit credentials and no
+implicit models: the key and model IDs must come from your explicit inputs.
+The only defaulted input is the target URL, which falls back to the literal
+loopback `http://127.0.0.1:8082` of a local quickstart. They require:
+
+- `TOKENROUTER_API_KEY`: a valid key for the test organization, exported in
+  your environment. It is never accepted from a hard-coded default, logged, or
+  written to disk.
+- `TOKENROUTER_MODEL` (`k6_chat.js`) or `TOKENROUTER_MODELS`
+  (`k6_mixed_models.js`): model IDs actually registered and authorized in the
+  target deployment. The mixed list needs at least two distinct models;
+  empty or duplicate entries and single-item lists abort before any request
+  is sent.
+- `TOKENROUTER_BASE_URL`: optional; it defaults to the literal loopback
+  `http://127.0.0.1:8082` of a local quickstart and must be an `http(s)` URL.
+
+Missing or malformed inputs abort in k6's init phase, before any HTTP request.
+Responses are checked for exact model identity: the response `model` must
+equal the requested model, not a prefix or substring of it. `k6_chat.js`
+counts cache hits only for the explicit `X-Cache` attribution values the
+gateway emits on hits (`EXACT`, `PG_EXACT`, `SEMANTIC`); a missing header is a
+normal miss.
+
 ```sh
 export TOKENROUTER_BASE_URL=http://127.0.0.1:18082
+export TOKENROUTER_MODEL=your-registered-model
 # Set TOKENROUTER_API_KEY in your environment to the test organization's key.
 : "${TOKENROUTER_API_KEY:?Set a valid test-organization key}"
 k6 run tests/load/k6_chat.js
 ```
 
-The scripts default to `http://localhost:8082` and `yabanin-dev-key` when those
-variables are absent; that default key is not created by the public quickstart.
-Their hard-coded model IDs must exist and be authorized in the target deployment.
-The quickstart's mock model alone does not satisfy these scenario inputs.
+The `make load-test-chat` and `make load-test-mixed` targets run the same two
+scripts. They require `TOKENROUTER_API_KEY` to be exported before `make` (they
+refuse to start without it and never place the key on a command line), and
+take `MODEL=` / `MODELS=` plus optional `BASE_URL=` and `SMOKE=1` as nonsecret
+inputs.
+
+For a small bounded run that checks wiring rather than capacity, set
+`TOKENROUTER_SMOKE=1`, or set `TOKENROUTER_VUS` together with
+`TOKENROUTER_DURATION`. These override only the stage profile; the assertions
+stay unchanged, the summary is labeled `smoke` or `custom`, and such runs are
+smoke evidence only — never report them as the full load profile.
 
 | Script | Requests/models | Configured assertions |
 |---|---|---|
-| `k6_chat.js` | Mixed prompts using `gpt-4o`; ramps as high as 1,000 virtual users. | p95 < 500 ms, p99 < 1,000 ms, failed requests < 1%, checks > 95%. |
+| `k6_chat.js` | Mixed prompts using the explicitly configured `TOKENROUTER_MODEL`; ramps as high as 1,000 virtual users. | p95 < 500 ms, p99 < 1,000 ms, failed requests < 1%, checks > 95%. |
 | `k6_cache_hit.js` | Repeated prompts using `gpt-4o`; ramps to 200 virtual users. | p95 < 200 ms, checks > 90%; includes a separate fast-response check. |
-| `k6_mixed_models.js` | Round-robin `gpt-4o`, `claude-3.5-sonnet`, `gpt-4o-mini`; ramps to 500 virtual users. | p95 < 800 ms, p99 < 1,500 ms, failed requests < 5%, checks > 90%. |
+| `k6_mixed_models.js` | Round-robin over the explicitly configured `TOKENROUTER_MODELS` (at least two distinct); ramps to 500 virtual users. | p95 < 800 ms, p99 < 1,500 ms, failed requests < 5%, checks > 90%. |
 
 Choose the script explicitly:
 
 ```sh
 k6 run tests/load/k6_cache_hit.js
-k6 run tests/load/k6_mixed_models.js
+TOKENROUTER_MODELS=your-model-a,your-model-b k6 run tests/load/k6_mixed_models.js
 ```
+
+`k6_cache_hit.js` is not covered by this correction: it still carries its
+historical hard-coded model and its implicit `localhost`/dev-key defaults. Do
+not rely on those implicit defaults; qualify that script separately before
+using it for any acceptance.
 
 Virtual-user counts are not request-per-second guarantees. End-to-end duration
 includes provider latency. Repeated prompts and low latency alone do not prove

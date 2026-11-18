@@ -204,6 +204,28 @@ bash scripts/quickstart/smoke.sh "$YABANIN_API_KEY"
 
 `make quickstart-smoke KEY="$YABANIN_API_KEY"` runs the same check.
 
+### Optional: local load smoke check
+
+With [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) installed
+separately — it is not part of this quickstart's tooling — you can exercise
+the load scripts against the quickstart mock with a tiny labeled smoke
+profile:
+
+```bash
+export TOKENROUTER_API_KEY="$YABANIN_API_KEY"
+make load-test-chat MODEL=mock-model SMOKE=1
+```
+
+The target refuses to start unless `TOKENROUTER_API_KEY` is already exported;
+it never places the key on a command line. The request goes to the local
+gateway on `127.0.0.1:8082` using the seeded `mock-model`, and the run is
+reported as a `smoke` profile. It checks load-script wiring and the exact
+model identity in responses only; it is not a load measurement of the
+gateway. The full profile (ramping to 1,000 virtual users) targets a
+separately prepared deployment and is unrelated to quickstart sizing.
+Unset the key when finished, as shown in [Stop, restart, and
+reset](#stop-restart-and-reset).
+
 Expected final line: `smoke ok (N request log rows)`, where `N` is at least 1.
 The check waits for the log consumer, so it takes several seconds. On a fresh
 database it verifies local plumbing against the mock. It counts cumulative
