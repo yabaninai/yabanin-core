@@ -4,6 +4,7 @@ package retry
 
 import (
 	"context"
+	"errors"
 	"net/http"
 	"testing"
 	"time"
@@ -64,4 +65,24 @@ func TestDo_SleeperCancellationWhileWaitingIsTerminal(t *testing.T) {
 	assert.Equal(t, []time.Duration{5 * time.Millisecond}, slept)
 	assert.Equal(t, 1, attempts, "cancellation inside the pending wait stops the loop before the second attempt")
 	assert.ErrorIs(t, res.Err, context.Canceled)
+}
+
+// TestDo_ErrorFromCancelledAttemptIsContextError pins the post-attempt
+// cancellation substitution: when fn itself returns an error after the
+// context died, Do surfaces context.Canceled instead of the attempt error.
+// Safety=OutcomeNotExecuted bypasses the unsafe-transport refusal, and
+// MaxAttempts=1 leaves no later pre-attempt check that could mask removal
+// of that substitution branch.
+func TestDo_ErrorFromCancelledAttemptIsContextError(t *testing.T) {
+	sentinel := errors.New("upstream attempt failed")
+	ctx, cancel := context.WithCancel(context.Background())
+	attempts := 0
+	res := Do(ctx, Policy{MaxAttempts: 1}, func(ctx context.Context) Result {
+		attempts++
+		cancel()
+		return Result{Err: sentinel, Safety: OutcomeNotExecuted}
+	})
+	assert.Equal(t, 1, attempts)
+	assert.ErrorIs(t, res.Err, context.Canceled)
+	assert.NotErrorIs(t, res.Err, sentinel)
 }

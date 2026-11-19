@@ -50,7 +50,7 @@ type IdempotencyProof interface {
 // 503 and 529. Do blocks transport retries with unknown outcomes.
 type Classifier func(statusCode int, err error) bool
 
-// Policy configures retry behaviour. Zero-value MaxAttempts disables retry.
+// Policy configures retry behaviour. Zero-value MaxAttempts selects DefaultPolicy.
 type Policy struct {
 	MaxAttempts  int
 	BaseDelay    time.Duration
@@ -94,12 +94,7 @@ var DefaultClassifier Classifier = func(code int, err error) bool {
 // Context cancellation aborts the loop immediately and returns the context
 // error rather than the last fn error.
 func Do(ctx context.Context, p Policy, fn func(ctx context.Context) Result) Result {
-	if p.MaxAttempts <= 0 {
-		p = DefaultPolicy()
-	}
-	if p.RetryOn == nil {
-		p.RetryOn = DefaultClassifier
-	}
+	p = p.withDefaults()
 
 	var last Result
 	for attempt := 0; attempt < p.MaxAttempts; attempt++ {
@@ -111,18 +106,8 @@ func Do(ctx context.Context, p Policy, fn func(ctx context.Context) Result) Resu
 		}
 
 		last = fn(ctx)
-		if last.Err != nil && last.StatusCode == 0 && !MayRepeat(last.Safety, last.Proof) {
-			return last
-		}
-		if last.Err == nil && !p.RetryOn(last.StatusCode, nil) {
-			return last
-		}
-		if last.Err != nil && ctx.Err() != nil {
-			last.Err = ctx.Err()
-			return last
-		}
-		if !p.RetryOn(last.StatusCode, last.Err) {
-			return last
+		if result, stop := terminalDecision(ctx, p, last); stop {
+			return result
 		}
 		if attempt == p.MaxAttempts-1 {
 			break
@@ -131,6 +116,38 @@ func Do(ctx context.Context, p Policy, fn func(ctx context.Context) Result) Resu
 		wait(ctx, p.delayFor(attempt, last))
 	}
 	return last
+}
+
+// withDefaults replaces an attempt-free policy with DefaultPolicy and a nil
+// classifier with DefaultClassifier.
+func (p Policy) withDefaults() Policy {
+	if p.MaxAttempts <= 0 {
+		p = DefaultPolicy()
+	}
+	if p.RetryOn == nil {
+		p.RetryOn = DefaultClassifier
+	}
+	return p
+}
+
+// terminalDecision applies the frozen post-attempt precedence and reports
+// whether the loop must stop: FIRST refuse an unsafe transport error
+// (errored, status 0, not proven repeatable), THEN return a non-retryable
+// nil-error result, THEN replace a remaining error with ctx.Err() when the
+// context died, THEN apply RetryOn. The returned Result carries the ctx.Err()
+// substitution; unchanged otherwise.
+func terminalDecision(ctx context.Context, p Policy, r Result) (Result, bool) {
+	if r.Err != nil && r.StatusCode == 0 && !MayRepeat(r.Safety, r.Proof) {
+		return r, true
+	}
+	if r.Err == nil && !p.RetryOn(r.StatusCode, nil) {
+		return r, true
+	}
+	if r.Err != nil && ctx.Err() != nil {
+		r.Err = ctx.Err()
+		return r, true
+	}
+	return r, !p.RetryOn(r.StatusCode, r.Err)
 }
 
 // wait suspends the loop between attempts for delay or until ctx ends. A
