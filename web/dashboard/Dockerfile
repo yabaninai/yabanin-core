@@ -13,6 +13,10 @@ COPY web/dashboard .
 COPY design /src/design
 COPY scripts/web/bundle_budget.mjs ../../scripts/web/bundle_budget.mjs
 RUN npm run build
+COPY LICENSE NOTICE LICENSING.md /src/
+COPY scripts/release/dashboard-notices.mjs /src/scripts/release/
+RUN ./node_modules/.bin/vite build --sourcemap --manifest --outDir /tmp/dashboard-maps \
+    && node /src/scripts/release/dashboard-notices.mjs --map-root /tmp/dashboard-maps --out dist/licenses
 
 # Serve stage
 # nginx:alpine digest-pinned 2026-10-25 via `docker buildx imagetools inspect` (relprep §9 follow-up)
