@@ -114,6 +114,57 @@ this layer covers and what it does not.
   CVE and is not evidence that runtime or user-supplied glob patterns are
   safe. The exception must be removed as soon as an upstream fix is adopted
   or reachability changes.
+- **Lockfile scans include development dependencies.** The dependency
+  quality gate (`scripts/quality/dep_audit.py`) invokes the pinned Trivy
+  with `--include-dev-deps`, so test/build-tool findings cannot be silently
+  omitted from lockfile reports; dev-marked criticals fail the gate exactly
+  like runtime ones.
+- **Exception scope is enforced per physical lockfile instance.** A
+  `dep_audit` exception names an exact `path` — the package key inside the
+  lockfile. The scanner binds each Trivy finding to its physical instances
+  through `PkgIdentifier`/`Packages` identifier UIDs and the reported
+  lockfile line locations, resolving each location against the parsed start
+  lines of the lockfile's own packages map, so same-line entries of
+  different versions stay ambiguous whatever the JSON spacing. A
+  Trivy finding that aggregates several physical instances is excepted only
+  when every instance has its own matching entry; missing, conflicting or
+  ambiguous identity/location metadata — including a `Locations` field that
+  is not a list or a `StartLine` that is not a positive, non-boolean
+  integer — is a scanner error, never a
+  broadened waiver. A lock entry's explicit `name` determines its package
+  identity: legitimate npm alias installs count as physical instances of
+  the package they name, while a finding or location pointing at an entry
+  for a different package is refused rather than excepted. Exceptions for dev-tree instances additionally declare
+  the lockfile's `development` classification and apply only to lock
+  entries with the matching dev flag, and malformed scanner output — a
+  non-list `Vulnerabilities` field, entries that are not objects, or a
+  `Severity` outside the pinned scanner's recognized values
+  (`CRITICAL`, `HIGH`, `MEDIUM`, `LOW`, `UNKNOWN`) — is a scanner error
+  rather than a clean result: malformed or unrecognized severities (for
+  example a padded `HIGH `) are never silently dropped findings, while
+  valid non-HIGH/CRITICAL values remain outside this gate.
+  Scanner-reported lockfile targets are repository-relative paths
+  confined to the scanned checkout: absolute, parent-traversing or
+  symlink-escaping targets are refused before any file is read.
+  Duplicate keys in a raw scanner report or in the exception registry
+  are rejected rather than resolved last-wins.
+- **Known issue: CVE-2026-112366 in `picomatch` — dashboard and Node SDK
+  lockfiles (build/test-only, owner-approved).** The dashboard build tree
+  carries 2.3.2 (hoisted) and 4.0.5 (nested under `tinyglobby` and `vite`);
+  the Node SDK dev tree carries 4.0.7. All reach picomatch only through
+  build/lint/test tooling fed static operator-owned glob patterns — the
+  SDK's test discovery uses Vitest's default include/exclude globs, `tsc`
+  compiles static `tsconfig` includes and does not use picomatch, and the
+  published SDK package ships no dev tool code. No runtime or
+  user-supplied pattern path was identified in the current
+  source/configuration. Owner decisions: dashboard
+  (question-qwc5b2rs) and SDK option B, both 2026-11-18; four exact
+  physical-instance entries for these two trees in
+  `scripts/quality/security-exceptions.yaml` expire 2026-11-30. These are
+  not a general ReDoS waiver, do not cover
+  MEDIUM findings in the same trees, and must be removed as soon as an
+  upstream fix lands (none exists; the advisory affects <=4.0.7) or
+  reachability changes.
 - **Runtime supply chain.** Container restrictions and listener exposure depend
   on the chosen Compose or Helm profile. Review the rendered configuration
   for read-only filesystems, privilege restrictions, network isolation and
