@@ -2,6 +2,7 @@
 """Fast regressions for the quickstart. Run with unittest discovery here."""
 import json
 from pathlib import Path
+import re
 import tempfile
 import unittest
 from unittest.mock import patch
@@ -9,6 +10,18 @@ from urllib.parse import parse_qs, urlsplit
 
 from console import Console
 from stand import base_url, providers, validate_topology
+
+
+class QuickstartImageTest(unittest.TestCase):
+    def test_redis_image_pins_bsd_licensed_release(self):
+        compose = Path(__file__).resolve().parents[3] / "deploy/quickstart/docker-compose.yml"
+        services = re.split(r"^  redis:[ \t]*\n", compose.read_text(), flags=re.MULTILINE)
+        self.assertEqual(len(services), 2, "expected one Redis service")
+        redis = re.split(r"^ {0,2}\S", services[1], maxsplit=1, flags=re.MULTILINE)[0]
+        images = re.findall(r"^    image:[ \t]*([^\s#]+)", redis, flags=re.MULTILINE)
+        self.assertEqual(images, [
+            "redis:7.2-alpine@sha256:2f66de68111e64c3927859f158f8e666066dae2b97d9f82770a6f37a5aa1c335"
+        ])
 
 
 class ProviderSetupTest(unittest.TestCase):
