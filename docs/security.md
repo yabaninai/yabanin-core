@@ -163,7 +163,7 @@ this layer covers and what it does not.
   `scripts/quality/security-exceptions.yaml` expire 2026-11-30. These are
   not a general ReDoS waiver, do not cover
   MEDIUM findings in the same trees, and must be removed as soon as an
-  upstream fix lands (none exists; the advisory affects <=4.0.7) or
+  upstream fix lands (none exists; the advisory affects versions through 4.0.7) or
   reachability changes.
 - **Runtime supply chain.** Container restrictions and listener exposure depend
   on the chosen Compose or Helm profile. Review the rendered configuration
