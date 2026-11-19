@@ -232,6 +232,8 @@ quality-fast quality-static quality-security quality-security-code quality-secur
 _quality-self:
 	bash -n scripts/quality/run.sh scripts/quality/changed.sh scripts/ci/run-with-report.sh scripts/security/govulncheck-classify.sh
 	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+	node --test scripts/release/test_dashboard_notices.mjs
+	python3 -m unittest discover -s deploy/mock-provider -p 'test_*.py'
 
 _quality-fast:
 	$(GO_SCOPE) go build
