@@ -81,6 +81,16 @@ function notice(sourceRoot, origin, destination, copies) {
   return { origin, path: destination, sha256: hash(bytes) }
 }
 
+function packageNoticePath(relative) {
+  // Escape the literal "deps" as well so real directories cannot alias a nested install.
+  const parts = relative.split('/').slice(1).flatMap(part => {
+    if (part === 'node_modules') return ['deps', 'nested']
+    if (part === 'deps') return ['deps', 'literal']
+    return part
+  })
+  return ['packages', ...parts].join('/')
+}
+
 function packageNotices(dashboard, lock, origin, copies) {
   const dir = path.join(dashboard, origin)
   const { name, version } = json(path.join(dir, 'package.json'))
@@ -96,7 +106,7 @@ function packageNotices(dashboard, lock, origin, copies) {
   }
   const notices = legal.map(file => {
     const relative = path.relative(dashboard, file)
-    return notice(dashboard, relative, 'packages/' + relative, copies)
+    return notice(dashboard, relative, packageNoticePath(relative), copies)
   })
   return { name, version, origin, notices }
 }

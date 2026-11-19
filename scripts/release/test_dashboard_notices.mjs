@@ -141,7 +141,7 @@ test('incorrect notice hash in the inventory fails verification', t => {
 test('missing shipped notice fails verification', t => {
   const f = fixture(t)
   passes(f)
-  rmSync(path.join(f.out, 'packages', lucide, 'LICENSE'))
+  rmSync(path.join(f.out, 'packages/lucide-react/LICENSE'))
   fails(f, /delivered notice file set differs/, true)
 })
 
@@ -158,24 +158,59 @@ test('changed emitted bytes cannot use a stale mapped twin', t => {
   fails(f, /emitted asset differs from mapped build/)
 })
 
-test('a second contributing package needs its own legal text', t => {
-  const f = fixture(t)
-  const origin = 'node_modules/@example/widget'
+function addWidget(f, origin, version) {
   const name = '@example/widget'
   const dir = path.join(f.dashboard, origin)
-  save(path.join(dir, 'package.json'), JSON.stringify({ name, version: '1.0.0' }))
+  save(path.join(dir, 'package.json'), JSON.stringify({ name, version }))
   save(path.join(dir, 'widget.js'), 'export const widget = 2;')
   const lockFile = path.join(f.dashboard, 'package-lock.json')
   const lock = JSON.parse(read(lockFile))
-  lock.packages[origin] = { version: '1.0.0' }
+  lock.packages[origin] = { version }
   save(lockFile, JSON.stringify(lock))
   const mapFile = path.join(f.maps, asset + '.map')
   const map = JSON.parse(read(mapFile))
   map.sources.push(path.relative(path.dirname(mapFile), path.join(dir, 'widget.js')))
   map.sourcesContent.push(read(path.join(dir, 'widget.js')))
   save(mapFile, JSON.stringify(map))
+  return dir
+}
+
+test('a second contributing package needs its own legal text', t => {
+  const f = fixture(t)
+  const dir = addWidget(f, 'node_modules/@example/widget', '1.0.0')
   fails(f, /missing legal text: node_modules\/@example\/widget/)
   save(path.join(dir, 'COPYING'), 'Widget test license\n')
   passes(f)
-  assert.equal(read(path.join(f.out, 'packages', origin, 'COPYING')), 'Widget test license\n')
+  assert.equal(read(path.join(f.out, 'packages/@example/widget/COPYING')), 'Widget test license\n')
+})
+
+test('delivered targets exclude node_modules and preserve distinct physical instances', t => {
+  const f = fixture(t)
+  const top = 'node_modules/@example/widget'
+  const nested = lucide + '/' + top
+  const topDir = addWidget(f, top, '1.0.0')
+  const nestedDir = addWidget(f, nested, '1.0.0')
+  save(path.join(topDir, 'LICENSE'), 'Top-level widget license')
+  save(path.join(nestedDir, 'LICENSE'), 'Nested widget license')
+  save(path.join(f.dashboard, lucide, '@example/widget/LICENSE'), 'Parent attribution')
+  save(path.join(f.dashboard, lucide, 'deps/nested/@example/widget/LICENSE'), 'Literal directory attribution')
+  passes(f)
+  const { packages } = JSON.parse(read(path.join(f.out, 'inventory.json')))
+  assert.deepEqual(packages.map(p => [p.origin, p.name, p.version]), [
+    [top, '@example/widget', '1.0.0'], [lucide, 'lucide-react', '0.469.0'], [nested, '@example/widget', '1.0.0'],
+  ])
+  const notices = packages.flatMap(p => p.notices)
+  for (const n of notices) {
+    assert.ok(!n.path.split('/').includes('node_modules'), 'forbidden delivered path: ' + n.path)
+  }
+  assert.deepEqual(notices.map(n => n.origin).sort(), [
+    top + '/LICENSE', nested + '/LICENSE', lucide + '/LICENSE', lucide + '/nOtIcE.txt',
+    lucide + '/@example/widget/LICENSE', lucide + '/deps/nested/@example/widget/LICENSE',
+  ].sort())
+  assert.equal(new Set(notices.map(n => n.path)).size, notices.length)
+  for (const n of notices) {
+    const original = readFileSync(path.join(f.dashboard, n.origin))
+    assert.deepEqual(readFileSync(path.join(f.out, n.path)), original)
+    assert.equal(n.sha256, digest(original))
+  }
 })
