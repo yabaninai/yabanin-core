@@ -1,0 +1,6 @@
+/*
+ * iconv.c
+ * Implementation of SUSv4 XCU iconv utility
+ * Copyright © 2011 Rich Felker
+ * Licensed under the terms of the GNU General Public License, v2 or later
+ */
