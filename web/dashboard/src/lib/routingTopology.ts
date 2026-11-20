@@ -641,6 +641,10 @@ function groupNodes(groups: Map<string, GroupSummary>, byId: Map<string, TopoNod
 
 export function mountTopology(view: TopologyView, sel: MountSelection, limits: MountLimits = MOUNT_LIMITS): MountedTopology {
   const totals = { nodes: view.nodes.length, edges: view.edges.length }
+  // Selection only changes highlighting when every configured entry already fits.
+  if (!sel.queryActive && totals.nodes <= limits.maxNodes && totals.edges <= limits.maxEdges) {
+    return { view, totals, groups: new Map(), grouped: false }
+  }
   const byId = new Map(view.nodes.map(n => [n.id, n]))
 
   // The candidate pool, then the budgets. A pool inside both budgets

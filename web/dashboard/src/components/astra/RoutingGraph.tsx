@@ -25,7 +25,7 @@
 //  * Plain SVG, astra tokens only, no chart library, no animation beyond the
 //    140ms opacity/stroke transition on selection (none under
 //    prefers-reduced-motion).
-import { useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { RoutingMap } from '../../api/routing'
 import { currentHashQuery, relatedListHref } from '../../lib/inspectUrl'
@@ -35,6 +35,8 @@ import {
   type TopoEdge, type TopoNode, type TopoNodeKind, type TopoBand, type TopologyView, type SelectionPath,
   type GroupSummary,
 } from '../../lib/routingTopology'
+import { visibleEdge, type EdgeWindow } from '../../lib/routingEdgeWindow'
+import { useRoutingEdgeWindow } from '../../hooks/useRoutingEdgeWindow'
 import { StateNotice } from './StateNotice'
 
 type T = ReturnType<typeof useTranslation>['t']
@@ -204,6 +206,7 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
   // The selected path runs over the FULL view: selection highlights the real
   // configuration path, not just the mounted slice of it.
   const path = useMemo(() => selectionPath(view, selectedId), [view, selectedId])
+  const labelOf = useCallback((id: string) => byId.get(id)?.label ?? id, [byId])
   const searchRef = useRef<HTMLInputElement>(null)
 
   if (view.nodes.length === 0) {
@@ -223,7 +226,6 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
   // Group summaries are always visible: they do not exist in the FULL view
   // the focus runs over, and they are the mount's own navigation surface.
   const visible = (id: string) => id.startsWith('group:') || focus.focusIds.has(id) || id === selectedId
-  const labelOf = (id: string) => byId.get(id)?.label ?? id
 
   const moveFocus = (from: string, dir: NavDir) => {
     // Arrow keys walk the VISIBLE subgraph only — navigating into a dimmed
@@ -402,8 +404,9 @@ function TopologyCanvas({ view, totals, layout, visible, path, hasSelection, sel
   onNodeKeyDown: (event: KeyboardEvent, id: string) => void
 }) {
   const { t } = useTranslation()
+  const { canvas, window } = useRoutingEdgeWindow()
   return (
-    <svg
+    <svg ref={canvas}
       role="group"
       className="routing-topo"
       aria-label={t('routingMap.graphAria', { nodes: totals.nodes, edges: totals.edges })}
@@ -443,6 +446,7 @@ function TopologyCanvas({ view, totals, layout, visible, path, hasSelection, sel
           <TopoEdgeView
             key={edge.id}
             edge={edge}
+            window={window}
             from={from}
             to={to}
             focusDim={!(visible(edge.from) && visible(edge.to))}
@@ -477,8 +481,9 @@ function TopologyCanvas({ view, totals, layout, visible, path, hasSelection, sel
 }
 
 /** One directed config edge: uniform width, dash by kind, olive on the path. */
-function TopoEdgeView({ edge, from, to, focusDim, onPath, hasSelection, labelOf }: {
+function TopoEdgeView({ edge, window, from, to, focusDim, onPath, hasSelection, labelOf }: {
   edge: TopoEdge
+  window: EdgeWindow | null
   from: NodeBox
   to: NodeBox
   focusDim: boolean
@@ -487,23 +492,26 @@ function TopoEdgeView({ edge, from, to, focusDim, onPath, hasSelection, labelOf 
   labelOf: (id: string) => string
 }) {
   const { t } = useTranslation()
+  const title = useMemo(() => edgeTitle(edge, labelOf, t), [edge, labelOf, t])
   const { a, b } = edgeEndpoints(from, to)
   const self = edge.from === edge.to
   const back = !self && isBackEdge(from, to)
+  const line = self || back ? { d: edgeD(a, b, self, back), target: true, offset: 0 } : visibleEdge(a, b, window)
   const { stroke, markerId } = edgePaint(edge, onPath)
   const opacity = edgeOpacity(focusDim, onPath, hasSelection)
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - (self ? 30 : 0) }
   return (
     <g className="topo-edge" data-testid="routing-graph-edge" opacity={opacity}>
       <path
-        d={edgeD(a, b, self, back)}
+        d={line.d}
         fill="none"
         stroke={stroke}
         strokeWidth={EDGE_W}
         strokeDasharray={EDGE_DASH[edge.kind] || undefined}
-        markerEnd={`url(#${markerId})`}
+        strokeDashoffset={line.offset || undefined}
+        markerEnd={line.target ? `url(#${markerId})` : undefined}
       >
-        <title>{edgeTitle(edge, labelOf, t)}</title>
+        <title>{title}</title>
       </path>
       {edge.label !== '' && !focusDim && (
         <text x={mid.x} y={mid.y} textAnchor="middle" dominantBaseline="middle"
@@ -536,8 +544,8 @@ function TopoNodeView({ node, box, dim, onPath, hasSelection, isMatch, isSelecte
   onNodeKeyDown: (event: KeyboardEvent, id: string) => void
 }) {
   const { t } = useTranslation()
-  const aria = nodeAria(node, t)
-  const status = nodeStatus(node, t)
+  const aria = useMemo(() => nodeAria(node, t), [node, t])
+  const status = useMemo(() => nodeStatus(node, t), [node, t])
   const opacity = nodeOpacity(dim, onPath, hasSelection)
   return (
     <g
