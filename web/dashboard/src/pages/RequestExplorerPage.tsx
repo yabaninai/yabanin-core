@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useHashParam } from '../hooks/useHashParam'
 import { useInspectParam } from '../hooks/useInspectParam'
+import { useRequestLabelKeys } from '../hooks/useRequestLabelKeys'
 import {
-  fetchLabelKeys, getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
+  getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
 import { currentHashQuery, relatedListHref } from '../lib/inspectUrl'
@@ -26,7 +27,7 @@ import { FilterBar, type FilterBarHandle } from '../components/astra/FilterBar'
 import { GlobalScopeBar } from '../components/GlobalScopeBar'
 import { Pagination } from '../components/Pagination'
 import { useGlobalScope } from '../lib/globalScope'
-import { requestExplorerWindow } from './requestExplorerWindow'
+import { resolveRequestFilters } from './requestExplorerWindow'
 import { useAutoRefresh, useAutoRefreshInterval, useDocumentHidden } from '../lib/freshness'
 import { FreshnessControl } from '../components/astra/FreshnessControl'
 import { useTablePrefs } from '../hooks/useTablePrefs'
@@ -837,7 +838,7 @@ export function RequestExplorerPage() {
   const [autoRefreshMs, setAutoRefreshMs] = useAutoRefreshInterval()
   const tabHidden = useDocumentHidden()
   const [topModels, setTopModels] = useState<Array<{ model: string; actual_cost_usd: number }>>([])
-  const [labelKeys, setLabelKeys] = useState<string[]>([])
+  const { labelKeys, refreshLabels } = useRequestLabelKeys(org)
   const [inspectParam, setInspectParam] = useInspectParam()
   const inspectId = inspectParam.startsWith('request:') ? inspectParam.slice('request:'.length) : inspectParam
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
@@ -890,10 +891,7 @@ export function RequestExplorerPage() {
   // exactly the same applied scope (they are fetched together, generation-
   // guarded by `gen`). The quick fields and the errors-only toggle live
   // inside the committed query — there are no parallel filter params.
-  const buildFilterParams = () => {
-    const window = requestExplorerWindow(gs)
-    return { orgId: org, from: window.from, to: window.to, query: yqlCommitted || undefined }
-  }
+  const buildFilterParams = () => resolveRequestFilters(gs, yqlCommitted, refreshLabels)
 
   const load = async (p = 1) => {
     if (!org) return
@@ -983,18 +981,6 @@ export function RequestExplorerPage() {
       .then(rep => setTopModels((rep.top_models_by_cost ?? []).slice(0, 8)))
       .catch(() => setTopModels([]))
   }, [org])
-
-  // Label keys for the FilterBar field registry (best-effort; a failure just
-  // leaves the builder without label.<key> options).
-  useEffect(() => {
-    if (!org) { setLabelKeys([]); return }
-    const ctrl = new AbortController()
-    const range = requestExplorerWindow(gs)
-    fetchLabelKeys(org, range.from, range.to, { signal: ctrl.signal })
-      .then(rows => setLabelKeys(rows.map(r => r.key)))
-      .catch(() => setLabelKeys([]))
-    return () => ctrl.abort()
-  }, [org, gs])
 
   // Value suggestions from existing endpoints: models come from the savings
   // report already fetched for the hints.
