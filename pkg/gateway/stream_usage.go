@@ -44,30 +44,44 @@ func ensureStreamUsage(body []byte, providerName string, enabled map[string]bool
 	if providerName == "" {
 		providerName = "openai-compat"
 	}
-	if enabled == nil || !enabled[providerName] {
+	if !enabled[providerName] {
 		return body, true
 	}
 
 	var root map[string]json.RawMessage
-	if err := json.Unmarshal(body, &root); err != nil {
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return body, true
 	}
 
 	soRaw, has := root["stream_options"]
 	if !has {
-		root["stream_options"] = json.RawMessage(`{"include_usage":true}`)
-		out, err := json.Marshal(root)
-		if err != nil { // unreachable for RawMessage roots; keep fail-open
-			return body, true
-		}
-		return out, false
+		return addStreamUsageOption(root, body)
 	}
+	return setStreamUsageOption(root, soRaw, body)
+}
 
-	var so map[string]json.RawMessage
-	if err := json.Unmarshal(soRaw, &so); err != nil {
+// addStreamUsageOption handles a body without stream_options: it adds
+// {"include_usage":true} and re-marshals the root. A marshal error is
+// unreachable for RawMessage roots; keep the fail-open anyway.
+func addStreamUsageOption(root map[string]json.RawMessage, body []byte) (out []byte, clientRequested bool) {
+	root["stream_options"] = json.RawMessage(`{"include_usage":true}`)
+	out, err := json.Marshal(root)
+	if err != nil {
 		return body, true
 	}
-	if inc, ok := so["include_usage"]; ok && string(inc) == "true" {
+	return out, false
+}
+
+// setStreamUsageOption handles a body whose stream_options lacks
+// include_usage (or sets it to false): it sets the flag to true, preserves
+// every other stream_options key and re-marshals both levels. Unreadable
+// stream_options and marshal errors fail open to the original body.
+func setStreamUsageOption(root map[string]json.RawMessage, soRaw json.RawMessage, body []byte) (out []byte, clientRequested bool) {
+	var so map[string]json.RawMessage
+	if err := json.Unmarshal(soRaw, &so); err != nil || so == nil {
+		return body, true
+	}
+	if string(so["include_usage"]) == "true" {
 		return body, true
 	}
 
