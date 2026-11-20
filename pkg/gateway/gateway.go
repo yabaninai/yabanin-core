@@ -1724,7 +1724,7 @@ type gatewayEgress struct {
 	mcpCredsSrc *mcpCredsSource
 	// A2A-01: external A2A agent proxy (nil when YABANIN_A2A_GATEWAY is not
 	// set or no DB pool — the /api/a2a/send route group is then not mounted).
-	a2aProxy *a2aagg.Proxy
+	a2aProxy a2aProxy
 	// TOOL-01/03: tool policy engine (nil without a DB pool; zero policies
 	// = allow-all, no behavior change) and the built-in server-side tool
 	// executor (web_fetch et al; nil without a DB pool).
@@ -1871,6 +1871,16 @@ type gatewayObservability struct {
 	driftDetector *classifier.DriftDetector
 	// V9: shadow-mode dispatcher (nil when shadow is disabled).
 	shadow *shadow.Dispatcher
+}
+
+// a2aProxy is the Send boundary the a2aSend handler codes against; the
+// production wiring is *a2aagg.Proxy. The seam exists because the handler's
+// InvokeError mapping is defensive: the real proxy answers agent-only only
+// for an empty agent identity, which the handler's own agent-principal
+// check rejects before the proxy is called, so the mapping arms must stay
+// verifiable at the dependency boundary instead of only on the wire path.
+type a2aProxy interface {
+	Send(ctx context.Context, orgID string, id a2aagg.Identity, req a2aagg.SendRequest) (json.RawMessage, error)
 }
 
 // gateway is the request-path service. Its dependencies are grouped into the

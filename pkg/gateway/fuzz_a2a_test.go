@@ -58,14 +58,14 @@ func fuzzA2ARequest(t *testing.T, org, agent, body string) (*httptest.ResponseRe
 }
 
 func FuzzA2ASend(f *testing.F) {
-	for id := 1; id <= 15; id++ {
+	for id := 1; id <= 16; id++ {
 		f.Add([]byte{byte(id)}) // frozen regression corpus
 	}
 	// Generated-request seeds: policy-denied agent send, and an unknown agent.
 	f.Add([]byte{0x00, 0x00, 0x00})
 	f.Add([]byte{0x40, 0x00, 0x02})
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > 0 && data[0] >= 1 && data[0] <= 15 {
+		if len(data) > 0 && data[0] >= 1 && data[0] <= 16 {
 			fuzzA2ACases[int(data[0])](t)
 			return
 		}
@@ -140,6 +140,7 @@ var fuzzA2ACases = map[int]func(*testing.T){
 	13: fuzzA2A13,
 	14: fuzzA2A14,
 	15: fuzzA2A15,
+	16: a2aAgentOnlyMappingCase,
 }
 
 // // A2A-01 nil proxy → 404, no body
