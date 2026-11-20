@@ -7,7 +7,6 @@ import (
 	"math"
 	"net/http"
 	"net/http/httptest"
-	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -18,6 +17,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/router"
+	"github.com/stretchr/testify/require"
 )
 
 // fuzzModelLoader serves one static easy-pool model.
@@ -119,13 +119,19 @@ func rdGenOracle(t *testing.T, d routingDecision, hdr string, hdrSet bool) {
 	if !hdrSet || !json.Valid([]byte(hdr)) {
 		t.Fatalf("rd gen: finite decision must set a JSON header: %q", hdr)
 	}
-	var back routingDecision
-	if err := json.Unmarshal([]byte(hdr), &back); err != nil {
-		t.Fatalf("rd gen: header not decodable: %v (%q)", err, hdr)
+	want := map[string]any{"source": d.Source, "class": d.Class, "affinity": d.Affinity}
+	if d.Preferred != "" {
+		want["preferred"] = d.Preferred
 	}
-	if !reflect.DeepEqual(back, d) {
-		t.Fatalf("rd gen: header round-trip mismatch: %+v != %+v (%q)", back, d, hdr)
+	if d.Threshold != 0 {
+		want["threshold"] = d.Threshold
 	}
+	if d.Confidence != 0 {
+		want["confidence"] = d.Confidence
+	}
+	var got map[string]any
+	require.NoError(t, json.Unmarshal([]byte(hdr), &got))
+	require.Equal(t, want, got)
 }
 
 // fuzzRoutingGenerated exercises decision serialization with generated
@@ -149,18 +155,15 @@ func rdGenerated(t *testing.T, data []byte) {
 
 	gw := fuzzRoutingGateway(true)
 	ctx := context.Background()
-	m1, q1, d1, e1 := gw.selectTierModel(ctx, classifier.ClassEasy, "org1",
-		fmt.Sprintf("pref-%02x", p[0]), fmt.Sprintf("sess-%02x%02x", p[1], p[2]), routingModeQuality)
-	m2, q2, d2, e2 := gw.selectTierModel(ctx, classifier.ClassEasy, "org1",
-		fmt.Sprintf("pref-%02x", p[0]), fmt.Sprintf("sess-%02x%02x", p[1], p[2]), routingModeQuality)
-	if !reflect.DeepEqual(m1, m2) || !reflect.DeepEqual(q1, q2) ||
-		!reflect.DeepEqual(d1, d2) || !errorsEqual(e1, e2) {
-		t.Fatalf("rd gen: tier selection not deterministic: %+v/%+v vs %+v/%+v", m1, q1, m2, q2)
+	preferred := fmt.Sprintf("pref-%02x", p[0])
+	session := fmt.Sprintf("sess-%02x%02x", p[1], p[2])
+	for range 2 {
+		model, quality, canary, err := gw.selectTierModel(ctx, classifier.ClassEasy, "org1", preferred, session, routingModeQuality)
+		require.NoError(t, err)
+		require.Equal(t, "m-easy", model.Name)
+		require.Equal(t, router.QualityOutcome{FallbackReason: "no_snapshot"}, quality)
+		require.Equal(t, router.CanaryDecision{}, canary)
 	}
-}
-
-func errorsEqual(a, b error) bool {
-	return (a == nil) == (b == nil) && (a == nil || a.Error() == b.Error())
 }
 
 var fuzzRDCases = map[int]func(*testing.T){

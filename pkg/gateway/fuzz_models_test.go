@@ -14,6 +14,7 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reireirei/yabanin/pkg/config"
 	"github.com/reireirei/yabanin/pkg/testdb"
@@ -448,9 +449,8 @@ func fuzzMC13(t *testing.T) {
 	r2.Header.Set("anthropic-version", "2023-06-01")
 	w2 := httptest.NewRecorder()
 	empty.listModels(w2, r2)
-	if strings.Contains(w2.Body.String(), "first_id\":\"") && !strings.Contains(w2.Body.String(), `"first_id":""`) {
-		t.Fatalf("MC-13: empty list must have empty ids: %s", w2.Body.String())
-	}
+	require.Equal(t, http.StatusOK, w2.Code)
+	require.JSONEq(t, `{"first_id":"","last_id":"","has_more":false,"data":[]}`, w2.Body.String())
 }
 
 func fuzzMC14(t *testing.T) {
@@ -725,5 +725,9 @@ func fuzzMC26(t *testing.T) {
 		t.Fatalf("MC-26: healthy insert: %v", err)
 	}
 	mc26AliasFault(t, pool, alias, healthy)
-	mc26RegistryFault(t, pool, on)
+	registry := catalogFixture(t)
+	mc26RelaxCreatedNull(t, registry)
+	_, err := queryEnabledModels(t.Context(), registry)
+	require.NoError(t, err)
+	mc26RegistryFault(t, registry, on)
 }
