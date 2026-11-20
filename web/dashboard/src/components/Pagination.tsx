@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react'
+import { useCallback, useEffect, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 
 // U02: shared pagination for the control-plane list pages (Orgs, Models,
@@ -31,7 +31,7 @@ function readPageFromURL(): number {
 }
 
 // writePageToURL mirrors ?page=N into the address bar without a full
-// navigation (pushState when leaving page 1, replaceState otherwise).
+// navigation. A genuine page change gets its own history entry.
 function writePageToURL(page: number) {
   try {
     const url = new URL(window.location.href)
@@ -49,6 +49,7 @@ function writePageToURL(page: number) {
 export function Pagination({ page, pageSize, total, totalPages, loading, onChange }: PaginationProps) {
   const { t } = useTranslation()
   const [pending, setPending] = useState(false)
+  const previousPage = useRef(page)
 
   // On mount, adopt the page from the URL and tell the page to load it.
   useEffect(() => {
@@ -59,9 +60,11 @@ export function Pagination({ page, pageSize, total, totalPages, loading, onChang
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
-  // Keep the URL in sync when the page changes from anywhere.
+  // Mount adopts a deep link. Only later page changes can add history entries.
   useEffect(() => {
-    writePageToURL(page)
+    if (page === previousPage.current) return
+    previousPage.current = page
+    if (readPageFromURL() !== page) writePageToURL(page)
   }, [page])
 
   const go = useCallback(
