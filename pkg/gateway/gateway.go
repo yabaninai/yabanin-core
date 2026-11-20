@@ -158,24 +158,7 @@ func newGatewayHTTPRouter(cfg config.Gateway, l *slog.Logger) (*chi.Mux, time.Du
 		}))
 	}
 
-	// Initialize metrics subsystem (no-op if disabled).
-	if cfg.MetricsEnabled {
-		metrics.Init()
-		// V9: shadow-mode collectors are promauto-registered at package load
-		// (pkg/shadow); re-register them through the same idempotent path so
-		// the /metrics exposition is complete when shadow is enabled.
-		if cfg.Shadow.Enabled {
-			for _, c := range shadow.Collectors() {
-				if err := prometheus.Register(c); err != nil {
-					if !strings.Contains(err.Error(), "duplicate metrics") {
-						l.Warn("shadow metric registration failed", "error", err)
-					}
-				}
-			}
-		}
-		httpRouter.Use(metrics.PrometheusMiddleware())
-		l.Info("metrics enabled")
-	}
+	mountGatewayMetrics(httpRouter, cfg, l)
 
 	// Request-ID contract (pkg/requestid): the client's X-Request-ID is
 	// echoed verbatim on the response, carried in the request context for
@@ -239,6 +222,27 @@ func newGatewayHTTPRouter(cfg config.Gateway, l *slog.Logger) (*chi.Mux, time.Du
 		l.Info("tracing enabled")
 	}
 	return httpRouter, streamIdleTimeout, streamUsageProviders
+}
+
+func mountGatewayMetrics(httpRouter *chi.Mux, cfg config.Gateway, l *slog.Logger) {
+	if !cfg.MetricsEnabled {
+		return
+	}
+	metrics.Init()
+	// V9: shadow-mode collectors are promauto-registered at package load
+	// (pkg/shadow); re-register them through the same idempotent path so
+	// the /metrics exposition is complete when shadow is enabled.
+	if cfg.Shadow.Enabled {
+		for _, c := range shadow.Collectors() {
+			if err := prometheus.Register(c); err != nil {
+				if !strings.Contains(err.Error(), "duplicate metrics") {
+					l.Warn("shadow metric registration failed", "error", err)
+				}
+			}
+		}
+	}
+	httpRouter.Use(metrics.PrometheusMiddleware())
+	l.Info("metrics enabled")
 }
 
 // buildGateway is the gateway composition root (AF-17): every dependency the
