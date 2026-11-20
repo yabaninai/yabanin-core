@@ -34,6 +34,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -66,6 +67,7 @@ type rowsErrProxy struct {
 	ln         net.Listener
 	backend    string
 	truncAfter int
+	ctx        context.Context
 
 	mu               sync.Mutex
 	conns            int
@@ -79,11 +81,12 @@ type rowsErrProxy struct {
 
 func startRowsErrProxy(t *testing.T, backend string, truncAfter int) *rowsErrProxy {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	var lc net.ListenConfig
+	ln, err := lc.Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("rows-err proxy listen: %v", err)
 	}
-	p := &rowsErrProxy{ln: ln, backend: backend, truncAfter: truncAfter}
+	p := &rowsErrProxy{ln: ln, backend: backend, truncAfter: truncAfter, ctx: t.Context()}
 	t.Cleanup(func() {
 		_ = ln.Close()
 		p.mu.Lock()
@@ -182,12 +185,13 @@ func (p *rowsErrProxy) forwardServerToClient(client, server net.Conn, cap *connC
 
 func (p *rowsErrProxy) serve(client net.Conn, n int, cap *connCapture) {
 	defer p.wg.Done()
-	server, err := net.Dial("tcp", p.backend)
+	var dialer net.Dialer
+	server, err := dialer.DialContext(p.ctx, "tcp", p.backend)
 	if err != nil {
 		_ = client.Close()
 		return
 	}
-	defer server.Close()
+	defer func() { _ = server.Close() }()
 	p.track(server)
 
 	p.wg.Add(1)
@@ -428,8 +432,16 @@ func standAddr(pool *pgxpool.Pool) string {
 func proxiedPool(t *testing.T, p *rowsErrProxy) *pgxpool.Pool {
 	t.Helper()
 	return testdb.PostgresPool(t, func(pc *pgxpool.Config) {
+		_, portStr, err := net.SplitHostPort(p.ln.Addr().String())
+		if err != nil {
+			t.Fatalf("rows-err proxy address: %v", err)
+		}
+		port, err := strconv.ParseUint(portStr, 10, 16)
+		if err != nil {
+			t.Fatalf("rows-err proxy port %q: %v", portStr, err)
+		}
 		pc.ConnConfig.Host = "127.0.0.1"
-		pc.ConnConfig.Port = uint16(p.ln.Addr().(*net.TCPAddr).Port)
+		pc.ConnConfig.Port = uint16(port)
 	})
 }
 

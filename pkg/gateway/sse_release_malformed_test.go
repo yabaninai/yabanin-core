@@ -73,7 +73,7 @@ func TestSSEReleaseMalformedHeldFrameAllowed(t *testing.T) {
 		t.Fatalf("release-malformed allowed: malformed frame not byte-identical in output: %q", body.String())
 	}
 	iName, iBad, iArgs := bytes.Index(out, fragName), bytes.Index(out, malformed), bytes.Index(out, fragArgs)
-	if iName < 0 || iBad < 0 || iArgs < 0 || !(iName < iBad && iBad < iArgs) {
+	if iName < 0 || iBad < 0 || iArgs < 0 || iName >= iBad || iBad >= iArgs {
 		t.Fatalf("release-malformed allowed: arrival order not preserved (name=%d bad=%d args=%d): %q",
 			iName, iBad, iArgs, body.String())
 	}
