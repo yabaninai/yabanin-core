@@ -102,7 +102,7 @@ func (e *Enforcer) CheckBudget(ctx context.Context, teamID string) error {
 			return ErrNoBudget
 		}
 		e.log.Warn("budget lookup unavailable, denying request", "team_id", teamID, "error", err)
-		return fmt.Errorf("%w: %v", ErrBudgetUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrBudgetUnavailable, err)
 	}
 
 	if snap.spendMicroUSD >= snap.monthlyLimitMicroUSD {
