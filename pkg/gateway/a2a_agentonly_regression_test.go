@@ -91,3 +91,22 @@ func a2aAgentOnlyMappingCase(t *testing.T) {
 		t.Fatalf("a2a agent-only case 16: boundary calls = %d, want 1", stub.calls)
 	}
 }
+
+// TestA2ATypedNilProxyReturnsEmpty404 pins the A2A-01 feature-off contract
+// at the interface seam: fuzzA2AGateway(nil, …) must leave gw.a2aProxy the
+// nil INTERFACE — a typed nil *a2aagg.Proxy stored in the interface is
+// non-nil there, bypasses a2aSend's 404 and panics inside Send (the
+// independent a3532d3 seed replay). The isolated removal of the guard in
+// fuzzA2AGateway makes this test panic again: that panic is the negative
+// control for the guard.
+func TestA2ATypedNilProxyReturnsEmpty404(t *testing.T) {
+	gw := fuzzA2AGateway(nil, false)
+	w, r := fuzzA2ARequest(t, "org1", "yag_1", `{}`)
+	gw.a2aSend(w, r)
+	if w.Code != http.StatusNotFound || w.Body.Len() != 0 {
+		t.Fatalf("a2a typed-nil 404: want 404 empty, got %d %q", w.Code, w.Body.String())
+	}
+	if gw.a2aProxy != nil {
+		t.Errorf("a2a typed-nil guard: gw.a2aProxy = %T, want nil interface", gw.a2aProxy)
+	}
+}

@@ -30,7 +30,12 @@ func fuzzA2AGateway(proxy *a2aagg.Proxy, engineOn bool) *gateway {
 	if engineOn {
 		gw.toolPolicies = fuzzToolEngine()
 	}
-	gw.a2aProxy = proxy
+	// A typed nil *a2aagg.Proxy must not enter the interface seam as a
+	// non-nil interface value: that would bypass a2aSend's feature-off 404
+	// and panic inside Send. Keep the field the nil interface instead.
+	if proxy != nil {
+		gw.a2aProxy = proxy
+	}
 	return gw
 }
 
