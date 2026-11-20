@@ -794,11 +794,13 @@ func parseCountField(fields map[string]interface{}, key string) (int64, bool) {
 		// 2^63 boundaries: float64 cannot represent every int64, and a
 		// runtime out-of-range float→int conversion is
 		// implementation-dependent, so reject at the exact representable
-		// edges instead of truncating a counter into existence.
+		// edges instead of truncating a counter into existence. These
+		// comparisons alone reject non-finite values BEFORE any
+		// conversion: NaN != Trunc(NaN), and ±Inf already sit beyond
+		// the bounds.
 		const maxInt64Plus1 = 9223372036854775808.0    // 2^63
 		const minInt64AsFloat = -9223372036854775808.0 // -2^63, exact
-		if math.IsNaN(val) || math.IsInf(val, 0) || val != math.Trunc(val) ||
-			val >= maxInt64Plus1 || val < minInt64AsFloat {
+		if val != math.Trunc(val) || val >= maxInt64Plus1 || val < minInt64AsFloat {
 			return 0, false
 		}
 		return int64(val), true

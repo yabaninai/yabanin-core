@@ -75,6 +75,8 @@ func TestAttributedCountFields(t *testing.T) {
 		{"NaN retry", "1", "NaN", int64(1), nil},
 		{"float64 NaN attempt", math.NaN(), "0", nil, nil},
 		{"float64 +Inf retry", "1", math.Inf(1), int64(1), nil},
+		{"float64 -Inf attempt", math.Inf(-1), "0", nil, nil},
+		{"float64 below -2^63 attempt", -9223372036854775810.0, float64(0), nil, nil},
 		{"out-of-range attempt string", "9223372036854775808", "0", nil, nil},
 		{"float64 2^63 overflow attempt", 9223372036854775808.0, float64(0), nil, nil},
 		{"empty strings", "", "", nil, nil},
