@@ -161,12 +161,13 @@ func TestIntegration_StoreOutage_DeniesNeverServesLastKnownLimit(t *testing.T) {
 	team := visibilitySeedTeam(t, pool, "vis-outage-"+uuid.NewString()[:8])
 
 	adminStore := adminstore.New(pool, slog.Default(), nil)
-	e := NewEnforcer(pool, slog.Default())
+	outagePool := testdb.PostgresPool(t, func(c *pgxpool.Config) { c.MaxConns = 1 })
+	e := NewEnforcer(outagePool, slog.Default())
 
 	require.NoError(t, adminStore.UpsertTeamBudget(ctx, team, 100.0, true))
 	require.NoError(t, e.CheckBudget(ctx, team), "preconditions: allowed under the live limit")
 
-	pool.Close() // the outage
+	outagePool.Close() // only this enforcer loses its database connections
 
 	err := e.CheckBudget(ctx, team)
 	require.ErrorIs(t, err, ErrBudgetUnavailable,
