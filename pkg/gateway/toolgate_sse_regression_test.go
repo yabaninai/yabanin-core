@@ -83,7 +83,7 @@ func sseChoiceByIndex(t *testing.T, doc map[string]any, want int) map[string]any
 	choices, _ := doc["choices"].([]any)
 	for pos, c := range choices {
 		choice, _ := c.(map[string]any)
-		idx := want
+		var idx int
 		if v, ok := choice["index"].(float64); ok {
 			idx = int(v)
 		} else {
