@@ -37,6 +37,13 @@ export function providerKeysLink(orgId: string): string {
 export function gatewayKeysLink(orgId: string): string {
   return `#keys?org=${encodeURIComponent(orgId)}`
 }
+
+// CUI-02 first-run defect (2026-11-20): step 3 also deep-links the budgets
+// screen — the first request needs a team budget or the gateway rejects it
+// with budget_not_configured (see pages/budgets/FirstTeamBudget.tsx).
+export function budgetsLink(orgId: string): string {
+  return `#budgets?org=${encodeURIComponent(orgId)}`
+}
 // UI-contract (CUI-02, owner correction 2026-11-20): the evidence identity is
 // the KNOWN setup request id — the X-Request-ID the operator's client sent
 // through the gateway, carried on the onboarding URL as an explicit `request`

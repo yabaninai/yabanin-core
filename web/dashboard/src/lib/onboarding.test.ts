@@ -1,7 +1,7 @@
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
 import {
-  ONBOARDING_CLIENTS, allStepsDone, clientConfigBlock, dashboardHomeLink,
+  ONBOARDING_CLIENTS, allStepsDone, budgetsLink, clientConfigBlock, dashboardHomeLink,
   firstRequestLink, firstRequestState, gatewayKeyState, gatewayKeysLink, isOnboardingClient, isRequestStats,
   providerKeyState, providerKeysLink,
   type OnboardingSignals,
@@ -25,6 +25,9 @@ test('allStepsDone: unknown (null) never counts as done', () => {
 test('deep links carry the org scope and the exact W-BYOK tab', () => {
   assert.equal(providerKeysLink('org 1'), '#org-settings?tab=provider-keys&org=org%201')
   assert.equal(gatewayKeysLink('org 1'), '#keys?org=org%201')
+  // CUI-02: step 3 also deep-links budgets — the first request needs a
+  // team budget or the gateway rejects it (budget_not_configured).
+  assert.equal(budgetsLink('org 1'), '#budgets?org=org%201')
 })
 test('firstRequestLink: the wizard links its KNOWN setup request, typed (CUI-02)', () => {
   // The identity is the URL `request` param (the X-Request-ID the operator's

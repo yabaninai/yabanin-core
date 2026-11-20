@@ -2,9 +2,10 @@ import type { ReactNode } from 'react'
 import { useTranslation } from 'react-i18next'
 import { CopyBlock } from '../../components/CopyBlock'
 import {
-  ONBOARDING_CLIENTS, clientConfigBlock, gatewayKeysLink, providerKeysLink,
+  ONBOARDING_CLIENTS, budgetsLink, clientConfigBlock, gatewayKeysLink, providerKeysLink,
   type OnboardingClient, type OnboardingSignals,
 } from '../../lib/onboarding'
+import { FirstTeamBudget } from '../budgets/FirstTeamBudget'
 import { StepHeader } from './StepHeader'
 
 // The first three welcome steps (org-scoped reads, visible to every
@@ -96,7 +97,8 @@ function ClientTabs({ client, setClient }: { client: OnboardingClient; setClient
 // confirms itself via the first-successful-request signal. The selected
 // client is page-level state so it survives a completed/pending view
 // flip exactly as before the split.
-export function ClientSetupStep({ state, evidence, client, setClient }: {
+export function ClientSetupStep({ org, state, evidence, client, setClient }: {
+  org: string
   state: boolean | null
   evidence: ReactNode
   client: OnboardingClient
@@ -129,6 +131,16 @@ export function ClientSetupStep({ state, evidence, client, setClient }: {
         })}
       />
       <p className="text-xs text-[color:var(--astra-text-muted)]">{t('welcome.baseUrlNote')}</p>
+      {/* CUI-02: without a team budget the first request is rejected 403
+          budget_not_configured — say so up front and deep-link the fix. */}
+      <p className="text-xs text-[color:var(--astra-text-muted)]" data-testid="welcome-step-budget-note">
+        {t('welcome.budgetNote')}{' '}
+        <a href={budgetsLink(org)} className="underline" data-testid="welcome-open-budgets">{t('welcome.openBudgets')}</a>
+      </p>
+      {/* The missing first-budget path itself: the write binds to the
+          setup key's server-set team, explicitly confirmed (see
+          pages/budgets/FirstTeamBudget.tsx). */}
+      <FirstTeamBudget org={org} />
     </li>
   )
 }
@@ -146,7 +158,7 @@ export function OnboardingSteps({ org, signals, evidence, client, setClient }: {
     <>
       <ProviderKeyStep org={org} state={signals.providerKey} />
       <GatewayKeyStep org={org} state={signals.gatewayKey} />
-      <ClientSetupStep state={signals.firstRequest} evidence={evidence} client={client} setClient={setClient} />
+      <ClientSetupStep org={org} state={signals.firstRequest} evidence={evidence} client={client} setClient={setClient} />
     </>
   )
 }
