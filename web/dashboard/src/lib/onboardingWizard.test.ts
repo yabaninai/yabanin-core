@@ -33,7 +33,17 @@ import {
 
 const here = dirname(fileURLToPath(import.meta.url))
 const repoRoot = join(here, '..', '..', '..', '..')
-const pageSource = readFileSync(join(here, '..', 'pages', 'OnboardingPage.tsx'), 'utf8')
+// The onboarding feature's scoped files in welcome-flow order: the page
+// composes the step views, the shared evidence control and the wizard
+// state machine from pages/onboarding/*, so the source-level pins below
+// read that same surface (nothing pinned was moved out of scope).
+const pageSource = [
+  'pages/OnboardingPage.tsx',
+  'pages/onboarding/OnboardingSteps.tsx',
+  'pages/onboarding/StepHeader.tsx',
+  'pages/onboarding/WizardSteps.tsx',
+  'pages/onboarding/useOnboardingWizard.ts',
+].map(rel => readFileSync(join(here, '..', rel), 'utf8')).join('\n')
 
 const UNKNOWN: WizardSignals = { residencyRegion: null, toolPolicyCount: null, packRegions: null }
 
@@ -340,7 +350,10 @@ describe('state matrix (design/wizard §3)', () => {
       'the profiles, defaults and review bodies are the only gated steps')
     assert.equal((pageSource.match(/<StateNotice state="partial" message=\{t\('welcome\.wizardRootOnly'\)\} \/>/g) ?? []).length, 3,
       'each gated step renders the honest partial note (never a hidden step)')
-    const firstThree = block('data-testid="welcome-step-provider"', 'data-testid="welcome-step-profiles"')
+    // Region boundary: with the step views in their own files, the slice
+    // runs from the provider <li> to the end of the client <li> (its last
+    // line) — the same steps-1–3 markup region this pin has always checked.
+    const firstThree = block('data-testid="welcome-step-provider"', "t('welcome.baseUrlNote')")
     assert.ok(!firstThree.includes('wizardRootBlocked'),
       'steps 1–3 are org-scoped reads — they must render for non-root operators too')
   })
