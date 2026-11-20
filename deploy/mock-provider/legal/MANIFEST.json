@@ -225,7 +225,7 @@
     },
     "NOTICE": {
       "project_path": "NOTICE",
-      "sha256": "7fe41781ae513a8bf66981d35dfa60349960d8f5a3d69543490f35cf3c6c1f7c"
+      "sha256": "27db5df06e37c4b983ed245e403914dc07b866969b16665445d9b10f832f3c61"
     },
     "notices/alpine-base/APKBUILD.txt": {
       "sha256": "8800c0afeb236224b14a6df19c797433a54c0d46a2a21f987bee43bf3efd0a9f",

@@ -1,10 +1,7 @@
 Yabanin Gateway
 Copyright 2026 Dmitry Lakhvich
 
-Project-authored code is licensed under the Apache License, Version 2.0.
-Files under the designated enterprise/ prefix carry their own proprietary
-terms in enterprise/LICENSE (owner decision D1 of November 2026; see LICENSING.md for the exact date)
-and are not covered by the root Apache-2.0 grant; every file outside that
-prefix stays Apache-2.0.
+Project-authored code is licensed under the Apache License, Version 2.0;
+see LICENSE and LICENSING.md for licensing and trademark notes.
 Third-party components retain their own copyright and license notices.
 This notice is not a complete third-party license bundle.
