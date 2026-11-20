@@ -108,6 +108,25 @@ test('explicit identity confirmation: high risk + entity=team id forces typing t
   assert.ok(src.includes('entity: selected.teamId'), 'confirmation requires typing the team id')
 })
 
+test('BLOCKER 1 fixed: the action UI is rendered, not just run', () => {
+  assert.ok(src.includes('{firstBudgetAction.ui}'), 'the dialog mounts — run() alone shows nothing in a real browser')
+})
+
+test('BLOCKER 2 fixed (source side): amount and typed entity are separate states in the shared dialog', () => {
+  const dialog = readFileSync(join(here, '..', '..', 'components', 'astra', 'ActionDialog.tsx'), 'utf8')
+  // the amount input keeps the shared value; the name input binds the
+  // separate name state when provided (two-field), falling back to the
+  // shared value otherwise (entity-only consumers unchanged).
+  assert.ok(dialog.includes('id="action-dialog-input"'), 'amount field id')
+  const nameInput = dialog.slice(dialog.indexOf('id="action-dialog-name"'), dialog.indexOf('id="action-dialog-name"') + 400)
+  assert.ok(nameInput.includes('nameBind.value'), 'name field binds the (possibly separate) name state')
+  // execute receives only the shared amount value; the typed name is
+  // never passed to execute in two-field mode.
+  assert.ok(dialog.includes('execute({ value: value.trim(), reason: reason.trim() })'), 'execute value is the amount field only')
+  assert.ok(dialog.includes("nameValue={pending.opts.input && pending.nameRequired ? name : undefined}"), 'separate name state is wired only for two-field actions')
+  // real-interaction coverage lives in components/astra/ActionDialog.test.ts
+})
+
 test('no bypass: root-only team enumeration never appears; no auto-provision or preseed', () => {
   assert.ok(!src.includes('listTeamsByOrg(') && !src.includes('listTeams('), 'must not use the root-only team enumeration')
   assert.ok(!src.includes("'/api/teams'"), 'must not call the root-only /api/teams')

@@ -161,6 +161,9 @@ export function FirstTeamBudget({ org }: { org: string }): ReactNode {
         disabled={!selected}
         onClick={openFirstBudget}
       >{t('budgets.firstSubmit')}</button>
+      {/* The dialog itself: run() only queues the action — without
+          rendering action.ui nothing appears (confirmed blocker 1). */}
+      {firstBudgetAction.ui}
     </div>
   )
 }
