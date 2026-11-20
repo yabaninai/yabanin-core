@@ -72,13 +72,18 @@ test('listProviderCredentials tolerates a {data:[…]} envelope and a junk body'
   assert.deepEqual(await listProviderCredentials('org-wbyok'), [])
 })
 
-test('createProviderCredential POSTs {name, provider, base_url, key} — key never in the URL', async () => {
+test('createProviderCredential POSTs {name, provider, base_url, api_key} — wire alias, key never in the URL', async () => {
   installFetch(csrfAware(call => {
     assert.equal(call.url, '/api/orgs/org-wbyok/provider-credentials')
     assert.equal(call.init.method, 'POST')
-    assert.deepEqual(JSON.parse(String(call.init.body)), {
-      name: 'prod-openai', provider: 'openai', base_url: 'https://api.example.com/v1', key: 'sk-secret-wbyok',
+    const body = JSON.parse(String(call.init.body)) as Record<string, unknown>
+    // The server strict-decodes api_key and 400s a literal `key` field
+    // (real browser evidence A/zz-error.png); the outbound JSON must carry
+    // the alias and must NOT contain the UI property name.
+    assert.deepEqual(body, {
+      name: 'prod-openai', provider: 'openai', base_url: 'https://api.example.com/v1', api_key: 'sk-secret-wbyok',
     })
+    assert.equal(Object.hasOwn(body, 'key'), false, 'outbound create JSON must not contain a key field')
     return { status: 201, body: CRED }
   }))
   const cred = await createProviderCredential('org-wbyok', {
@@ -104,7 +109,9 @@ test('updateProviderCredential sends a rotated key when present and URL-encodes 
   installFetch(csrfAware(call => {
     assert.equal(call.url, '/api/orgs/org-wbyok/provider-credentials/cred%2F1')
     assert.equal(call.init.method, 'PUT')
-    assert.deepEqual(JSON.parse(String(call.init.body)), { key: 'sk-rotated' })
+    const body = JSON.parse(String(call.init.body)) as Record<string, unknown>
+    assert.deepEqual(body, { api_key: 'sk-rotated' })
+    assert.equal(Object.hasOwn(body, 'key'), false, 'outbound update JSON must not contain a key field')
     return { status: 200, body: { ...CRED, key_version: 3 } }
   }))
   await updateProviderCredential('org-wbyok', 'cred/1', { key: 'sk-rotated' })
@@ -144,9 +151,9 @@ test('the module keeps no state between calls: a second create carries only its 
   await createProviderCredential('org-wbyok', { name: 'a', provider: 'openai', base_url: 'https://x', key: 'sk-first' })
   await createProviderCredential('org-wbyok', { name: 'b', provider: 'openai', base_url: 'https://x', key: 'sk-second' })
   assert.equal(postBodies.length, 2)
-  assert.equal((JSON.parse(postBodies[0]) as { key: string }).key, 'sk-first')
+  assert.equal((JSON.parse(postBodies[0]) as { api_key: string }).api_key, 'sk-first')
   assert.equal(
-    (JSON.parse(postBodies[1]) as { key: string }).key,
+    (JSON.parse(postBodies[1]) as { api_key: string }).api_key,
     'sk-second',
     'the first key must not leak into the second request',
   )
