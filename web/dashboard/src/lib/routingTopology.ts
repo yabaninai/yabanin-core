@@ -23,11 +23,24 @@ import {
   type GraphFocus, type GraphNode, type NodeBox, type RoutingGraph,
 } from './routingGraph.ts'
 
-export type TopoNodeKind = GraphNode['kind'] | 'provider'
+export type TopoNodeKind = GraphNode['kind'] | 'provider' | 'group'
 export type TopoEdgeKind = 'alias' | 'rule' | 'chain' | 'provider'
 export type TopoBand = 'alias' | 'rule' | 'model' | 'provider'
 
-export type TopoNode = Omit<GraphNode, 'kind'> & { kind: TopoNodeKind }
+/**
+ * A bounded mount's stand-in for one lane band's unmounted entries: the
+ * named, deterministic member list (content order) plus the exact count of
+ * edges hidden with them — nothing about the hidden entries is estimated.
+ */
+export interface GroupSummary {
+  band: TopoBand
+  /** Hidden member ids, content order — named, never anonymous. */
+  memberIds: string[]
+  /** Hidden edges attributed to this band (every hidden edge counts once). */
+  hiddenEdgeCount: number
+}
+
+export type TopoNode = Omit<GraphNode, 'kind'> & { kind: TopoNodeKind; group?: GroupSummary }
 
 export interface TopoEdge {
   id: string
@@ -55,7 +68,7 @@ export interface TopologyView {
 const PROVIDER = (name: string) => `provider:${name}`
 const MODEL = (name: string) => `model:${name}`
 
-const KIND_RANK: Record<TopoNodeKind, number> = { alias: 0, rule: 1, model: 2, missing: 3, provider: 4 }
+const KIND_RANK: Record<TopoNodeKind, number> = { alias: 0, rule: 1, model: 2, missing: 3, provider: 4, group: 5 }
 
 /** Content-based node order — stable when the API arrays are reordered. */
 function compareNodes(a: TopoNode, b: TopoNode): number {
@@ -94,14 +107,24 @@ function pushEdge(adjacency: Map<string, TopoEdge[]>, key: string, edge: TopoEdg
   if (!list.includes(edge)) list.push(edge)
 }
 
+// TopoNodeKind widens at the mount boundary (group summaries); this index
+// is pre-mount and never sees a group node, so narrow the kind to TopoBand.
+function bandIndex(nodes: TopoNode[]): Map<string, TopoBand> {
+  const bandOf = new Map<string, TopoBand>()
+  for (const n of nodes) {
+    if (n.kind === 'group') continue
+    bandOf.set(n.id, n.kind === 'missing' ? 'model' : n.kind)
+  }
+  return bandOf
+}
+
 export function buildTopology(map: RoutingMap): TopologyView {
   const graph = buildRoutingGraph(map)
   // Content-sorted so node order (paint order, DOM ids) is reorder-stable.
   const nodes: TopoNode[] = graph.nodes.map(n => ({ ...n })).sort(compareNodes)
   const providers = providerNodes(map)
   nodes.push(...providers)
-  const bandOf = new Map<string, TopoBand>()
-  for (const n of nodes) bandOf.set(n.id, n.kind === 'missing' ? 'model' : n.kind)
+  const bandOf = bandIndex(nodes)
 
   const edges: TopoEdge[] = graph.edges.map(e => ({ ...e }))
   for (const p of providers) {
@@ -222,7 +245,11 @@ const BAND_SEED: Record<'alias' | 'rule' | 'model', number> = { alias: 0, rule: 
 function seedDepths(view: TopologyView): Map<string, number> {
   const depth = new Map<string, number>()
   for (const n of view.nodes) {
-    depth.set(n.id, n.kind === 'provider' ? -1 : BAND_SEED[n.kind === 'missing' ? 'model' : n.kind])
+    // Seed by lane band, not kind: mounted views (mountTopology) add group
+    // summaries that must seat inside their members' band, and the band map
+    // already folds missing phantoms into the model band.
+    const band = view.bandOf.get(n.id) ?? 'model'
+    depth.set(n.id, band === 'provider' ? -1 : BAND_SEED[band])
   }
   return depth
 }
@@ -289,13 +316,15 @@ function placeLanes(ids: string[], x: number, boxes: Map<string, NodeBox>): [num
  * in the same column as a deep model).
  */
 function seatProviders(view: TopologyView, depth: Map<string, number>): void {
+  // Band-based (kind-based in spirit): group summaries belong to a lane and
+  // must not be mistaken for rightmost-lane providers.
   let deepest = 1
   for (const n of view.nodes) {
-    if (n.kind === 'provider') continue
+    if ((view.bandOf.get(n.id) ?? 'model') === 'provider') continue
     deepest = Math.max(deepest, depth.get(n.id) ?? 2)
   }
   for (const n of view.nodes) {
-    if (n.kind === 'provider') depth.set(n.id, deepest + 1)
+    if ((view.bandOf.get(n.id) ?? 'model') === 'provider') depth.set(n.id, deepest + 1)
   }
 }
 
@@ -378,4 +407,265 @@ export function missingTargetNames(map: RoutingMap): string[] {
   for (const a of map.aliases) noteMissing(missing, known, a.target_model)
   for (const r of map.rules) noteMissing(missing, known, r.target_model)
   return [...missing].sort((a, b) => a.localeCompare(b))
+}
+
+// ===== Bounded mount: everything exists, only the canvas is bounded =====
+//
+// The honest-scale contract for the visualizer: every configured entry
+// exists in the view model (exact totals), while the RENDERED canvas stays
+// bounded. mountTopology derives — BEFORE any render — which entries may
+// mount:
+//
+//  * ≤ limits.maxNodes node boxes (group summaries included) and
+//    ≤ limits.maxEdges edge paths;
+//  * every unmounted entry survives verbatim as a deterministic, NAMED
+//    group summary per lane band (member list in content order plus the
+//    exact hidden member and edge counts — nothing estimated, nothing
+//    anonymous);
+//  * selection is content-based, so reordering the API arrays moves
+//    nothing: each band contributes members in content order, bands
+//    interleave round-robin (alias, rule, model, provider) so no lane is
+//    decapitated, and the last-added entry retires first when a budget is
+//    exceeded. Expanding a band group (`group:<band>`) reprioritizes that
+//    band's hidden members under the SAME budgets — the named expansion.
+//    The operator's selection is PINNED ahead of its band: an entry found
+//    via search stays mounted as the query clears or broadens — a bounded
+//    mount never evicts the inspected entry. An active search shrinks the
+//    candidate pool to the focus (matches + 1-hop context) BEFORE
+//    bounding, so a query reduces what mounts instead of merely dimming
+//    it.
+
+export interface MountLimits { maxNodes: number; maxEdges: number }
+
+/** Bounded-mount budgets for the rendered canvas: ≤200 nodes / ≤400 edges. */
+export const MOUNT_LIMITS: MountLimits = { maxNodes: 200, maxEdges: 400 }
+
+export interface MountSelection {
+  /** Active-search focus (matches + 1-hop context) over the FULL view. */
+  focusIds: Set<string>
+  /** True while a search query is active — the pool shrinks to the focus. */
+  queryActive: boolean
+  /** The selected node stays mounted (a selection must stay inspectable). */
+  selectedId: string | null
+  /** `group:<band>` whose hidden members this mount reprioritizes. */
+  expandedGroupId: string | null
+}
+
+export interface MountedTopology {
+  /** What renders: kept nodes + group summaries, and kept edges. */
+  view: TopologyView
+  /** Group node id → its named members and hidden-edge count. */
+  groups: Map<string, GroupSummary>
+  /** Exact FULL totals — the count chip and the canvas aria carry these. */
+  totals: { nodes: number; edges: number }
+  /** True when any grouping happened (false = the untouched base view). */
+  grouped: boolean
+}
+
+const BAND_ORDER: TopoBand[] = ['alias', 'rule', 'model', 'provider']
+
+/** The candidate pool: under an active query only the focus (plus the
+ * current selection) may mount — a search reduces the mount, it never
+ * merely dims it. */
+function mountPool(view: TopologyView, sel: MountSelection): TopoNode[] {
+  if (!sel.queryActive) return view.nodes
+  return view.nodes.filter(n => sel.focusIds.has(n.id) || n.id === sel.selectedId)
+}
+
+/** Per-band candidate lists in content order (missing phantoms fold into the model band). */
+function bandListsFor(pool: TopoNode[], bandOf: Map<string, TopoBand>): Map<TopoBand, string[]> {
+  const lists = new Map<TopoBand, string[]>(BAND_ORDER.map(band => [band, [] as string[]]))
+  for (const n of pool) {
+    lists.get(bandOf.get(n.id) ?? 'model')!.push(n.id)
+  }
+  return lists
+}
+
+/** Round-robin seats across the bands (alias, rule, model, provider),
+ * content order inside each band, capped at the node budget — bands
+ * interleave so no lane is decapitated. */
+function allocateRounds(lists: Map<TopoBand, string[]>, maxNodes: number): string[] {
+  const seq: string[] = []
+  const widest = Math.max(0, ...BAND_ORDER.map(band => lists.get(band)!.length))
+  for (let round = 0; round < widest; round++) {
+    for (const band of BAND_ORDER) {
+      const row = lists.get(band)!
+      if (round < row.length && seq.length < maxNodes) seq.push(row[round]!)
+    }
+  }
+  return seq
+}
+
+/** How many edges have BOTH endpoints kept — what still renders. */
+function edgesWithin(view: TopologyView, kept: Set<string>): number {
+  let count = 0
+  for (const e of view.edges) {
+    if (kept.has(e.from) && kept.has(e.to)) count++
+  }
+  return count
+}
+
+/** Bands that still hide members under `kept` — each needs a group
+ * summary, and group summaries count toward the node budget. */
+function hiddenBandCount(lists: Map<TopoBand, string[]>, kept: Set<string>): number {
+  let count = 0
+  for (const band of BAND_ORDER) {
+    if (lists.get(band)!.some(id => !kept.has(id))) count++
+  }
+  return count
+}
+
+/** Tail-retirement: the LAST-ADDED seats retire first until BOTH budgets
+ * fit. A pinned or expanded priority sits at the head, never at the tail,
+ * so it never retires. */
+function retireToFit(seq: string[], kept: Set<string>, lists: Map<TopoBand, string[]>, view: TopologyView, limits: MountLimits): void {
+  while (seq.length > 0
+    && (seq.length + hiddenBandCount(lists, kept) > limits.maxNodes || edgesWithin(view, kept) > limits.maxEdges)) {
+    kept.delete(seq.pop()!)
+  }
+}
+
+/** Round-robin allocation under both budgets: seats first, tail-retirement
+ * second. Deterministic in the list orders and the budgets alone. */
+function allocateBounded(lists: Map<TopoBand, string[]>, view: TopologyView, limits: MountLimits): Set<string> {
+  const seq = allocateRounds(lists, limits.maxNodes)
+  const kept = new Set(seq)
+  retireToFit(seq, kept, lists, view, limits)
+  return kept
+}
+
+/** The band whose group the operator expanded (never under an active
+ * query — the query already shrinks the pool). */
+function expandedBandOf(sel: MountSelection): TopoBand | null {
+  const id = sel.expandedGroupId
+  if (sel.queryActive || id === null) return null
+  const band = id.slice('group:'.length) as TopoBand
+  return BAND_ORDER.includes(band) ? band : null
+}
+
+/** The operator's selection, pinned: a selected real entry (never a group
+ * stand-in) is seated first in its band — no bounded mount may evict it,
+ * so clearing or broadening a search never loses the inspected entry. */
+function pinnedId(view: TopologyView, sel: MountSelection): string | null {
+  const id = sel.selectedId
+  if (id === null || id.startsWith('group:')) return null
+  return view.bandOf.has(id) ? id : null
+}
+
+/** The band's priority order: the pinned selection first, then the
+ * expanded band's hidden members (relative to the DEFAULT mount's post-fit
+ * kept set), then the rest — content order preserved inside each tier.
+ * Rotation changes WHO mounts, never the naming order. */
+function priorityOrder(list: string[], pinned: string | null, expanded: boolean, defaultKept: Set<string>): string[] {
+  const head = pinned === null ? [] : [pinned]
+  if (expanded) head.push(...list.filter(id => !defaultKept.has(id)))
+  const prioritized = (id: string): boolean => id === pinned || (expanded && !defaultKept.has(id))
+  return [...head, ...list.filter(id => !prioritized(id))]
+}
+
+/** Re-allocate under the SAME budgets with the mount's priorities
+ * applied: the pinned selection, then the named expansion. */
+function boundedWithPriority(lists: Map<TopoBand, string[]>, view: TopologyView, limits: MountLimits, sel: MountSelection, defaultKept: Set<string>): Set<string> {
+  const expanded = expandedBandOf(sel)
+  const pinned = pinnedId(view, sel)
+  if (expanded === null && pinned === null) return defaultKept
+  // The pin belongs to exactly ONE band — the band lists partition the
+  // pool, so seating the selection anywhere else would double-book the
+  // node budget and evict real entries. (Regression: the pin used to be
+  // prepended to every band list, seating one id four times.)
+  const pinnedBand = pinned === null ? null : view.bandOf.get(pinned) ?? 'model'
+  const prioritized = new Map(lists)
+  for (const band of BAND_ORDER) {
+    prioritized.set(band, priorityOrder(lists.get(band)!, band === pinnedBand ? pinned : null, band === expanded, defaultKept))
+  }
+  return allocateBounded(prioritized, view, limits)
+}
+
+/** Group summaries: hidden members NAMED in content order, one per band
+ * that keeps members hidden. */
+function collectGroups(lists: Map<TopoBand, string[]>, kept: Set<string>): Map<string, GroupSummary> {
+  const groups = new Map<string, GroupSummary>()
+  for (const band of BAND_ORDER) {
+    const hidden = lists.get(band)!.filter(id => !kept.has(id))
+    if (hidden.length > 0) groups.set(`group:${band}`, { band, memberIds: hidden, hiddenEdgeCount: 0 })
+  }
+  return groups
+}
+
+/** The hidden endpoint's band: the target if hidden, else the source
+ * (missing phantoms fold into the model band). */
+function hiddenEndpointBand(e: TopoEdge, kept: Set<string>, bandOf: Map<string, TopoBand>): TopoBand {
+  const hidden = kept.has(e.to) ? e.from : e.to
+  return bandOf.get(hidden) ?? 'model'
+}
+
+/** A pool-internal edge: BOTH endpoints are mount candidates. An edge an
+ * ACTIVE QUERY filtered out (an endpoint outside the pool) is hidden by
+ * SEARCH, not by grouping — it is never a candidate for attribution. */
+function poolInternal(e: TopoEdge, poolIds: Set<string>): boolean {
+  return poolIds.has(e.from) && poolIds.has(e.to)
+}
+
+/** Attribute every pool-internal hidden edge exactly once — to the band of
+ * the hidden `to` if any, else the band of the hidden `from`. That band
+ * always has a group when the edge is hidden by the budget (query-only
+ * hiding is not grouping and stays uncounted). */
+function attributeHiddenEdges(view: TopologyView, kept: Set<string>, groups: Map<string, GroupSummary>, poolIds: Set<string>): void {
+  for (const e of view.edges) {
+    if (!poolInternal(e, poolIds)) continue
+    if (kept.has(e.from) && kept.has(e.to)) continue
+    const group = groups.get(`group:${hiddenEndpointBand(e, kept, view.bandOf)}`)
+    if (group !== undefined) group.hiddenEdgeCount++
+  }
+}
+
+/** Group stand-in nodes: labeled first…last in content order, carrying the named summary. */
+function groupNodes(groups: Map<string, GroupSummary>, byId: Map<string, TopoNode>): TopoNode[] {
+  return [...groups.entries()].map(([gid, group]) => {
+    const first = byId.get(group.memberIds[0]!)!
+    const last = byId.get(group.memberIds[group.memberIds.length - 1]!)!
+    return {
+      id: gid,
+      kind: 'group' as const,
+      label: group.memberIds.length === 1 ? first.label : `${first.label}…${last.label}`,
+      sublabel: '',
+      enabled: true,
+      warningCodes: [],
+      group,
+    }
+  })
+}
+
+export function mountTopology(view: TopologyView, sel: MountSelection, limits: MountLimits = MOUNT_LIMITS): MountedTopology {
+  const totals = { nodes: view.nodes.length, edges: view.edges.length }
+  const byId = new Map(view.nodes.map(n => [n.id, n]))
+
+  // The candidate pool, then the budgets. A pool inside both budgets
+  // renders verbatim — the baseline small graph and every focused search
+  // result mount untouched, with no grouping at all.
+  const pool = mountPool(view, sel)
+  const lists = bandListsFor(pool, view.bandOf)
+  const poolIds = new Set(pool.map(n => n.id))
+  let kept = new Set(poolIds)
+  if (pool.length > limits.maxNodes || edgesWithin(view, kept) > limits.maxEdges) {
+    const defaultKept = allocateBounded(lists, view, limits)
+    kept = boundedWithPriority(lists, view, limits, sel, defaultKept)
+  }
+  const groups = collectGroups(lists, kept)
+  attributeHiddenEdges(view, kept, groups, poolIds)
+
+  // The mounted view: kept nodes in content order, then the group
+  // summaries — layout, DOM ids and keyboard focus see ONLY this view, so
+  // the canvas can never mount more than the budgets allow.
+  const bandOf = new Map(view.bandOf)
+  for (const [gid, group] of groups) bandOf.set(gid, group.band)
+  const nodes: TopoNode[] = view.nodes.filter(n => kept.has(n.id))
+  nodes.push(...groupNodes(groups, byId))
+  const edges = view.edges.filter(e => kept.has(e.from) && kept.has(e.to))
+  return {
+    view: { graph: view.graph, nodes, edges, adjacency: indexAdjacency(edges), bandOf },
+    groups,
+    totals,
+    grouped: groups.size > 0,
+  }
 }
