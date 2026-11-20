@@ -291,7 +291,7 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
         <MatchCount view={view} query={query} matched={focus.matchedIds.size} noMatches={focus.noMatches} />
       </div>
 
-      <div className="flex flex-wrap items-start gap-4">
+      <div className="flex flex-col items-stretch gap-4 md:flex-row md:flex-wrap md:items-start">
         <div className="max-w-full min-w-0 flex-1 overflow-auto rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule)] p-1">
           <TopologyCanvas
             view={mount.view}
