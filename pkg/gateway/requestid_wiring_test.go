@@ -48,7 +48,9 @@ func startReqidUpstream(t *testing.T) *reqidRecordingUpstream {
 		u.ids = append(u.ids, id)
 		u.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
-		fmt.Fprint(w, `{"id":"reqid-up","object":"chat.completion","model":"stub-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
+		if _, err := fmt.Fprint(w, `{"id":"reqid-up","object":"chat.completion","model":"stub-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`); err != nil {
+			t.Errorf("write upstream completion: %v", err)
+		}
 	}))
 	t.Cleanup(u.srv.Close)
 	return u
@@ -87,8 +89,8 @@ func reqidUnitServer(t *testing.T, u *reqidRecordingUpstream) *httptest.Server {
 }
 
 // reqidUnitPost drives a real HTTP client POST /v1/chat/completions with the
-// given request ID ("" = header absent). Returns the response (body drained).
-func reqidUnitPost(t *testing.T, srv *httptest.Server, requestID string) *http.Response {
+// given request ID ("" = header absent). Returns the status and echoed request ID.
+func reqidUnitPost(t *testing.T, srv *httptest.Server, requestID string) (int, string) {
 	t.Helper()
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
 		srv.URL+"/v1/chat/completions",
@@ -101,11 +103,11 @@ func reqidUnitPost(t *testing.T, srv *httptest.Server, requestID string) *http.R
 	}
 	resp, err := srv.Client().Do(req)
 	require.NoError(t, err)
+	defer func() { assert.NoError(t, resp.Body.Close()) }()
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
-	_ = resp.Body.Close()
 	t.Logf("POST /v1/chat/completions request-id=%q -> %d %s", requestID, resp.StatusCode, body)
-	return resp
+	return resp.StatusCode, resp.Header.Get("X-Request-ID")
 }
 
 // REQID-U1: a client-supplied X-Request-ID is echoed on the response
@@ -116,9 +118,9 @@ func TestRequestIDWiring_ClientIDEchoedAndPropagated(t *testing.T) {
 	srv := reqidUnitServer(t, u)
 	const clientID = "reqid-unit-client-7f3a2b"
 
-	resp := reqidUnitPost(t, srv, clientID)
-	require.Equal(t, http.StatusOK, resp.StatusCode)
-	require.Equal(t, clientID, resp.Header.Get("X-Request-ID"),
+	status, echoed := reqidUnitPost(t, srv, clientID)
+	require.Equal(t, http.StatusOK, status)
+	require.Equal(t, clientID, echoed,
 		"the production chain must echo the client's X-Request-ID verbatim")
 
 	ids := u.requestIDs()
@@ -134,9 +136,8 @@ func TestRequestIDWiring_GeneratedWhenAbsent(t *testing.T) {
 	u := startReqidUpstream(t)
 	srv := reqidUnitServer(t, u)
 
-	resp1 := reqidUnitPost(t, srv, "")
-	require.Equal(t, http.StatusOK, resp1.StatusCode)
-	id1 := resp1.Header.Get("X-Request-ID")
+	status, id1 := reqidUnitPost(t, srv, "")
+	require.Equal(t, http.StatusOK, status)
 	require.NotEmpty(t, id1, "an ID must be generated when the client sends none")
 	assert.True(t, strings.HasPrefix(id1, "req_"),
 		"generated IDs use the requestid package format, got %q", id1)
@@ -144,9 +145,8 @@ func TestRequestIDWiring_GeneratedWhenAbsent(t *testing.T) {
 	require.NotEmpty(t, ids)
 	assert.Equal(t, id1, ids[len(ids)-1], "the upstream hop must carry the generated ID")
 
-	resp2 := reqidUnitPost(t, srv, "")
-	require.Equal(t, http.StatusOK, resp2.StatusCode)
-	id2 := resp2.Header.Get("X-Request-ID")
+	status, id2 := reqidUnitPost(t, srv, "")
+	require.Equal(t, http.StatusOK, status)
 	require.NotEmpty(t, id2)
 	assert.NotEqual(t, id1, id2, "distinct requests must not share a generated ID")
 }
