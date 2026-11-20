@@ -23,8 +23,12 @@ import (
 
 // fuzzPolicyLoader serves static policy sets per org: org-deny denies
 // "secret_tool", org-args denies "forbidden" arguments on "safe_tool",
-// org-a2a denies "a2a:alpha", org-builtin denies "yabanin:web_fetch".
-// Every other org resolves to no rows (implicit allow-all).
+// org-a2a denies "a2a:alpha", org-builtin denies "yabanin:web_fetch",
+// org-fetch keys the forbidden-argument guard to the builtin executor's
+// web_fetch, and org-name01 adds a weak allowed first name (shim_tool,
+// no argument rules) beside that strict executable web_fetch for the
+// SSE-NAME-01 conflicting-declaration legs. Every other org resolves to
+// no rows (implicit allow-all).
 type fuzzPolicyLoader struct{}
 
 func (fuzzPolicyLoader) ListEnabled(_ context.Context, orgID string) ([]toolpolicy.Policy, error) {
@@ -61,6 +65,20 @@ func (fuzzPolicyLoader) ListEnabled(_ context.Context, orgID string) ([]toolpoli
 			{ID: "f0", OrgID: orgID, Name: "deny-never", Subject: "*", Server: "*",
 				Tool: "never_tool", Action: toolpolicy.ActionDeny, Enabled: true},
 			{ID: "f1", OrgID: orgID, Name: "fetch-args", Subject: "*", Server: "*",
+				Tool: "web_fetch", Action: toolpolicy.ActionAllow, Enabled: true,
+				Rules: json.RawMessage(`{"args":{"deny_regex":["forbidden"]}}`)},
+		}, nil
+	case "org-name01":
+		// SSE-NAME-01: secret_tool denied (also the gate-activating marker),
+		// shim_tool allowed with no argument rules (weak first name), and
+		// web_fetch allowed with the forbidden-argument deny_regex (strict
+		// executable final name).
+		return []toolpolicy.Policy{
+			{ID: "m0", OrgID: orgID, Name: "deny-secret", Subject: "*", Server: "*",
+				Tool: "secret_tool", Action: toolpolicy.ActionDeny, Enabled: true},
+			{ID: "m1", OrgID: orgID, Name: "shim-allow", Subject: "*", Server: "*",
+				Tool: "shim_tool", Action: toolpolicy.ActionAllow, Enabled: true},
+			{ID: "m2", OrgID: orgID, Name: "fetch-args", Subject: "*", Server: "*",
 				Tool: "web_fetch", Action: toolpolicy.ActionAllow, Enabled: true,
 				Rules: json.RawMessage(`{"args":{"deny_regex":["forbidden"]}}`)},
 		}, nil
@@ -384,8 +402,13 @@ func fuzzTG09(t *testing.T) {
 	if got := string(declaredArgs(map[string]any{"arguments": map[string]any{"b": 2.0}})); got != `{"b":2}` {
 		t.Fatalf("TG-09: map normalize → %q", got)
 	}
-	if got := string(declaredArgs(map[string]any{"arguments": 3.5})); got != "{}" {
+	// TG-09 (SSE-DECL-01 correction of the former "{}" pin): any other
+	// JSON value serializes as the consumer receives it.
+	if got := string(declaredArgs(map[string]any{"arguments": 3.5})); got != "3.5" {
 		t.Fatalf("TG-09: other type → %q", got)
+	}
+	if got := string(declaredArgs(map[string]any{"arguments": []any{"a"}})); got != `["a"]` {
+		t.Fatalf("TG-09: array form → %q", got)
 	}
 }
 

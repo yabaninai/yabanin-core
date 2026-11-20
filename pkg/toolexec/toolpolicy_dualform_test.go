@@ -254,17 +254,19 @@ func (g *outageGuard) GuardResult(_ context.Context, _, _, server, tool string, 
 }
 
 // outageBlocked drives the REAL ExecuteGuarded path against the counting
-// loopback upstream under the scripted guard and reports whether the call
-// was refused (tool_blocked) and how many upstream egresses happened.
-func outageBlocked(t *testing.T, g *outageGuard) (blocked bool, egress int32) {
+// loopback upstream under the scripted guard and reports the typed refusal
+// code ("" when the call was not refused) and the upstream egress count.
+func outageBlocked(t *testing.T, g *outageGuard) (code string, egress int32) {
 	t.Helper()
 	up := newGuardUpstream(t)
 	x := NewExecutor(NewDefaultConfig(), nil, nil).WithToolGuard(g)
 	_, err := x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
 		json.RawMessage(`{"url":"`+up.URL+`"}`))
 	var eErr *ExecError
-	blocked = errors.As(err, &eErr) && eErr.Code == ErrCodeToolBlocked
-	return blocked, up.calls.Load()
+	if errors.As(err, &eErr) {
+		code = eErr.Code
+	}
+	return code, up.calls.Load()
 }
 
 // DG-OUTAGE-BARE-DENY / DG-OUTAGE-PREFIXED-DENY: a deny under one form plus
@@ -283,9 +285,9 @@ func TestE2E_DualFormDenyPlusLoaderOutageBothOrders(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			blocked, egress := outageBlocked(t, tc.g)
-			if !blocked {
-				t.Fatalf("%s: deny under one form + outage under the other must return tool_blocked", tc.name)
+			code, egress := outageBlocked(t, tc.g)
+			if code != ErrCodeToolBlocked {
+				t.Fatalf("%s: deny under one form + outage under the other must return tool_blocked, got %q", tc.name, code)
 			}
 			if egress != 0 {
 				t.Fatalf("%s: refused call must reach the upstream zero times, got %d", tc.name, egress)
@@ -294,16 +296,17 @@ func TestE2E_DualFormDenyPlusLoaderOutageBothOrders(t *testing.T) {
 	}
 }
 
-// DG-OUTAGE-FAILOPEN: with an outage under every form and NO deny anywhere
-// (deny sentinel matches no tool), the intended fail-open Degraded posture
-// is preserved — the call proceeds (one egress) instead of being blocked.
-func TestE2E_DualFormLoaderOutageFailOpen(t *testing.T) {
+// DG-OUTAGE-FAILCLOSED: with an outage under every form and NO deny
+// anywhere (deny sentinel matches no tool), the indeterminate verdict is
+// refused with the typed policy-unavailable error and ZERO egress — an
+// unresolved permit never dispatches.
+func TestE2E_DualFormLoaderOutageFailsClosed(t *testing.T) {
 	g := &outageGuard{denyTool: "__no_deny__", outageTool: ""}
-	blocked, egress := outageBlocked(t, g)
-	if blocked {
-		t.Fatal("DG-OUTAGE-FAILOPEN: outage without any deny must not block (fail-open Degraded)")
+	code, egress := outageBlocked(t, g)
+	if code != ErrCodePolicyUnavailable {
+		t.Fatalf("DG-OUTAGE-FAILCLOSED: all-form outage must refuse as policy_unavailable, got %q", code)
 	}
-	if egress != 1 {
-		t.Fatalf("DG-OUTAGE-FAILOPEN: the call must run exactly once, got %d", egress)
+	if egress != 0 {
+		t.Fatalf("DG-OUTAGE-FAILCLOSED: refused call must reach the upstream zero times, got %d", egress)
 	}
 }

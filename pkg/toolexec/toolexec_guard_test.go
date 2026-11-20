@@ -176,15 +176,22 @@ func TestExecuteGuarded_ResultMask(t *testing.T) {
 	}
 }
 
-// TestExecuteGuarded_DegradedCountsError: a fail-open org outage proceeds
-// unguarded but counts as an error decision, never an allow.
-func TestExecuteGuarded_DegradedCountsError(t *testing.T) {
+// TestExecuteGuarded_DegradedRefusesTyped: an indeterminate (degraded)
+// org outage is not a permit — the call is refused with the typed
+// policy-unavailable error and never egresses, while the decision counter
+// still records exactly one error decision, never an allow.
+func TestExecuteGuarded_DegradedRefusesTyped(t *testing.T) {
 	up := newGuardUpstream(t)
 	g := &fakeToolGuard{args: toolpolicy.ArgsReport{Degraded: true}}
 	x := NewExecutor(NewDefaultConfig(), nil, nil).WithToolGuard(g)
-	if _, err := x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
-		json.RawMessage(`{"url":"`+up.URL+`"}`)); err != nil {
-		t.Fatalf("degraded must proceed: %v", err)
+	_, err := x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
+		json.RawMessage(`{"url":"`+up.URL+`"}`))
+	var eErr *ExecError
+	if !errors.As(err, &eErr) || eErr.Code != ErrCodePolicyUnavailable {
+		t.Fatalf("degraded must refuse as policy_unavailable, got %v", err)
+	}
+	if n := up.calls.Load(); n != 0 {
+		t.Fatalf("degraded refusal must never egress, got %d", n)
 	}
 	if d := decisionDelta(t, "org-1", ToolWebFetch, "error", func() {
 		_, _ = x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,

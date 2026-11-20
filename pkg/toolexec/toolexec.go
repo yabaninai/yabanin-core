@@ -124,13 +124,14 @@ func (e *ExecError) Error() string { return e.Code + ": " + e.Message }
 
 // Error codes (the gateway maps them to HTTP statuses).
 const (
-	ErrCodeNotFound    = "not_found"    // unknown builtin tool → 404
-	ErrCodeDenied      = "denied"       // guard hook deny → 409
-	ErrCodeSSRF        = "ssrf_blocked" // target failed the guard → 400
-	ErrCodeUpstream    = "upstream"     // fetch failed / bad status → 502
-	ErrCodeTimeout     = "timeout"      // 504
-	ErrCodeBadReq      = "bad_request"  // malformed params → 400
-	ErrCodeToolBlocked = "tool_blocked" // OP-6 toolpolicy guard deny → 400
+	ErrCodeNotFound          = "not_found"          // unknown builtin tool → 404
+	ErrCodeDenied            = "denied"             // guard hook deny → 409
+	ErrCodeSSRF              = "ssrf_blocked"       // target failed the guard → 400
+	ErrCodeUpstream          = "upstream"           // fetch failed / bad status → 502
+	ErrCodeTimeout           = "timeout"            // 504
+	ErrCodeBadReq            = "bad_request"        // malformed params → 400
+	ErrCodeToolBlocked       = "tool_blocked"       // OP-6 toolpolicy guard deny → 400
+	ErrCodePolicyUnavailable = "policy_unavailable" // indeterminate policy verdict before dispatch → 503
 )
 
 // Result is the successful execution outcome returned to the caller.
@@ -159,8 +160,11 @@ func (x *Executor) Execute(ctx context.Context, tool string, params json.RawMess
 // ExecuteGuarded runs one built-in tool call under the attached OP-6
 // the EFFECTIVE tool name (http_request composes http_<method>), so a deny
 // decision or an args rule (schema / max_bytes / deny_regex) blocks the call
-// with tool_blocked and it never reaches the tool — and the post-egress
-// GuardResult folds over the serialized body (mask rewrites it, deny drops
+// with tool_blocked and it never reaches the tool; an indeterminate
+// (degraded) args verdict refuses the same way as policy_unavailable,
+// because an unresolved permit never dispatches a server-side network
+// tool (TOOL-DEGRADED-01). The post-egress GuardResult folds over the
+// serialized body (mask rewrites it, deny drops
 // the result; the call itself already ran, the mcpagg parity). Decision
 // outcomes are counted on the shared toolpolicy decision counter
 // (server = "yabanin", tool = the effective name). The identity comes from
@@ -179,8 +183,8 @@ func (x *Executor) ExecuteGuarded(ctx context.Context, orgID, subject, tool stri
 		return x.Execute(ctx, tool, params)
 	}
 	rep := x.guardArgsFor(ctx, orgID, subject, effective, params)
-	if x.argsBlocked(orgID, effective, rep) {
-		return nil, &ExecError{Code: ErrCodeToolBlocked, Message: rep.Reason}
+	if err := x.argsRefusal(orgID, effective, rep); err != nil {
+		return nil, err
 	}
 	res, err := x.Execute(ctx, tool, params)
 	if err != nil {
@@ -193,20 +197,24 @@ func (x *Executor) ExecuteGuarded(ctx context.Context, orgID, subject, tool stri
 	return res, nil
 }
 
-// argsBlocked counts the merged args verdict on the shared decision counter
-// (degraded > deny > allow, the base metric semantics) and reports whether
-// the call is blocked before egress.
-func (x *Executor) argsBlocked(orgID, effective string, rep toolpolicy.ArgsReport) bool {
+// argsRefusal counts the merged args verdict on the shared decision counter
+// (the outcome rides the refusal: deny, error, allow) and returns the
+// pre-egress refusal, if any: a determinate deny refuses as tool_blocked,
+// and a degraded verdict — an indeterminate loader outage — fails CLOSED
+// with the typed policy-unavailable refusal, because an unresolved permit
+// never dispatches a server-side network tool (TOOL-DEGRADED-01).
+func (x *Executor) argsRefusal(orgID, effective string, rep toolpolicy.ArgsReport) *ExecError {
 	switch {
-	case rep.Degraded:
-		metricToolPolicy(orgID, effective, "error")
 	case rep.Denied:
 		metricToolPolicy(orgID, effective, "deny")
-		return true
+		return &ExecError{Code: ErrCodeToolBlocked, Message: rep.Reason}
+	case rep.Degraded:
+		metricToolPolicy(orgID, effective, "error")
+		return &ExecError{Code: ErrCodePolicyUnavailable, Message: rep.Reason}
 	default:
 		metricToolPolicy(orgID, effective, "allow")
+		return nil
 	}
-	return false
 }
 
 // applyResultGuard counts the merged result verdict and applies it to res:

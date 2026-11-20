@@ -14,6 +14,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"math"
 	"net/http"
 	"net/url"
 	"strings"
@@ -44,6 +45,66 @@ func agentSubject(r *http.Request) string {
 // gateToolCallsJSON filters a non-stream chat completion response. Returns
 // the (possibly rewritten) body and the denied tool names. Byte-identity is
 // preserved when nothing is denied.
+func (gw *gateway) filterToolCall(ctx context.Context, orgID, subject string, raw any) (keep bool, denied string, changed bool) {
+	call, _ := raw.(map[string]any)
+	fn, _ := call["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	if name == "" {
+		// Contentless wire skeletons are inert; argument-bearing nameless calls
+		// are ambiguous declarations and fail closed.
+		if string(declaredArgs(fn)) != "{}" {
+			return false, "", true
+		}
+		return true, "", false
+	}
+	if d := gw.toolPolicies.Decide(ctx, orgID, subject, name); d.Action == toolpolicy.ActionDeny {
+		return false, name, true
+	}
+	if rep := gw.toolPolicies.GuardDeclaredArgs(ctx, orgID, subject, name, declaredArgs(fn)); rep.Denied {
+		return false, name, true
+	}
+	return true, "", false
+}
+
+func (gw *gateway) filterToolCallMessage(ctx context.Context, orgID, subject string, choice map[string]any, denied *[]string) bool {
+	msg, _ := choice["message"].(map[string]any)
+	if msg == nil {
+		return false
+	}
+	calls, _ := msg["tool_calls"].([]any)
+	if len(calls) == 0 {
+		return false
+	}
+	kept := make([]any, 0, len(calls))
+	changed := false
+	for _, raw := range calls {
+		keep, name, drop := gw.filterToolCall(ctx, orgID, subject, raw)
+		if drop {
+			changed = true
+			if name != "" {
+				*denied = append(*denied, name)
+				metrics.ToolPolicyDeniedTotal.WithLabelValues(orgID, name).Inc()
+			}
+			continue
+		}
+		if keep {
+			kept = append(kept, raw)
+		}
+	}
+	if !changed {
+		return false
+	}
+	if len(kept) > 0 {
+		msg["tool_calls"] = kept
+		return true
+	}
+	delete(msg, "tool_calls")
+	if reason, _ := choice["finish_reason"].(string); reason == "tool_calls" {
+		choice["finish_reason"] = "stop"
+	}
+	return true
+}
+
 func (gw *gateway) gateToolCallsJSON(ctx context.Context, orgID, subject string, resp []byte) ([]byte, []string) {
 	if gw.toolPolicies == nil || !gw.toolPolicies.HasDenyPolicies(ctx, orgID) {
 		return resp, nil
@@ -55,57 +116,10 @@ func (gw *gateway) gateToolCallsJSON(ctx context.Context, orgID, subject string,
 	choices, _ := doc["choices"].([]any)
 	var denied []string
 	changed := false
-	for _, c := range choices {
-		choice, _ := c.(map[string]any)
-		if choice == nil {
-			continue
-		}
-		msg, _ := choice["message"].(map[string]any)
-		if msg == nil {
-			continue
-		}
-		calls, _ := msg["tool_calls"].([]any)
-		if len(calls) == 0 {
-			continue
-		}
-		kept := make([]any, 0, len(calls))
-		for _, cl := range calls {
-			call, _ := cl.(map[string]any)
-			fn, _ := call["function"].(map[string]any)
-			name, _ := fn["name"].(string)
-			if name == "" {
-				kept = append(kept, cl)
-				continue
-			}
-			if d := gw.toolPolicies.Decide(ctx, orgID, subject, name); d.Action == toolpolicy.ActionDeny {
-				denied = append(denied, name)
-				changed = true
-				metrics.ToolPolicyDeniedTotal.WithLabelValues(orgID, name).Inc()
-				continue
-			}
-			// call run through the chat-path args guard too — a client-side
-			// executor must not receive a call whose args violate the org's
-			// rules. Degraded (fail-open org outage) keeps the call: the
-			// response surface's pinned fail-open posture.
-			if rep := gw.toolPolicies.GuardDeclaredArgs(ctx, orgID, subject, name, declaredArgs(fn)); rep.Denied {
-				denied = append(denied, name)
-				changed = true
-				metrics.ToolPolicyDeniedTotal.WithLabelValues(orgID, name).Inc()
-				continue
-			}
-			kept = append(kept, cl)
-		}
-		if changed {
-			if len(kept) == 0 {
-				delete(msg, "tool_calls")
-				// No calls left: the model's tool-loop finish reason would
-				// strand the client — normalize to a plain stop.
-				if fr, _ := choice["finish_reason"].(string); fr == "tool_calls" {
-					choice["finish_reason"] = "stop"
-				}
-			} else {
-				msg["tool_calls"] = kept
-			}
+	for _, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		if choice != nil && gw.filterToolCallMessage(ctx, orgID, subject, choice, &denied) {
+			changed = true
 		}
 	}
 	if !changed {
@@ -122,24 +136,27 @@ func (gw *gateway) gateToolCallsJSON(ctx context.Context, orgID, subject string,
 // tool_call for the args guard. The OpenAI wire carries them as a
 // JSON-encoded string; some providers send a plain object — both normalize
 // to raw JSON (a malformed string is guarded as-is: it fails any schema and
-// deny_regex still scans it). Empty arguments normalize to "{}" (the
-// engine's GuardArgs does the same).
+// deny_regex still scans it). Any other JSON value (array, number,
+// boolean) serializes as the consumer receives it: a synthetic "{}" would
+// hide content the deny rules must see (SSE-DECL-01). Absent, null and
+// blank-string arguments normalize to "{}" (the engine's GuardArgs does
+// the same).
 func declaredArgs(fn map[string]any) json.RawMessage {
-	switch v := fn["arguments"].(type) {
-	case string:
-		if strings.TrimSpace(v) == "" {
-			return json.RawMessage(`{}`)
-		}
-		return json.RawMessage(v)
-	case map[string]any:
-		out, err := json.Marshal(v)
-		if err != nil {
-			return json.RawMessage(`{}`)
-		}
-		return out
-	default:
+	v, present := fn["arguments"]
+	if !present || v == nil {
 		return json.RawMessage(`{}`)
 	}
+	if s, isStr := v.(string); isStr {
+		if strings.TrimSpace(s) == "" {
+			return json.RawMessage(`{}`)
+		}
+		return json.RawMessage(s)
+	}
+	out, err := json.Marshal(v)
+	if err != nil {
+		return json.RawMessage(`{}`)
+	}
+	return out
 }
 
 // sseToolGateWriter is an http.ResponseWriter filter for the SSE surface.
@@ -153,9 +170,12 @@ func declaredArgs(fn map[string]any) json.RawMessage {
 // everything else through untouched.
 //
 // gated too. From the first fragment of such a call the frames are held
-// (order preserved) until the calls complete — a frame carrying a
-// finish_reason, the [DONE] sentinel, or an unparseable frame — and the
-// accumulated arguments run through GuardDeclaredArgs. A denied call's
+// (order preserved) until the calls complete — every executing
+// choice's finish_reason (SSE-REL-01: one choice's finish never releases
+// a sibling's still-accumulating call), the [DONE] sentinel, or an
+// unparseable frame (a malformed end DISCARDS still-unresolved calls,
+// never releases them) — and the accumulated arguments run
+// through GuardDeclaredArgs. A denied call's
 // fragments are dropped whole: the client never sees one byte of a call
 // whose arguments violate the org rules. A cancelled context fails open
 // (D-15): nothing is held, frames pass as before.
@@ -177,19 +197,50 @@ type sseToolGateWriter struct {
 	// survived, wherever those calls split across frames.
 	seenChoice map[int]bool
 	keptChoice map[int]bool
-	denied     int
-	active     bool
+	// executing tracks the choices whose allowed calls may still be
+	// accumulating (SSE-REL-01): a finish_reason completes only the choice
+	// that carries it, so a sibling's finish must not evaluate and release
+	// another choice's still-partial arguments.
+	executing map[int]bool
+	denied    int
+	active    bool
 
 	holding    bool                      // frames are held pending the args verdict
-	heldFrames [][]byte                  // held frames in arrival order
+	heldFrames []heldFrame               // held frames in arrival order
 	declName   map[callKey]string        // call identity → declared tool name
 	declArgs   map[callKey]*bytes.Buffer // call identity → accumulated arguments
+	// indexed records that the stream has carried an explicit integer
+	// choice index: from then on an absent member is ambiguity (a mixed
+	// stream), not a positional fallback.
+	indexed bool
+}
+
+// heldFrame is one held SSE event with the identity resolution it was
+// absorbed under (R4-3): ids/ambiguous are the frame's choice identities
+// at absorb time — release reuses them instead of re-resolving after
+// later frames changed the stream's indexed state — and touch lists the
+// choices whose frames this event carries: a held event streams
+// selectively once every choice it touches has finished (R4-1a).
+type heldFrame struct {
+	frame     []byte
+	ids       []int
+	ambiguous []bool
+	touch     []int
+}
+
+// frameRes is one frame's choice-identity resolution.
+type frameRes struct {
+	ids       []int
+	ambiguous []bool
 }
 
 // callKey is the streaming identity of one tool call: OpenAI call indexes
 // are unique only within a choice, so verdicts, argument tracking and drop
 // decisions key on the full (choice index, call index) pair — two choices
-// may validly declare index 0.
+// may validly declare index 0. The choice index is the WIRE choice.index
+// member (sparse and reordered choices arrays, SSE-IDX-01); the array
+// position is only the legacy fallback for consistently unindexed
+// streams.
 type callKey struct {
 	ci  int
 	idx int
@@ -203,7 +254,7 @@ func callKeyFor(ci, idx int) callKey { return callKey{ci: ci, idx: idx} }
 func newSSEToolGateWriter(ctx context.Context, w http.ResponseWriter, engine *toolpolicy.Engine, orgID, subject string, hasDeny bool) *sseToolGateWriter {
 	return &sseToolGateWriter{
 		w: w, engine: engine, orgID: orgID, subject: subject, ctx: ctx,
-		verdict: map[callKey]bool{}, seenChoice: map[int]bool{}, keptChoice: map[int]bool{}, active: hasDeny,
+		verdict: map[callKey]bool{}, seenChoice: map[int]bool{}, keptChoice: map[int]bool{}, executing: map[int]bool{}, active: hasDeny,
 		declName: map[callKey]string{}, declArgs: map[callKey]*bytes.Buffer{},
 	}
 }
@@ -244,47 +295,70 @@ func (g *sseToolGateWriter) flushFrames(final bool) {
 	}
 }
 
+// activateForFrame refreshes applicability on live tool-bearing output:
+// admin edits invalidate the org cache, and activation is one-way. Reading
+// decoded member names also activates on escaped tool_calls spellings.
+func (g *sseToolGateWriter) activateForFrame(frame []byte) {
+	if g.active {
+		return
+	}
+	payload, isData := sseDataPayload(frame)
+	if !isData || !payloadDeclaresToolCalls(payload) {
+		return
+	}
+	if g.engine != nil && g.engine.HasDenyPolicies(g.ctx, g.orgID) {
+		g.active = true
+	}
+}
+
 func (g *sseToolGateWriter) writeFrame(frame []byte) {
-	if !g.active || !bytes.HasPrefix(bytes.TrimSpace(frame), []byte("data: ")) {
+	g.activateForFrame(frame)
+	payload, isData := sseDataPayload(frame)
+	if !g.active || !isData {
+		// A non-data frame (comment, event:/id: field) carries no
+		// executable payload; a `data:` line without the optional space is
+		// still consumer-readable SSE and still gated (R4-2).
 		_, _ = g.w.Write(frame)
 		return
 	}
-	payload := framePayload(frame)
-	if bytes.Equal(payload, []byte("[DONE]")) {
-		g.release()
+	if bytes.Equal(bytes.TrimSpace(payload), []byte("[DONE]")) {
+		g.release(false)
 		_, _ = g.w.Write(frame)
 		return
 	}
 	var doc map[string]any
 	if err := json.Unmarshal(payload, &doc); err != nil {
-		g.release()
+		// A malformed end discards still-unresolved executable calls: their
+		// partial arguments were never guardable (SSE-REL-01e).
+		g.release(true)
 		_, _ = g.w.Write(frame)
 		return
 	}
-	// A frame carrying a finish_reason completes the response's tool_calls:
-	// whatever is held evaluates and releases (the finish rewrite below
-	// then sees the final call set).
-	terminal := frameTerminal(doc)
-	if g.holding {
-		g.heldFrames = append(g.heldFrames, frame)
-		g.absorb(doc)
-		if terminal {
-			g.release()
-		}
-		return
-	}
-	if hold := g.absorb(doc); hold && !g.failOpen() {
+	// A finish_reason completes only the choice that carries it
+	// (SSE-REL-01): a completed choice's held fragments evaluate and
+	// stream WITHOUT waiting for every unfinished sibling (R4-1a), and an
+	// ambiguous finish completes nothing — it must not release unresolved
+	// fragments (R4-1b).
+	res := g.frameResolution(doc)
+	hold, touch := g.absorb(doc, res)
+	if g.holding || (hold && !g.failOpen()) {
 		// An allowed-name call is declaring arguments: hold the frames from
 		// here until the calls complete, so an args-denied call is dropped
-		// before the client ever sees a fragment.
+		// before the client ever sees a fragment. The event stores the
+		// resolution it was absorbed under; release filters with the same
+		// identities the accumulation used (R4-3).
 		g.holding = true
-		g.heldFrames = append(g.heldFrames, frame)
-		if terminal {
-			g.release()
+		g.heldFrames = append(g.heldFrames, heldFrame{
+			frame: frame, ids: res.ids, ambiguous: res.ambiguous, touch: touch,
+		})
+		if g.completeChoices(doc, res) {
+			g.release(false)
+		} else {
+			g.releaseReady()
 		}
 		return
 	}
-	if out, changed := g.filterFrame(frame, doc, g.nameDenied); changed {
+	if out, changed := g.filterFrame(frame, doc, res, g.nameDenied); changed {
 		_, _ = g.w.Write(out)
 		return
 	}
@@ -296,9 +370,10 @@ func (g *sseToolGateWriter) writeFrame(frame []byte) {
 // that are not name-denied accumulate for the args guard, and the report
 // says whether any call in this frame may still be executing — those frames
 // must be held until the calls complete.
-func (g *sseToolGateWriter) absorb(doc map[string]any) (hold bool) {
+func (g *sseToolGateWriter) absorb(doc map[string]any, res frameRes) (hold bool, touch []int) {
 	choices, _ := doc["choices"].([]any)
-	for ci, c := range choices {
+	ids, ambiguous := res.ids, res.ambiguous
+	for pos, c := range choices {
 		choice, _ := c.(map[string]any)
 		if choice == nil {
 			continue
@@ -308,14 +383,24 @@ func (g *sseToolGateWriter) absorb(doc map[string]any) (hold bool) {
 			continue
 		}
 		calls, _ := delta["tool_calls"].([]any)
+		if ambiguous[pos] {
+			continue // ambiguous: accumulates nowhere and borrows no permit
+		}
+		ci := ids[pos]
+		touch = append(touch, ci)
+		executing := false
 		for _, cl := range calls {
 			call, _ := cl.(map[string]any)
 			if g.absorbCall(ci, call) {
 				hold = true
+				executing = true
 			}
 		}
+		if executing {
+			g.executing[ci] = true
+		}
 	}
-	return hold
+	return hold, touch
 }
 
 // absorbCall scans one tool-call fragment under its full (choice, index)
@@ -336,6 +421,17 @@ func (g *sseToolGateWriter) absorbCall(ci int, call map[string]any) bool {
 	if fn == nil {
 		return true
 	}
+	switch fn["arguments"].(type) {
+	case nil, string:
+		// absent/null normalizes to absent; string chunks accumulate below
+	default:
+		// A non-string, non-null argument form cannot accumulate under the
+		// wire's string-chunk contract. Refusing the identity fail-closed
+		// keeps the guard from inspecting a synthetic "{}" while the
+		// consumer receives the value (SSE-DECL-01); sticky like a deny.
+		g.verdict[key] = false
+		return false
+	}
 	if chunk, _ := fn["arguments"].(string); chunk != "" {
 		g.appendArgs(key, chunk)
 	}
@@ -348,6 +444,13 @@ func (g *sseToolGateWriter) absorbCall(ci int, call map[string]any) bool {
 // fragments of a call the policy already rejected (deny-wins per identity),
 // nor count the denial twice. The opposite direction stays live — an
 // allowed first name can still be denied by a later fragment's rename.
+// A later fragment bearing a DIFFERENT allowed name conflicts with the
+// first: the release guard would evaluate the accumulated arguments
+// under the first name while the consumer executes the last. Conflicting
+// declarations are rejected fail-closed and sticky — a form refusal, not
+// a policy verdict (SSE-NAME-01); repeating the SAME name is idempotent.
+// A deny-direction rename is evaluated and counted before the conflict
+// check so both deny directions stay live.
 func (g *sseToolGateWriter) decideName(key callKey, name string) {
 	if allowed, seen := g.verdict[key]; seen && !allowed {
 		return // denied under this identity: sticky, one denial per call
@@ -358,6 +461,14 @@ func (g *sseToolGateWriter) decideName(key callKey, name string) {
 			allowed = false
 			g.denied++
 			metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+		}
+	}
+	if allowed {
+		if prior, tracked := g.declName[key]; tracked && prior != name {
+			// SSE-NAME-01: conflicting declaration — see the comment
+			// above. The identity is refused fail-closed, sticky.
+			g.verdict[key] = false
+			return
 		}
 	}
 	g.verdict[key] = allowed
@@ -383,11 +494,22 @@ func (g *sseToolGateWriter) appendArgs(key callKey, chunk string) {
 // choice left without any call is marked dead (its "tool_calls"
 // finish_reason rewrites to "stop"), and the frame re-encodes when anything
 // changed. out carries the original frame bytes when nothing changed.
-func (g *sseToolGateWriter) filterFrame(frame []byte, doc map[string]any, drop func(ci, idx int) bool) (out []byte, changed bool) {
+func (g *sseToolGateWriter) filterFrame(frame []byte, doc map[string]any, res frameRes, drop func(ci, idx int) bool) (out []byte, changed bool) {
 	choices, _ := doc["choices"].([]any)
-	for ci, c := range choices {
+	ids, ambiguous := res.ids, res.ambiguous
+	for pos, c := range choices {
 		choice, _ := c.(map[string]any)
 		if choice == nil {
+			continue
+		}
+		ci := ids[pos]
+		if ambiguous[pos] {
+			// Ambiguous occurrences fail closed: every executable fragment
+			// of the choice drops (keyed off any wire identity), the
+			// non-executable rest of the frame flows.
+			if g.filterChoice(choice, -(pos + 1), func(int, int) bool { return true }) {
+				changed = true
+			}
 			continue
 		}
 		if g.filterChoice(choice, ci, drop) {
@@ -465,36 +587,135 @@ func (g *sseToolGateWriter) strandedFinish(choice map[string]any, ci int) bool {
 
 // release evaluates every held call's accumulated arguments through the
 // chat-path args guard and writes the held frames out (order preserved),
-// dropping the fragments of denied calls whole.
-func (g *sseToolGateWriter) release() {
+// dropping the fragments of denied calls whole. discardUnresolved (the
+// malformed-termination path) also drops every call of a choice that
+// never completed: a partial accumulation was never guardable and must
+// not stream unchecked.
+func (g *sseToolGateWriter) release(discardUnresolved bool) {
 	frames := g.heldFrames
 	g.heldFrames, g.holding = nil, false
 	if len(frames) == 0 {
 		return
 	}
 	drop := g.dropSet()
+	discard := map[int]bool{}
+	if discardUnresolved {
+		for ci := range g.executing {
+			discard[ci] = true
+		}
+	}
 	for _, f := range frames {
-		var doc map[string]any
-		if err := json.Unmarshal(framePayload(f), &doc); err != nil {
-			_, _ = g.w.Write(f)
-			continue
-		}
-		if out, changed := g.filterFrame(f, doc, func(ci, idx int) bool { return drop[callKeyFor(ci, idx)] }); changed {
-			_, _ = g.w.Write(out)
-			continue
-		}
-		_, _ = g.w.Write(f)
+		g.writeHeld(f, drop, discard)
 	}
 	g.declName = map[callKey]string{}
 	g.declArgs = map[callKey]*bytes.Buffer{}
+	g.executing = map[int]bool{}
+}
+
+// writeHeld filters one held event through its STORED resolution (R4-3):
+// the identities the accumulation used are the identities the drop
+// applies — re-resolving after later frames changed the stream's indexed
+// state could disagree with what was absorbed. A frame that no longer
+// parses passes byte-identically (never fail the stream over a filter
+// bug).
+func (g *sseToolGateWriter) writeHeld(f heldFrame, drop map[callKey]bool, discard map[int]bool) {
+	var doc map[string]any
+	if err := json.Unmarshal(framePayload(f.frame), &doc); err != nil {
+		_, _ = g.w.Write(f.frame)
+		return
+	}
+	if out, changed := g.filterFrame(f.frame, doc, frameRes{ids: f.ids, ambiguous: f.ambiguous}, func(ci, idx int) bool { return discard[ci] || drop[callKeyFor(ci, idx)] }); changed {
+		_, _ = g.w.Write(out)
+		return
+	}
+	_, _ = g.w.Write(f.frame)
+}
+
+// releaseReady streams held events whose touched choices have all
+// finished (R4-1a): a completed choice's fragments evaluate through the
+// release guard and reach the consumer without waiting for every
+// unfinished sibling. Two release classes keep the observable order
+// sane: an event that TOUCHES executable choices releases selectively
+// (each choice is an independent SSE substream; per-choice fragment
+// order is preserved even when cross-choice interleaving compacts),
+// while an event touching nothing — an error frame, a keepalive — never
+// jumps ahead of an earlier still-held event (strict arrival order).
+// Completed choices' declaration state clears with their release; name
+// verdicts stay sticky for the response lifetime.
+func (g *sseToolGateWriter) releaseReady() {
+	drop := g.partialDropSet()
+	kept := g.heldFrames[:0]
+	heldBefore := false
+	for _, f := range g.heldFrames {
+		releasable := true
+		for _, ci := range f.touch {
+			if g.executing[ci] {
+				releasable = false
+				break
+			}
+		}
+		if len(f.touch) == 0 {
+			releasable = !heldBefore
+		}
+		if !releasable {
+			kept = append(kept, f)
+			heldBefore = true
+			continue
+		}
+		g.writeHeld(f, drop, nil)
+	}
+	g.heldFrames = kept
+	for key := range g.declArgs {
+		if !g.executing[key.ci] {
+			delete(g.declArgs, key)
+		}
+	}
+	for key := range g.declName {
+		if !g.executing[key.ci] {
+			delete(g.declName, key)
+		}
+	}
 }
 
 // dropSet computes the release-time drop set over per-call identity: every
 // call the name decision denied (verdict — the same criterion the immediate
 // path applies, whether the deny was visible on the first fragment or a
 // mid-hold rename) plus every surviving held call whose accumulated
-// arguments the chat-path args guard denies.
-func (g *sseToolGateWriter) dropSet() map[callKey]bool {
+// arguments the chat-path args guard denies. An args denial is recorded
+// in the verdict map: it is sticky for the response lifetime, so a late
+// continuation after the call's own finish never re-opens the call.
+func (g *sseToolGateWriter) dropSet() map[callKey]bool        { return g.dropSetGuarded(false) }
+func (g *sseToolGateWriter) partialDropSet() map[callKey]bool { return g.dropSetGuarded(true) }
+
+// dropSetGuarded computes the drop set over per-call identity: every
+// call the name decision denied (verdict — the same criterion the
+// immediate path applies, whether the deny was visible on the first
+// fragment or a mid-hold rename) plus every surviving held call whose
+// accumulated arguments the chat-path args guard denies. skipExecuting
+// (the selective-release form, R4-1a) leaves still-executing choices'
+// accumulations unevaluated — the args guard only ever runs on complete
+// accumulations — and their frames cannot release anyway. An args denial
+// is recorded in the verdict map: it is sticky for the response
+// lifetime, so a late continuation after the call's own finish never
+// re-opens the call.
+func (g *sseToolGateWriter) guardArgsDenied(key callKey, name string, skipExecuting bool) bool {
+	if name == "" || g.engine == nil || (skipExecuting && g.executing[key.ci]) {
+		return false
+	}
+	args := json.RawMessage(`{}`)
+	if b := g.declArgs[key]; b != nil && b.Len() > 0 {
+		args = json.RawMessage(b.Bytes())
+	}
+	if rep := g.engine.GuardDeclaredArgs(g.ctx, g.orgID, g.subject, name, args); !rep.Denied {
+		return false
+	}
+	g.verdict[key] = false // sticky for the response lifetime (SSE-REL-01f)
+	g.denied++
+	metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+	return true
+}
+
+func (g *sseToolGateWriter) dropSetGuarded(skipExecuting bool) map[callKey]bool {
 	drop := map[callKey]bool{}
 	for key, allowed := range g.verdict {
 		if !allowed {
@@ -502,17 +723,17 @@ func (g *sseToolGateWriter) dropSet() map[callKey]bool {
 		}
 	}
 	for key, name := range g.declName {
-		if drop[key] || name == "" || g.engine == nil {
-			continue
-		}
-		args := json.RawMessage(`{}`)
-		if b := g.declArgs[key]; b != nil && b.Len() > 0 {
-			args = json.RawMessage(b.Bytes())
-		}
-		if rep := g.engine.GuardDeclaredArgs(g.ctx, g.orgID, g.subject, name, args); rep.Denied {
+		if drop[key] || g.guardArgsDenied(key, name, skipExecuting) {
 			drop[key] = true
-			g.denied++
-			metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+		}
+	}
+	for key := range g.declArgs {
+		if _, named := g.declName[key]; !named {
+			// Accumulated arguments that never faced a name decision: a
+			// nameless call carrying content is an ambiguous executable
+			// declaration — refuse fail-closed rather than release it
+			// unguarded (SSE-DECL-01).
+			drop[key] = true
 		}
 	}
 	return drop
@@ -533,7 +754,72 @@ func (g *sseToolGateWriter) failOpen() bool {
 
 // framePayload strips the SSE envelope from a data frame.
 func framePayload(frame []byte) []byte {
-	return bytes.TrimSpace(bytes.TrimPrefix(bytes.TrimSpace(frame), []byte("data: ")))
+	if payload, isData := sseDataPayload(frame); isData {
+		return payload
+	}
+	return bytes.TrimSpace(frame)
+}
+
+// sseDataPayload extracts the joined data payload of one complete SSE
+// event (R4-2): each data line contributes its value minus ONE optional
+// leading space — `data:` and `data: ` are both legal spellings — and
+// multiple data lines of one event join with "\n". isData is false for
+// frames without a data field (comments, event:/id: fields carry no
+// executable payload).
+func sseDataPayload(frame []byte) (payload []byte, isData bool) {
+	var parts [][]byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		rest, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			continue
+		}
+		if len(rest) > 0 && rest[0] == ' ' {
+			rest = rest[1:]
+		}
+		parts = append(parts, rest)
+	}
+	if len(parts) == 0 {
+		return nil, false
+	}
+	return bytes.Join(parts, []byte("\n")), true
+}
+
+// payloadDeclaresToolCalls reports whether a JSON payload carries a
+// "tool_calls" member anywhere, reading DECODED member names (R4-2): a
+// literal byte match misses escaped spellings like \u0074ool_calls, and
+// activation must never under-detect a declaration. Over-detection is
+// harmless — activation only turns filtering on.
+func scanToolCallTokens(dec *json.Decoder) bool {
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		switch t := tok.(type) {
+		case string:
+			if t == "tool_calls" {
+				return true
+			}
+		case json.Delim:
+			if (t == '{' || t == '[') && scanToolCallTokens(dec) {
+				return true
+			}
+		}
+	}
+	_, _ = dec.Token() // consume the container's closing delimiter
+	return false
+}
+
+func payloadDeclaresToolCalls(payload []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	if open, ok := tok.(json.Delim); !ok || (open != '{' && open != '[') {
+		return false
+	}
+	return scanToolCallTokens(dec)
 }
 
 // frameTerminal reports whether the frame carries a finish_reason (the
@@ -552,12 +838,116 @@ func frameTerminal(doc map[string]any) bool {
 	return false
 }
 
+// completeChoices records the frame's completions and reports whether
+// every held call can release (SSE-REL-01): a finish_reason completes
+// only the choice that carries it, so a sibling's finish never evaluates
+// and releases another choice's still-accumulating arguments — the args
+// guard only ever runs on complete accumulations. An ambiguous finished
+// member cannot be attributed to a choice: it completes NOTHING and
+// releases nothing (R4-1b) — the still-executing siblings keep the hold
+// until their own finish, [DONE], a malformed frame or the final flush.
+func (g *sseToolGateWriter) completeChoices(doc map[string]any, res frameRes) bool {
+	choices, _ := doc["choices"].([]any)
+	for pos, c := range choices {
+		choice, _ := c.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if fr, _ := choice["finish_reason"].(string); fr == "" {
+			continue
+		}
+		if res.ambiguous[pos] {
+			continue
+		}
+		delete(g.executing, res.ids[pos])
+	}
+	return len(g.executing) == 0
+}
+
 // callIndex extracts the streaming call index (missing → 0).
 func callIndex(call map[string]any) int {
 	if v, ok := call["index"].(float64); ok {
 		return int(v)
 	}
 	return 0
+}
+
+// resolveIdentities maps one frame's choices to wire identities and flags
+// ambiguity per occurrence. An explicit non-negative integer index
+// resolves to its wire value (and marks the stream indexed); an absent
+// member falls back to the array position ONLY while NEITHER the stream
+// NOR the frame in hand has ever carried an index — consistently
+// unindexed streams keep their legacy positional behavior (R4-3: the
+// whole frame determines the fallback, so a member missing its index
+// BEFORE the first explicit index in array order borrows no sibling
+// key). Once indexing is in effect, a missing member could denote any
+// choice, a fractional or negative value carries no wire meaning, and
+// two occurrences resolving to the same index within one frame share
+// state — all are ambiguous. Ambiguous executable fragments borrow no
+// permit: they are never accumulated under a sibling key and never
+// released (SSE-IDX-01).
+//
+// The resolution is a PURE function of the stream's indexed state before
+// the frame: resolveFrameIdentities never mutates receiver state, and
+// frameResolution commits g.indexed exactly once per frame, so absorb,
+// filter and release always share one resolution per event.
+func (g *sseToolGateWriter) frameResolution(doc map[string]any) frameRes {
+	choices, _ := doc["choices"].([]any)
+	ids, ambiguous, indexed := resolveFrameIdentities(choices, g.indexed)
+	g.indexed = indexed
+	return frameRes{ids: ids, ambiguous: ambiguous}
+}
+
+func resolveChoiceIdentity(choice map[string]any, pos int, firstAt map[int]int, ids []int, ambiguous []bool) bool {
+	value, ok := choice["index"].(float64)
+	if !ok {
+		return false
+	}
+	if value != math.Trunc(value) || value < 0 {
+		ambiguous[pos] = true
+		return false
+	}
+	ci := int(value)
+	if first, duplicate := firstAt[ci]; duplicate {
+		ambiguous[pos] = true
+		ambiguous[first] = true
+		return true
+	}
+	firstAt[ci] = pos
+	ids[pos] = ci
+	return true
+}
+
+func resolveFrameIdentities(choices []any, streamIndexed bool) (ids []int, ambiguous []bool, indexed bool) {
+	ids = make([]int, len(choices))
+	ambiguous = make([]bool, len(choices))
+	indexed = streamIndexed
+	frameIndexed := false
+	firstAt := map[int]int{} // resolved wire index → first position claiming it
+	for pos, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		ids[pos] = pos
+		if choice == nil {
+			continue
+		}
+		if resolveChoiceIdentity(choice, pos, firstAt, ids, ambiguous) {
+			frameIndexed = true
+		}
+	}
+	if !frameIndexed && !indexed {
+		return ids, ambiguous, indexed // legacy positional stream
+	}
+	indexed = true
+	for pos, raw := range choices {
+		choice, _ := raw.(map[string]any)
+		if choice == nil {
+			continue
+		}
+		if _, ok := choice["index"]; !ok {
+			ambiguous[pos] = true // mixed stream: no sibling-permit borrow
+		}
+	}
+	return ids, ambiguous, indexed
 }
 
 // DeniedCount reports suppressed calls (logging/diagnostics).
@@ -698,12 +1088,13 @@ func (gw *gateway) builtinToolInvoke(w http.ResponseWriter, r *http.Request, org
 		// redacted internally; the deny/failure reason rides the message).
 		gw.auditBuiltin(r.Context(), orgID, id, req.Tool, nil, code, status, latency, upstreamURL)
 		statusByCode := map[string]int{
-			toolexec.ErrCodeNotFound:    http.StatusNotFound,
-			toolexec.ErrCodeDenied:      http.StatusConflict,
-			toolexec.ErrCodeSSRF:        http.StatusBadRequest,
-			toolexec.ErrCodeBadReq:      http.StatusBadRequest,
-			toolexec.ErrCodeTimeout:     http.StatusGatewayTimeout,
-			toolexec.ErrCodeToolBlocked: http.StatusBadRequest,
+			toolexec.ErrCodeNotFound:          http.StatusNotFound,
+			toolexec.ErrCodeDenied:            http.StatusConflict,
+			toolexec.ErrCodeSSRF:              http.StatusBadRequest,
+			toolexec.ErrCodeBadReq:            http.StatusBadRequest,
+			toolexec.ErrCodeTimeout:           http.StatusGatewayTimeout,
+			toolexec.ErrCodeToolBlocked:       http.StatusBadRequest,
+			toolexec.ErrCodePolicyUnavailable: http.StatusServiceUnavailable,
 		}
 		httpStatus := http.StatusBadGateway
 		if s, ok := statusByCode[code]; ok {

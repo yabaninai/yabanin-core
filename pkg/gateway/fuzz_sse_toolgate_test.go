@@ -122,7 +122,15 @@ func fuzzSSEGenerated(t *testing.T, data []byte) {
 	active := len(p) == 0 || p[0]&0x40 == 0
 	engine := fuzzToolEngine()
 	w := httptest.NewRecorder()
-	g := newSSEToolGateWriter(context.Background(), w, engine, "org-deny", "*", active)
+	// SSE-REV-01: the inactive variant models an org WITHOUT deny rows —
+	// applicability refresh finds none and the stream stays untouched.
+	// (A false snapshot over an org that HAS denies is the corrected
+	// transient state, pinned by fuzzSSE01's second half.)
+	org := "org-deny"
+	if !active {
+		org = "org-none"
+	}
+	g := newSSEToolGateWriter(context.Background(), w, engine, org, "*", active)
 
 	stream := strings.Join(frames, "")
 	sseGenWriteChunks(t, g, stream, p)
@@ -177,14 +185,33 @@ func fuzzSSE01(t *testing.T) {
 
 	ctx := context.Background()
 	engine := fuzzToolEngine()
-	w := httptest.NewRecorder()
-	g := newSSEToolGateWriter(ctx, w, engine, "org-deny", "*", false)
 	frame := []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"name\":\"secret_tool\"}}]}}]}\n\n")
+
+	// An org without deny rows: the open-time snapshot is false and live
+	// tool-bearing output refreshes applicability only to find none —
+	// frames pass through untouched. SSE-REV-01 preserves this contract.
+	w := httptest.NewRecorder()
+	g := newSSEToolGateWriter(ctx, w, engine, "org-none", "*", false)
 	if _, err := g.Write(frame); err != nil {
 		t.Fatalf("SSE-01: write: %v", err)
 	}
 	if w.Body.String() != string(frame) {
 		t.Fatalf("SSE-01: inactive writer must not alter frames: %q", w.Body.String())
+	}
+
+	// Corrected invariant (SSE-REV-01, intentional frozen-invariant
+	// correction): a false open-time snapshot for an org that HAS deny
+	// rows is transient — the first tool-bearing frame re-consults the
+	// engine, activates the gate, and the denied name is filtered. The
+	// former pin asserted the stale snapshot persists for the whole
+	// stream; that persistence was the revocation gap.
+	w2 := httptest.NewRecorder()
+	g2 := newSSEToolGateWriter(ctx, w2, engine, "org-deny", "*", false)
+	if _, err := g2.Write(frame); err != nil {
+		t.Fatalf("SSE-01: write: %v", err)
+	}
+	if strings.Contains(w2.Body.String(), "secret_tool") {
+		t.Fatalf("SSE-01: stale inactive snapshot released a denied tool: %q", w2.Body.String())
 	}
 }
 
@@ -517,7 +544,8 @@ func fuzzSSE17(t *testing.T) {
 		}},
 	}
 	g := &sseToolGateWriter{seenChoice: map[int]bool{}, keptChoice: map[int]bool{}}
-	out, changed := g.filterFrame(frame, doc, func(_, _ int) bool { return true })
+	res := frameRes{ids: []int{0}, ambiguous: []bool{false}} // single unindexed choice
+	out, changed := g.filterFrame(frame, doc, res, func(_, _ int) bool { return true })
 	if changed || !bytes.Equal(out, frame) {
 		t.Fatalf("SSE-17: guard must pass the original frame through: changed=%v out=%q", changed, out)
 	}

@@ -9,6 +9,11 @@ package cli
 // holding/heldFrames are cleared; declName/declArgs are reset; and the
 // F5 sticky-deny state (verdict, seenChoice/keptChoice) is preserved —
 // release must not clear security state indiscriminately.
+//
+// SSE-REL-01e adds the termination form: release(true) (a malformed END)
+// discards the still-executing choices' calls - their partial arguments
+// never stream unchecked - while the malformed frame itself passes
+// byte-identically and a discard is not a denial (verdicts untouched).
 
 import (
 	"bytes"
@@ -35,7 +40,13 @@ func releaseFixture(allowed bool) (g *sseToolGateWriter, body *bytes.Buffer, fra
 	fragArgs = []byte("data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\"{\\\"a\\\":1}\"}}]}}]}\n\n")
 	key := callKeyFor(0, 0)
 	g.holding = true
-	g.heldFrames = [][]byte{fragName, malformed, fragArgs}
+	// single consistently-unindexed choice: positional identity 0, unambiguous
+	res := frameRes{ids: []int{0}, ambiguous: []bool{false}}
+	g.heldFrames = []heldFrame{
+		{frame: fragName, ids: res.ids, ambiguous: res.ambiguous, touch: []int{0}},
+		{frame: malformed},
+		{frame: fragArgs, ids: res.ids, ambiguous: res.ambiguous, touch: []int{0}},
+	}
 	g.declName = map[callKey]string{key: name}
 	g.declArgs = map[callKey]*bytes.Buffer{key: bytes.NewBufferString(`{"a":1}`)}
 	g.verdict = map[callKey]bool{key: allowed}
@@ -66,7 +77,7 @@ func assertReleaseStateCleared(t *testing.T, g *sseToolGateWriter) {
 func TestSSEReleaseMalformedHeldFrameAllowed(t *testing.T) {
 	g, body, fragName, malformed, fragArgs := releaseFixture(true)
 
-	g.release() // no panic is part of the contract
+	g.release(false) // no panic is part of the contract
 
 	out := body.Bytes()
 	if !bytes.Contains(out, malformed) {
@@ -94,7 +105,7 @@ func TestSSEReleaseMalformedHeldFrameAllowed(t *testing.T) {
 func TestSSEReleaseMalformedHeldFrameDenied(t *testing.T) {
 	g, body, _, malformed, _ := releaseFixture(false)
 
-	g.release()
+	g.release(false)
 
 	out := body.String()
 	if strings.Contains(out, "secret_tool") {
@@ -113,14 +124,43 @@ func TestSSEReleaseMalformedHeldFrameDenied(t *testing.T) {
 	}
 }
 
+// TestSSEReleaseMalformedTerminationDiscards: SSE-REL-01e - the malformed
+// TERMINATION form. The choice never completed (still executing), so its
+// calls discard whole even though their accumulated arguments alone would
+// not deny; the malformed frame itself still passes byte-identically, the
+// reset contract holds, and the verdict stays untouched (a discard is not
+// a denial).
+func TestSSEReleaseMalformedTerminationDiscards(t *testing.T) {
+	g, body, _, malformed, _ := releaseFixture(true)
+	g.executing[0] = true // the choice never completed
+
+	g.release(true)
+
+	out := body.String()
+	if strings.Contains(out, "safe_tool") || strings.Contains(out, `"a":1`) {
+		t.Fatalf("release-malformed termination: unresolved call fragments must discard, got %q", out)
+	}
+	if !strings.Contains(out, string(malformed)) {
+		t.Fatalf("release-malformed termination: malformed frame not emitted byte-identically: %q", out)
+	}
+	assertReleaseStateCleared(t, g)
+	if v := g.verdict[callKeyFor(0, 0)]; !v {
+		t.Fatalf("release-malformed termination: verdict must stay untouched by a discard: %v", g.verdict)
+	}
+}
+
 // TestSSEReleaseValidHeldFramesControl: no malformed input — the valid
 // held frames pass through byte-identically in order with the same
 // reset/sticky contracts (control for the malformed legs above).
 func TestSSEReleaseValidHeldFramesControl(t *testing.T) {
 	g, body, fragName, _, fragArgs := releaseFixture(true)
-	g.heldFrames = [][]byte{fragName, fragArgs}
+	res := frameRes{ids: []int{0}, ambiguous: []bool{false}}
+	g.heldFrames = []heldFrame{
+		{frame: fragName, ids: res.ids, ambiguous: res.ambiguous, touch: []int{0}},
+		{frame: fragArgs, ids: res.ids, ambiguous: res.ambiguous, touch: []int{0}},
+	}
 
-	g.release()
+	g.release(false)
 
 	out := body.Bytes()
 	if !bytes.Equal(out, append(append([]byte{}, fragName...), fragArgs...)) {

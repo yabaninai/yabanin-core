@@ -234,6 +234,7 @@ _quality-self:
 	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
 	node --test scripts/release/test_dashboard_notices.mjs
 	python3 -m unittest discover -s deploy/mock-provider -p 'test_*.py'
+	python3 scripts/release/test_release_evidence.py
 
 _quality-fast:
 	$(GO_SCOPE) go build
