@@ -93,20 +93,26 @@ type mcGenCatalog struct {
 	aliases  map[string]string // alias -> target
 }
 
-func mcGenCatalogFor(p []byte) mcGenCatalog {
+func mcGenCatalogFor(p [5]byte) mcGenCatalog {
 	c := mcGenCatalog{disabled: map[string]bool{}, aliases: map[string]string{}}
 	n := 1 + int(p[0])%3
-	for i := 0; i < n; i++ {
+	for i, bits := range p[1:4] {
+		if i == n {
+			break
+		}
 		name := fmt.Sprintf("fzgen-%02x-%02x", p[1], byte(i))
 		c.names = append(c.names, name)
-		if p[1+i]&1 == 1 {
+		if bits&1 == 1 {
 			c.disabled[name] = true
 		}
 	}
-	for j := 0; j < int(p[1])%3; j++ {
+	for j, bits := range p[2:4] {
+		if j == int(p[1])%3 {
+			break
+		}
 		alias := fmt.Sprintf("fzgen-al-%02x-%02x", p[0], byte(j))
-		if p[2+j]&0x80 == 0 {
-			c.aliases[alias] = c.names[int(p[2+j])%len(c.names)]
+		if bits&0x80 == 0 {
+			c.aliases[alias] = c.names[int(bits)%len(c.names)]
 		} else {
 			c.aliases[alias] = "fzgen-dangling"
 		}
@@ -166,7 +172,7 @@ func mcGenerated(t *testing.T, data []byte) {
 	var p [5]byte
 	copy(p[:], data)
 	pool := catalogFixture(t)
-	c := mcGenCatalogFor(p[:])
+	c := mcGenCatalogFor(p)
 	mcSeedCatalog(t, pool, c)
 	gw := fuzzModelsGateway(newPGModelLister(pool), nil)
 	w := httptest.NewRecorder()
