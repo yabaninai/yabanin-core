@@ -11,6 +11,7 @@ import (
 
 	"github.com/reireirei/yabanin/internal/retryclock"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 // sleeperScheduling records every scheduled delay; cancel, when non-nil,
@@ -83,6 +84,6 @@ func TestDo_ErrorFromCancelledAttemptIsContextError(t *testing.T) {
 		return Result{Err: sentinel, Safety: OutcomeNotExecuted}
 	})
 	assert.Equal(t, 1, attempts)
-	assert.ErrorIs(t, res.Err, context.Canceled)
+	require.ErrorIs(t, res.Err, context.Canceled)
 	assert.NotErrorIs(t, res.Err, sentinel)
 }
