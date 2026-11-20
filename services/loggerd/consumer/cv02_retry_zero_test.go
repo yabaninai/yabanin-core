@@ -76,7 +76,10 @@ func TestAttributedCountFields(t *testing.T) {
 		{"float64 NaN attempt", math.NaN(), "0", nil, nil},
 		{"float64 +Inf retry", "1", math.Inf(1), int64(1), nil},
 		{"float64 -Inf attempt", math.Inf(-1), "0", nil, nil},
-		{"float64 below -2^63 attempt", -9223372036854775810.0, float64(0), nil, nil},
+		// -9223372036854777856.0 = math.Nextafter(-0x1p63, -Inf): the
+		// first float64 representable BELOW -2^63 (spacing 2^11 there);
+		// -9223372036854775810.0 would round to exactly -2^63 (accepted).
+		{"float64 below -2^63 attempt", -9223372036854777856.0, float64(0), nil, nil},
 		{"out-of-range attempt string", "9223372036854775808", "0", nil, nil},
 		{"float64 2^63 overflow attempt", 9223372036854775808.0, float64(0), nil, nil},
 		{"empty strings", "", "", nil, nil},
@@ -95,6 +98,28 @@ func TestAttributedCountFields(t *testing.T) {
 			assert.Equal(t, tc.wantRetry, attributedRetryCount(fields), "retry_count")
 		})
 	}
+}
+
+// Direct parser-boundary pin (CV-02): the attribution helpers only ever
+// bind positive counters, so a nil result there cannot distinguish
+// "below the float64 minimum boundary" from a merely negative value.
+// parseCountField itself must accept exactly -2^63 — the last
+// representable edge — and reject the first representable value below
+// it, guarding the implementation-dependent float->int conversion.
+func TestParseCountFieldNegativeFloat64Boundary(t *testing.T) {
+	// Exact lower edge: -2^63 is representable and parses true.
+	v, ok := parseCountField(map[string]interface{}{
+		"retry_count": float64(-9223372036854775808.0),
+	}, "retry_count")
+	assert.True(t, ok, "-2^63 exact must parse")
+	assert.Equal(t, int64(math.MinInt64), v)
+
+	// First representable value below -2^63: rejected before conversion.
+	v, ok = parseCountField(map[string]interface{}{
+		"retry_count": math.Nextafter(-0x1p63, math.Inf(-1)),
+	}, "retry_count")
+	assert.False(t, ok, "below -2^63 must not parse")
+	assert.Equal(t, int64(0), v)
 }
 
 // The regression pin: a real single-attempt completion (attempt_count=1,
