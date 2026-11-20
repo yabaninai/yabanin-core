@@ -1,5 +1,6 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { readLastOrg, rememberOrg } from '../lib/orgScope'
+import { subscribeGlobalScope } from '../lib/globalScope'
 
 // UI-contract #1: org/time scope lives in the URL so a filtered view is a
 // shareable link and survives reload/back-forward. The app routes via the
@@ -11,11 +12,53 @@ function readHashQuery(): URLSearchParams {
   return new URLSearchParams(q)
 }
 
+/** The hook's read model: explicit hash param first (deep-link priority),
+ *  the remembered org next (org only — same priority as the mount init and
+ *  lib/globalScope's hashchange adopter). */
+function readParam(key: string): string {
+  return readHashQuery().get(key) ?? (key === 'org' ? readLastOrg() : '')
+}
+
 export function useHashParam(key: string): [string, (v: string) => void] {
   // Cross-tab continuity for the org scope: when the hash carries no org,
   // start from the last committed one; committing an org updates it.
-  const [value, setValue] = useState(
-    () => readHashQuery().get(key) ?? (key === 'org' ? readLastOrg() : ''))
+  const [value, setValue] = useState(() => readParam(key))
+
+  // Same-document synchronization (CUI-01 finding): the hash query is
+  // written by more than this hook's setter — the Topbar OrgSwitcher's
+  // scope store, deep links, and back/forward across page navigations.
+  // Every key re-adopts from the CURRENT hash so org/request/... state can
+  // never go stale while the page stays mounted (a forced reload was the
+  // old workaround, not a contract).
+  //
+  // Two real event sources, both verified in Chromium:
+  //   * hashchange — link navigation, deep links and back/forward (every
+  //     URL this app writes keeps its whole query inside the fragment, so
+  //     any history step that changes a param fires hashchange; popstate
+  //     would only double-report those and is deliberately NOT bound);
+  //   * the shared scope store — its commits (Topbar period/org switches)
+  //     rewrite the hash with replaceState, which fires NO hashchange, so
+  //     hash-keyed consumers subscribe to the store's existing emit via
+  //     subscribeGlobalScope (no competing store, no history writes).
+  // The hook's own writes use replaceState too, so adoption cannot loop.
+  // Adoption re-reads the CURRENT hash (arriving URLs stay authoritative,
+  // memory fallback for a missing org exactly like the mount init) and
+  // never rewrites the URL or the remembered org.
+  useEffect(() => {
+    const adopt = () => {
+      const next = readParam(key)
+      setValue(prev => (prev === next ? prev : next))
+    }
+    window.addEventListener('hashchange', adopt)
+    const unsubscribe = subscribeGlobalScope(adopt)
+    // Adopt once on subscribe too: a hash written between the initial
+    // render and this effect must not stay invisible until the NEXT event.
+    adopt()
+    return () => {
+      window.removeEventListener('hashchange', adopt)
+      unsubscribe()
+    }
+  }, [key])
 
   const set = useCallback((v: string) => {
     setValue(v)

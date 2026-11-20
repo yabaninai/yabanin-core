@@ -1,15 +1,19 @@
-import { useCallback, useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import { readInspectParam, writeInspectParam } from '../lib/inspectUrl'
 
-// Page-local state for the inspect deep-link (EntityDrawer). Reads
-// `?inspect=<id>` from the hash query once at mount (a shared link opens the
-// drawer on load) and rewrites only that param on open/close, preserving
-// everything else (page id, org scope, locale, sort) — the same contract as
-// useHashParam/useTableUrlState.
+// The URL controls the inspector both at mount and during same-document navigation.
 
 function readHashQuery(): URLSearchParams {
   const q = window.location.hash.split('?')[1] ?? ''
   return new URLSearchParams(q)
+}
+
+function readHashInspect(): string {
+  try {
+    return readInspectParam(readHashQuery()) ?? ''
+  } catch {
+    return ''
+  }
 }
 
 function writeHash(id: string | null): void {
@@ -20,19 +24,19 @@ function writeHash(id: string | null): void {
   // replaceState: opening/closing an inspector is view state, not navigation.
   window.history.replaceState(
     null, '',
-    `${window.location.pathname}${window.location.search}#${path}${qs ? `?${qs}` : ''}`,
+    `${window.location.pathname}${window.location.search}#${path.replace(/^#+/, '')}${qs ? `?${qs}` : ''}`,
   )
 }
 
 export function useInspectParam(): [string, (id: string | null) => void] {
-  const [value, setValue] = useState(() => {
-    try {
-      return readInspectParam(readHashQuery()) ?? ''
-    } catch {
-      // Non-browser environment (or unparsable URL) — no drawer.
-      return ''
-    }
-  })
+  const [value, setValue] = useState(readHashInspect)
+
+  useEffect(() => {
+    const adopt = () => setValue(readHashInspect())
+    window.addEventListener('hashchange', adopt)
+    adopt()
+    return () => window.removeEventListener('hashchange', adopt)
+  }, [])
 
   const set = useCallback((id: string | null) => {
     const next = id && id.trim() !== '' ? id.trim() : ''

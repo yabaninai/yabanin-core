@@ -263,9 +263,9 @@ function wantedDepth(edge: TopoEdge, depth: Map<string, number>): number {
 }
 
 /** One relaxation round; true when any depth moved (another round is due). */
-function relaxOnce(view: TopologyView, depth: Map<string, number>): boolean {
+function relaxOnce(edges: readonly TopoEdge[], depth: Map<string, number>): boolean {
   let changed = false
-  for (const e of view.edges) {
+  for (const e of edges) {
     if (e.from === e.to) continue
     const want = wantedDepth(e, depth)
     if (want < 0 || want <= (depth.get(e.to) ?? -1)) continue
@@ -284,8 +284,11 @@ function relaxOnce(view: TopologyView, depth: Map<string, number>): boolean {
  * past the deepest model that feeds them.
  */
 function relaxDepths(view: TopologyView, depth: Map<string, number>): void {
-  for (let round = 0; round <= view.edges.length + 2; round++) {
-    if (!relaxOnce(view, depth)) break
+  // A cyclic chain can keep accumulating depth until the round limit.
+  // Choose a stable traversal order without changing configured hop order.
+  const edges = [...view.edges].sort((a, b) => a.id.localeCompare(b.id))
+  for (let round = 0; round <= edges.length + 2; round++) {
+    if (!relaxOnce(edges, depth)) break
   }
 }
 
@@ -558,7 +561,7 @@ function pinnedId(view: TopologyView, sel: MountSelection): string | null {
  * Rotation changes WHO mounts, never the naming order. */
 function priorityOrder(list: string[], pinned: string | null, expanded: boolean, defaultKept: Set<string>): string[] {
   const head = pinned === null ? [] : [pinned]
-  if (expanded) head.push(...list.filter(id => !defaultKept.has(id)))
+  if (expanded) head.push(...list.filter(id => id !== pinned && !defaultKept.has(id)))
   const prioritized = (id: string): boolean => id === pinned || (expanded && !defaultKept.has(id))
   return [...head, ...list.filter(id => !prioritized(id))]
 }

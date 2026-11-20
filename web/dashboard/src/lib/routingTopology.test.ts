@@ -555,6 +555,11 @@ test('mountTopology: pinning the selection never double-books a seat (exactly on
   let conserved = pinned.view.nodes.filter(n => n.kind !== 'group').length
   for (const g of pinned.groups.values()) conserved += g.memberIds.length
   assert.equal(conserved, 241, 'conservation with the selection pinned')
+  const expanded = mountTopology(view, { ...IDLE, selectedId: hiddenId, expandedGroupId: 'group:model' }, limits)
+  assert.equal(expanded.view.nodes.filter(n => n.kind !== 'group').length, 17, 'pin plus expansion must not consume a second seat')
+  assert.equal(expanded.groups.size, 3)
+  assert.equal(expanded.view.nodes.length, 20)
+  assert.ok(expanded.view.nodes.some(n => n.id === 'model:m009'), 'the selected hidden member must not displace m009')
 })
 
 test('mountTopology: a query hides only pool-internal edges — search filtering is not grouping', () => {
