@@ -24,6 +24,14 @@ FROM nginx:alpine@sha256:713fc2ebfd92e8217db451477182ee91944b123d2b1ee9fd5a8c6e9
 COPY --from=builder /src/web/dashboard/dist /usr/share/nginx/html
 COPY web/dashboard/nginx-main.conf /etc/nginx/nginx.conf
 COPY web/dashboard/nginx.conf /etc/nginx/conf.d/default.conf
+# COPY preserves build-context modes, so a checkout with 0600 files / 0700
+# dirs would ship unreadable content to the unprivileged runtime user.
+# Normalize delivered content: 0644 for regular files (static assets,
+# license notices, nginx configs), 0755 for directories (NEXT-16/TP-09).
+RUN find /usr/share/nginx/html -type d -exec chmod 0755 {} + \
+    && find /usr/share/nginx/html -type f -exec chmod 0644 {} + \
+    && chmod 0755 /etc/nginx /etc/nginx/conf.d \
+    && chmod 0644 /etc/nginx/nginx.conf /etc/nginx/conf.d/default.conf
 # nginx creates only the last path component itself; pre-create the /tmp
 # temp trees writable by the unprivileged runtime user (nobody:nogroup).
 RUN mkdir -p /tmp/nginx/client /tmp/nginx/proxy /tmp/nginx/fastcgi     /tmp/nginx/uwsgi /tmp/nginx/scgi     && chown -R nobody:nogroup /tmp/nginx
