@@ -787,11 +787,7 @@ func nullableInt64(fields map[string]interface{}, key string) interface{} {
 // nil, fraction, NaN/Inf, out of range, wrong type) returns (0, false): a
 // corrupt field never becomes a counter via truncation.
 func parseCountField(fields map[string]interface{}, key string) (int64, bool) {
-	v, ok := fields[key]
-	if !ok || v == nil {
-		return 0, false
-	}
-	switch val := v.(type) {
+	switch val := fields[key].(type) {
 	case int64:
 		return val, true
 	case float64:
