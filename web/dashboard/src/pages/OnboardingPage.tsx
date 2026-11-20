@@ -3,7 +3,7 @@ import { useTranslation } from 'react-i18next'
 import { listAPIKeys } from '../api/keys'
 import { getOrgOnboarding, markOrgOnboarding, type OrgOnboarding } from '../api/onboarding'
 import { listProviderCredentials } from '../api/providerCredentials'
-import { requestStats } from '../api/requests'
+import { listRequests, requestStats } from '../api/requests'
 import { applyToolPolicyPreset, listToolPolicies, listToolPolicyPresets, type ToolPolicyPreset } from '../api/toolPolicy'
 import { getOrgResidency, listPolicyPacks, updateOrgResidency, upsertPolicyPack } from '../api/orgSettings'
 import { CopyBlock } from '../components/CopyBlock'
@@ -14,7 +14,7 @@ import { useHashParam } from '../hooks/useHashParam'
 import { usePermissions } from '../hooks/usePermissions'
 import {
   ONBOARDING_CLIENTS, REGION_PACK_IDS, allStepsDone, clientConfigBlock, dashboardHomeLink,
-  firstRequestState, gatewayKeyState, gatewayKeysLink, providerKeyState, providerKeysLink,
+  firstRequestLink, firstRequestState, gatewayKeyState, gatewayKeysLink, providerKeyState, providerKeysLink,
   DEFAULT_WIZARD_SELECTION, wizardAppliedPackRegions, wizardItemDisplayState, wizardItemLiveState, wizardPlan, wizardPlanDone, wizardPlanItemKey, wizardPresetFromRegion,
   type OnboardingClient, type OnboardingSignals,
   type WizardApplyOutcome, type WizardDeploymentPreset, type WizardResidencyPreset, type WizardSelection, type WizardSignals,
@@ -85,12 +85,24 @@ export function OnboardingPage() {
   const { t } = useTranslation()
   const [orgId, setOrgId] = useHashParam('org')
   const org = orgId.trim()
+  // The setup-request identity (see the evidence state below): URL param,
+  // supplied by the operator through the wizard's own entry control below.
+  const [requestIdParam, setRequestIdParam] = useHashParam('request')
   const perms = usePermissions(org || undefined)
   const isRoot = perms.isRoot
 
   const [flag, setFlag] = useState<OrgOnboarding | null>(null)
   const [flagState, setFlagState] = useState<FlagState>('loading')
   const [signals, setSignals] = useState<OnboardingSignals>({ providerKey: null, gatewayKey: null, firstRequest: null })
+  // CUI-02 evidence identity: the KNOWN setup request id (the X-Request-ID
+  // the operator's client sent through the gateway), carried on the onboarding
+  // URL as an explicit `request` param so reload/resume preserves it. Never
+  // derived from list position or timestamps.
+  const [evidenceRequest, setEvidenceRequest] = useState<string | null>(null)
+  // The entry control's draft + its verification outcome (invalid shows the
+  // not-found feedback; a confirmed id renders the evidence link above).
+  const [requestEntry, setRequestEntry] = useState('')
+  const [entryState, setEntryState] = useState<'idle' | 'checking' | 'invalid'>('idle')
   const [client, setClient] = useState<OnboardingClient>('opencode')
   const [skipping, setSkipping] = useState(false)
   // The auto-complete mark fires at most once per org (a ref, not state:
@@ -274,6 +286,27 @@ export function OnboardingPage() {
     })()
     return () => { cancelled = true }
   }, [org])
+  // ----- CUI-02: verify the setup-request identity for THIS org -----
+  // The id comes only from the URL (`request` param — the wizard entry
+  // control writes it there). listRequests with an exact requestId
+  // collapses to that one org-scoped record, so a foreign org, a typo or
+  // a not-yet-persisted id yields no row and no link — the identity is
+  // revalidated on every org/param change (no cross-tenant carryover, no
+  // list-position or timestamp inference).
+  useEffect(() => {
+    setEvidenceRequest(null)
+    const id = requestIdParam.trim()
+    if (!org || !id) { setEntryState('idle'); return }
+    let cancelled = false
+    setEntryState('checking')
+    void (async () => {
+      const res = await listRequests({ orgId: org, page: 1, pageSize: 1, requestId: id })
+      if (cancelled) return
+      if (res?.data?.some(r => r.request_id === id)) { setEvidenceRequest(id); setEntryState('idle') }
+      else setEntryState('invalid')
+    })().catch(() => { if (!cancelled) setEntryState('invalid') })
+    return () => { cancelled = true }
+  }, [org, requestIdParam])
 
   // ----- auto-complete: every step confirmed true → persist the mark -----
   useEffect(() => {
@@ -338,6 +371,49 @@ export function OnboardingPage() {
     </div>
   )
 
+  // CUI-02: the ONE operator action for the setup-request identity —
+  // rendered in BOTH the pending steps view and the completed (allSet)
+  // view, so a plain reopen of a completed org can still enter or correct
+  // the id. The operator pastes the X-Request-ID their client's response
+  // carried; the exact org-scoped persisted read validates it; the
+  // confirmed id rides the onboarding URL (`request` param) so
+  // reload/resume keeps it. Never derived from list position or
+  // timestamps.
+  const setupRequestEntry = (
+    <>
+      <form
+        className="flex flex-wrap items-center gap-2"
+        onSubmit={(e) => {
+          e.preventDefault()
+          const id = requestEntry.trim()
+          if (id) setRequestIdParam(id)
+        }}
+      >
+        <label htmlFor="welcome-setup-request-input" className="sr-only">
+          {t('welcome.setupRequestIdLabel')}
+        </label>
+        <input
+          id="welcome-setup-request-input"
+          data-testid="welcome-setup-request-input"
+          className="input min-h-[44px] max-w-[24rem] flex-1 font-mono text-xs"
+          placeholder={t('welcome.setupRequestIdPlaceholder')}
+          value={requestEntry}
+          onChange={(e) => setRequestEntry(e.target.value)}
+          autoComplete="off"
+          spellCheck={false}
+        />
+        <button type="submit" className="btn-secondary min-h-[44px]" data-testid="welcome-setup-request-verify">
+          {t('welcome.setupRequestIdVerify')}
+        </button>
+      </form>
+      {entryState === 'invalid' && (
+        <p className="text-sm" role="alert" data-testid="welcome-setup-request-invalid">
+          {t('welcome.setupRequestNotFound')}
+        </p>
+      )}
+    </>
+  )
+
   return (
     <div className="space-y-6" data-testid="welcome-flow">
       <PageHeader
@@ -368,7 +444,16 @@ export function OnboardingPage() {
             {t('welcome.allSet')}
           </p>
           <p className="text-sm text-[color:var(--astra-text-muted)]">{t('welcome.allSetHint')}</p>
-          <a href={dashboardHomeLink(isRoot)} className="btn-primary mt-1 w-fit min-h-[44px]">
+          {/* Same entry/validation action as the pending view: a completed
+              org can still attach or correct its setup-request identity on
+              a plain reopen (the verified link below stays when present). */}
+          {setupRequestEntry}
+          {evidenceRequest && (
+            <a href={firstRequestLink(org, evidenceRequest)} className="btn-secondary w-fit min-h-[44px]" data-testid="welcome-first-request-link">
+              {t('welcome.viewFirstRequest')}
+            </a>
+          )}
+          <a href={dashboardHomeLink(isRoot)} className="btn-primary w-fit min-h-[44px]">
             {t('welcome.goDashboard')}
           </a>
         </div>
@@ -429,6 +514,14 @@ export function OnboardingPage() {
                   ? <span className="text-[color:var(--astra-text-muted)]">{t('welcome.wizardStateTodo')}</span>
                   : <span className="text-[color:var(--astra-text-muted)]">{t('welcome.stateChecking')}</span>}
             </p>
+            {/* CUI-02: the shared operator entry control (defined once with
+                the completed view — same input, same validation action). */}
+            {setupRequestEntry}
+            {evidenceRequest && (
+              <a href={firstRequestLink(org, evidenceRequest)} className="btn-secondary w-fit min-h-[44px]" data-testid="welcome-first-request-link">
+                {t('welcome.viewFirstRequest')}
+              </a>
+            )}
 
             <div className="flex flex-wrap gap-2" role="tablist" aria-label={t('welcome.clientTabs')}>
               {ONBOARDING_CLIENTS.map(id => (
