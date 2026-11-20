@@ -203,7 +203,7 @@ func TestCheckBudget_NoBudgetConfigured(t *testing.T) {
 	db := newFakeBudgetDB()
 	e := NewEnforcer(db, newBudgetTestLogger())
 	err := e.CheckBudget(context.Background(), "team-1")
-	assert.ErrorIs(t, err, ErrNoBudget) // deny by default — no budget row configured
+	require.ErrorIs(t, err, ErrNoBudget) // deny by default — no budget row configured
 	assert.Equal(t, 1, db.snapshotReads(), "the denial comes from an authoritative read")
 }
 
