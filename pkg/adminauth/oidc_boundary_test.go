@@ -57,6 +57,8 @@ type boundaryProvider struct {
 	altCount atomic.Int64 // alternates the signing kid when signKidAlternates
 	alt      atomic.Bool  // when true, /token alternates k2/k3 per response
 	minted   map[string]int
+
+	jwksGETs atomic.Int64 // /jwks requests served: the observable refetch count
 }
 
 func newBoundaryProvider(t *testing.T) *boundaryProvider {
@@ -91,6 +93,7 @@ func newBoundaryProvider(t *testing.T) *boundaryProvider {
 		})
 	})
 	mux.HandleFunc("/jwks", func(w http.ResponseWriter, _ *http.Request) {
+		p.jwksGETs.Add(1)
 		p.mu.Lock()
 		kids := append([]string(nil), p.published...)
 		p.mu.Unlock()
@@ -190,6 +193,39 @@ func exchangeWith(t *testing.T, c *OIDCClient, ok bool, label string) {
 	}
 	if !ok && err == nil {
 		t.Fatalf("%s: must fail closed", label)
+	}
+}
+
+// adoptFreshKid drives a long-lived client's keyset until it has fully
+// adopted the CURRENT published set: it mints kid-signed tokens and
+// exchanges them on c until one verifies, then requires a fresh JWKS
+// refetch to have done the job (GET count moved). kid must never have been
+// published before this call, so neither the keyset cache nor any in-flight
+// refetch result contains it and a stale result cannot verify the token.
+//
+// The synchronization matters because go-oidc's RemoteKeySet hands a
+// refetch result to the caller BEFORE its background goroutine writes the
+// keyset cache (the inflight channel closes first; the locked cachedKeys
+// write and inflight release follow), and a fresh refetch only starts once
+// that locked section completed. A verified adoptFreshKid therefore proves
+// the cache write of the previous rotation has landed. The deadline only
+// guards a wedged scheduler.
+func adoptFreshKid(t *testing.T, p *boundaryProvider, c *OIDCClient, kid, label string) {
+	t.Helper()
+	p.setSignKid(kid)
+	getsBefore := p.jwksGETs.Load()
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		_, err := c.ExchangeAndVerify(context.Background(), "code", "boundary-nonce", "verifier")
+		if err == nil {
+			if gets := p.jwksGETs.Load(); gets <= getsBefore {
+				t.Fatalf("%s: adopting fresh kid %s must go through a JWKS refetch (GETs %d -> %d)", label, kid, getsBefore, gets)
+			}
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("%s: keyset never adopted fresh kid %s (last error: %v)", label, kid, err)
+		}
 	}
 }
 
@@ -316,25 +352,39 @@ func TestOIDCBoundary_RetiredKidCacheAsymmetry(t *testing.T) {
 	//     retired key and rejects its tokens immediately — the card's
 	//     "old key is rejected" negative, pinned at mock level. The
 	//     live-IdP equivalent runs in keycloak_live_boundary_test.go.
+	//
+	// go-oidc writes the keyset cache asynchronously AFTER the exchange that
+	// triggered the refetch has returned, so rotations synchronize through
+	// adoptFreshKid: a never-before-published kid can only verify through a
+	// fresh refetch, which starts only after the previous rotation's cache
+	// write completed. No assertion races the goroutine's scheduling.
 	p := newBoundaryProvider(t)
 	c, err := NewOIDCClient(context.Background(), p.server.URL, "cid", "sec", "https://adm/cb")
 	if err != nil {
 		t.Fatalf("NewOIDCClient: %v", err)
 	}
 
-	exchangeWith(t, c, true, "warmup k1") // cache: [k1]
+	exchangeWith(t, c, true, "warmup k1") // fresh keyset: refetch [k1]; cache: [k1]
 
 	p.setPublished("k1", "k2")
-	p.setSignKid("k2")
-	exchangeWith(t, c, true, "forward rotation adopts k2") // refetch; cache: [k1, k2]
+	adoptFreshKid(t, p, c, "k2", "forward rotation adopts k2") // refetch; cache: [k1, k2]
 
 	p.setPublished("k2") // retire k1
 	p.setSignKid("k1")
 	exchangeWith(t, c, true, "retired kid still verifies from cache (transient retention, cache untouched)")
 
-	p.setPublished("k2", "k4") // next rotation lands
-	p.setSignKid("k4")
-	exchangeWith(t, c, true, "unknown kid k4 forces a refetch") // cache: [k2, k4] — k1 EVICTED
+	// The next rotation lands: refetch; cache: [k2, k4] — k1 EVICTED.
+	p.setPublished("k2", "k4")
+	adoptFreshKid(t, p, c, "k4", "unknown kid k4 forces a refetch")
+
+	// Barrier before the eviction assertion: prove the k4 refetch's cache
+	// write completed. k3 exists in the keyring but was never published in
+	// this test, so adopting it needs a fresh refetch, which can only start
+	// after the k4 rotation's goroutine finished writing [k2, k4]. Every set
+	// from here on excludes k1, so this barrier's own pending write cannot
+	// resurrect the retired kid.
+	p.setPublished("k2", "k4", "k3")
+	adoptFreshKid(t, p, c, "k3", "post-rotation cache-write barrier")
 
 	p.setSignKid("k1")
 	exchangeWith(t, c, false, "evicted retired kid now fails closed on the same long-lived client")

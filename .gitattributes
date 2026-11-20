@@ -2,3 +2,5 @@
 deploy/mock-provider/legal/notices/openssl/AUTHORS.md -diff
 deploy/mock-provider/legal/notices/** whitespace=-blank-at-eol
 deploy/mock-provider/legal/reference/** whitespace=-blank-at-eol
+# Preserve the byte-exact upstream license used by the OIDC qualification fixture.
+pkg/adminauth/testdata/oidcgate/LICENSE-go-oidc whitespace=-blank-at-eof
