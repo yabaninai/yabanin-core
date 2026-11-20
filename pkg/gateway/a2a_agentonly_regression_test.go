@@ -1,6 +1,6 @@
 package cli
 
-// A2A-08 dependency-boundary regression (critical-go seed-cover
+// A2A-16 dependency-boundary regression (critical-go seed-cover
 // correction): the a2aSend InvokeError switch's ErrCodeAgentOnly arm is
 // defensive — the real a2aagg.Proxy answers agent-only only for an empty
 // agent identity, which the handler's own agent-principal check rejects
@@ -78,6 +78,7 @@ func TestA2AProxyAgentOnlyMappingForbidden(t *testing.T) {
 // dependency-boundary leg through the seed replay, covering the a2a.go
 // ErrCodeAgentOnly arm in the seed coverage profile.
 func a2aAgentOnlyMappingCase(t *testing.T) {
+	t.Helper()
 	stub := &a2aAgentOnlyStub{}
 	gw := &gateway{log: fuzzDiscardLogger()}
 	gw.a2aProxy = stub
