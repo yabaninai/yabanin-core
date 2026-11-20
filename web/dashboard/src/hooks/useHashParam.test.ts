@@ -79,9 +79,11 @@ function Scope() {
   const [org] = useHashParam('org')
   const [request] = useHashParam('request')
   const [tab, setTab] = useHashParam('tab')
-  g.__scope = { org, request, tab }
+  const scope = useGlobalScope()
+  const [inspect] = useInspectParam()
+  g.__scope = { org, request, tab, storeOrg: scope.org, inspect }
   return createElement('div', null,
-    createElement('output', { id: 'out' }, JSON.stringify({ org, request, tab })),
+    createElement('output', { id: 'out' }, JSON.stringify({ org, request, tab, storeOrg: scope.org, inspect })),
     createElement('a', { id: 'link-display', href: '#settings?tab=display&lang=en' }, 'Display'),
     createElement('button', { id: 'set-tab', onClick: () => setTab('theme') }, 'Theme'),
   )
@@ -210,16 +212,28 @@ test('(a) actual link navigation re-adopts the param; Back and Forward follow th
   } finally { await page.close() }
 })
 
-test('(a-org) hashchange org switch updates the org consumer; Back/Forward return orgA then orgB', async () => {
-  const page = await openPage('#onboarding?org=orgA&request=r1', 'Scope')
+test('(a-org) native switch and history restore both the hash param and shared store org', async () => {
+  const page = await openPage('#requests-explorer?org=orgA&inspect=request:r1', 'Scope')
   try {
-    await page.waitForFunction(() => JSON.parse(document.querySelector('#out')!.textContent!).org === 'orgA')
-    await page.evaluate(() => { location.hash = '#onboarding?org=orgB&request=r1' })
-    await page.waitForFunction(() => JSON.parse(document.querySelector('#out')!.textContent!).org === 'orgB')
-    await page.evaluate(() => history.back())
-    await page.waitForFunction(() => JSON.parse(document.querySelector('#out')!.textContent!).org === 'orgA')
-    await page.evaluate(() => history.forward())
-    await page.waitForFunction(() => JSON.parse(document.querySelector('#out')!.textContent!).org === 'orgB')
+    await page.waitForFunction(() => {
+      const s = JSON.parse(document.querySelector('#out')!.textContent!)
+      return s.org === 'orgA' && s.storeOrg === 'orgA' && s.inspect === 'request:r1'
+    })
+    await page.evaluate(() => { location.hash = '#requests-explorer?org=orgB' })
+    await page.waitForFunction(() => {
+      const s = JSON.parse(document.querySelector('#out')!.textContent!)
+      return s.org === 'orgB' && s.storeOrg === 'orgB' && s.request === '' && s.inspect === ''
+    })
+    await page.goBack()
+    await page.waitForFunction(() => {
+      const s = JSON.parse(document.querySelector('#out')!.textContent!)
+      return s.org === 'orgA' && s.storeOrg === 'orgA' && s.inspect === 'request:r1'
+    })
+    await page.goForward()
+    await page.waitForFunction(() => {
+      const s = JSON.parse(document.querySelector('#out')!.textContent!)
+      return s.org === 'orgB' && s.storeOrg === 'orgB' && s.request === '' && s.inspect === ''
+    })
   } finally { await page.close() }
 })
 
