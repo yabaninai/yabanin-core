@@ -280,7 +280,7 @@ rerun pending):
 Complexity after R3: worst functions at 15 (`_pinned_service_failures`,
 `_pg_collection_identity_failures`, stdlib AST gocyclo-style approximation;
 no pinned Python tool exists -- documented policy gap), remaining changed
-functions <= 14.
+functions `<= 14`.
 
 ## What is NOT claimed
 
@@ -294,21 +294,23 @@ technical verification and must not be bypassed.
 
 ## Usage
 
-    # 1. dashboard map build (same inputs -> same chunk hashes as dist/)
-    cd web/dashboard
-    npx vite build --outDir <map-root> --sourcemap --manifest
+```bash
+# 1. dashboard map build (same inputs -> same chunk hashes as dist/)
+cd web/dashboard
+npx vite build --outDir <map-root> --sourcemap --manifest
 
-    # 2. release artifacts + notice payloads
-    make licenses-report
-    RELEASE_DIR=dist/release bash scripts/release/release-artifacts.sh
+# 2. release artifacts + notice payloads
+make licenses-report
+RELEASE_DIR=dist/release bash scripts/release/release-artifacts.sh
 
-    # 3. evidence
-    python3 scripts/release/dashboard_evidence.py --map-root <map-root>
-    python3 scripts/release/release_evidence.py generate
-    python3 scripts/release/release_evidence.py verify [--expected-head <commit>]
+# 3. evidence
+python3 scripts/release/dashboard_evidence.py --map-root <map-root>
+python3 scripts/release/release_evidence.py generate
+python3 scripts/release/release_evidence.py verify [--expected-head <commit>]
 
-    # 4. negative controls (fixture tree; real-repo provenance included)
-    python3 scripts/release/test_release_evidence.py
+# 4. negative controls (fixture tree; real-repo provenance included)
+python3 scripts/release/test_release_evidence.py
+```
 
 `--map-root` is required: public product tooling must not depend on
 machine-specific paths, and the command above is the reproducible way to
