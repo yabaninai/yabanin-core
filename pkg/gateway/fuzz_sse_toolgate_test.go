@@ -39,6 +39,23 @@ func FuzzSSEToolGate(f *testing.F) {
 	// an inactive passthrough stream (see fuzzSSEGenerated).
 	f.Add([]byte{0x00, 0x00, 0x00, 0x00})
 	f.Add([]byte{0x80, 0x01, 0x02, 0x03, 0x81})
+	// Critical-go seed extensions (arm table in sseGenFrames): identity
+	// conflict, hold/discard lifecycles, ambiguous identities, nameless and
+	// object-argument calls, plus inactive-stream payloads that fail JSON
+	// decoding at different stages. Byte shapes follow the arm table: bit 0
+	// picks the name (0x80 set for values ≥ 0x80), 0x04/0x08/0x10/0x20 are the
+	// call-shape arms, 0x40 on the FIRST byte selects the inactive org, and
+	// c[3] carries the frame-shape arms.
+	f.Add([]byte{129, 0, 0, 0, 130, 0, 0, 0})                        // decideName conflict on one call key
+	f.Add([]byte{129, 1, 0, 0, 128, 0, 0, 0x04})                     // held call, then malformed payload → discard
+	f.Add([]byte{129, 0, 0, 0, 129, 1, 0, 0, 129, 0, 0, 0x10, 0x80}) // two held choices, terminal #0, ambiguous index-less finish
+	f.Add([]byte{129, 0, 0, 0, 129, 0, 0, 0x20})                     // held call, then a null choice member
+	f.Add([]byte{128, 0, 0, 0, 128, 0, 0, 1})                        // same denied call key twice → sticky deny
+	f.Add([]byte{145, 0, 0, 0})                                      // fractional choice index → ambiguous drop
+	f.Add([]byte{161, 0, 0, 0})                                      // duplicated choice index → both ambiguous
+	f.Add([]byte{133, 0, 0, 0})                                      // nameless call with arguments → release guard
+	f.Add([]byte{137, 0, 0, 0})                                      // object arguments → identity refused
+	f.Add([]byte{193, 0, 0, 0x0C, 193, 0, 0, 0x40})                  // inactive: scalar then invalid-first-token payloads
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 0 && data[0] >= 1 && data[0] <= 18 {
 			fuzzSSECases[int(data[0])](t)
@@ -62,29 +79,76 @@ func sseGenName(b byte) string {
 	}
 }
 
-// sseGenFrames derives an SSE frame stream from the fuzzed bytes: tool-call
-// fragments (name/args/choice-index vary), keepalive comments and an optional
-// terminal finish frame. Every data line is valid JSON by construction.
+// sseGenFrames derives an SSE frame stream from the fuzzed bytes. Frame
+// shape comes from the 4-byte groups: c[0] carries the tool name (low two
+// bits) plus the call-shape arms 0x04 nameless / 0x08 object arguments /
+// 0x10 fractional choice index / 0x20 duplicated choice; c[1] is the choice
+// index, c[2] the call index, and c[3] the frame-shape arms 0x04 malformed
+// payload / 0x08 scalar payload / 0x10 indexed terminal frame / 0x20 null
+// choice member / 0x40 invalid-first-token payload. Bit 0x80 on c[0] and
+// the trailing byte feed the historical name/finish derivation. The pre-extension seeds keep c[3] ∈ {0, 3} and
+// c[0] ∈ {0x00, 0x80}, so every new arm is clear for them and their emitted
+// stream is byte-identical to the pre-extension generator.
 func sseGenFrames(p []byte) (frames []string, sawDenied bool) {
 	for i := 0; i+3 < len(p); i += 4 {
 		c := p[i : i+4]
 		name := sseGenName(c[0])
-		if name == "secret_tool" {
-			sawDenied = true
-		}
 		if c[0]&3 == 3 { // non-data line: keepalive/comment passthrough
 			frames = append(frames, ": keepalive "+fmt.Sprintf("%02x", c[1])+"\n\n")
 			continue
 		}
+		switch {
+		case c[3]&0x40 != 0:
+			frames = append(frames, "data: }\n\n") // first JSON token itself invalid
+			continue
+		case c[3]&0x04 != 0 && c[3]&0x08 == 0:
+			frames = append(frames, "data: {bad\n\n") // malformed JSON payload
+			continue
+		case c[3]&0x04 != 0:
+			frames = append(frames, "data: 5\n\n") // scalar JSON payload
+			continue
+		case c[3]&0x10 != 0:
+			frames = append(frames, fmt.Sprintf(`data: {"choices":[{"index":%d,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n", c[1]%2))
+			continue
+		}
+		// Only call frames can carry (and leak) a denied name; nameless
+		// frames omit the name key, so no denial is declared either.
+		nameless := c[0]&0x04 != 0
+		if name == "secret_tool" && !nameless {
+			sawDenied = true
+		}
 		argsBytes, _ := json.Marshal(string(c[1:])) // infallible for strings; valid JSON fragment
-		frame := fmt.Sprintf(`data: {"choices":[{"index":%d,"delta":{"tool_calls":[{"index":%d,"function":{"name":%q,"arguments":%s}}]}}]}`+"\n\n",
-			c[1]%2, c[2]%3, name, string(argsBytes))
-		frames = append(frames, frame)
+		if c[0]&0x08 != 0 {                         // non-string argument form: refused fail-closed
+			argsBytes = []byte(`{"fuzz":true}`)
+		}
+		fn := fmt.Sprintf(`"arguments":%s`, string(argsBytes))
+		if !nameless {
+			fn = fmt.Sprintf(`"name":%q,`+fn, name)
+		}
+		choice := fmt.Sprintf(`{"index":%s,"delta":{"tool_calls":[{"index":%d,"function":{%s}}]}}`,
+			choiceIndex(c), c[2]%3, fn)
+		if c[0]&0x20 != 0 { // duplicate choice: the same wire index twice in one frame
+			choice += "," + choice
+		}
+		choices := choice
+		if c[3]&0x20 != 0 { // null choice member inside an indexed frame
+			choices = "null," + choices
+		}
+		frames = append(frames, fmt.Sprintf(`data: {"choices":[%s]}`+"\n\n", choices))
 	}
 	if len(p) > 0 && p[len(p)-1]&0x80 != 0 {
 		frames = append(frames, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
 	}
 	return frames, sawDenied
+}
+
+// choiceIndex renders the SSE choice index: a whole number unless the
+// fractional-index arm is set (an unresolvable positional identity).
+func choiceIndex(c []byte) string {
+	if c[0]&0x10 != 0 {
+		return fmt.Sprintf("%d.5", c[1]%2)
+	}
+	return fmt.Sprintf("%d", c[1]%2)
 }
 
 // sseGenStreamOracle holds the independent invariants for generated streams:
@@ -103,7 +167,18 @@ func sseGenStreamOracle(t *testing.T, out string, active, sawDenied bool, denied
 		}
 	}
 	for _, line := range strings.Split(out, "\n") {
-		if d, ok := strings.CutPrefix(line, "data: "); ok && d != "" && !json.Valid([]byte(d)) {
+		d, ok := strings.CutPrefix(line, "data: ")
+		if !ok || d == "" {
+			continue
+		}
+		if d == "{bad" || d == "}" || d == "5" {
+			// Generator-injected non-JSON payloads exercising the
+			// fail-open/first-token/scalar passthrough paths; their
+			// byte-identity is asserted by the writer, not by JSON
+			// parsing here.
+			continue
+		}
+		if !json.Valid([]byte(d)) {
 			t.Fatalf("sse gen: released data line is not valid JSON: %q (out %q)", d, out)
 		}
 	}
@@ -137,6 +212,11 @@ func fuzzSSEGenerated(t *testing.T, data []byte) {
 	sseGenStreamOracle(t, w.Body.String(), active, sawDenied, g.DeniedCount())
 	if !active && w.Body.String() != stream {
 		t.Fatalf("sse gen: inactive writer altered the stream: %q != %q", w.Body.String(), stream)
+	}
+	// Critical-go pin: a choice that is not an object can never carry a
+	// terminal finish reason, whatever the surrounding payload shape.
+	if frameTerminal(map[string]any{"choices": []any{nil}}) {
+		t.Fatal("sse gen: nil choice must not count as a terminal frame")
 	}
 }
 

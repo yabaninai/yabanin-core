@@ -111,6 +111,9 @@ func FuzzToolGateJSON(f *testing.F) {
 	// Generated-body seeds: mixed allowed/denied calls, and a raw-bytes body.
 	f.Add([]byte{0x00, 0x01, 0x00, 0x01})
 	f.Add([]byte{0x55, 0x01, 0x02})
+	// Critical-go seed extension: a nameless call bearing real arguments —
+	// an ambiguous wire declaration that filterToolCall must drop.
+	f.Add([]byte{0x2C, 0x01})
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) > 0 && data[0] >= 1 && data[0] <= 18 {
 			fuzzTGCases[int(data[0])](t)
@@ -146,6 +149,11 @@ func tgGenBody(p []byte) []byte {
 				"name":      name,
 				"arguments": fmt.Sprintf(`{"k":%q}`, string(c)),
 			},
+		}
+		if c[0]&8 != 0 {
+			// Nameless arm (critical-go): a tool call without a function
+			// name but with real declared arguments.
+			delete(call["function"].(map[string]any), "name")
 		}
 		msg := map[string]any{"role": "assistant", "content": "ok"}
 		if c[0]&4 != 0 {
@@ -238,6 +246,11 @@ func tgGenerated(t *testing.T, data []byte) {
 		t.Fatalf("tg gen: passthrough altered raw body: %q -> %q", body, out)
 	}
 	tgGenOracle(t, body, out, denied, rawMode && !json.Valid(body))
+	// Critical-go pin: the empty decision record renders as the empty
+	// payload (gateway_policy_test.go pins the same contract in unit land).
+	if got := marshalPolicyDecisions(nil); got != "" {
+		t.Fatalf("tg gen: empty policy decisions must marshal empty: %q", got)
+	}
 }
 
 var fuzzTGCases = map[int]func(*testing.T){

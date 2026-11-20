@@ -135,6 +135,22 @@ func btGenerated(t *testing.T, data []byte) {
 	if w.Body.Len() > 0 && !json.Valid(w.Body.Bytes()) {
 		t.Fatalf("bt gen: non-JSON envelope: %q", w.Body.String())
 	}
+	// Critical-go contract pins for the event media-hygiene funnel (this
+	// driver wires no publisher, so auditBuiltin's hygiene call is
+	// unreachable here; the contract is pinned directly instead).
+	if mediaHygienicEvent(nil) != nil {
+		t.Fatal("bt gen: nil event must stay nil")
+	}
+	media := &eventpub.Event{Payload: `{"img":"data:image/png;base64,` + strings.Repeat("QUJD", 64) + `"}`}
+	sanitized := mediaHygienicEvent(media)
+	if sanitized == nil || sanitized == media || sanitized.Payload == media.Payload ||
+		strings.Contains(sanitized.Payload, "QUJDQUJDQUJD") {
+		t.Fatalf("bt gen: inline media not stripped: %q", sanitized.Payload)
+	}
+	plain := &eventpub.Event{Payload: `{"ok":true}`}
+	if got := mediaHygienicEvent(plain); got != plain {
+		t.Fatal("bt gen: media-free event must return the same pointer")
+	}
 }
 
 // btGenAssert checks the generated invoke against the authorization and
