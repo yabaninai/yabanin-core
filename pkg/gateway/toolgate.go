@@ -145,9 +145,12 @@ func declaredArgs(fn map[string]any) json.RawMessage {
 // sseToolGateWriter is an http.ResponseWriter filter for the SSE surface.
 // It buffers writes until a complete `data: {...}\n\n` frame is available,
 // filters delta.tool_calls entries by policy (a name-bearing first fragment
-// decides for that call index; later argument fragments follow the
-// decision), rewrites finish_reason when every call of a choice was denied,
-// and passes everything else through untouched.
+// decides for that call — keyed by the full (choice, call index) pair,
+// because call indexes are unique only within a choice; a deny is sticky
+// for the call's identity, so a later rename cannot un-deny it; later
+// argument fragments follow the decision), rewrites finish_reason when
+// every call a choice declared across the response was denied, and passes
+// everything else through untouched.
 //
 // gated too. From the first fragment of such a call the frames are held
 // (order preserved) until the calls complete — a frame carrying a
@@ -167,23 +170,41 @@ type sseToolGateWriter struct {
 	// failure mode is pinned by TestToolPolicyFailsOpenOnCancelledContext.
 	ctx context.Context
 
-	buf        []byte
-	byIdx      map[int]bool // call index → allowed
-	deadChoice map[int]bool // choice index → every call denied (finish rewrite)
+	buf     []byte
+	verdict map[callKey]bool // call identity → name decision
+	// seenChoice/keptChoice track each choice response-wide for the finish
+	// rewrite: a choice is stranded only when it declared calls and none
+	// survived, wherever those calls split across frames.
+	seenChoice map[int]bool
+	keptChoice map[int]bool
 	denied     int
 	active     bool
 
-	holding    bool                  // frames are held pending the args verdict
-	heldFrames [][]byte              // held frames in arrival order
-	declName   map[int]string        // call index → declared tool name
-	declArgs   map[int]*bytes.Buffer // call index → accumulated arguments
+	holding    bool                      // frames are held pending the args verdict
+	heldFrames [][]byte                  // held frames in arrival order
+	declName   map[callKey]string        // call identity → declared tool name
+	declArgs   map[callKey]*bytes.Buffer // call identity → accumulated arguments
 }
+
+// callKey is the streaming identity of one tool call: OpenAI call indexes
+// are unique only within a choice, so verdicts, argument tracking and drop
+// decisions key on the full (choice index, call index) pair — two choices
+// may validly declare index 0.
+type callKey struct {
+	ci  int
+	idx int
+}
+
+// callKeyFor is the single identity seam for call-scoped state: verdicts,
+// argument tracking and drop decisions all resolve a call through it, so
+// they can never disagree about what a call is.
+func callKeyFor(ci, idx int) callKey { return callKey{ci: ci, idx: idx} }
 
 func newSSEToolGateWriter(ctx context.Context, w http.ResponseWriter, engine *toolpolicy.Engine, orgID, subject string, hasDeny bool) *sseToolGateWriter {
 	return &sseToolGateWriter{
 		w: w, engine: engine, orgID: orgID, subject: subject, ctx: ctx,
-		byIdx: map[int]bool{}, deadChoice: map[int]bool{}, active: hasDeny,
-		declName: map[int]string{}, declArgs: map[int]*bytes.Buffer{},
+		verdict: map[callKey]bool{}, seenChoice: map[int]bool{}, keptChoice: map[int]bool{}, active: hasDeny,
+		declName: map[callKey]string{}, declArgs: map[callKey]*bytes.Buffer{},
 	}
 }
 
@@ -271,13 +292,13 @@ func (g *sseToolGateWriter) writeFrame(frame []byte) {
 }
 
 // absorb runs the per-fragment scan of one parsed frame: the name-bearing
-// first fragments decide their call index (as before, pinned), the argument
-// chunks of calls that are not name-denied accumulate for the args guard,
-// and the report says whether any call in this frame may still be executing
-// — those frames must be held until the calls complete.
+// first fragments decide their call's identity, the argument chunks of calls
+// that are not name-denied accumulate for the args guard, and the report
+// says whether any call in this frame may still be executing — those frames
+// must be held until the calls complete.
 func (g *sseToolGateWriter) absorb(doc map[string]any) (hold bool) {
 	choices, _ := doc["choices"].([]any)
-	for _, c := range choices {
+	for ci, c := range choices {
 		choice, _ := c.(map[string]any)
 		if choice == nil {
 			continue
@@ -289,44 +310,72 @@ func (g *sseToolGateWriter) absorb(doc map[string]any) (hold bool) {
 		calls, _ := delta["tool_calls"].([]any)
 		for _, cl := range calls {
 			call, _ := cl.(map[string]any)
-			idx := callIndex(call)
-			fn, _ := call["function"].(map[string]any)
-			name, _ := fn["name"].(string)
-			if name != "" {
-				// First fragment: decide for this call index.
-				allowed := true
-				if g.engine != nil {
-					if d := g.engine.Decide(g.ctx, g.orgID, g.subject, name); d.Action == toolpolicy.ActionDeny {
-						allowed = false
-						g.denied++
-						metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
-					}
-				}
-				g.byIdx[idx] = allowed
-				if allowed {
-					if _, tracking := g.declName[idx]; !tracking {
-						g.declName[idx] = name
-					}
-				}
-			}
-			if g.nameDenied(0, idx) {
-				continue // name-denied: dropped at rewrite time
-			}
-			hold = true
-			if fn == nil {
-				continue
-			}
-			if chunk, _ := fn["arguments"].(string); chunk != "" {
-				b := g.declArgs[idx]
-				if b == nil {
-					b = &bytes.Buffer{}
-					g.declArgs[idx] = b
-				}
-				b.WriteString(chunk)
+			if g.absorbCall(ci, call) {
+				hold = true
 			}
 		}
 	}
 	return hold
+}
+
+// absorbCall scans one tool-call fragment under its full (choice, index)
+// identity: a name-bearing first fragment decides the verdict for that key,
+// an allowed call's argument chunks accumulate for the release args guard,
+// and the return reports whether the call may still be executing (its
+// frames must be held).
+func (g *sseToolGateWriter) absorbCall(ci int, call map[string]any) bool {
+	key := callKeyFor(ci, callIndex(call))
+	fn, _ := call["function"].(map[string]any)
+	name, _ := fn["name"].(string)
+	if name != "" {
+		g.decideName(key, name)
+	}
+	if g.nameDenied(ci, key.idx) {
+		return false // name-denied: dropped at rewrite time
+	}
+	if fn == nil {
+		return true
+	}
+	if chunk, _ := fn["arguments"].(string); chunk != "" {
+		g.appendArgs(key, chunk)
+	}
+	return true
+}
+
+// decideName runs the name decision for one call identity. The first
+// name-bearing fragment decides, and a deny is STICKY for the whole call:
+// a later fragment renaming the call to an allowed name must not un-deny
+// fragments of a call the policy already rejected (deny-wins per identity),
+// nor count the denial twice. The opposite direction stays live — an
+// allowed first name can still be denied by a later fragment's rename.
+func (g *sseToolGateWriter) decideName(key callKey, name string) {
+	if allowed, seen := g.verdict[key]; seen && !allowed {
+		return // denied under this identity: sticky, one denial per call
+	}
+	allowed := true
+	if g.engine != nil {
+		if d := g.engine.Decide(g.ctx, g.orgID, g.subject, name); d.Action == toolpolicy.ActionDeny {
+			allowed = false
+			g.denied++
+			metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+		}
+	}
+	g.verdict[key] = allowed
+	if allowed {
+		if _, tracking := g.declName[key]; !tracking {
+			g.declName[key] = name
+		}
+	}
+}
+
+// appendArgs accumulates one argument chunk of a held call.
+func (g *sseToolGateWriter) appendArgs(key callKey, chunk string) {
+	b := g.declArgs[key]
+	if b == nil {
+		b = &bytes.Buffer{}
+		g.declArgs[key] = b
+	}
+	b.WriteString(chunk)
 }
 
 // filterFrame applies the drop decisions to one parsed frame: tool_calls
@@ -341,39 +390,8 @@ func (g *sseToolGateWriter) filterFrame(frame []byte, doc map[string]any, drop f
 		if choice == nil {
 			continue
 		}
-		// Terminal frame: a choice whose every call was denied must not
-		// strand the client in a tool loop — rewrite the finish reason.
-		if fr, _ := choice["finish_reason"].(string); fr == "tool_calls" && g.deadChoice[ci] {
-			choice["finish_reason"] = "stop"
+		if g.filterChoice(choice, ci, drop) {
 			changed = true
-		}
-		delta, _ := choice["delta"].(map[string]any)
-		if delta == nil {
-			continue
-		}
-		calls, _ := delta["tool_calls"].([]any)
-		if len(calls) == 0 {
-			continue
-		}
-		kept := make([]any, 0, len(calls))
-		anyKept, anyDropped := false, false
-		for _, cl := range calls {
-			call, _ := cl.(map[string]any)
-			if drop(ci, callIndex(call)) {
-				anyDropped = true
-				continue // suppress this fragment
-			}
-			anyKept = true
-			kept = append(kept, cl)
-		}
-		if anyDropped {
-			changed = true
-			if anyKept {
-				delta["tool_calls"] = kept
-			} else {
-				delete(delta, "tool_calls")
-				g.deadChoice[ci] = true
-			}
 		}
 	}
 	if !changed {
@@ -386,6 +404,65 @@ func (g *sseToolGateWriter) filterFrame(frame []byte, doc map[string]any, drop f
 	return append(append([]byte("data: "), enc...), '\n', '\n'), true
 }
 
+// filterChoice applies the drop decisions to one choice: tool_calls entries
+// the drop function rejects are removed, and the choice's seen/kept record
+// updates response-wide — a call that survives anywhere keeps the choice's
+// tool loop alive even when the frame in hand lost all of its calls. The
+// finish rewrite is evaluated AFTER this choice's drops: a frame carrying
+// both the call fragments and finish_reason must rewrite in the same pass —
+// the split-frame sequence and the JSON surface (gateToolCallsJSON) pin the
+// same no-strand contract.
+func (g *sseToolGateWriter) filterChoice(choice map[string]any, ci int, drop func(ci, idx int) bool) bool {
+	changed := false
+	if delta, _ := choice["delta"].(map[string]any); delta != nil {
+		if calls, _ := delta["tool_calls"].([]any); len(calls) > 0 {
+			g.seenChoice[ci] = true
+			kept := make([]any, 0, len(calls))
+			anyKept, anyDropped := false, false
+			for _, cl := range calls {
+				call, _ := cl.(map[string]any)
+				if drop(ci, callIndex(call)) {
+					anyDropped = true
+					continue // suppress this fragment
+				}
+				anyKept = true
+				kept = append(kept, cl)
+			}
+			if anyKept {
+				g.keptChoice[ci] = true
+			}
+			if anyDropped {
+				changed = true
+				if anyKept {
+					delta["tool_calls"] = kept
+				} else {
+					delete(delta, "tool_calls")
+				}
+			}
+		}
+	}
+	if g.strandedFinish(choice, ci) {
+		changed = true
+	}
+	return changed
+}
+
+// strandedFinish rewrites the choice's finish reason when every call the
+// choice declared across the whole response was denied: a "tool_calls"
+// finish with no surviving call would strand the consumer's tool loop, so
+// it normalizes to "stop" (the JSON surface pins the same contract). The
+// seen/kept record is response-wide, so a survivor in an earlier or later
+// frame keeps the loop alive and an all-denied choice normalizes however
+// its calls were split.
+func (g *sseToolGateWriter) strandedFinish(choice map[string]any, ci int) bool {
+	fr, _ := choice["finish_reason"].(string)
+	if fr != "tool_calls" || !g.seenChoice[ci] || g.keptChoice[ci] {
+		return false
+	}
+	choice["finish_reason"] = "stop"
+	return true
+}
+
 // release evaluates every held call's accumulated arguments through the
 // chat-path args guard and writes the held frames out (order preserved),
 // dropping the fragments of denied calls whole.
@@ -395,44 +472,56 @@ func (g *sseToolGateWriter) release() {
 	if len(frames) == 0 {
 		return
 	}
-	drop := map[int]bool{}
-	for idx, name := range g.declName {
-		if g.nameDenied(0, idx) {
-			drop[idx] = true // name-denied mid-hold
-			continue
-		}
-		if name == "" || g.engine == nil {
-			continue
-		}
-		args := json.RawMessage(`{}`)
-		if b := g.declArgs[idx]; b != nil && b.Len() > 0 {
-			args = json.RawMessage(b.Bytes())
-		}
-		if rep := g.engine.GuardDeclaredArgs(g.ctx, g.orgID, g.subject, name, args); rep.Denied {
-			drop[idx] = true
-			g.denied++
-			metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
-		}
-	}
+	drop := g.dropSet()
 	for _, f := range frames {
 		var doc map[string]any
 		if err := json.Unmarshal(framePayload(f), &doc); err != nil {
 			_, _ = g.w.Write(f)
 			continue
 		}
-		if out, changed := g.filterFrame(f, doc, func(_, idx int) bool { return drop[idx] }); changed {
+		if out, changed := g.filterFrame(f, doc, func(ci, idx int) bool { return drop[callKeyFor(ci, idx)] }); changed {
 			_, _ = g.w.Write(out)
 			continue
 		}
 		_, _ = g.w.Write(f)
 	}
-	g.declName = map[int]string{}
-	g.declArgs = map[int]*bytes.Buffer{}
+	g.declName = map[callKey]string{}
+	g.declArgs = map[callKey]*bytes.Buffer{}
 }
 
-// nameDenied reports whether the call index was denied by its name decision.
-func (g *sseToolGateWriter) nameDenied(_ int, idx int) bool {
-	allowed, seen := g.byIdx[idx]
+// dropSet computes the release-time drop set over per-call identity: every
+// call the name decision denied (verdict — the same criterion the immediate
+// path applies, whether the deny was visible on the first fragment or a
+// mid-hold rename) plus every surviving held call whose accumulated
+// arguments the chat-path args guard denies.
+func (g *sseToolGateWriter) dropSet() map[callKey]bool {
+	drop := map[callKey]bool{}
+	for key, allowed := range g.verdict {
+		if !allowed {
+			drop[key] = true // name-denied: never in declName, still denied
+		}
+	}
+	for key, name := range g.declName {
+		if drop[key] || name == "" || g.engine == nil {
+			continue
+		}
+		args := json.RawMessage(`{}`)
+		if b := g.declArgs[key]; b != nil && b.Len() > 0 {
+			args = json.RawMessage(b.Bytes())
+		}
+		if rep := g.engine.GuardDeclaredArgs(g.ctx, g.orgID, g.subject, name, args); rep.Denied {
+			drop[key] = true
+			g.denied++
+			metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+		}
+	}
+	return drop
+}
+
+// nameDenied reports whether the call at (choice, index) was denied by its
+// name decision.
+func (g *sseToolGateWriter) nameDenied(ci int, idx int) bool {
+	allowed, seen := g.verdict[callKeyFor(ci, idx)]
 	return seen && !allowed
 }
 
@@ -577,11 +666,11 @@ func (gw *gateway) builtinToolInvoke(w http.ResponseWriter, r *http.Request, org
 		apierrors.Write(w, http.StatusServiceUnavailable, "unavailable", "built-in tools are not configured")
 		return
 	}
-	// The policy checks the EFFECTIVE name: http_request composes to
-	// http_<method> so name presets (network-readonly denies http_post)
-	// apply to the built-in executor naturally.
-	toolName := "yabanin:" + toolexec.EffectiveToolName(req.Tool, req.Params)
-	if gw.policyDeniesTool(w, r, orgID, id.AgentID, toolName) {
+	// The policy pre-check runs under BOTH addresses of the EFFECTIVE name
+	// (denyBuiltinInvoke → toolexec.PolicyKeys). http_request composes
+	// http_<method> so preset names (network-readonly denies http_post)
+	// apply naturally.
+	if gw.denyBuiltinInvoke(w, r, orgID, id.AgentID, req) {
 		return
 	}
 	start := time.Now()
@@ -660,7 +749,9 @@ func (gw *gateway) builtinToolCatalog(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// Hide tools the org policy denies: the catalog answers what THIS agent
-	// may actually call, not the global list.
+	// may actually call, not the global list. A deny under either address
+	// form (bare name or "yabanin:<name>") hides the tool — PolicyKeys
+	// parity with the invoke pre-check and the executor guard.
 	cat := toolexec.Catalog()
 	out := make([]toolexec.ToolDescriptor, 0, len(cat))
 	for _, d := range cat {
@@ -668,16 +759,43 @@ func (gw *gateway) builtinToolCatalog(w http.ResponseWriter, r *http.Request) {
 		if d.EffectiveName != "" {
 			continue // composite tools document their effective name inline; hide from the flat catalog
 		}
-		if gw.toolPolicies != nil {
-			if dec := gw.toolPolicies.Decide(r.Context(), orgID, agentID, "yabanin:"+name); dec.Action == toolpolicy.ActionDeny {
-				continue
-			}
+		if gw.toolPolicies != nil && gw.builtinToolHidden(r.Context(), orgID, agentID, name) {
+			continue
 		}
 		out = append(out, d)
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(out)
+}
+
+// denyBuiltinInvoke runs the built-in pre-check under every policy address
+// of the EFFECTIVE name (toolexec.PolicyKeys — the bare name and
+// "yabanin:<name>", the same addresses the executor guard and the catalog
+// consult): a deny row in either form refuses the invoke (403 policy_denied
+// is written inside policyDeniesTool); an allow row in one form never
+// un-denies the other.
+func (gw *gateway) denyBuiltinInvoke(w http.ResponseWriter, r *http.Request, orgID, agent string, req mcpagg.InvokeRequest) bool {
+	for _, key := range toolexec.PolicyKeys(toolexec.EffectiveToolName(req.Tool, req.Params)) {
+		if gw.policyDeniesTool(w, r, orgID, agent, key) {
+			return true
+		}
+	}
+	return false
+}
+
+// builtinToolHidden reports whether an org deny row hides a built-in tool
+// from the agent catalog: the tool is checked under EVERY policy address
+// (toolexec.PolicyKeys — the bare name and "yabanin:<name>", the same
+// addresses the invoke pre-check and the executor guard consult), so a
+// deny row in either form hides it.
+func (gw *gateway) builtinToolHidden(ctx context.Context, orgID, agent, tool string) bool {
+	for _, key := range toolexec.PolicyKeys(tool) {
+		if d := gw.toolPolicies.Decide(ctx, orgID, agent, key); d.Action == toolpolicy.ActionDeny {
+			return true
+		}
+	}
+	return false
 }
 
 // auditBuiltin records a built-in tool execution on the loggerd trail with

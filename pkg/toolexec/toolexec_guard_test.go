@@ -31,11 +31,13 @@ type fakeToolGuard struct {
 	gotServer   string
 	gotTool     string
 	gotArgs     string
+	argsSeq     [][2]string // every (server, tool) the args phase consulted
 }
 
 func (g *fakeToolGuard) GuardArgs(_ context.Context, _, _, server, tool string, args json.RawMessage) toolpolicy.ArgsReport {
 	g.argsCalls++
 	g.gotServer, g.gotTool, g.gotArgs = server, tool, string(args)
+	g.argsSeq = append(g.argsSeq, [2]string{server, tool})
 	return g.args
 }
 
@@ -106,9 +108,19 @@ func TestExecuteGuarded_ArgsDeny_BlockedBeforeUpstream(t *testing.T) {
 	if up.calls.Load() != 0 {
 		t.Fatalf("denied call must not reach the tool, got %d requests", up.calls.Load())
 	}
-	if g.argsCalls != 1 || g.gotServer != BuiltinServerName || g.gotTool != ToolWebFetch ||
-		!strings.Contains(g.gotArgs, up.URL) {
-		t.Fatalf("guard must see (yabanin, web_fetch, args) once: %+v", g)
+	// Dual-form contract pin: the deny may fire on either address, and the
+	// guard is consulted for BOTH (bare + qualified) with the args intact.
+	want := [][2]string{{BuiltinServerName, ToolWebFetch}, {BuiltinServerName, PolicyKey(ToolWebFetch)}}
+	if g.argsCalls != len(want) {
+		t.Fatalf("guard must be consulted under both policy addresses, got %d calls: %v", g.argsCalls, g.argsSeq)
+	}
+	for i := range want {
+		if g.argsSeq[i] != want[i] {
+			t.Fatalf("guard address order = %v, want %v", g.argsSeq, want)
+		}
+	}
+	if !strings.Contains(g.gotArgs, up.URL) {
+		t.Fatalf("guard must see the args: %s", g.gotArgs)
 	}
 }
 
@@ -124,8 +136,9 @@ func TestExecuteGuarded_EffectiveNameGuarded(t *testing.T) {
 	if !errors.As(err, &eErr) || eErr.Code != ErrCodeToolBlocked {
 		t.Fatalf("want tool_blocked, got %v", err)
 	}
-	if g.gotTool != "http_post" {
-		t.Fatalf("guard must see the effective name http_post, got %q", g.gotTool)
+	want := [][2]string{{BuiltinServerName, "http_post"}, {BuiltinServerName, PolicyKey("http_post")}}
+	if len(g.argsSeq) != len(want) || g.argsSeq[0] != want[0] || g.argsSeq[1] != want[1] {
+		t.Fatalf("guard must see the effective name under both addresses, got %v", g.argsSeq)
 	}
 }
 
