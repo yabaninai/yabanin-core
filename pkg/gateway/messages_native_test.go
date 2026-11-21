@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/reireirei/yabanin/pkg/apiformat"
 	"github.com/reireirei/yabanin/pkg/budget"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
@@ -47,14 +48,10 @@ func TestMessagesNative_StreamPassthrough(t *testing.T) {
 	req.Header.Set("anthropic-version", "2023-06-01")
 	req.Header.Set("anthropic-beta", "claude-code-20250219")
 	req.Header.Set("x-claude-code-session-id", "cc-session-1")
-	goldenIdentity(req)
-	// Claude Code requests carry no resolved session; let the endpoint
-	// fall back to the claude-code session header.
-	req.Header.Del("X-Session-Id")
 	rec := httptest.NewRecorder()
-	// Handler-direct: the auth middleware strips client identity headers
-	// while durable terminal facts require a tenant.
-	gw.messages(rec, req)
+	r := chi.NewRouter()
+	gw.routes(r)
+	r.ServeHTTP(rec, req)
 
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
@@ -208,7 +205,10 @@ func TestMessagesNative_StreamClientCancel(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	defer gwServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -219,7 +219,6 @@ func TestMessagesNative_StreamClientCancel(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -393,7 +392,10 @@ func TestMessages_AdaptedStreamClientCancel(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	defer gwServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -404,7 +406,6 @@ func TestMessages_AdaptedStreamClientCancel(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)

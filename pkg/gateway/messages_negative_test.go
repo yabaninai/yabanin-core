@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 )
 
@@ -56,7 +57,10 @@ func TestMessagesNative_CancelMidToolJSONBillsOnce(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	defer gwServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -67,7 +71,6 @@ func TestMessagesNative_CancelMidToolJSONBillsOnce(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -210,7 +213,10 @@ func TestMessages_AdaptedCancelMidToolFragmentBillsOnce(t *testing.T) {
 	})
 	t.Cleanup(restore)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	defer gwServer.Close()
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -221,7 +227,6 @@ func TestMessages_AdaptedCancelMidToolFragmentBillsOnce(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
