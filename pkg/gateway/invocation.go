@@ -763,6 +763,7 @@ const accountingCommitFailedCode = "accounting_commit_failed"
 // committed. Deliberately no safe-retry language (central binding): the
 // reconciler owns the admitted row; support reconciles the charge.
 func writeTerminalAccountingFailure(w http.ResponseWriter) {
+	w.Header().Set("X-Should-Retry", "false")
 	apierrors.WriteWithCode(w, http.StatusInternalServerError, apierrors.ErrorCodeAPI,
 		"upstream request completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge",
 		accountingCommitFailedCode)

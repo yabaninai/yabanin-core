@@ -75,3 +75,10 @@ func jsonString(raw json.RawMessage) string {
 	}
 	return s
 }
+
+// Preserve an explicit retry refusal when a buffered error changes wire format.
+func preserveRetryRefusal(dst, src http.Header) {
+	if src.Get("X-Should-Retry") == "false" {
+		dst.Set("X-Should-Retry", "false")
+	}
+}
