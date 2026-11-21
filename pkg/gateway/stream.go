@@ -167,6 +167,13 @@ type streamRun struct {
 	// FinalAggregate live there (stream_policy.go).
 	streamPolicy *sseStreamPolicyWriter
 
+	// sseTail tracks the passthrough relay's client-facing tail when no
+	// assembling layer sits in the chain (streamPolicy == nil):
+	// completePassthroughTail uses it to close a torn event before the
+	// drain-failure frame. nil whenever the policy seam is built — the seam
+	// owns event assembly and drops its own partials.
+	sseTail *ssePassthroughTail
+
 	// sseTee is the bounded capture of what the model streamed back (the
 	// explorer's response sample); streamIdle is the idle watchdog (nil
 	// when disabled).
@@ -326,6 +333,10 @@ func (gw *gateway) serveStream(w http.ResponseWriter, ctx context.Context, info 
 	// From here we've already flushed chunks to the client; we can only
 	// report the outcome to observability.
 	if drainErr != nil {
+		// The drain failed mid-stream: close a torn passthrough event first
+		// so the drain-failure frame composes at an event boundary (the
+		// policy-seam path assembles events itself and needs no completion).
+		r.completePassthroughTail()
 		r.finishDrainFailure(usage, drainErr, ttftMs, hasTTFT)
 		return
 	}
@@ -764,6 +775,21 @@ func (r *streamRun) wrapWriters() http.Flusher {
 		flusher, _ = r.w.(http.Flusher)
 	}
 
+	// Passthrough tail tracking: with the policy seam absent the relay
+	// forwards handler bytes to the client bit-for-bit, so a drain failure
+	// between a written data line and its blank separator leaves a dangling
+	// partial event on the wire. The tracker observes the client-bound bytes
+	// (it wraps below the tool gate, so denied fragments never count) and
+	// completePassthroughTail closes a torn tail before the error frame.
+	// When the seam is built it owns assembly instead: finishStream drops
+	// its never-processed partial, and no tracker is installed.
+	if r.streamPolicy == nil {
+		tw := &ssePassthroughTail{w: r.w}
+		r.sseTail = tw
+		r.w = tw
+		flusher = tw
+	}
+
 	// TOOL-02: SSE-surface tool-call gating. Wraps the (possibly recording)
 	// writer with a frame filter: a name-bearing first fragment of a call
 	// decides per policy for that call index; denied fragments never reach
@@ -773,6 +799,70 @@ func (r *streamRun) wrapWriters() http.Flusher {
 		flusher, _ = r.w.(http.Flusher)
 	}
 	return flusher
+}
+
+// ssePassthroughTail observes the client-facing tail of the passthrough
+// relay: whether the bytes written so far end inside an SSE event (a data
+// line was written but its blank frame separator has not). Writes pass
+// through unchanged — the passthrough relay stays bit-for-bit; only
+// completePassthroughTail ever appends, exactly one LF, at drain-failure
+// composition time. Single-goroutine by construction: drain and the
+// end-of-stream composition run on the serveStream goroutine.
+type ssePassthroughTail struct {
+	w     http.ResponseWriter
+	total int64 // bytes passed through (0 = nothing streamed: nothing torn)
+	lfRun int   // trailing consecutive LF count of the cumulative stream, capped at 2
+}
+
+func (t *ssePassthroughTail) Header() http.Header  { return t.w.Header() }
+func (t *ssePassthroughTail) WriteHeader(code int) { t.w.WriteHeader(code) }
+func (t *ssePassthroughTail) Flush() {
+	if f, ok := t.w.(http.Flusher); ok {
+		f.Flush()
+	}
+}
+
+func (t *ssePassthroughTail) Write(p []byte) (int, error) {
+	t.total += int64(len(p))
+	if n := len(p); n > 0 {
+		// Trailing LF run of the cumulative stream. A write that is
+		// entirely LFs extends the previous run — the passthrough handler
+		// writes a line and its terminator as separate calls, so the
+		// "\n\n" separator can split across writes.
+		run := 0
+		for i := n - 1; i >= 0 && p[i] == '\n'; i-- {
+			run++
+		}
+		if run == n {
+			t.lfRun = min(t.lfRun+run, 2)
+		} else {
+			t.lfRun = min(run, 2)
+		}
+	}
+	return t.w.Write(p)
+}
+
+// torn reports a streamed tail that ends mid-event: at least one byte was
+// written and the trailing LF run is shorter than the "\n\n" frame
+// separator.
+func (t *ssePassthroughTail) torn() bool {
+	return t.total > 0 && t.lfRun < 2
+}
+
+// completePassthroughTail closes a torn SSE event on the passthrough relay
+// right before the drain-failure notification composes its error frame: one
+// LF turns a dangling "data: …\n" tail into its whole event, byte-exact
+// against the upstream stream, so the error frame starts at an event
+// boundary instead of gluing into a half-written event (the line-buffered
+// relay contract). Never reached on the policy-seam path: there the
+// assembly buffer drops the never-processed partial instead
+// (sseStreamPolicyWriter.finishStream) — completing it would emit raw,
+// unmutated upstream content that passed no policy stage.
+func (r *streamRun) completePassthroughTail() {
+	if r.streamPolicy != nil || r.sseTail == nil || !r.sseTail.torn() {
+		return
+	}
+	_, _ = io.WriteString(r.sseTail, "\n")
 }
 
 // streamIdentityRequest carries the stream stage's trusted identity headers

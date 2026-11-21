@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -52,18 +53,49 @@ func TestIdleReader_FiresAfterSilence(t *testing.T) {
 }
 
 func TestIdleReader_ResetsOnData(t *testing.T) {
+	const (
+		window     = 100 * time.Millisecond
+		tick       = 25 * time.Millisecond
+		totalBytes = 12 // ≈300ms of flow, well past the first window
+		// A fire is legitimate only when the reader goroutine was actually
+		// descheduled long enough to cross the window (runner load can do
+		// that). Any fire with all read gaps below the threshold means the
+		// reset contract broke — the regression behind CI run 44814334185,
+		// which fired while beat gaps stayed at ~25ms.
+		fireGapThreshold = window - 20*time.Millisecond
+	)
+
 	fired := make(chan struct{})
-	tr := &tickReader{remaining: 12, interval: 25 * time.Millisecond} // 300ms of flow
-	ir := newIdleReader(tr, 100*time.Millisecond, func() { close(fired) })
+	tr := &tickReader{remaining: totalBytes, interval: tick}
+	var (
+		mu      sync.Mutex
+		anchor  = time.Now() // arming instant
+		beats   []time.Time  // post-read timestamps
+		fireLog []time.Time
+	)
+	ir := newIdleReader(tr, window, func() {
+		mu.Lock()
+		fireLog = append(fireLog, time.Now())
+		mu.Unlock()
+		// Deliberately not sync.Once-guarded: a second callback run must
+		// panic here (close of closed channel) exactly like it panicked the
+		// CI binary — pins the double-close defect.
+		close(fired)
+	})
 	defer ir.Stop()
 
 	done := make(chan int, 1)
 	go func() {
 		var total int
 		buf := make([]byte, 4)
-		for total < 12 {
+		for total < totalBytes {
 			n, err := ir.Read(buf)
 			total += n
+			if n > 0 {
+				mu.Lock()
+				beats = append(beats, time.Now())
+				mu.Unlock()
+			}
 			if err != nil {
 				break
 			}
@@ -71,17 +103,40 @@ func TestIdleReader_ResetsOnData(t *testing.T) {
 		done <- total
 	}()
 
+	var total int
 	select {
-	case <-fired:
-		t.Fatal("idle watchdog fired while data was flowing")
-	case total := <-done:
-		if total != 12 {
-			t.Fatalf("read %d bytes, want 12", total)
-		}
+	case total = <-done:
 	case <-time.After(2 * time.Second):
 		t.Fatal("reader stalled")
 	}
-	assert.False(t, ir.Fired(), "watchdog must not fire while bytes keep arriving")
+	if total != totalBytes {
+		t.Fatalf("read %d bytes, want %d", total, totalBytes)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(fireLog) == 0 {
+		assert.False(t, ir.Fired(), "watchdog must not fire while bytes keep arriving")
+		return
+	}
+	// Fire(s) observed: legitimate only if some gap between reads — from the
+	// arming instant to the first beat, or between beats — crossed the
+	// window. Healthy ticks leave ~25ms gaps; a Reset regression fires
+	// despite those, a real deschedule leaves a gap ≥ window.
+	maxGap := time.Duration(0)
+	for i, beat := range beats {
+		start := anchor
+		if i > 0 {
+			start = beats[i-1]
+		}
+		if gap := beat.Sub(start); gap > maxGap {
+			maxGap = gap
+		}
+	}
+	if maxGap < fireGapThreshold {
+		t.Fatalf("idle watchdog fired while data flowed within the window: %d fire(s), max read gap %v < %v",
+			len(fireLog), maxGap, fireGapThreshold)
+	}
 }
 
 // TestServeStream_IdleUpstreamGetsIdleError: an upstream that goes silent
