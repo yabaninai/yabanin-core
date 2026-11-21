@@ -124,6 +124,8 @@ type StoreInterface interface {
 	ListRequests(ctx context.Context, f adminstore.RequestListFilters) ([]adminstore.RequestListRow, int, error)
 	// Full request detail (stored response snapshot + raw fields), org-scoped.
 	GetRequestDetail(ctx context.Context, orgID, requestID string) (*adminstore.RequestDetail, error)
+	// Exact-row request detail by immutable request_logs.id (grant binding).
+	GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error)
 	GetSavingsReport(ctx context.Context, orgID string, days int, provider string) (*adminstore.SavingsReport, error)
 	GetShadowComparison(ctx context.Context, orgID string, days int) (*adminstore.ShadowComparison, error)
 	// ADL-04: quality closed-loop (evalgate verdicts → per-model / per-task-class

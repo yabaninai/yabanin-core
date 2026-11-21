@@ -69,11 +69,19 @@ func (s *exportRetentionStore) GetRequestDetail(ctx context.Context, orgID, requ
 	return s.mockStore.GetRequestDetail(ctx, orgID, requestID)
 }
 
-func (s *exportRetentionStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+// GetRequestDetailRow mirrors GetRequestDetail for the 0031 grant path: the
+// row-key pinned pre-consume read must record the payload access the handler
+// attached, or the detail contract assertions go blind.
+func (s *exportRetentionStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	s.access, _ = adminstore.RequestPayloadAccessFromContext(ctx)
+	return s.mockStore.GetRequestDetailRow(ctx, orgID, rowKey)
+}
+
+func (s *exportRetentionStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	if s.consumeErr != nil {
-		return s.consumeErr
+		return adminstore.RequestPayloadGrant{}, s.consumeErr
 	}
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func TestRequestExportAppliesPayloadMatrix(t *testing.T) {

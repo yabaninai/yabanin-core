@@ -79,11 +79,11 @@ func (s *fix08SeamStore) preflightFiltersSeen() *adminstore.RequestListFilters {
 	return s.preflightFilters
 }
 
-func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func (s *fix08SeamStore) StreamRequestExport(ctx context.Context, filters adminstore.RequestListFilters, access adminstore.RequestPayloadAccess, maxRows int, emit func(*adminstore.RequestDetail) error) (int, error) {
@@ -155,8 +155,15 @@ func (s *fix08NoExportStore) ConsumeRequestPayloadGrant(token, orgID, requestID,
 	return s.base.ConsumeRequestPayloadGrant(token, orgID, requestID, rootID, now)
 }
 
-func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
-	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
+	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
+}
+
+// PeekRequestPayloadGrantTarget is declared explicitly because the embedded
+// StoreInterface hides mockStore's extra methods: without it the handler's
+// requestPayloadGrantStore assertion fails and even issuance 503s.
+func (s *fix08NoExportStore) PeekRequestPayloadGrantTarget(ctx context.Context, token, orgID, requestID, rootID string, now time.Time) (int64, error) {
+	return s.base.PeekRequestPayloadGrantTarget(ctx, token, orgID, requestID, rootID, now)
 }
 
 func (s *fix08NoExportStore) RevokeRequestPayloadGrant(token, rootID string) error {
@@ -292,10 +299,12 @@ func TestFIX08ExpiredGrantWithDBErrorFailsClosed(t *testing.T) {
 
 		rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token)
 
-		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
-		require.Equal(t, []string{"preflight"}, store.callsSoFar())
+		// Peek denies the expiry BEFORE any preflight store call (0031),
+		// so a failing database cannot turn an expired grant into a 500.
+		require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		require.Empty(t, store.callsSoFar())
 		require.True(t, grantAlive(store.mockStore, token),
-			"the expired token was never consumed — the pre-flight failure must not burn it either")
+			"the expired token was never consumed — the peek denial must not burn it either")
 	})
 
 	t.Run("expired grant, healthy store", func(t *testing.T) {
@@ -309,10 +318,27 @@ func TestFIX08ExpiredGrantWithDBErrorFailsClosed(t *testing.T) {
 
 		require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 		require.NotContains(t, rec.Body.String(), "arguments")
-		require.Equal(t, []string{"preflight", "consume"}, store.callsSoFar(),
-			"the expired grant must stop at the consume seam after the prechecks")
+		require.Empty(t, store.callsSoFar(),
+			"the expired grant is denied at the peek and never reaches the prechecks or the consume")
 		require.True(t, grantAlive(store.mockStore, token),
 			"a failed consume must not delete the grant record (it stays expired, not burned)")
+	})
+
+	// The DB-refusal/no-burn contract itself stays pinned on a VALID grant:
+	// a preflight database failure must answer 500 (a real error, not the
+	// generic grant denial) and leave the healthy token redeemable.
+	t.Run("valid grant, failing preflight", func(t *testing.T) {
+		store := &fix08SeamStore{mockStore: newMockStore(), failPreflight: true}
+		h := New(store, "", "", nil)
+		t.Cleanup(h.Stop)
+		token := issueExportGrant(t, h, `{"ttl_seconds":60,"org_id":"org-1","request_id":"req-1"}`)
+
+		rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token)
+
+		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		require.Equal(t, []string{"preflight"}, store.callsSoFar())
+		require.True(t, grantAlive(store.mockStore, token),
+			"the pre-flight failure must not burn a valid grant")
 	})
 }
 

@@ -252,8 +252,8 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 	require.NoError(t, err)
 	requireRowCount(t, ctx, pool, "organizations", 1, "before the interrupted revert")
 
-	// The honest mid-revert crash: the applied number line is 30, 29, 28, 27, 26, 25, 24,
-	// 22, 21, 20, 19, 18, 17, 16, 15, 14 (the embedded set carries the reserved
+	// The honest mid-revert crash: the applied number line is 31, 30, 29, 28, 27, 26, 25,
+	// 24, 22, 21, 20, 19, 18, 17, 16, 15, 14 (the embedded set carries the reserved
 	// gap 0023 as a no-file version — 0024 is present via e03p01b and 0025
 	// via e04p01a — so the revert walks the applied
 	// versions, not the plain number line) — the poisoned 0013
@@ -261,7 +261,7 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 	// target position (the driver marks the target dirty before running the
 	// file). The source carries every pair (the revert needs the
 	// 0014/0015/0016/0017/0018/0019/0020/0021/0022, 0024, 0025, 0026, 0027,
-	// 0028, 0029 and 0030 down files) —
+	// 0028, 0029, 0030 and 0031 down files) —
 	// only the 0013 down body is poisoned. The true schema position stays
 	// 13: its down never completed a statement.
 	poisoned := subsetMigrator(t, ctx, dsn,

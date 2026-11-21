@@ -111,12 +111,42 @@ func (h *AdminHandlers) apiOrgRequestExport() http.HandlerFunc {
 			writeJSON(w, http.StatusServiceUnavailable, apiError{Error: "request export is unavailable"})
 			return
 		}
-		// The pre-flight count is a discarded metadata read: when redeeming a
-		// grant it runs under the grant-hypothetical widening below so the
-		// row cap matches what the stream would emit. This is hypothetical
-		// authorization for a discarded read only — no row from this call is
-		// ever emitted, and disclosure still requires the verified atomic
-		// consume before the stream starts.
+		// ---- Phase: grant target resolution (peek — never a consume) ----
+		// A grant redemption discloses exactly the one physical row the
+		// grant is bound to: the peek resolves its immutable row key, and
+		// the pinned predicate below makes match, count, and emission all
+		// address that row. A legacy pre-binding grant denies generically
+		// without burning. Like every precheck this runs before the
+		// one-time consume, so its denials leave the token redeemable.
+		rowKey := int64(0)
+		grantStore, hasGrantStore := h.store.(requestPayloadGrantStore)
+		if grantToken != "" {
+			if !hasGrantStore {
+				auditRequestExportDecision(h, r, orgID, filters, grantScope, false, "grant_unusable", 0)
+				writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
+				return
+			}
+			var perr error
+			rowKey, perr = grantStore.PeekRequestPayloadGrantTarget(r.Context(), grantToken, orgID, filters.RequestID, requestUserID(r), time.Now().UTC())
+			if perr != nil {
+				// Invalid, expired, revoked, replayed, wrong org/grantee/
+				// request, unbound legacy, or a grant-store failure: the
+				// same fail-closed generic 403, token untouched.
+				auditRequestExportDecision(h, r, orgID, filters, grantScope, false, "grant_invalid_or_unavailable", 0)
+				writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
+				return
+			}
+		}
+		// The pre-flight count is a discarded metadata read over the SAME
+		// predicate the disclosure stream will walk — user filters included —
+		// so the row cap matches what the stream would emit. For a grant
+		// redemption the predicate is pinned to the bound physical row key
+		// (0031): the count decides whether the bound row still exists AND
+		// matches the caller's filters (zero → 404, token untouched), while
+		// correlation siblings sharing request_id (0028) can neither satisfy
+		// the pin nor trip the 1000-row cap against an exactly-one-row grant.
+		// No row from this call is ever emitted; disclosure still requires
+		// the verified atomic consume before any payload byte is written.
 		preflight := filters
 		if grantToken != "" {
 			preflight.OrgWideMetadata = true
@@ -124,11 +154,19 @@ func (h *AdminHandlers) apiOrgRequestExport() http.HandlerFunc {
 			preflight.PayloadGrant = true
 			preflight.PayloadSearchAllowed = true
 			preflight.PayloadUserID = ""
+			preflight.RowKey = rowKey
 		}
 		_, total, err := h.store.ListRequests(r.Context(), preflight)
 		if err != nil {
 			auditRequestExportDecision(h, r, orgID, filters, grantScope, false, "store_error", 0)
 			h.respondError(w, r, err, http.StatusInternalServerError)
+			return
+		}
+		if grantToken != "" && total == 0 {
+			// Bound row purged, cross-org, or not matching the caller's
+			// filters: deny without burning, indistinguishable from absent.
+			auditRequestExportDecision(h, r, orgID, filters, grantScope, false, "row_not_found", 0)
+			h.respondError(w, r, adminstore.ErrNotFound, http.StatusNotFound)
 			return
 		}
 		if total > maxRequestExportRows {
@@ -138,24 +176,25 @@ func (h *AdminHandlers) apiOrgRequestExport() http.HandlerFunc {
 		}
 		// ---- Phase: atomic one-time consume (last step before disclosure) ----
 		if grantToken != "" {
-			grantStore, ok := h.store.(requestPayloadGrantStore)
-			if !ok || grantStore.ConsumeRequestPayloadGrantScope(grantToken, orgID, filters.RequestID, requestUserID(r), grantScope, time.Now().UTC()) != nil {
+			if _, err := grantStore.ConsumeRequestPayloadGrantScope(grantToken, orgID, filters.RequestID, rowKey, requestUserID(r), grantScope, time.Now().UTC()); err != nil {
 				// Grant-store failures and invalid, expired, revoked,
 				// wrong-scope, or already-consumed tokens have the same
-				// fail-closed response: the token survives a failed consume.
+				// fail-closed response: a rolled-back consume leaves the
+				// token redeemable.
 				auditRequestExportDecision(h, r, orgID, filters, grantScope, false, "grant_invalid_or_unavailable", 0)
 				writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
 				return
 			}
-			// A request-bound explicit grant also supplies metadata visibility
-			// for that one request; filters.RequestID prevents org-wide widening.
-			// From here the grant is consumed: the attempt is final.
-			filters.OrgWideMetadata = true
-			filters.OwnerUserID = ""
+			// Stream the exact predicate the pre-flight verified: the
+			// caller's filters pinned to the bound row under the widened
+			// grant view. authorizeRequestList owner-scopes filters to the
+			// caller, which would mask a bound row owned by a different
+			// user or agent — pre-flight would pass, the token would burn,
+			// and the stream would emit an empty 200. Retention and role
+			// constraints ran unchanged above. From here the grant is
+			// consumed: the attempt is final.
+			filters = preflight
 			payloadAllowed = true
-			filters.PayloadGrant = true
-			filters.PayloadSearchAllowed = true
-			filters.PayloadUserID = ""
 		}
 		// ---- Phase: disclosure (the 200 commits; stream failures are final) ----
 		access := adminstore.RequestPayloadAccess{

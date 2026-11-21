@@ -8,11 +8,11 @@ beside an existing binary does not change its embedded migration set.
 
 ## Current schema and numbering
 
-- Current embedded head: **0030** (`tool_fact_invocations`). A successful
-  migration to this release records `version = 30` and `dirty = false`.
-- Next available migration number: **0031**.
-- The shipped set contains **29 up/down pairs**: `0001` through `0022`, then
-  `0024` through `0030`. Version **0023 is permanently reserved and unused**;
+- Current embedded head: **0031** (`request_payload_grant_row`). A successful
+  migration to this release records `version = 31` and `dirty = false`.
+- Next available migration number: **0032**.
+- The shipped set contains **30 up/down pairs**: `0001` through `0022`, then
+  `0024` through `0031`. Version **0023 is permanently reserved and unused**;
   do not create a replacement file for it or renumber later migrations.
 - Files use the format `NNNN_name.up.sql` and `NNNN_name.down.sql`, with a
   four-digit version and a lowercase descriptive name. Each version has exactly
@@ -45,6 +45,7 @@ The later additions include:
 | `0028` | Per-invocation accounting identity: request admissions, terminal facts, invocation-keyed settlement and credit dedupe (expand) |
 | `0029` | Removal of the superseded settlement charge key and global credit usage index (contract of `0028`) |
 | `0030` | Per-invocation identity for retained tool facts: `invocation_id` on `tool_calls`/`tool_call_invocations` with partial unique arbiters (legacy rows keep NULL) |
+| `0031` | Row-identity binding for one-request payload grants: nullable `request_row_key` on `request_payload_grants`, bound at issuance, no backfill |
 
 A schema object's presence does not by itself establish that a feature is
 configured, enabled or exposed by a particular deployment. Consult the SQL

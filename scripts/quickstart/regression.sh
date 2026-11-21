@@ -6,7 +6,7 @@
 #      services, published ports bind 127.0.0.1 only
 #   S2 canonical seed + documented first request (smoke.sh) on the clean stack
 #   S3 empty DB: every embedded migration applied on the fresh volume,
-#     against the pinned schema contract (head 0030, 29 pairs, 0023
+#     against the pinned schema contract (head 0031, 30 pairs, 0023
 #     reserved) — never a derived max()/count
 #   S3b/S3c managed beta views (frozen): exactly the seven views with
 #     content-minimized columns; per-org values pinned independently
@@ -620,12 +620,12 @@ code401=$(curl -s -o /dev/null -w '%{http_code}' -H "Authorization: Bearer $bogu
 note "bogus key rejected with 401"
 
 # --- schema contract (pinned; migrations/README.md "Current schema and
-# numbering" + pkg/migrate numbering tests): head version 0030, exactly 29
-# up/down pairs 0001-0022 + 0024-0030, 0023 permanently reserved unused.
+# numbering" + pkg/migrate numbering tests): head version 0031, exactly 30
+# up/down pairs 0001-0022 + 0024-0031, 0023 permanently reserved unused.
 # The expectation is pinned, never derived: deleting the head migration or
 # renumbering must FAIL here instead of silently lowering a max()/count.
-SCHEMA_HEAD=30
-SCHEMA_UP_SET="0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 0021 0022 0024 0025 0026 0027 0028 0029 0030"
+SCHEMA_HEAD=31
+SCHEMA_UP_SET="0001 0002 0003 0004 0005 0006 0007 0008 0009 0010 0011 0012 0013 0014 0015 0016 0017 0018 0019 0020 0021 0022 0024 0025 0026 0027 0028 0029 0030 0031"
 
 migration_versions() { # <up|down>: sorted embedded migration version numbers
   ls pkg/migrate/migrations/*."$1".sql \
@@ -647,7 +647,7 @@ downs=$(migration_versions down)
 dbver=$(dbq "SELECT version FROM schema_migrations")
 dirty=$(dbq "SELECT dirty FROM schema_migrations")
 viol=$(schema_contract_violations "$dbver" "$dirty" "$ups" "$downs")
-[[ -z "$viol" ]] || fail "S3: schema contract violated (pinned head $SCHEMA_HEAD, 29 pairs, 0023 reserved): $viol"
+[[ -z "$viol" ]] || fail "S3: schema contract violated (pinned head $SCHEMA_HEAD, 30 pairs, 0023 reserved): $viol"
 counts=$(dbq "SELECT (SELECT count(*) FROM organizations)||'/'||(SELECT count(*) FROM api_keys)||'/'||(SELECT count(*) FROM admin_users)")
 [[ "$counts" == "1/1/1" ]] || fail "S3: seeded counts $counts != 1/1/1"
 credits=$(dbq "SELECT count(*) FROM org_credits WHERE balance_cents > 0")
@@ -656,12 +656,12 @@ credits=$(dbq "SELECT count(*) FROM org_credits WHERE balance_cents > 0")
 # catch (lowered head, missing head migration file, dirty state) — otherwise
 # the pinned check above could pass vacuously.
 neg_head=$(schema_contract_violations 28 f "$ups" "$downs")
-[[ "$neg_head" == *"28 != pinned head 30"* ]] || fail "S3: oracle missed lowered head: $neg_head"
-neg_missing=$(schema_contract_violations "$dbver" f "$(printf '%s ' $SCHEMA_UP_SET | sed 's/0030 //; s/ $//')" "$downs")
-[[ "$neg_missing" == *"up set mismatch"* ]] || fail "S3: oracle missed missing 0030: $neg_missing"
+[[ "$neg_head" == *"28 != pinned head 31"* ]] || fail "S3: oracle missed lowered head: $neg_head"
+neg_missing=$(schema_contract_violations "$dbver" f "$(printf '%s ' $SCHEMA_UP_SET | sed 's/0031 //; s/ $//')" "$downs")
+[[ "$neg_missing" == *"up set mismatch"* ]] || fail "S3: oracle missed missing 0031: $neg_missing"
 neg_dirty=$(schema_contract_violations "$dbver" t "$ups" "$downs")
 [[ "$neg_dirty" == *"dirty=t"* ]] || fail "S3: oracle missed dirty schema_migrations: $neg_dirty"
-note "schema head=$dbver (pinned $SCHEMA_HEAD), dirty=f, 29 up/down pairs (0023 reserved); oracle catches lowered head / missing 0030 / dirty"
+note "schema head=$dbver (pinned $SCHEMA_HEAD), dirty=f, 30 up/down pairs (0023 reserved); oracle catches lowered head / missing 0031 / dirty"
 
 # --- S3b managed beta views: seven names, content-minimized columns,
 # frozen per-org values, app-role reads (expectations pinned, never

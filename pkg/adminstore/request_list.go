@@ -59,6 +59,13 @@ type RequestListFilters struct {
 	// RequestID is an exact primary-key-style lookup (Bifrost `request_id`
 	// filter): when set it collapses the list to that one request.
 	RequestID string
+	// RowKey pins the shared list/count/stats/export predicate to one
+	// immutable request_logs row (payload-grant redemption, 0031). It
+	// composes with every other filter, so a grant disclosure both matches
+	// and counts exactly the bound physical row: correlation siblings that
+	// legitimately share request_id (0028) can neither widen the match nor
+	// trip the export row cap. Zero means unbounded.
+	RowKey int64
 	// RuleID narrows to rows whose stored routing_decision names this
 	// routing rule (CORE-TRACE-04 rule→requests lookup). The stored column
 	// is legacy TEXT: the probe is guarded so a malformed historical value
@@ -165,6 +172,11 @@ func requestListWhere(f RequestListFilters) (string, []interface{}) {
 	}
 	if f.RequestID != "" {
 		add("request_id = $%d", f.RequestID)
+	}
+	if f.RowKey > 0 {
+		// Exact physical-row pin: unlike request_id (a correlation field),
+		// the immutable row key addresses one row (see RequestListFilters).
+		add("id = $%d", f.RowKey)
 	}
 	if f.RuleID != "" {
 		// pg_input_is_valid + CASE guard the legacy TEXT column (PG16 core,
