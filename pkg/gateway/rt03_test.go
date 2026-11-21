@@ -494,6 +494,14 @@ func TestRT03_Evalgate_PremiumAllowed_VerdictStillProduced(t *testing.T) {
 	assert.Equal(t, 1, store.count(), "the allowed premium comparison keeps producing verdicts")
 	assert.Equal(t, 1, premium.totalCalls(), "the premium upstream is called once")
 	assert.Equal(t, "premium-target", premium.callAt(0).Model)
+	accounting := gw.invocations.(*fakeInvocationStore)
+	accounting.mu.Lock()
+	defer accounting.mu.Unlock()
+	ids := make(map[string]bool)
+	for _, row := range accounting.admitted {
+		ids[row.InvocationID] = true
+	}
+	require.Len(t, ids, 3, "each paid call requires its own durable start (primary=%d premium=%d judge=%d)", primaryOK.totalCalls(), premium.totalCalls(), judgeHits)
 }
 
 // --- Shadow target is gated -----------------------------------------------------
