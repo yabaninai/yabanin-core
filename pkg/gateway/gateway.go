@@ -428,6 +428,7 @@ func newGatewaySkeleton(ctx context.Context, w *gatewayWiring) *gateway {
 			publisher:          w.pub,
 			retryPolicy:        retry.DefaultPolicy(),
 			unknownModelPolicy: w.cfg.UnknownModelPolicy,
+			invocations:        NewPGInvocationStore(w.pool),
 			dbPool:             w.pool,     // DB pool for evalgate/feedback stores (P5.9+)
 			dbPricer:           w.dbPricer, // P6 pricer handle; installed as the process-global default only at server boot
 			nowFn:              time.Now,
