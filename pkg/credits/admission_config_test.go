@@ -77,7 +77,7 @@ func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 			// cache entry means the DB is never touched (audit-fixture style).
 			s := NewStoreWithConfig(&pgxpool.Pool{}, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
 			s.mu.Lock()
-			s.cache["org-a"] = &cachedBalance{walletCents: tc.balance, updated: time.Now()}
+			s.cache["org-a"] = &cachedBalance{walletCents: tc.balance, cachedAt: time.Now()}
 			s.mu.Unlock()
 
 			bal, err := s.CheckBalance(context.Background(), "org-a")

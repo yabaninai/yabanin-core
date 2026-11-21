@@ -160,6 +160,27 @@ func TestTopUp_IncreasesBalance(t *testing.T) {
 	}
 }
 
+func TestGetBalance_CachedWalletTimestamp(t *testing.T) {
+	ctx := t.Context()
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	const org = "org-cached-stamp"
+	stamp := time.Date(2024, time.March, 3, 11, 27, 43, 0, time.UTC)
+	if _, err := pool.Exec(ctx, "INSERT INTO org_credits (org_id, balance_cents, updated_at) VALUES ($1, 432, $2)", org, stamp); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(pool, nil)
+	for _, source := range []string{"database", "cache"} {
+		bal, err := store.GetBalance(ctx, org)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bal.UpdatedAt.Equal(stamp) || bal.BalanceCents != 432 {
+			t.Fatalf("%s read returned %d cents at %s, want 432 cents at %s", source, bal.BalanceCents, bal.UpdatedAt, stamp)
+		}
+	}
+}
+
 func TestDeduct_ReducesBalance(t *testing.T) {
 	ctx := context.Background()
 	pool := setupFixtureDB(t)

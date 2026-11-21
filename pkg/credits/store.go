@@ -220,7 +220,8 @@ type Store struct {
 type cachedBalance struct {
 	walletCents       int64
 	remainderMicroUSD int64
-	updated           time.Time
+	walletUpdatedAt   time.Time
+	cachedAt          time.Time
 }
 
 // NewStore creates a credits store backed by the database.
@@ -259,9 +260,9 @@ func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) 
 
 	// Try cache first.
 	s.mu.RLock()
-	if cb, ok := s.cache[orgID]; ok && time.Since(cb.updated) < s.cfg.CacheTTL {
+	if cb, ok := s.cache[orgID]; ok && time.Since(cb.cachedAt) < s.cfg.CacheTTL {
 		s.mu.RUnlock()
-		return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.updated)
+		return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
 	}
 	s.mu.RUnlock()
 
@@ -282,7 +283,10 @@ func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) 
 
 	// Update cache.
 	s.mu.Lock()
-	s.cache[orgID] = &cachedBalance{walletCents: walletCents, remainderMicroUSD: remainder, updated: time.Now()}
+	s.cache[orgID] = &cachedBalance{
+		walletCents: walletCents, remainderMicroUSD: remainder,
+		walletUpdatedAt: updatedAt, cachedAt: time.Now(),
+	}
 	s.mu.Unlock()
 
 	return effectiveBalance(orgID, walletCents, remainder, updatedAt)
