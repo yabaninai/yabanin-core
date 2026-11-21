@@ -238,6 +238,7 @@ func newPolicyReconcileHTTPGateway(t *testing.T, pg *pgxpool.Pool, rdb *redis.Cl
 		gatewayCompliance: gatewayCompliance{policyRuntime: runtime},
 	}
 	gw.auth = NewAuthMiddleware(gw.cfg, resolver)
+	gw.invocations = NewPGInvocationStore(pg)
 	router := chi.NewRouter()
 	gw.routes(router)
 	server := httptest.NewServer(router)

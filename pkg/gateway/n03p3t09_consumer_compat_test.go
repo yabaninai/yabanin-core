@@ -75,6 +75,7 @@ func n03p3t09CompletionsGateway(t *testing.T, upstreamURL string, rt *PolicyRunt
 		cfg:                  cfg,
 		log:                  slog.Default(),
 		auth:                 NewAuthMiddleware(cfg, newTestResolver(testOrg, nil)),
+		invocations:          &fakeInvocationStore{},
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: upstreamURL, Enabled: true}},
 		pool:                 upstream.NewPool(upstream.Options{}),
 		streamUsageProviders: map[string]bool{"openai": true},

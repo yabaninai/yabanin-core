@@ -56,11 +56,12 @@ func t08Gateway(t *testing.T, upstreamURL string) *gateway {
 	t.Helper()
 	info := resolver.ModelInfo{ModelName: "compat-canon", Provider: "openai", UpstreamURL: upstreamURL, UpstreamAPIKey: "up", Enabled: true}
 	return &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: upstreamURL},
-		log:  slog.New(slog.DiscardHandler),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info, info.ModelName: info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: upstreamURL},
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver(testOrg, nil)),
+		invocations: &fakeInvocationStore{},
+		res:         stubModelResolver{"m": info, info.ModelName: info},
+		pool:        upstream.NewPool(upstream.Options{}),
 	}
 }
 

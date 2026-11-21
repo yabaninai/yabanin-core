@@ -108,9 +108,10 @@ func TestN07P6T02_SupportedAdapterMatrix(t *testing.T) {
 			defer server.Close()
 
 			gw := &gateway{
-				cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-				log:  slog.New(slog.DiscardHandler),
-				auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+				cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+				log:         slog.New(slog.DiscardHandler),
+				auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver(testOrg, nil)),
+				invocations: &fakeInvocationStore{},
 				res: stubModelResolver{
 					"rr":  {ModelName: "rr-canon", Provider: prov, UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true},
 					"mod": {ModelName: "mod-canon", Provider: prov, UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true},

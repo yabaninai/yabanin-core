@@ -375,7 +375,8 @@ func TestN03P1T09_CC05_ContinueShape_LegacySurface_OldAndNewConfig(t *testing.T)
 			gw := &gateway{
 				cfg:               config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: up.srv.URL},
 				log:               slog.Default(),
-				auth:              NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+				auth:              NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver(testOrg, nil)),
+				invocations:       &fakeInvocationStore{},
 				res:               stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: up.srv.URL, Enabled: true}},
 				pool:              upstream.NewPool(upstream.Options{}),
 				streamIdleTimeout: 0,
