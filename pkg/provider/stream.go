@@ -290,20 +290,31 @@ func compactSingleDataLine(frame []byte) bool {
 	return bytes.HasPrefix(f, []byte("data:")) && !bytes.HasPrefix(f, []byte("data: ")) && !bytes.ContainsRune(f, '\n')
 }
 
+// frameIsTerminal reports whether this frame completes the stream's [DONE]
+// terminator: the assembled data line itself, or (FIX-11, upstream side) a
+// terminator glued to an unfinished event as its final data field. The bytes
+// still pass through verbatim (the passthrough contract), but the terminal is
+// recognized so the drain succeeds — an unrecognized one fails with
+// ErrStreamIncomplete and the finisher appends a duplicate terminator the
+// client already effectively received.
+func (r *openAIStreamRun) frameIsTerminal(data []byte) bool {
+	if isDoneDataLine(data) {
+		return true
+	}
+	return FrameEndsWithDoneLine(r.frame)
+}
+
+// dropTrailingFrame reports whether an emit at stream end (no blank separator
+// seen) should discard the frame: the tail can be a torn final line, so only
+// a complete JSON event or the terminator is safe to relay.
+func dropTrailingFrame(data []byte, done, trailing bool) bool {
+	return trailing && !done && !json.Valid(bytes.TrimPrefix(data, []byte("data: ")))
+}
+
 func (r *openAIStreamRun) emit(w io.Writer, flusher http.Flusher, suppressUsage, trailing bool) error {
 	data := openAIEventData(r.frame)
-	done := isDoneDataLine(data)
-	if !done && FrameEndsWithDoneLine(r.frame) {
-		// FIX-11 (upstream side): the terminator arrived glued to an
-		// unfinished event. The event's final data field IS the
-		// terminator: the bytes pass through verbatim (the passthrough
-		// contract), but the terminal is recognized so the drain
-		// succeeds — an unrecognized one fails with ErrStreamIncomplete
-		// and the finisher appends a duplicate terminator the client
-		// already effectively received.
-		done = true
-	}
-	if trailing && !done && !json.Valid(bytes.TrimPrefix(data, []byte("data: "))) {
+	done := r.frameIsTerminal(data)
+	if dropTrailingFrame(data, done, trailing) {
 		return nil
 	}
 	compact := compactSingleDataLine(r.frame)
