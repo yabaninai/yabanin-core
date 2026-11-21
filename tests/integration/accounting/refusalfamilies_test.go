@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // refusalFamily is one client-facing dispatch family: how to issue one
@@ -231,27 +233,46 @@ type sseFrame struct {
 // validators can assert the composed event sequence, per-frame payloads
 // and usage instead of substring spot checks. Data lines are joined
 // with newlines per the SSE spec.
-func parseSSEFrames(body string) []sseFrame {
+func parseSSEFrames(body string) ([]sseFrame, error) {
+	// Normalize all three SSE line endings before splitting into complete lines.
+	body = strings.ReplaceAll(strings.ReplaceAll(body, "\r\n", "\n"), "\r", "\n")
 	var frames []sseFrame
 	var event string
 	var data []string
-	flush := func() {
-		if event != "" || len(data) > 0 {
-			frames = append(frames, sseFrame{Event: event, Data: strings.Join(data, "\n")})
+	for {
+		line, rest, complete := strings.Cut(body, "\n")
+		if !complete {
+			break
 		}
-		event, data = "", nil
-	}
-	for _, line := range strings.Split(body, "\n") {
-		switch {
-		case line == "":
-			flush()
-		case strings.HasPrefix(line, "event: "):
-			event = strings.TrimPrefix(line, "event: ")
-		case strings.HasPrefix(line, "data: "):
-			data = append(data, strings.TrimPrefix(line, "data: "))
+		body = rest
+		if line == "" {
+			if len(data) != 0 {
+				frames = append(frames, sseFrame{Event: event, Data: strings.Join(data, "\n")})
+			}
+			event, data = "", nil
+			continue
+		}
+		field, value, _ := strings.Cut(line, ":")
+		value = strings.TrimPrefix(value, " ")
+		switch field {
+		case "event":
+			event = value
+		case "data":
+			data = append(data, value)
 		}
 	}
-	flush()
+	if body != "" || event != "" || len(data) != 0 {
+		return frames, io.ErrUnexpectedEOF
+	}
+	return frames, nil
+}
+
+func controlSSEFrames(t *testing.T, body string) []sseFrame {
+	t.Helper()
+	frames, err := parseSSEFrames(body)
+	if err != nil {
+		t.Fatalf("incomplete SSE control after %d frames: %v (body %s)", len(frames), err, clip(body))
+	}
 	return frames
 }
 
@@ -330,35 +351,32 @@ type chatChunk struct {
 // delta frame, terminal finish frame carrying the known usage, then the
 // [DONE] sentinel — parsed, in order, with exact usage.
 func validateChatSSE(t *testing.T, s *stand, body string) {
-	frames := parseSSEFrames(body)
+	frames := controlSSEFrames(t, body)
 	if len(frames) != 4 {
 		t.Fatalf("families: chat sse control has %d frames, want 4 (role, content, finish+usage, [DONE]) (body %s)", len(frames), clip(body))
 	}
-	var role, content, finish chatChunk
-	if err := json.Unmarshal([]byte(frames[0].Data), &role); err != nil {
-		t.Fatalf("families: chat sse frame 0 is not a chunk: %v (body %s)", err, clip(body))
-	}
-	if err := json.Unmarshal([]byte(frames[1].Data), &content); err != nil {
-		t.Fatalf("families: chat sse frame 1 is not a chunk: %v (body %s)", err, clip(body))
-	}
-	if err := json.Unmarshal([]byte(frames[2].Data), &finish); err != nil {
-		t.Fatalf("families: chat sse frame 2 is not a chunk: %v (body %s)", err, clip(body))
-	}
-	if len(role.Choices) != 1 || role.Choices[0].Delta.Role != "assistant" || role.Choices[0].Delta.Content != "" {
-		t.Fatalf("families: chat sse frame 0 is not the role frame (body %s)", clip(body))
-	}
-	if len(content.Choices) != 1 || content.Choices[0].Delta.Content != fixtureAssistantContent {
-		t.Fatalf("families: chat sse frame 1 does not carry the fixture content (body %s)", clip(body))
-	}
-	if len(finish.Choices) != 1 || finish.Choices[0].FinishReason == nil || *finish.Choices[0].FinishReason != "stop" {
-		t.Fatalf("families: chat sse frame 2 is not the finish frame (body %s)", clip(body))
-	}
-	if finish.Usage == nil || finish.Usage.PromptTokens != fixturePromptTokens || finish.Usage.CompletionTokens != fixtureCompletionTokens {
-		t.Fatalf("families: chat sse finish frame usage malformed (body %s)", clip(body))
-	}
-	if frames[3].Data != "[DONE]" {
-		t.Fatalf("families: chat sse terminal frame %q, want [DONE] (body %s)", frames[3].Data, clip(body))
-	}
+	role := controlChatChunk(t, frames[0])
+	content := controlChatChunk(t, frames[1])
+	finish := controlChatChunk(t, frames[2])
+	require.Len(t, role.Choices, 1)
+	require.Equal(t, "assistant", role.Choices[0].Delta.Role)
+	require.Empty(t, role.Choices[0].Delta.Content)
+	require.Len(t, content.Choices, 1)
+	require.Equal(t, fixtureAssistantContent, content.Choices[0].Delta.Content)
+	require.Len(t, finish.Choices, 1)
+	require.NotNil(t, finish.Choices[0].FinishReason)
+	require.Equal(t, "stop", *finish.Choices[0].FinishReason)
+	require.NotNil(t, finish.Usage)
+	require.EqualValues(t, fixturePromptTokens, finish.Usage.PromptTokens)
+	require.EqualValues(t, fixtureCompletionTokens, finish.Usage.CompletionTokens)
+	require.Equal(t, "[DONE]", frames[3].Data)
+}
+
+func controlChatChunk(t *testing.T, frame sseFrame) chatChunk {
+	t.Helper()
+	var chunk chatChunk
+	require.NoError(t, json.Unmarshal([]byte(frame.Data), &chunk))
+	return chunk
 }
 
 // validateEmbeddingsReply asserts the embeddings list contract.
@@ -438,7 +456,7 @@ func validateResponsesReply(t *testing.T, s *stand, body string) {
 // content, completed with the known usage — and no [DONE] sentinel,
 // whose presence would prove the chat-adapted path answered.
 func validateResponsesSSE(t *testing.T, s *stand, body string) {
-	frames := parseSSEFrames(body)
+	frames := controlSSEFrames(t, body)
 	requireEventSequence(t, "responses sse control", frames,
 		[]string{"response.created", "response.output_text.delta", "response.completed"})
 	requireNoDONESentinel(t, "responses sse control", frames)
@@ -573,7 +591,7 @@ func validateImagesReply(t *testing.T, s *stand, body string) {
 // whose NESTED response.usage carries the known tokens — the exact
 // branch realtimeUsageFromEvent bills — and no [DONE] sentinel.
 func validateRealtimeSSE(t *testing.T, s *stand, body string) {
-	frames := parseSSEFrames(body)
+	frames := controlSSEFrames(t, body)
 	requireEventSequence(t, "realtime sse control", frames,
 		[]string{"response.created", "response.output_text.delta", "response.done"})
 	requireNoDONESentinel(t, "realtime sse control", frames)
@@ -688,6 +706,18 @@ func (s *stand) classifyMessagesAdapted(t *testing.T) {
 	if err != nil || status != httpOK {
 		t.Fatalf("harness: messages classification probe failed (status=%d err=%v body=%s)", status, err, clip(body))
 	}
+	validateAdaptedMessage(t, body)
+	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
+		t.Fatalf("harness: messages classification whole-ledger delta = %d/%d/%d, want 1/1/1", delta.arrivals, delta.dispatches, delta.receipts)
+	}
+	if paths := s.fixture.ArrivalPaths(rid); len(paths) != 1 || paths[0] != "/v1/chat/completions" {
+		t.Fatalf("harness: messages classification arrival path(s) %v, want [/v1/chat/completions] — the chat-adapted dispatch classification failed", paths)
+	}
+	t.Logf("harness: /v1/messages classified: Anthropic client surface over the chat dispatch family (request id %s)", rid)
+}
+
+func validateAdaptedMessage(t *testing.T, body string) {
+	t.Helper()
 	var doc struct {
 		Type    string `json:"type"`
 		Role    string `json:"role"`
@@ -710,13 +740,6 @@ func (s *stand) classifyMessagesAdapted(t *testing.T) {
 	if doc.Usage.InputTokens != fixturePromptTokens || doc.Usage.OutputTokens != fixtureCompletionTokens {
 		t.Fatalf("harness: messages classification usage = %d/%d, want %d/%d", doc.Usage.InputTokens, doc.Usage.OutputTokens, fixturePromptTokens, fixtureCompletionTokens)
 	}
-	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("harness: messages classification whole-ledger delta = %d/%d/%d, want 1/1/1", delta.arrivals, delta.dispatches, delta.receipts)
-	}
-	if paths := s.fixture.ArrivalPaths(rid); len(paths) != 1 || paths[0] != "/v1/chat/completions" {
-		t.Fatalf("harness: messages classification arrival path(s) %v, want [/v1/chat/completions] — the chat-adapted dispatch classification failed", paths)
-	}
-	t.Logf("harness: /v1/messages classified: Anthropic client surface over the chat dispatch family (request id %s)", rid)
 }
 
 // classifyCountTokensEstimator proves /v1/messages/count_tokens is a

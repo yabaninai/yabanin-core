@@ -181,34 +181,40 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		<-ch
 	}
 
-	switch r.URL.Path {
+	f.serveAccepted(w, r.URL.Path, rid, body)
+}
+
+func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fixtureBody) {
+	switch path {
 	case "/v1/embeddings":
-		f.serveEmbeddings(w, rid, body.Model, r.URL.Path)
+		f.serveEmbeddings(w, rid, body.Model, path)
 	case "/v1/responses":
 		if body.Stream {
-			f.serveResponsesStream(w, rid, body.Model, r.URL.Path)
+			f.serveResponsesStream(w, rid, body.Model, path)
 			return
 		}
-		f.serveResponsesJSON(w, rid, body.Model, r.URL.Path)
+		f.serveResponsesJSON(w, rid, body.Model, path)
 	case "/v1/completions":
-		f.serveCompletionsJSON(w, rid, body.Model, r.URL.Path)
+		f.serveCompletionsJSON(w, rid, body.Model, path)
 	case "/v1/moderations":
-		f.serveModerationsJSON(w, rid, body.Model, r.URL.Path)
+		f.serveModerationsJSON(w, rid, body.Model, path)
 	case "/v1/rerank":
-		f.serveRerankJSON(w, rid, body.Model, r.URL.Path)
+		f.serveRerankJSON(w, rid, body.Model, path)
 	case "/v1/images/generations":
-		f.serveImagesJSON(w, rid, body.Model, r.URL.Path)
+		f.serveImagesJSON(w, rid, body.Model, path)
 	case "/v1/realtime":
-		f.serveRealtimeStream(w, rid, body.Model, r.URL.Path)
+		f.serveRealtimeStream(w, rid, body.Model, path)
 	default:
-		// Chat-completions protocol, buffered or SSE: the default
-		// upstream family, including chat-adapted /v1/responses traffic.
-		if body.Stream {
-			f.serveStream(w, rid, body.Model, r.URL.Path)
-			return
-		}
-		f.serveChatJSON(w, rid, body.Model, r.URL.Path)
+		f.serveChat(w, rid, path, body)
 	}
+}
+
+func (f *fixture) serveChat(w http.ResponseWriter, rid, path string, body fixtureBody) {
+	if body.Stream {
+		f.serveStream(w, rid, body.Model, path)
+		return
+	}
+	f.serveChatJSON(w, rid, body.Model, path)
 }
 
 // serveChatJSON delivers the buffered chat-completions reply.
