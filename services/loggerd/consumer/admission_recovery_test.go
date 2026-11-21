@@ -21,7 +21,10 @@ type recoveryScan struct {
 	cursor string
 }
 
-func (s *recoveryScan) Query(_ context.Context, _ string, args ...any) (pgx.Rows, error) {
+func (s *recoveryScan) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	if query == staleAdmissionIDs {
+		return &fakeRows{vals: [][]any{{"stale-a"}, {"stale-b"}}}, nil
+	}
 	s.cursor = args[0].(string)
 	return &fakeRows{vals: s.rows}, nil
 }
@@ -66,7 +69,8 @@ func TestAdmissionRecoveryBatchPastInvalidFact(t *testing.T) {
 		},
 	}
 	c := NewWithCreditStore(nil, delivery, "events", silentLogger(), credits.NewStore(nil, silentLogger()))
-	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero(), "failed expiry must be rate-limited")
+	_, retry := c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero(), "failed expiry must be rate-limited")
 	cursor, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
 	require.NoError(t, err)
 	require.False(t, more)
@@ -81,9 +85,16 @@ func TestAdmissionRecoveryExpiryFailureIsRetried(t *testing.T) {
 	scan.failNext = map[string]int{"UPDATE request_admissions": 1}
 	scan.failErr = errors.New("database temporarily unavailable")
 	c := New(nil, nil, "events", silentLogger())
-	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
-	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
-	require.Len(t, scan.execsBySubstring("UPDATE request_admissions"), 1)
+	_, retry := c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero())
+	successful := scan.execsBySubstring("UPDATE request_admissions")
+	require.Len(t, successful, 1)
+	require.Equal(t, "stale-b", successful[0].args[1])
+	_, retry = c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero())
+	successful = scan.execsBySubstring("UPDATE request_admissions")
+	require.Len(t, successful, 3)
+	require.Equal(t, "stale-a", successful[1].args[1])
 }
 
 type brokenFactPage struct {

@@ -17,15 +17,12 @@ const (
 	recoveryGraceSeconds = 15 * 60
 )
 
-const expireAdmissionsSQL = `WITH stale AS (
- SELECT a.invocation_id FROM request_admissions a
- WHERE a.state='admitted' AND a.admitted_at < now() - make_interval(secs => $1)
- AND NOT EXISTS (SELECT 1 FROM request_terminal_facts f WHERE f.invocation_id=a.invocation_id)
- ORDER BY a.admitted_at, a.invocation_id LIMIT $2 FOR UPDATE OF a SKIP LOCKED
-)
-UPDATE request_admissions a SET state='unresolved',resolved_at=now(),resolve_reason='grace_elapsed_no_terminal_facts'
-FROM stale WHERE a.invocation_id=stale.invocation_id AND a.state='admitted'
-AND NOT EXISTS (SELECT 1 FROM request_terminal_facts f WHERE f.invocation_id=a.invocation_id)`
+const staleWithoutFacts = `a.state='admitted' AND a.admitted_at < now() - make_interval(secs => $1)
+ AND NOT EXISTS (SELECT 1 FROM request_terminal_facts f WHERE f.invocation_id=a.invocation_id AND f.org_id=a.org_id)`
+const staleAdmissionIDs = `SELECT a.invocation_id::text FROM request_admissions a WHERE ` + staleWithoutFacts +
+	` AND a.invocation_id > $2::uuid ORDER BY a.invocation_id LIMIT $3`
+const expireAdmissionSQL = `UPDATE request_admissions SET state='unresolved',resolved_at=now(),resolve_reason='grace_elapsed_no_terminal_facts'
+ WHERE invocation_id=(SELECT a.invocation_id FROM request_admissions a WHERE a.invocation_id=$2::uuid AND ` + staleWithoutFacts + ` FOR UPDATE SKIP LOCKED)`
 
 const factColumns = `a.invocation_id::text,a.org_id,a.kind,f.kind,coalesce(a.client_request_id,''),coalesce(f.client_request_id,''),f.event`
 const pendingSource = ` FROM request_admissions a JOIN request_terminal_facts f USING(invocation_id,org_id)
@@ -52,10 +49,11 @@ func readRecoveryFact(row pgx.Row) (recoveryFact, error) {
 // upstream or depending on Redis delivery. Its context owns one leadership term.
 func (c *StreamConsumer) RunAdmissionRecovery(ctx context.Context, db SettlementDB) {
 	cursor := initialRecoveryCursor
+	expiryCursor := initialRecoveryCursor
 	var nextExpiry time.Time
 	for ctx.Err() == nil {
 		if !time.Now().Before(nextExpiry) {
-			nextExpiry = c.expireAdmissionBatch(ctx, db)
+			expiryCursor, nextExpiry = c.expireAdmissionBatch(ctx, db, expiryCursor)
 		}
 		next, more, err := c.recoverAdmissionBatch(ctx, db, cursor)
 		cursor = next
@@ -71,21 +69,39 @@ func (c *StreamConsumer) RunAdmissionRecovery(ctx context.Context, db Settlement
 	}
 }
 
-func (c *StreamConsumer) expireAdmissionBatch(ctx context.Context, db SettlementDB) time.Time {
+// Expiry runs once per stale invocation. One failed transition leaves its
+// admission retryable without rolling back its neighbors.
+func (c *StreamConsumer) expireAdmissionBatch(ctx context.Context, db SettlementDB, cursor string) (string, time.Time) {
 	expiryCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
-	tag, err := db.Exec(expiryCtx, expireAdmissionsSQL, recoveryGraceSeconds, recoveryBatchSize)
+	retry := time.Now().Add(recoveryInterval)
+	rows, err := db.Query(expiryCtx, staleAdmissionIDs, recoveryGraceSeconds, cursor, recoveryBatchSize)
 	if err != nil {
-		c.logger.Error("cannot expire admissions without terminal usage", "error", err)
-		return time.Now().Add(recoveryInterval)
+		c.logger.Error("cannot list stale admissions", "error", err)
+		return cursor, retry
 	}
-	if n := tag.RowsAffected(); n > 0 {
-		c.logger.Warn("admissions have no terminal usage evidence", "count", n)
+	ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		c.logger.Error("cannot read stale admissions", "error", err)
+		return cursor, retry
 	}
-	if tag.RowsAffected() == recoveryBatchSize {
-		return time.Time{}
+	for _, id := range ids {
+		if expiryCtx.Err() != nil {
+			return cursor, retry
+		}
+		tag, err := db.Exec(expiryCtx, expireAdmissionSQL, recoveryGraceSeconds, id)
+		switch {
+		case err != nil:
+			c.logger.Error("could not expire stale admission", "invocation_id", id, "error", err)
+		case tag.RowsAffected() > 0:
+			c.logger.Warn("admission has no terminal usage evidence", "invocation_id", id)
+		}
+		cursor = id
 	}
-	return time.Now().Add(recoveryInterval)
+	if len(ids) == recoveryBatchSize {
+		return cursor, time.Time{}
+	}
+	return initialRecoveryCursor, retry
 }
 
 func (c *StreamConsumer) recoverAdmissionBatch(ctx context.Context, db SettlementDB, cursor string) (string, bool, error) {
