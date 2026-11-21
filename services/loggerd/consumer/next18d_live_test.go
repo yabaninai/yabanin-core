@@ -107,10 +107,19 @@ func applyConsumerReservationFixture(ctx context.Context, t *testing.T, pool *pg
 		                          CHECK (reservations_mode IN ('off','shadow','enforce')),
 		                          ADD COLUMN IF NOT EXISTS default_output_cap_tokens integer CHECK (default_output_cap_tokens > 0)`)
 	require.NoError(t, err)
-	// The production usage idempotency index (some package tests drop it).
-	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_request_id
+	// The production usage idempotency domains (migration 0028). The
+	// pre-0029 global request-id index was contracted away by 0029 and
+	// must NOT be re-created: invocation rows legitimately share one
+	// client request id, so the global domain would reject them. On the
+	// migrated stand both indexes already exist; the idempotent creates
+	// are stand hygiene only.
+	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_legacy
 		ON credit_transactions (request_id)
-		WHERE request_id IS NOT NULL AND type = 'usage'`)
+		WHERE request_id IS NOT NULL AND invocation_id IS NULL AND type = 'usage'`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_invocation
+		ON credit_transactions (invocation_id)
+		WHERE invocation_id IS NOT NULL AND type = 'usage'`)
 	require.NoError(t, err)
 }
 

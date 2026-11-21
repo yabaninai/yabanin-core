@@ -101,16 +101,6 @@ func fencingWallet(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org st
 	return balanceCents, remainderMicro, ledgerRows, ledgerMicro
 }
 
-// fencingRestoreMigratedLedger drops the PRE-0029 global usage index the
-// fixture helpers re-create: on the migrated contract (0029) it must not
-// exist, and the tests below settle multiple invocation rows that share
-// ONE client request id by design.
-func fencingRestoreMigratedLedger(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	_, err := pool.Exec(ctx, `DROP INDEX IF EXISTS uniq_credit_transactions_usage_request_id`)
-	require.NoError(t, err)
-}
-
 // TestSettlementWorkerCompetingClaims: a NEWER claim supersedes the stale
 // worker's (attempts bumped, status still 'processing'). The token
 // mismatch alone must fence the batch and the terminal marks; nothing —
@@ -120,7 +110,6 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
-	fencingRestoreMigratedLedger(ctx, t, pool)
 
 	const org = "77777777-7777-4777-8777-7777777777f1"
 	const sharedReq = "wfnc-worker-shared-request"
@@ -234,7 +223,6 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
-	fencingRestoreMigratedLedger(ctx, t, pool)
 
 	const org = "99999999-9999-4999-8999-9999999999f2"
 	const sharedReq = "wfnc-same-token-recovery"

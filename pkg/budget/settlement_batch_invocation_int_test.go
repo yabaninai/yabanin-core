@@ -24,12 +24,15 @@ import (
 
 // seedBatchInvocationJob inserts a pending settlement_jobs row carrying
 // the billed invocation identity the 0028+ claim projection reads back.
+// invocationID "" maps to SQL NULL — the legacy (NULL-invocation) domain —
+// exactly how the executor's legacy insert path writes those rows; an
+// empty-string uuid would be rejected by the column type (22P02).
 func seedBatchInvocationJob(ctx context.Context, tb testing.TB, pool *pgxpool.Pool, org, requestID, invocationID, kind string, amount money.MicroUSD, payload []byte) int64 {
 	tb.Helper()
 	var id int64
 	err := pool.QueryRow(ctx, `
 		INSERT INTO settlement_jobs (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
-		VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
+		VALUES ($1, $2, NULLIF($3, '')::uuid, $4, $5, $6, 'pending', $7)
 		RETURNING id`, org, requestID, invocationID, kind, amount.Cents(), int64(amount), payload).Scan(&id)
 	require.NoError(tb, err, "seed invocation settlement job")
 	return id
@@ -220,21 +223,34 @@ func TestSettleOrgBatchFencingLostOwnership(t *testing.T) {
 	seedBatchWallet(ctx, t, pool, org, 10_000, 0)
 	amount := money.MicroUSD(1_500_000)
 
-	claim := func() (id1, id2 int64) {
-		id1 = seedBatchInvocationJob(ctx, t, pool, org, "fence-req-1", "55555555-5555-4555-8555-555555555551", SettleKindResale, amount, []byte(`{}`))
-		id2 = seedBatchInvocationJob(ctx, t, pool, org, "fence-req-2", "55555555-5555-4555-8555-555555555552", SettleKindResale, amount, []byte(`{}`))
+	// Per-subtest invocation identities: all subtests share the org wallet
+	// on one migrated stand, and uniq_settlement_jobs_invocation
+	// (org_id, invocation_id, charge_kind) rejects re-seeding the same
+	// uuids. Request-id texts collide with no domain and stay shared.
+	fencingIdentity := func(variant int) (inv1, inv2 string) {
+		base := 40 + 10*variant // v1: ...551/...552, v2: ...561/...562, v3: ...571/...572
+		return fmt.Sprintf("55555555-5555-4555-8555-5555555555%02d", base+1),
+			fmt.Sprintf("55555555-5555-4555-8555-5555555555%02d", base+2)
+	}
+	claim := func(t *testing.T, variant int) (id1, id2 int64) {
+		t.Helper()
+		inv1, inv2 := fencingIdentity(variant)
+		id1 = seedBatchInvocationJob(ctx, t, pool, org, "fence-req-1", inv1, SettleKindResale, amount, []byte(`{}`))
+		id2 = seedBatchInvocationJob(ctx, t, pool, org, "fence-req-2", inv2, SettleKindResale, amount, []byte(`{}`))
 		// The state a live claim leaves behind.
 		_, err := pool.Exec(ctx, `UPDATE settlement_jobs SET status = 'processing', attempts = 1, lease_until = now() + interval '30s' WHERE id = ANY($1::bigint[])`, []int64{id1, id2})
 		require.NoError(t, err)
 		return id1, id2
 	}
-	entriesFor := func(id1, id2 int64) []SettleEntry {
+	entriesFor := func(variant int, id1, id2 int64) []SettleEntry {
+		inv1, inv2 := fencingIdentity(variant)
 		return []SettleEntry{
-			{JobID: id1, FencingToken: 1, RequestID: "fence-req-1", InvocationID: "55555555-5555-4555-8555-555555555551", Kind: SettleKindResale, Amount: amount, Payload: []byte(`{}`)},
-			{JobID: id2, FencingToken: 1, RequestID: "fence-req-2", InvocationID: "55555555-5555-4555-8555-555555555552", Kind: SettleKindResale, Amount: amount, Payload: []byte(`{}`)},
+			{JobID: id1, FencingToken: 1, RequestID: "fence-req-1", InvocationID: inv1, Kind: SettleKindResale, Amount: amount, Payload: []byte(`{}`)},
+			{JobID: id2, FencingToken: 1, RequestID: "fence-req-2", InvocationID: inv2, Kind: SettleKindResale, Amount: amount, Payload: []byte(`{}`)},
 		}
 	}
-	assertNothingMoved := func() {
+	assertNothingMoved := func(t *testing.T) {
+		t.Helper()
 		bal, _ := settlementWalletState(ctx, t, pool, org)
 		assert.EqualValues(t, 10_000, bal, "fenced batch moves no money")
 		rows, _ := walletLedger(ctx, t, pool, org)
@@ -242,26 +258,26 @@ func TestSettleOrgBatchFencingLostOwnership(t *testing.T) {
 	}
 
 	t.Run("newer reclaim bumps the token", func(t *testing.T) {
-		id1, id2 := claim()
+		id1, id2 := claim(t, 1)
 		// A newer claim: processing again, attempts incremented.
 		_, err := pool.Exec(ctx, `UPDATE settlement_jobs SET attempts = 2 WHERE id = ANY($1::bigint[])`, []int64{id1, id2})
 		require.NoError(t, err)
-		_, err = SettleOrgBatch(ctx, pool, org, 0, entriesFor(id1, id2), BatchSpenders{})
+		_, err = SettleOrgBatch(ctx, pool, org, 0, entriesFor(1, id1, id2), BatchSpenders{})
 		require.ErrorIs(t, err, ErrStaleSettlementToken)
-		assertNothingMoved()
+		assertNothingMoved(t)
 		var status string
 		require.NoError(t, pool.QueryRow(ctx, `SELECT status FROM settlement_jobs WHERE id = $1`, id1).Scan(&status))
 		assert.Equal(t, "processing", status, "rightful owner's claim untouched")
 	})
 
 	t.Run("recovered lease same token", func(t *testing.T) {
-		id1, id2 := claim()
+		id1, id2 := claim(t, 2)
 		// recoverExpiredLeases: processing -> retry, attempts UNCHANGED.
 		_, err := pool.Exec(ctx, `UPDATE settlement_jobs SET status = 'retry', lease_until = NULL, next_attempt_at = now() WHERE id = ANY($1::bigint[])`, []int64{id1, id2})
 		require.NoError(t, err)
-		_, err = SettleOrgBatch(ctx, pool, org, 0, entriesFor(id1, id2), BatchSpenders{})
+		_, err = SettleOrgBatch(ctx, pool, org, 0, entriesFor(2, id1, id2), BatchSpenders{})
 		require.ErrorIs(t, err, ErrStaleSettlementToken, "recovered-but-not-reclaimed jobs must fence despite matching attempts")
-		assertNothingMoved()
+		assertNothingMoved(t)
 		var status string
 		var attempts int
 		require.NoError(t, pool.QueryRow(ctx, `SELECT status, attempts FROM settlement_jobs WHERE id = $1`, id1).Scan(&status, &attempts))
@@ -270,8 +286,8 @@ func TestSettleOrgBatchFencingLostOwnership(t *testing.T) {
 	})
 
 	t.Run("zero token keeps direct-caller behavior", func(t *testing.T) {
-		id1, id2 := claim()
-		entries := entriesFor(id1, id2)
+		id1, id2 := claim(t, 3)
+		entries := entriesFor(3, id1, id2)
 		entries[0].FencingToken = 0
 		entries[1].FencingToken = 0
 		disp, err := SettleOrgBatch(ctx, pool, org, 0, entries, BatchSpenders{})
@@ -318,7 +334,7 @@ func TestSettleOrgBatchReleasedAllowance(t *testing.T) {
 	assert.EqualValues(t, 0, disp[id].DecrementMicroUSD, "released allowance decrements nothing")
 
 	bal, _ := settlementWalletState(ctx, t, pool, org)
-	assert.EqualValues(t, 8_800, bal, "wallet charge applied")
+	assert.EqualValues(t, 9_880, bal, "wallet charge applied: 1,200,000 µ = 120c at 10,000 µ per cent")
 	var reserved int64
 	require.NoError(t, pool.QueryRow(ctx, `SELECT reserved_micro_usd FROM org_credits WHERE org_id = $1`, org).Scan(&reserved))
 	assert.EqualValues(t, 500_000, reserved, "reserve pool untouched")
