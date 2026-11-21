@@ -17,9 +17,12 @@ import (
 // crash; never age still-live controls) — with no invented usage, no
 // wallet debit and no fabricated request_logs success. Exactly that one
 // UUID — never a duplicate mint, never a replacement — must surface as
-// the unresolved row through the restart. Discovery through the admission
-// row is sufficient; a request_logs row is NOT forced (and if one exists
-// it must not claim success/usage/cost).
+// the unresolved row through the restart, bound to this tenant only (the
+// same correlation id read under a foreign org must return nothing). The
+// state/reason resolution is eventual: the accepted bound is the
+// 15-minute grace contract, so the poll uses that window with early exit.
+// Discovery through the admission row is sufficient; a request_logs row
+// is NOT forced (and if one exists it must not claim success/usage/cost).
 //
 // Baseline (4e9895d) truth: request_admissions does not exist — the case
 // must fail there with an explicit defect message, not pass vacuously.
@@ -107,12 +110,14 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 
 	// Strict unresolved for the EXACT captured UUID: poll until precisely
 	// one admission exists under this correlation id, it is the barrier
-	// UUID, and it is 'unresolved' with the exact contract reason.
-	// 'admitted' (stuck), 'voided' (claims proven-never-dispatched —
-	// false, the fixture observed the dispatch) and 'reconciled' (claims
-	// terminal evidence that does not exist) are all explicit defects, as
-	// is any duplicate mint under the single HTTP invocation.
-	pollUntil(t, 6*time.Minute, "target admission reaches 'unresolved'", func() error {
+	// UUID, and it is 'unresolved' with the exact contract reason. The
+	// window is the accepted eventual bound (15 minutes, matching the
+	// grace contract) with early exit on success. 'admitted' (stuck),
+	// 'voided' (claims proven-never-dispatched — false, the fixture
+	// observed the dispatch) and 'reconciled' (claims terminal evidence
+	// that does not exist) are all explicit defects, as is any duplicate
+	// mint under the single HTTP invocation.
+	pollUntil(t, 15*time.Minute, "target admission reaches 'unresolved'", func() error {
 		rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 		switch {
 		case len(rows) == 0:
@@ -145,27 +150,35 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	})
 	t.Logf("target: admission %s reached 'unresolved' with reason %s", targetUUID, reasonGraceElapsed)
 
+	// Tenant binding: the unresolved row must surface only under this
+	// stand's org — the same correlation id read under a foreign tenant
+	// must return nothing (storage-level tenant scope; org-facing API
+	// exposure is reviewed separately).
+	if foreign := s.oracleAdmissions(t, rid, "org-not-this-tenant"); len(foreign) != 0 {
+		t.Fatalf("unresolved: admission rows for %s leaked under a foreign org: %s", rid, fmtAdmissions(foreign))
+	}
+
+	// No terminal evidence may ever have appeared: the classification is
+	// 'no terminal facts' — a facts row here would mean the unresolved
+	// state sits on fabricated evidence.
+	if n := s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID); n != 0 {
+		t.Fatalf("unresolved: %d terminal facts row(s) for %s although the provider response was never delivered back — fabricated evidence behind the unresolved classification", n, rid)
+	}
+
 	// No invented usage, no wallet debit, no fabricated request_logs claim.
 	s.requireNoWalletDebit(t, rid, s.oracleDB.orgID, "unresolved")
 	if balanceAfter, _ := s.oracleWalletBalance(t, s.oracleDB.orgID); balanceAfter != balanceBefore {
 		t.Fatalf("unresolved: wallet balance moved %d -> %d with no chargeable evidence for %s", balanceBefore, balanceAfter, rid)
 	}
 	logRows := s.oracleRequestLogRows(t, rid, s.oracleDB.orgID)
-	for _, r := range logRows {
-		if r.Status == httpOK {
-			t.Fatalf("unresolved: request_logs row claims 200 for crashed %s (fabricated success)", rid)
-		}
-		if r.TokensIn > 0 || r.TokensOut > 0 || r.CostUSD > 0 {
-			t.Fatalf("unresolved: request_logs row invents usage/cost for crashed %s: status=%d tokens=%d/%d cost=%v", rid, r.Status, r.TokensIn, r.TokensOut, r.CostUSD)
-		}
-	}
+	requireNoFabricatedRequestLogRows(t, rid, s.oracleDB.orgID, logRows, "unresolved")
 	if len(logRows) == 0 {
 		t.Logf("unresolved: no request_logs row for %s (acceptable: discovery through the admission row)", rid)
 	} else {
 		t.Logf("unresolved: content-free request_logs row present for %s (acceptable: no usage claimed)", rid)
 	}
-	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs > 1 {
-		t.Fatalf("unresolved: settlement jobs = %d, want <= 1", jobs)
+	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs != 0 {
+		t.Fatalf("unresolved: %d settlement job(s) for %s although zero terminal facts exist — settlement without evidence", jobs, rid)
 	}
 
 	// Post-recovery control: the system still serves and charges exactly once.
