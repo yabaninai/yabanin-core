@@ -97,11 +97,12 @@ func fuzzEmbeddingsForwarded(t *testing.T, in string) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-fuzz", nil)),
+		invocations: &fakeInvocationStore{},
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
 	}
 	var ev *eventpub.Event
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
@@ -111,7 +112,7 @@ func fuzzEmbeddingsForwarded(t *testing.T, in string) {
 
 	validateEmbeddingsForwardedContent(t, &wire, "embed-a", text)
 
-	if ev == nil || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
+	if ev == nil || ev.OrgID != "org-fuzz" || ev.InvocationID == "" || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
 		t.Fatalf("event %+v", ev)
 	}
 }
