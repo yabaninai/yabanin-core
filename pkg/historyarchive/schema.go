@@ -5,11 +5,17 @@
 //
 // The package is deliberately data-free: it declares the contract as typed
 // constants and one ordered column manifest, and the tests in this package
-// enforce the manifest against the live migration schema
-// (migrations/0001_init.up.sql). Any future schema change to request_logs
-// (hot tier) therefore fails this package's contract tests until the
-// manifest is updated in the same change — schema evolution is pinned, which
-// is the seam the S3/Iceberg object writer and the hot→cold transfer consume.
+// enforce the manifest against the cumulative migrated schema
+// (migrations/0001_init.up.sql plus the sanctioned additive migrations).
+// Any schema change to request_logs (hot tier) therefore fails this
+// package's contract tests until the manifest is updated in the same
+// change — schema evolution is pinned, which is the seam the S3/Iceberg
+// object writer and the hot→cold transfer consume. Released migrations are
+// immutable (migrations/README.md), so a sanctioned column addition is
+// expressed as a SanctionedRequestLogsAdds entry carrying the exact
+// filename and DDL; the manifest is derived cumulatively (0001 columns,
+// then sanctioned adds in migration order) and every shipped manifest
+// generation stays resolvable for old archive batches.
 //
 // Scope boundaries (owner decisions I26-I30/I62/I63):
 //   - 90 days is a TIER boundary, never an age-based deletion deadline.
@@ -106,11 +112,11 @@ type HistoryColumn struct {
 	Kind   ColumnKind
 }
 
-// HistoryColumns is the ordered history-record manifest — the exact column
-// list of CREATE TABLE public.request_logs in migrations/0001_init.up.sql,
-// in schema order. This is the schema the hot→cold transfer replicates and
-// the digest that pins schema evolution; no migration adds request_logs
-// columns today (enforced), so this table is the single column source.
+// requestLogsBaseColumns is the ordered column list of CREATE TABLE
+// public.request_logs in migrations/0001_init.up.sql, in schema order.
+// The live manifest is derived from this base plus the sanctioned additive
+// migrations below — released migration bytes stay immutable, so evolution
+// appends through the registry, never by editing 0001.
 //
 // Classification notes (the honest ones):
 //   - error is metadata: production capture does not strip provider error
@@ -119,7 +125,7 @@ type HistoryColumn struct {
 //     the archive treats it the same way. Known limitation, recorded in the
 //     lane record; a future card may reclassify it.
 //   - labels is metadata: org-supplied key/value labels, no content payload.
-var HistoryColumns = []HistoryColumn{
+var requestLogsBaseColumns = []HistoryColumn{
 	{Name: "id", DBType: "bigint", Kind: KindMetadata},
 	{Name: "session_id", DBType: "uuid", Kind: KindMetadata},
 	{Name: "org_id", DBType: "uuid", Kind: KindAuthz},
@@ -168,6 +174,138 @@ var HistoryColumns = []HistoryColumn{
 	{Name: "session_key_id", DBType: "uuid", Kind: KindMetadata},
 }
 
+// SanctionedRequestLogsAdd records one migration that adds request_logs
+// columns outside the 0001 CREATE TABLE. Migration is the exact migration
+// filename; DDL is the exact ALTER statement byte-for-byte as it appears in
+// that file; Column is the appended manifest entry. The contract test
+// (TestNoLateColumnAddsToRequestLogs) fails on ANY request_logs ADD COLUMN
+// that is not listed here with these exact bytes — an unknown add never
+// reaches the manifest silently.
+type SanctionedRequestLogsAdd struct {
+	Migration string
+	DDL       string
+	Column    HistoryColumn
+}
+
+// SanctionedRequestLogsAdds is the sanctioned additive-migration registry,
+// in migration (filename) order. The cumulative manifest is the base 0001
+// columns plus these columns, appended in registry order — the same column
+// order a fully migrated database carries (0001 columns in CREATE order,
+// then each ALTER ADD appended).
+var SanctionedRequestLogsAdds = []SanctionedRequestLogsAdd{{
+	Migration: "0028_request_invocations.up.sql",
+	DDL:       "ALTER TABLE public.request_logs ADD COLUMN invocation_id uuid;",
+	Column: HistoryColumn{
+		Name: "invocation_id",
+		// Server-minted per-invocation identity (0028): durable accounting
+		// and settlement dedupe key it; legacy rows are NULL. Metadata, not
+		// authz — the payload-authorization predicates do not filter on it
+		// (pinned by TestAuthzColumnsPinned).
+		DBType: "uuid",
+		Kind:   KindMetadata,
+	},
+}}
+
+// HistoryColumns is the ordered history-record manifest: the exact column
+// list a fully migrated deployment's request_logs carries — 0001's CREATE
+// TABLE columns in schema order, then the sanctioned additive migration
+// columns in migration order. This is the schema the hot→cold transfer
+// projects and the digest that pins schema evolution. It is derived, never
+// hand-maintained: a schema change reaches it only through the sanctioned
+// registry, and the contract tests prove manifest, SQL bytes and a fully
+// migrated database agree.
+var HistoryColumns = cumulativeRequestLogsColumns()
+
+func cumulativeRequestLogsColumns() []HistoryColumn {
+	out := make([]HistoryColumn, 0, len(requestLogsBaseColumns)+len(SanctionedRequestLogsAdds))
+	out = append(out, requestLogsBaseColumns...)
+	for _, add := range SanctionedRequestLogsAdds {
+		out = append(out, add.Column)
+	}
+	return out
+}
+
+// SchemaGeneration is one shipped manifest generation. Version numbers are
+// sequential from 1 (base 0001 manifest) and grow by one per sanctioned
+// additive migration; Columns is the frozen manifest of that generation and
+// Digest its schema fingerprint. The digest is the fingerprint a cold-batch
+// writer records per batch and a reader resolves through
+// GenerationForDigest (the N10-P02-T05 schema-evolution hook). Core ships
+// no live batch writer/reader today (the only production import is the
+// policy read model pkg/adminstore/history_tier.go); the registry resolves
+// manifest generations for historical artifacts at contract scope, and the
+// same registry is the seam a future or commercial writer consumes.
+type SchemaGeneration struct {
+	Version int
+	Digest  string
+	Columns []HistoryColumn
+}
+
+// generations lists every shipped manifest generation, oldest first, ending
+// with the current one. Construction freezes each generation's columns and
+// digest; a generation whose manifest would not validate is an init-time
+// programmer error, not a runtime condition.
+var generations = buildGenerations()
+
+func buildGenerations() []SchemaGeneration {
+	gs := make([]SchemaGeneration, 0, len(SanctionedRequestLogsAdds)+1)
+	cols := append([]HistoryColumn(nil), requestLogsBaseColumns...)
+	gs = append(gs, freezeGeneration(1, cols))
+	for i, add := range SanctionedRequestLogsAdds {
+		cols = append(cols, add.Column)
+		gs = append(gs, freezeGeneration(i+2, cols))
+	}
+	return gs
+}
+
+// freezeGeneration validates a manifest copy and pins its digest. A panic
+// here means a sanctioned registry entry produced an invalid manifest —
+// the package's own contract is broken and every caller must fail.
+func freezeGeneration(version int, cols []HistoryColumn) SchemaGeneration {
+	digest, err := ValidateManifest(cols)
+	if err != nil {
+		panic(fmt.Sprintf("historyarchive: generation %d manifest invalid: %v", version, err))
+	}
+	return SchemaGeneration{Version: version, Digest: digest, Columns: cols}
+}
+
+// CurrentGeneration returns the manifest generation new archive batches are
+// written with (HistoryColumns and its digest). The returned Columns are an
+// isolated copy: callers cannot mutate the package's frozen generations.
+func CurrentGeneration() SchemaGeneration {
+	return withIsolatedColumns(generations[len(generations)-1])
+}
+
+// Generations returns every shipped manifest generation, oldest first, each
+// with an isolated Columns copy.
+func Generations() []SchemaGeneration {
+	out := make([]SchemaGeneration, len(generations))
+	for i, g := range generations {
+		out[i] = withIsolatedColumns(g)
+	}
+	return out
+}
+
+// GenerationForDigest resolves a recorded artifact digest to its shipped
+// manifest generation (Columns isolated). It fails closed: an unknown
+// digest (a generation this binary never shipped) is an error, never a
+// best-effort fallback to the current manifest.
+func GenerationForDigest(digest string) (SchemaGeneration, error) {
+	for _, g := range generations {
+		if g.Digest == digest {
+			return withIsolatedColumns(g), nil
+		}
+	}
+	return SchemaGeneration{}, fmt.Errorf("history archive digest %q matches no shipped manifest generation", digest)
+}
+
+// withIsolatedColumns returns g with a private copy of Columns, so the
+// exported accessors can never alias the frozen internal slices.
+func withIsolatedColumns(g SchemaGeneration) SchemaGeneration {
+	g.Columns = append([]HistoryColumn(nil), g.Columns...)
+	return g
+}
+
 // Column returns the manifest entry for name.
 func Column(name string) (HistoryColumn, bool) {
 	for _, c := range HistoryColumns {
@@ -206,8 +344,9 @@ func TierEligible(createdAt, now time.Time) bool {
 
 // Digest returns a deterministic fingerprint over a column manifest (sha256,
 // hex). The transfer writer records it per archive batch so a reader can
-// detect which schema generation a cold batch was written with — the hook
-// for N10-P02-T05 schema evolution. Pass HistoryColumns for the live digest.
+// detect which schema generation a cold batch was written with (resolved
+// through GenerationForDigest — the N10-P02-T05 schema evolution hook).
+// Pass HistoryColumns for the live digest.
 func Digest(cols []HistoryColumn) string {
 	h := sha256.New()
 	for _, c := range cols {

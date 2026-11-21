@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // rootMigrationsFS locates the canonical migrations directory (two levels up
@@ -64,53 +66,161 @@ func parseRequestLogsSchema(t *testing.T, path string) []HistoryColumn {
 	return cols
 }
 
-// TestHistoryColumns_MatchMigratedSchema is the schema-fix tooth: the
-// manifest must equal the live request_logs schema byte-for-byte (names,
-// types, order). A schema change that does not update the manifest in the
-// same change fails here, which is exactly how N10-P02-T02 «fixes» the
-// history schema for the archive: drift becomes impossible to merge
-// unnoticed.
-func TestHistoryColumns_MatchMigratedSchema(t *testing.T) {
-	live := parseRequestLogsSchema(t, filepath.Join(rootMigrationsDir, "0001_init.up.sql"))
-	if len(live) != len(HistoryColumns) {
-		t.Fatalf("history schema drifted: live schema has %d columns, manifest has %d — update HistoryColumns in the same change",
-			len(live), len(HistoryColumns))
+// sanctionedAddRegex parses a sanctioned ADD COLUMN statement into its
+// column name and raw type token (same trimming rules as the 0001 parser).
+var sanctionedAddRegex = regexp.MustCompile(
+	`(?i)^ALTER\s+TABLE\s+(?:ONLY\s+)?(?:public\.)?request_logs\s+ADD\s+COLUMN\s+([a-z_][a-z0-9_]*)\s+([^;]+);$`)
+
+// parseSanctionedAdd extracts the column a sanctioned DDL statement adds.
+func parseSanctionedAdd(t *testing.T, ddl string) HistoryColumn {
+	t.Helper()
+	m := sanctionedAddRegex.FindStringSubmatch(strings.TrimSpace(ddl))
+	if m == nil {
+		t.Fatalf("sanctioned DDL does not parse as a request_logs ADD COLUMN statement: %q", ddl)
 	}
-	for i, lc := range live {
+	return HistoryColumn{Name: m[1], DBType: strings.TrimSpace(m[2])}
+}
+
+// TestHistoryColumns_MatchMigratedSchema is the schema-fix tooth: the
+// manifest must equal the cumulative migrated schema byte-for-byte — 0001's
+// CREATE TABLE columns in order, then each sanctioned additive migration's
+// column in migration order. A schema change that does not update the
+// manifest in the same change fails here, which is exactly how N10-P02-T02
+// «fixes» the history schema for the archive: drift becomes impossible to
+// merge unnoticed. Released migrations are immutable, so the comparison
+// source is the pinned SQL bytes, never an edited history.
+func TestHistoryColumns_MatchMigratedSchema(t *testing.T) {
+	cumulative := parseRequestLogsSchema(t, filepath.Join(rootMigrationsDir, "0001_init.up.sql"))
+	for _, add := range SanctionedRequestLogsAdds {
+		cumulative = append(cumulative, parseSanctionedAdd(t, add.DDL))
+	}
+	if len(cumulative) != len(HistoryColumns) {
+		t.Fatalf("history schema drifted: cumulative schema has %d columns, manifest has %d — extend SanctionedRequestLogsAdds (and the generation) in the same change",
+			len(cumulative), len(HistoryColumns))
+	}
+	for i, lc := range cumulative {
 		mc := HistoryColumns[i]
 		if lc.Name != mc.Name {
 			t.Fatalf("history schema drifted at position %d: live column %q, manifest column %q", i, lc.Name, mc.Name)
 		}
 		if lc.DBType != mc.DBType {
-			t.Fatalf("history schema drifted at column %q: live type %q, manifest type %q — update HistoryColumns in the same change",
+			t.Fatalf("history schema drifted at column %q: live type %q, manifest type %q — update the sanctioned registry in the same change",
 				mc.Name, lc.DBType, mc.DBType)
 		}
 	}
 }
 
 // TestNoLateColumnAddsToRequestLogs closes the ALTER TABLE loophole: no
-// migration may add request_logs columns outside the 0001 CREATE TABLE,
-// because the manifest (and therefore every archive batch digest) is defined
-// against that single column source.
+// migration may add request_logs columns outside the 0001 CREATE TABLE
+// unless it is a registered sanctioned add — exact filename, exact DDL
+// bytes. Anything else (unknown file, unknown statement, edited bytes)
+// fails here, so a column can never silently reach the live schema without
+// also reaching the manifest and a new generation.
 func TestNoLateColumnAddsToRequestLogs(t *testing.T) {
-	entries, err := os.ReadDir(rootMigrationsDir)
-	if err != nil {
-		t.Fatalf("read migrations dir: %v", err)
-	}
 	alterAdd := regexp.MustCompile(`(?i)ALTER\s+TABLE\s+(ONLY\s+)?(public\.)?request_logs\s+ADD`)
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".up.sql") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(rootMigrationsDir, e.Name()))
-		if err != nil {
-			t.Fatalf("read %s: %v", e.Name(), err)
-		}
-		for lineNo, line := range strings.Split(string(data), "\n") {
-			if alterAdd.MatchString(line) {
-				t.Fatalf("%s:%d adds a request_logs column outside the pinned manifest — update HistoryColumns and this test's allowance in the same change", e.Name(), lineNo+1)
+	paths, err := filepath.Glob(filepath.Join(rootMigrationsDir, "*.up.sql"))
+	require.NoError(t, err)
+	require.NotEmpty(t, paths)
+	var found []SanctionedRequestLogsAdd
+	for _, path := range paths {
+		data, err := os.ReadFile(filepath.Clean(path))
+		require.NoError(t, err)
+		for _, line := range strings.Split(string(data), "\n") {
+			ddl := strings.TrimSpace(line)
+			if alterAdd.MatchString(ddl) {
+				col := parseSanctionedAdd(t, ddl)
+				found = append(found, SanctionedRequestLogsAdd{Migration: filepath.Base(path), DDL: ddl, Column: col})
 			}
 		}
+	}
+	require.Len(t, found, len(SanctionedRequestLogsAdds))
+	for i, got := range found {
+		want := SanctionedRequestLogsAdds[i]
+		require.Equal(t, want.Migration, got.Migration)
+		require.Equal(t, want.DDL, got.DDL)
+		require.Equal(t, want.Column.Name, got.Column.Name)
+		require.Equal(t, want.Column.DBType, got.Column.DBType)
+	}
+}
+
+// legacyManifestDigest is the manifest digest of generation 1 — the
+// 46-column pre-invocation manifest shipped at 03cfedc — pinned as an
+// external literal (independently computed from that revision). It anchors
+// history: no edit to the base column list, the freezing logic or the
+// digest function can silently rewrite what generation 1 was.
+const legacyManifestDigest = "4e8d9ee60cbd0f4285d4ccc40ff22ebef74db2145ab209ceb39f86a6ed32d207"
+
+// TestSchemaGenerationRegistry pins the version-handling half of the
+// contract: generation 1 equals the externally pinned legacy digest and
+// column count, every generation validates, older generations are strict
+// prefixes of newer ones (evolution appends only), digests are distinct,
+// the current generation is HistoryColumns, historical generations resolve
+// by digest (contract-scope artifact resolution — Core ships no live batch
+// writer/reader today), and unknown digests fail closed.
+func TestSchemaGenerationRegistry(t *testing.T) {
+	gs := Generations()
+	require.Len(t, gs, len(SanctionedRequestLogsAdds)+1)
+	require.Equal(t, legacyManifestDigest, gs[0].Digest)
+	require.Len(t, gs[0].Columns, 46)
+	for i, g := range gs {
+		require.Equal(t, i+1, g.Version)
+		digest, err := ValidateManifest(g.Columns)
+		require.NoError(t, err)
+		require.Equal(t, g.Digest, digest)
+		resolved, err := GenerationForDigest(digest)
+		require.NoError(t, err)
+		require.Equal(t, g, resolved)
+		if i > 0 {
+			prev := gs[i-1]
+			require.Len(t, g.Columns, len(prev.Columns)+1)
+			require.Equal(t, prev.Columns, g.Columns[:len(prev.Columns)])
+			require.NotEqual(t, prev.Digest, digest)
+		}
+	}
+	require.Equal(t, HistoryColumns, CurrentGeneration().Columns)
+	require.Equal(t, Digest(HistoryColumns), CurrentGeneration().Digest)
+	_, err := GenerationForDigest(legacyManifestDigest + "00")
+	require.Error(t, err)
+}
+
+func TestReturnedGenerationColumnsAreIsolated(t *testing.T) {
+	old, err := GenerationForDigest(legacyManifestDigest)
+	require.NoError(t, err)
+	old.Columns[0].Name = "caller edit"
+	CurrentGeneration().Columns[0].DBType = "caller edit"
+	for _, g := range Generations() {
+		g.Columns[0].Name = "caller edit"
+	}
+	fresh, err := GenerationForDigest(legacyManifestDigest)
+	require.NoError(t, err)
+	require.Equal(t, legacyManifestDigest, Digest(fresh.Columns))
+	require.Equal(t, HistoryColumns, CurrentGeneration().Columns)
+}
+
+// TestInvocationIdentityPinned pins the 0028 addition's manifest shape:
+// invocation_id is the appended (last) column, uuid, metadata — never an
+// authz column, since the payload-authorization predicates do not filter
+// on it (TestAuthzColumnsPinned holds the exact authz set).
+func TestInvocationIdentityPinned(t *testing.T) {
+	last := HistoryColumns[len(HistoryColumns)-1]
+	if last.Name != "invocation_id" || last.DBType != "uuid" || last.Kind != KindMetadata {
+		t.Fatalf("invocation_id must be the appended uuid metadata column, got %+v", last)
+	}
+	if c, ok := Column("invocation_id"); !ok || c.Kind != KindMetadata || c.DBType != "uuid" {
+		t.Fatalf("Column(invocation_id) = %+v, %v — must resolve as uuid metadata", c, ok)
+	}
+	// The pre-invocation generation (what archive batches written before
+	// 0028 carry) must not know the column.
+	v1 := Generations()[0]
+	if _, ok := func() (HistoryColumn, bool) {
+		for _, c := range v1.Columns {
+			if c.Name == "invocation_id" {
+				return c, true
+			}
+		}
+		return HistoryColumn{}, false
+	}(); ok {
+		t.Fatalf("generation 1 must not carry invocation_id — it predates 0028")
 	}
 }
 
