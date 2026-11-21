@@ -207,7 +207,9 @@ func n03p6t06ChatGateway(t *testing.T, upstreamURL string) *gateway {
 	n03p6t06ResetDefaultPricer(t)
 	gw := goldenChatGateway(t, upstreamURL)
 	gw.streamUsageProviders = streamUsageEnabled([]string{"openai"})
-	gw.auth = NewAuthMiddleware(gw.cfg, nil)
+	// Strict auth must resolve the tenant from the key (production shape);
+	// a nil resolver leaves org empty and durable accounting refuses.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-test", nil))
 	return gw
 }
 

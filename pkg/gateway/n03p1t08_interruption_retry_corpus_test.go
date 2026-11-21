@@ -115,7 +115,10 @@ func n03p1t08Gate() *reservationGate {
 	return &reservationGate{
 		plan: &budget.Plan{Mode: budget.ModeOff},
 		rsv: &budget.Reservation{OrgID: n03p1t08Org, Scopes: []budget.ScopeReserve{
-			{Scope: budget.ScopeWallet, Key: n03p1t08Org, Bound: 1_000_000},
+			// AllowanceID mirrors a real grant: the terminal projection
+			// rejects tuples without one (an un-granted reserve cannot be
+			// a durable fact).
+			{Scope: budget.ScopeWallet, Key: n03p1t08Org, AllowanceID: 1, Bound: 1_000_000},
 		}},
 	}
 }
@@ -531,6 +534,10 @@ func TestN03P1T08_MidStreamBreak_FreshRetrySelfContained(t *testing.T) {
 			"/v1/chat/completions", strings.NewReader(n03p1t08ChatBody()))
 		r.Header.Set("Content-Type", "application/json")
 		goldenIdentity(r)
+		// The reservation gate below binds org-t08's wallet: the terminal
+		// projection requires the wallet tuple's scope key to match the
+		// request's actual tenant.
+		r.Header.Set("X-Org-Id", n03p1t08Org)
 		// The termination taxonomy (§5.3 Finalize) is stamped by the
 		// reservation gate's attach; stamp the off-mode gate directly.
 		r = r.WithContext(withReservationGate(r.Context(), n03p1t08Gate()))

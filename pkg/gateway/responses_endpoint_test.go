@@ -30,14 +30,20 @@ func responsesTestGateway(t *testing.T, upstreamURL string) *gateway {
 		"gpt-5-codex": {ModelName: "gpt-5-codex", Provider: "openai", UpstreamURL: upstreamURL, Enabled: true},
 	}
 	return &gateway{
-		cfg:                  cfg,
-		log:                  slog.Default(),
-		auth:                 NewAuthMiddleware(cfg, nil),
+		cfg: cfg,
+		log: slog.Default(),
+		// Strict auth resolves the tenant from the API key exactly like the
+		// production edge (client identity headers are stripped); durable
+		// accounting binds org_id NOT NULL and refuses unattributed
+		// dispatches.
+		auth:                 NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
 		res:                  res,
 		pool:                 upstream.NewPool(upstream.Options{}),
 		fallback:             router.NewFallbackExecutor(res, 3, slog.Default()),
 		retryPolicy:          retry.DefaultPolicy(),
 		streamUsageProviders: map[string]bool{"openai": true},
+		// Explicit in-memory invocation store (see streamTestGateway).
+		invocations: &fakeInvocationStore{},
 	}
 }
 

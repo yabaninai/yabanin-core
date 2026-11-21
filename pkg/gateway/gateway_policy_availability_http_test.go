@@ -69,7 +69,9 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	cfg.FallbackModel = "r00905-model"
 	cfg.UnknownModelPolicy = "reject"
 	gw := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler),
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}},
 		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL})},
 		gatewayRouting: gatewayRouting{res: stubModelResolver{
 			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},
@@ -188,7 +190,9 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	}
 	failOpenRuntime.coldFailureMode = PolicyColdFailureFailOpen
 	failOpenGW := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler),
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}},
 		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL})},
 		gatewayRouting: gatewayRouting{res: stubModelResolver{
 			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},
@@ -520,7 +524,9 @@ func newPolicyAvailabilityUpstream(t *testing.T, upstreamCalls *atomic.Int64) *h
 func startPolicyAvailabilityHTTPGateway(t *testing.T, cfg config.Gateway, upstreamURL string, directPool *pgxpool.Pool, rt *PolicyRuntime) (*httptest.Server, *http.Client) {
 	t.Helper()
 	gw := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler),
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}},
 		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamURL})},
 		gatewayRouting: gatewayRouting{res: stubModelResolver{
 			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},

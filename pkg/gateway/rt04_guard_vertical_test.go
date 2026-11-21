@@ -118,6 +118,7 @@ func (c *rt04Capture) count() int {
 // DB/Redis/classifier, pointing the upstream pool at upstreamURL.
 func rt04Gateway(upstreamURL string, mode guardhooks.Mode, reg *verticals.Registry) *gateway {
 	return &gateway{
+		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
 		cfg: config.Gateway{
 			Provider: upstreamURL,
 			APIKey:   "test-key",

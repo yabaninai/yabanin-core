@@ -47,6 +47,7 @@ func TestChatCompletions_OpenCodeToolLoopForwardsTools(t *testing.T) {
 	body := opencodeToolLoopJSON("gpt-4")
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 
@@ -68,6 +69,7 @@ func TestChatCompletions_ZAICodingDisabled(t *testing.T) {
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		bytes.NewReader(opencodeToolLoopJSON("glm-5.3")))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 
@@ -87,6 +89,7 @@ func TestChatCompletions_ZAICodingUnsupportedModel(t *testing.T) {
 	body := []byte(`{"model":"gpt-4o","messages":[{"role":"user","content":"hi"}]}`)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 
@@ -122,6 +125,7 @@ func TestChatCompletions_ZAICodingQuotaAndPinnedURL(t *testing.T) {
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		bytes.NewReader([]byte(`{"model":"glm-5.3","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 

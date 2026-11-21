@@ -178,6 +178,7 @@ func TestChatCompletions_DecisionHeaderPresentAndParsable(t *testing.T) {
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}`
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(body)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 
@@ -204,6 +205,7 @@ func TestChatCompletions_DecisionHeaderDisabled(t *testing.T) {
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}`
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(body)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 

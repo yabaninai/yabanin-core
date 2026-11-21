@@ -242,6 +242,14 @@ func (h *invocationIdentity) beginPaidDispatch(ctx context.Context, store invoca
 	if err := nilInvocationStore(store); err != nil {
 		return err
 	}
+	// Both accounting tables bind org_id NOT NULL and the terminal
+	// projection rejects an empty tenant: an org-less paid request could
+	// be dispatched but never durably accounted, so it refuses up front
+	// (fail-closed) instead of failing its terminal commit after the
+	// provider was already paid.
+	if h.orgID == "" {
+		return fmt.Errorf("%w: %s has no tenant attribution", ErrInvocationStoreUnavailable, h.id)
+	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	switch {

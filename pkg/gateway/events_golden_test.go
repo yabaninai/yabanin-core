@@ -119,6 +119,12 @@ func goldenEvent(t *testing.T, name string, got, want *eventpub.Event, volatile 
 	g, w := *got, *want
 	g.DurationMs, w.DurationMs = 0, 0
 	g.FirstTokenMs, w.FirstTokenMs = 0, 0
+	// TS (wall-clock stamped at the terminal funnel) and InvocationID
+	// (server-minted per-run uuid) are per-run nondeterministics like the
+	// clocks: zeroed on both sides. The invocation accounting contract
+	// itself is asserted by the dedicated review tests.
+	g.TS, w.TS = 0, 0
+	g.InvocationID, w.InvocationID = "", ""
 	if w.Error == "SENTINEL" {
 		// Prefix-shaped errors are asserted in the volatile callback.
 		w.Error = g.Error
@@ -151,7 +157,8 @@ func goldenProcessedFromSSE(t *testing.T, sse, status, reason string) string {
 }
 
 // goldenChatGateway wires the full chat pipeline (streamTestGateway base) to a
-// resolved "gpt-4o" candidate on the given upstream.
+// resolved "gpt-4o" candidate on the given upstream. The base fixture wires
+// the in-memory invocation store; deliberate-refusal tests reset it.
 func goldenChatGateway(t *testing.T, upstreamURL string) *gateway {
 	t.Helper()
 	gw := streamTestGateway(upstreamURL)

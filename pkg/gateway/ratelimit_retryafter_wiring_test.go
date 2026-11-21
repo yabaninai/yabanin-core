@@ -67,6 +67,7 @@ func n07rlRetryGateway(t *testing.T, upstreamURL string) *gateway {
 func n07rlPostChat(t *testing.T, gw *gateway, body string, ctx context.Context) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

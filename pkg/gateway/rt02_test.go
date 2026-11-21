@@ -506,6 +506,8 @@ func rt02RouteGateway(t *testing.T, u *rt02Upstream, access *rt02Access, target 
 		pool:        upstream.NewPool(upstream.Options{BaseURL: u.srv.URL}),
 		fallback:    fallbackrouter.NewFallbackExecutor(stubModelResolver{"alias-x": target}, 3, nil),
 		retryPolicy: retry.Policy{MaxAttempts: 1},
+		// Explicit in-memory invocation store (see streamTestGateway).
+		invocations: &fakeInvocationStore{},
 	}
 	if access != nil {
 		gw.wl = access
