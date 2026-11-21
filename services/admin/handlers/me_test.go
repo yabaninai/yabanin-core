@@ -22,6 +22,10 @@ type meOrgJSON struct {
 	Name        string   `json:"name"`
 	Role        string   `json:"role"`
 	Permissions []string `json:"permissions"`
+	// Additive presentation fields (tenant UI/API parity).
+	Slug     string `json:"slug"`
+	Currency string `json:"currency"`
+	Timezone string `json:"timezone"`
 }
 
 type meJSON struct {
@@ -73,6 +77,16 @@ func (s *meStore) GetOrganizationByID(_ context.Context, id string) (*adminstore
 		return org, nil
 	}
 	return nil, adminstore.ErrNotFound
+}
+
+// ListOrganizations serves the root-only directory from the same fixture
+// orgs (only used by the no-widening control below).
+func (s *meStore) ListOrganizations(_ context.Context, _ adminstore.PageFilter) ([]*adminstore.Organization, int64, error) {
+	out := make([]*adminstore.Organization, 0, len(s.orgs))
+	for _, org := range s.orgs {
+		out = append(out, org)
+	}
+	return out, int64(len(out)), nil
 }
 
 // getMe performs an authenticated GET /api/me through the full router
@@ -241,5 +255,80 @@ func TestMe_Unauthenticated(t *testing.T) {
 
 	if code, _ := getMe(t, router, ""); code != http.StatusUnauthorized {
 		t.Errorf("GET /api/me without a session = %d, want 401", code)
+	}
+}
+
+// Tenant UI/API parity: the member's own organizations carry their
+// authoritative presentation settings (slug/currency/timezone) so readers
+// resolve display settings — and OrgSelect lists their orgs — from /api/me
+// alone. Values come from the same org record the name does; unset values
+// are omitted (the client applies USD/UTC defaults); a foreign org's
+// presentation must never leak.
+func TestMe_MemberPresentationScopedToOwnOrgs(t *testing.T) {
+	store := newMeStore()
+	store.admins["test-admin"] = &adminstore.AdminUser{ID: "test-admin", Email: "admin@x.test", DisplayName: "Alice Admin", Active: true}
+	store.userRoles["test-admin"] = map[string]adminstore.OrgRole{
+		"org-a": adminstore.RoleReader,
+		"org-c": adminstore.RoleOperator,
+	}
+	store.orgs["org-a"] = &adminstore.Organization{ID: "org-a", Name: "Org A", Slug: "acme", Currency: "EUR", Timezone: "Europe/Berlin"}
+	// org-c has no presentation set: fields must be absent (empty), never
+	// fabricated defaults — the client owns the default fallback.
+	store.orgs["org-c"] = &adminstore.Organization{ID: "org-c", Name: "Org C"}
+	// Foreign org the caller holds no membership on: its values must not
+	// appear anywhere in the payload.
+	store.orgs["org-b"] = &adminstore.Organization{ID: "org-b", Name: "Org B", Slug: "foreign", Currency: "JPY", Timezone: "Asia/Tokyo"}
+	h := handlers.New(store, meSecret, "localhost", nil)
+	router := h.SetupRouter()
+
+	code, body := getMe(t, router, makeSessionCookie(t, "admin@x.test", false, meSecret))
+	if code != http.StatusOK {
+		t.Fatalf("GET /api/me as member = %d, want 200; body: %s", code, body)
+	}
+	me := decodeMe(t, body)
+	if len(me.Organizations) != 2 {
+		t.Fatalf("organizations = %+v, want 2 entries", me.Organizations)
+	}
+	a, c := me.Organizations[0], me.Organizations[1]
+	if a.ID != "org-a" {
+		t.Fatalf("first entry = %+v, want org-a", a)
+	}
+	if a.Slug != "acme" || a.Currency != "EUR" || a.Timezone != "Europe/Berlin" {
+		t.Errorf("org-a presentation = slug %q currency %q timezone %q, want acme/EUR/Europe/Berlin (authoritative store values)", a.Slug, a.Currency, a.Timezone)
+	}
+	if c.Slug != "" || c.Currency != "" || c.Timezone != "" {
+		t.Errorf("org-c presentation = %+v, want omitted (client applies defaults)", c)
+	}
+	for _, leak := range []string{"org-b", "Org B", "foreign", "JPY", "Asia/Tokyo"} {
+		if strings.Contains(body, leak) {
+			t.Errorf("payload leaked foreign-org data (%q): %s", leak, body)
+		}
+	}
+}
+
+// No-widening control: the org directory stays root-only. A member session
+// — even one whose /api/me now carries presentation — must keep receiving
+// 403 from GET /api/organizations; root still lists.
+func TestMe_DirectoryStaysRootOnly(t *testing.T) {
+	store := newMeStore()
+	store.admins["test-root"] = &adminstore.AdminUser{ID: "test-root", Email: "root@x.test", DisplayName: "Root", IsRoot: true, Active: true}
+	store.admins["test-admin"] = &adminstore.AdminUser{ID: "test-admin", Email: "admin@x.test", DisplayName: "Alice", Active: true}
+	store.userRoles["test-admin"] = map[string]adminstore.OrgRole{"org-a": adminstore.RoleReader}
+	store.orgs["org-a"] = &adminstore.Organization{ID: "org-a", Name: "Org A", Slug: "acme", Currency: "EUR", Timezone: "Europe/Berlin"}
+	h := handlers.New(store, meSecret, "localhost", nil)
+	router := h.SetupRouter()
+
+	get := func(cookie string) int {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/api/organizations", nil)
+		req.AddCookie(testCookie("yabanin_admin_session", cookie))
+		w := httptest.NewRecorder()
+		router.ServeHTTP(w, req)
+		return w.Code
+	}
+	if code := get(makeSessionCookie(t, "admin@x.test", false, meSecret)); code != http.StatusForbidden {
+		t.Errorf("GET /api/organizations as member = %d, want 403 (directory not widened)", code)
+	}
+	if code := get(makeSessionCookie(t, "root@x.test", true, meSecret)); code != http.StatusOK {
+		t.Errorf("GET /api/organizations as root = %d, want 200", code)
 	}
 }

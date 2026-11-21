@@ -30,6 +30,16 @@ type meOrganization struct {
 	Name        string                  `json:"name"`
 	Role        adminstore.OrgRole      `json:"role"`
 	Permissions []adminstore.Permission `json:"permissions"`
+	// Presentation fields are additive (tenant UI/API parity): the dashboard
+	// resolves org display settings and the org picker from this payload
+	// alone, so a member — who cannot list the root-only /api/organizations
+	// directory — still gets authoritative slug/currency/timezone for the
+	// orgs they hold a membership on, and never for any other org. Same
+	// GetOrganizationByID read the name already comes from; empty values
+	// are omitted and the client applies its USD/UTC defaults.
+	Slug     string `json:"slug,omitempty"`
+	Currency string `json:"currency,omitempty"`
+	Timezone string `json:"timezone,omitempty"`
 }
 
 // meResponse is the console /api/me payload. The portal /api/me (portal.go)
@@ -109,6 +119,9 @@ func (h *AdminHandlers) Me() http.HandlerFunc {
 				Name:        org.Name,
 				Role:        role,
 				Permissions: perms,
+				Slug:        org.Slug,
+				Currency:    org.Currency,
+				Timezone:    org.Timezone,
 			})
 		}
 
