@@ -166,13 +166,9 @@ func TestTP04_NonStreamValidResponseStillJudged(t *testing.T) {
 	judgeSrv, _, judgeBody := judgeHitServer(t, &judgeHits)
 	store := newFakeVerdictStore()
 
-	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(completeResp("gpt-4o-mini"))
-	}))
-	t.Cleanup(primary.Close)
+	primary := newRT03Upstream(t, nil)
 
-	gw := evalgateTestGateway(t, primary.URL, judgeSrv.URL, store)
+	gw := evalgateTestGateway(t, primary.srv.URL, judgeSrv.URL, store)
 
 	body := nonStreamBody("gpt-4o-mini", mediumPrompt)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
@@ -190,11 +186,14 @@ func TestTP04_NonStreamValidResponseStillJudged(t *testing.T) {
 	if got := store.count(); got != 1 {
 		t.Fatalf("stored verdicts = %d, want 1", got)
 	}
-	// The cheap side of the pair must be the real response text, never a
-	// placeholder.
-	if prompt := judgeBody(); !strings.Contains(prompt, "Response A (from a cheaper/faster model)") ||
-		strings.Contains(prompt, "[streaming response") {
-		t.Fatalf("judge prompt must compare the real cheap response: %s", prompt)
+	var wire struct{ Messages []struct{ Content string } }
+	if err := json.Unmarshal([]byte(judgeBody()), &wire); err != nil || len(wire.Messages) != 1 {
+		t.Fatalf("invalid judge request: %v", err)
+	}
+	for _, pair := range []string{"Response A (from a cheaper/faster model):\nok-from-gpt-4o-mini\n", "Response B (from a premium/higher-quality model):\nok-from-gpt-4o\n"} {
+		if !strings.Contains(wire.Messages[0].Content, pair) {
+			t.Errorf("missing answer text %q in %q", pair, wire.Messages[0].Content)
+		}
 	}
 }
 
@@ -309,8 +308,8 @@ func TestTP04_ComparableCheapResponse(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := comparableCheapResponse([]byte(tc.body)); ok != tc.want {
-				t.Fatalf("comparableCheapResponse(%s) = %v, want %v", tc.name, ok, tc.want)
+			if _, ok := comparableResponseText([]byte(tc.body)); ok != tc.want {
+				t.Fatalf("comparableResponseText(%s) = %v, want %v", tc.name, ok, tc.want)
 			}
 		})
 	}

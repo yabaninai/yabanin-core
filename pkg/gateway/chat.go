@@ -1657,7 +1657,8 @@ func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, fin
 		// TP-04: a judge pair needs the cheap answer as full comparable
 		// text. Tool-only, empty or unparseable bodies must not produce a
 		// fabricated verdict — skip judging and record why.
-		if _, ok := comparableCheapResponse(resp); !ok {
+		cheapAnswer, ok := comparableResponseText(resp)
+		if !ok {
 			l.Debug("evalgate: cheap response unavailable (tool-only, empty or unparseable), judge skipped",
 				"org_id", orgID, "request_id", cc.reqID)
 			return
@@ -1689,7 +1690,7 @@ func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, fin
 		gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
 
 		// Run judge evaluation asynchronously (non-blocking).
-		go gw.evalgateJudge(context.WithoutCancel(ctx), cc, gateID, userPrompt, string(resp), cheapModelName, premiumModelName, conf)
+		go gw.evalgateJudge(context.WithoutCancel(ctx), cc, gateID, userPrompt, cheapAnswer, cheapModelName, premiumModelName, conf)
 	}
 }
 
@@ -1724,7 +1725,12 @@ func (gw *gateway) evalgateJudge(ctx context.Context, cc *chatContext, gateID ca
 		return
 	}
 
-	v, _, err := gw.judge.EvaluateMeasured(judgeCtx, prompt, cheapResp, string(premiumResp), func(ctx context.Context, model string) error {
+	premiumAnswer, ok := comparableResponseText(premiumResp)
+	if !ok {
+		l.Debug("evalgate: premium response has no comparable text", "request_id", cc.reqID)
+		return
+	}
+	v, _, err := gw.judge.EvaluateMeasured(judgeCtx, prompt, cheapResp, premiumAnswer, func(ctx context.Context, model string) error {
 		judgeID := newInvocationIdentity(orgID, cc.reqID, cc.sessionID, cc.apiKeyID, eventSessionID(ctx), model)
 		return judgeID.beginPaidDispatch(ctx, gw.invocations, invocationKindJudge)
 	})
@@ -2082,12 +2088,12 @@ func whitelistModel(info resolver.ModelInfo, requested string) string {
 	return requested
 }
 
-// comparableCheapResponse reports whether a non-stream completion body
+// comparableResponseText reports whether a non-stream completion body
 // carries a full comparable text answer for the evalgate judge. Tool-only
 // responses (content null/empty with tool_calls), empty or unparseable
 // bodies must not be judged: they would fabricate a calibration pair
 // (TP-04).
-func comparableCheapResponse(body []byte) (string, bool) {
+func comparableResponseText(body []byte) (string, bool) {
 	var doc struct {
 		Choices []struct {
 			Message struct {

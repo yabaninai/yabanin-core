@@ -635,3 +635,21 @@ func TestRT03_EvalgateStartFailurePreventsPaidCall(t *testing.T) {
 		})
 	}
 }
+
+func TestRT03_EvalgatePremiumToolOnlySkipsEvaluator(t *testing.T) {
+	var judgeHits int32
+	judge, _, _ := judgeHitServer(t, &judgeHits)
+	verdicts := newFakeVerdictStore()
+	premium := newRT03Upstream(t, func(rt03Call) rt03Response {
+		return rt03Response{Body: `{"choices":[{"message":{"content":null,"tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`}
+	})
+	gw := evalgateTestGateway(t, premium.srv.URL, judge.URL, verdicts)
+	gw.res = stubModelResolver{"premium": {ModelName: "premium", Provider: "openai", UpstreamURL: premium.srv.URL, Enabled: true}}
+	cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "tool-only", body: nonStreamBody("cheap", mediumPrompt)}
+	cc.req.Model = "cheap"
+	gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+	require.Equal(t, 1, premium.totalCalls())
+	require.Zero(t, judgeHits)
+	require.Zero(t, verdicts.count())
+	require.Len(t, gw.invocations.(*fakeInvocationStore).admitted, 1)
+}
