@@ -131,6 +131,10 @@ func TestTerminalAccountingDecodedIdentity(t *testing.T) {
 
 func TestTerminalAccountingProducerReservations(t *testing.T) {
 	event := accountingFixture()
+	event.Reservations = "[]"
+	empty, err := event.TerminalAccountingFields()
+	require.NoError(t, err)
+	require.Empty(t, empty["reservations"])
 	event.AgentID = "agent-a"
 	admission := &budget.Reservation{Scopes: []budget.ScopeReserve{
 		{Scope: budget.ScopeWallet, Key: event.OrgID, AllowanceID: 7, Bound: 100},

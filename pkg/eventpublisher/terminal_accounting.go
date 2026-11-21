@@ -169,6 +169,9 @@ func (event *Event) terminalReservations() (string, error) {
 	if err := dec.Decode(new(json.RawMessage)); err != io.EOF {
 		return "", errors.New("invalid trailing terminal reservation data")
 	}
+	if len(tuples) == 0 {
+		return "", nil
+	}
 	seen := map[string]bool{}
 	for _, tuple := range tuples {
 		if !tuple.matches(event) || seen[tuple.ScopeKind] {
