@@ -163,6 +163,15 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Media codec branch (media accounting families): multipart
+	// transcription bodies are not JSON — validate and serve them through
+	// their own codec path. Ledger order (arrival → dispatch → receipt)
+	// is identical to the JSON families.
+	if r.URL.Path == "/v1/audio/transcriptions" {
+		f.serveTranscriptionRequest(w, r, rid)
+		return
+	}
+
 	var body fixtureBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
@@ -186,6 +195,8 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 
 func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fixtureBody) {
 	switch path {
+	case "/v1/audio/speech":
+		f.serveAudioSpeech(w, rid, body.Model, path)
 	case "/v1/embeddings":
 		f.serveEmbeddings(w, rid, body.Model, path)
 	case "/v1/responses":
