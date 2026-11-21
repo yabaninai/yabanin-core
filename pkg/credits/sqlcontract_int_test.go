@@ -46,12 +46,12 @@ func sqlc03fContract(t *testing.T, name string, fn func(ctx context.Context) err
 	}
 }
 
-// sqlc03fCreditsFixture seeds two token-scoped wallets: orgA is a funded
-// wallet with a sub-cent remainder, a live reserve and a legacy-style
-// ledger trail; orgB is a nearly empty wallet used for the grace floor and
-// the low-balance scan. All identifiers carry the per-run token so the seed
-// coexists with every other test on the shared stand, and cleanup removes
-// exactly the seeded rows.
+// sqlc03fCreditsFixture seeds two token-scoped wallets on the real migrated
+// stand: orgA is a funded wallet with a sub-cent remainder, a live reserve
+// and a legacy-style ledger trail; orgB is a nearly empty wallet used for
+// the grace floor and the low-balance scan. All identifiers carry the
+// per-run token so the seed coexists with every other test on the stand,
+// and cleanup removes exactly the seeded rows.
 type sqlc03fCreditsFixture struct {
 	Token       string
 	OrgA, OrgB  string
@@ -63,25 +63,6 @@ func sqlc03fSeed(t *testing.T, pool *pgxpool.Pool) *sqlc03fCreditsFixture {
 	t.Helper()
 	ctx := context.Background()
 	token := fmt.Sprintf("sc03f%x", time.Now().UnixNano())
-
-	// Fixture wall guard: this package's own tests drop and recreate the
-	// credits tables in a pre-0023 shape (store_test.go setupTestTables /
-	// teardownTestTables), and -shuffle can order this contract BEFORE that
-	// setup, so make sure the base table exists, then restore the production
-	// reservation columns — additive, exactly like the migrated schema.
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS org_credits (
-			org_id TEXT PRIMARY KEY,
-			balance_cents BIGINT NOT NULL DEFAULT 0,
-			remainder_micro_usd BIGINT NOT NULL DEFAULT 0 CHECK (remainder_micro_usd >= 0 AND remainder_micro_usd < 10000),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err, "ensure the base org_credits table")
-	_, err = pool.Exec(ctx, `
-		ALTER TABLE org_credits
-			ADD COLUMN IF NOT EXISTS reserved_micro_usd bigint NOT NULL DEFAULT 0 CHECK (reserved_micro_usd >= 0),
-			ADD COLUMN IF NOT EXISTS grace_floor_cents bigint CHECK (grace_floor_cents BETWEEN -100000 AND 0)`)
-	require.NoError(t, err, "restore the 0023 org_credits columns")
 
 	fx := &sqlc03fCreditsFixture{
 		Token:       token,
@@ -117,24 +98,7 @@ func sqlc03fSeed(t *testing.T, pool *pgxpool.Pool) *sqlc03fCreditsFixture {
 	// Ledger trail for orgA: a top-up and a usage charge (exact micro on the
 	// usage row, invoice ref on the top-up) — GetTransactions scans both
 	// nullable columns; orgB keeps one top-up only.
-	// Order-independence: store_test.go owns the legacy table shapes; under
-	// -shuffle this contract can run before that setup, so create the base
-	// tables here too (CREATE ... IF NOT EXISTS matches setupTestTables).
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS credit_transactions (
-			id BIGSERIAL PRIMARY KEY,
-			org_id TEXT NOT NULL,
-			amount_cents BIGINT NOT NULL,
-			balance_after BIGINT NOT NULL,
-			type TEXT NOT NULL CHECK (type IN ('topup', 'usage')),
-			request_id TEXT,
-			invoice_ref TEXT,
-			metadata JSONB DEFAULT '{}',
-			amount_micro_usd BIGINT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err, "ensure the base credit_transactions table")
-	_, err = pool.Exec(ctx, `
+	_, err := pool.Exec(ctx, `
 		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, invoice_ref, amount_micro_usd)
 		VALUES ($1, 5000, 5000, 'topup', NULL, $2, 50000000),
 		       ($1, -12, 4988, 'usage', $3, NULL, -120000)`,

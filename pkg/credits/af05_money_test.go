@@ -73,7 +73,7 @@ func requireReconciled(ctx context.Context, t *testing.T, pool *pgxpool.Pool, or
 // scenario a pure accumulation (no admission stop at the default −$1 floor).
 func TestDeductMicro_ThousandSubCentRequestsAcrossRestarts(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-thousand"
@@ -106,7 +106,7 @@ func TestDeductMicro_ThousandSubCentRequestsAcrossRestarts(t *testing.T) {
 // Replay of the same request never double-charges — at exact µUSD either.
 func TestDeductMicro_ReplayDoesNotDoubleCharge(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-replay"
@@ -132,7 +132,7 @@ func TestDeductMicro_ReplayDoesNotDoubleCharge(t *testing.T) {
 // atomically in the same transaction.
 func TestDeductMicro_RemainderCarryChargesWholeCent(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-carry"
@@ -164,7 +164,7 @@ func TestDeductMicro_RemainderCarryChargesWholeCent(t *testing.T) {
 // floor is allowed only when it carries no residue.
 func TestDeductMicro_FloorBoundariesWithRemainder(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	cases := []struct {
@@ -232,7 +232,7 @@ func TestDeductMicro_FloorBoundariesWithRemainder(t *testing.T) {
 // admits regardless of residue.
 func TestCheckBalance_FractionalAdmission(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	cases := []struct {
@@ -272,7 +272,7 @@ func TestCheckBalance_FractionalAdmission(t *testing.T) {
 // grace keeps admission out of the picture — this tests exactness.
 func TestDeductMicro_ConcurrentExactTotals(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-concurrent"
@@ -315,7 +315,7 @@ func TestDeductMicro_ConcurrentExactTotals(t *testing.T) {
 // stay consistent with fractional activity on top of them.
 func TestDeductMicro_HistoricalLedgerUntouched(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-historical"
@@ -366,7 +366,7 @@ func TestDeductMicro_HistoricalLedgerUntouched(t *testing.T) {
 // accrued sub-cent residue, and effective balance moves by exactly the cents.
 func TestTopUp_InteractsWithRemainderExactly(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-topup"
@@ -394,7 +394,7 @@ func TestTopUp_InteractsWithRemainderExactly(t *testing.T) {
 // price must never become a zero (or negative) charge.
 func TestDeductMicro_BoundaryRejections(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	orgID := "af05-boundary"
@@ -446,7 +446,7 @@ func TestEffectiveBalance_OverflowFailsClosed(t *testing.T) {
 // is shared, so assertions are scoped to this test's orgs.
 func TestLowBalanceOrgs(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	seedWallet(ctx, t, pool, "af05-low-a", -5)
@@ -472,7 +472,7 @@ func TestLowBalanceOrgs(t *testing.T) {
 // Transaction listing clamps out-of-range limits to the default page.
 func TestGetTransactions_LimitClamped(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	orgID := "af05-tx-clamp"

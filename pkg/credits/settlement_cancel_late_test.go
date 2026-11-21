@@ -21,14 +21,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// setupSettlementStand prepares the disposable stand for this corpus.
-// setupTestTables only guarantees the base tables: sibling tests in this
-// package drop and recreate credit_transactions in the legacy pre-0023
-// shape (store_test.go teardown/setup) and -shuffle decides who runs
-// first, so the additive guard below restores the production partial
-// unique index that shape loses — the durable request-identity backstop
-// this corpus pins (uniq_credit_transactions_usage_request_id, migration
-// 0001). Re-adding it is additive and matches the migrated schema exactly.
+// setupSettlementStand builds this corpus's illustrative interim posture
+// inside an isolated fixture schema (setupFixtureDB hands each test one):
+// the setupTestTables base shape plus the original global usage index
+// (uniq_credit_transactions_usage_request_id, migration 0001) that 0029
+// contracts away on the real stand — the durable request-identity backstop
+// this corpus pins. None of that DDL can reach the public migrated schema.
 func setupSettlementStand(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	setupTestTables(ctx, t, pool)
@@ -60,7 +58,7 @@ func usageRowsFor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID, 
 // delivery replays the same operation. The settled amount never moves.
 func TestSettlementCancelBillsOnce_LateUsageClaimsNothing(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t09-cancel-late"
@@ -103,7 +101,7 @@ func TestSettlementCancelBillsOnce_LateUsageClaimsNothing(t *testing.T) {
 // nothing and the settled amount stands.
 func TestSettlementLegacyAndExactPathsOneOperation(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	cases := []struct {
@@ -159,7 +157,7 @@ func TestSettlementLegacyAndExactPathsOneOperation(t *testing.T) {
 // applies and the rest observe the settled identity and no-op.
 func TestSettlementReplayRaceChargesOnce(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t09-replay-race"
@@ -202,7 +200,7 @@ func TestSettlementReplayRaceChargesOnce(t *testing.T) {
 // have poisoned the identity against that late priced event.
 func TestSettlementUnknownOutcomeRejected_IdentityStaysChargeable(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t09-unknown"
@@ -238,7 +236,7 @@ func TestSettlementUnknownOutcomeRejected_IdentityStaysChargeable(t *testing.T) 
 // wallet keeps every cent.
 func TestSettlementIdentityConflictOtherOrgRejected(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgA, orgB := "t09-conflict-a", "t09-conflict-b"

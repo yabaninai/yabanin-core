@@ -40,7 +40,7 @@ func TestDeductMicroInvocation_CanonicalIDGate(t *testing.T) {
 // the books reconcile.
 func TestDeductMicroInvocation_ReplayIsIdempotent(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -68,7 +68,7 @@ func TestDeductMicroInvocation_ReplayIsIdempotent(t *testing.T) {
 // charge against the first tenant's row.
 func TestDeductMicroInvocation_WrongTenantIsIntegrityConflict(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -96,7 +96,7 @@ func TestDeductMicroInvocation_WrongTenantIsIntegrityConflict(t *testing.T) {
 // conflict: identity and amount are one fact, not two idempotency keys.
 func TestDeductMicroInvocation_ChangedAmountIsIntegrityConflict(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -120,7 +120,7 @@ func TestDeductMicroInvocation_ChangedAmountIsIntegrityConflict(t *testing.T) {
 // that parks for attention, never a no-op and never a double charge.
 func TestDeductMicro_LegacyAfterInvokedIsNeverSilentlySuppressed(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -147,7 +147,7 @@ func TestDeductMicro_LegacyAfterInvokedIsNeverSilentlySuppressed(t *testing.T) {
 // the still-live global usage index (interim posture until 0029).
 func TestDeductMicro_InvokedAfterLegacyCollidesLoudly(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -172,7 +172,7 @@ func TestDeductMicro_InvokedAfterLegacyCollidesLoudly(t *testing.T) {
 // as the old schema: the retried deduction probes again and succeeds.
 func TestDeductMicro_ProbeFailureIsNotCachedAsOldSchema(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 

@@ -30,7 +30,7 @@ import (
 // cent — no shared charge, no partial wallet write, no silent no-op.
 func TestSettlementIdentityConflictCrossOrgRace(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgA, orgB := "t10-race-a", "t10-race-b"
@@ -100,7 +100,7 @@ func TestSettlementIdentityConflictCrossOrgRace(t *testing.T) {
 // settled identity stays a no-op whatever amount it carries.
 func TestSettlementHugeChargeFailsClosed_IdentityStaysFree(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t10-huge"
@@ -150,7 +150,7 @@ func TestSettlementHugeChargeFailsClosed_IdentityStaysFree(t *testing.T) {
 // stays free for the real priced event, which then settles exactly once.
 func TestSettlementCancelledContextLeavesNoPartialState(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t10-cancelled"
@@ -190,7 +190,7 @@ func TestSettlementCancelledContextLeavesNoPartialState(t *testing.T) {
 // into a second charge.
 func TestSettlementFundsRefusalKeepsIdentityChargeable(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupSettlementStand(ctx, t, pool)
 
 	orgID := "t10-funds"
