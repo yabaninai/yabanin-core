@@ -219,9 +219,6 @@ func (r *RedisPublisher) Publish(ctx context.Context, event *Event) error {
 		events.FieldAttestationHash:            event.AttestationHash,
 		events.FieldAttestationSignature:       event.AttestationSignature,
 		events.FieldAttestationKeyID:           event.AttestationKeyID,
-		// W-BYOK-CORE: BYOK attribution (bool → "true"/"" for the string
-		// stream wire, matching the omitempty JSON contract).
-		"used_org_key": boolStreamValue(event.UsedOrgKey),
 		// OP-8: policy-pipeline decision record (JSON array contract on
 		// the Event struct).
 		"policy": event.Policy,
