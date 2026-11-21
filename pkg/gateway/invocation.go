@@ -288,7 +288,7 @@ func (h *invocationIdentity) void(ctx context.Context, store invocationStore) er
 		return nil
 	}
 	if err := store.VoidInvocation(ctx, h.id); err != nil {
-		return fmt.Errorf("%w: void %s: %v", ErrInvocationStoreUnavailable, h.id, err)
+		return fmt.Errorf("%w: void %s: %w", ErrInvocationStoreUnavailable, h.id, err)
 	}
 	h.voided = true
 	return nil
@@ -659,34 +659,45 @@ func (gw *gateway) stampAndCommitInvocationTerminal(ctx context.Context, ev *eve
 	if ev.TS == 0 {
 		ev.TS = time.Now().UnixMilli()
 	}
-	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalFactsTimeout)
+	err := retryInvocationWrite(ctx, func(ctx context.Context) error {
+		return h.commitInvocationTerminal(ctx, gw.invocations, ev)
+	})
+	if err != nil {
+		l.Error("terminal facts commit failed after paid dispatch; withholding event from consumer",
+			"invocation_id", h.ID(), "error", err)
+	}
+	return err
+}
+
+// Call only when every candidate was rejected before any upstream dispatch.
+func (gw *gateway) voidUndispatchedInvocation(ctx context.Context, l *slog.Logger) {
+	h := invocationIdentityFrom(ctx)
+	if h == nil || !h.Admitted() {
+		return
+	}
+	err := retryInvocationWrite(ctx, func(ctx context.Context) error {
+		return h.void(ctx, gw.invocations)
+	})
+	if err != nil {
+		l.Error("could not close admission after local refusal", "invocation_id", h.ID(), "error", err)
+	}
+}
+
+// Both operations use a stable invocation ID and permit identical recommits.
+func retryInvocationWrite(ctx context.Context, write func(context.Context) error) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalFactsTimeout)
 	defer cancel()
-	// Acceptance leaf 38c441b: a serialization failure on the terminal
-	// INSERT (PG 40001 / deadlock 40P01) is TRANSIENT — retry the SAME
-	// invocation in the same bounded independent context. The write is
-	// per-invocation and idempotent under exact equality, so a recovered
-	// commit lands exactly once: no extra provider arrivals, no second
-	// debit. Permanent storage errors are not retried and keep
-	// propagating so the funnel can block the client success.
-	var err error
-	for attempt := 0; attempt < terminalFactsAttempts; attempt++ {
-		if attempt > 0 {
-			select {
-			case <-time.After(terminalFactsRetryBackoff << uint(attempt-1)):
-			case <-fctx.Done():
-			}
+	for attempt := 1; ; attempt++ {
+		err := write(ctx)
+		if attempt == terminalFactsAttempts || !shouldRetryTerminalCommit(err) {
+			return err
 		}
-		err = h.commitInvocationTerminal(fctx, gw.invocations, ev)
-		if err == nil {
-			return nil
-		}
-		if !shouldRetryTerminalCommit(err) {
-			break
+		select {
+		case <-time.After(terminalFactsRetryBackoff << uint(attempt-1)):
+		case <-ctx.Done():
+			return errors.Join(err, ctx.Err())
 		}
 	}
-	l.Error("terminal facts commit failed after paid dispatch; withholding event from consumer",
-		"invocation_id", h.ID(), "error", err)
-	return err
 }
 
 // shouldRetryTerminalCommit decides the bounded idempotent same-UUID/
