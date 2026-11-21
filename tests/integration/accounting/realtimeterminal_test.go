@@ -14,21 +14,21 @@ import (
 )
 
 func realtimeBoundarySession(shape string) []string {
-	response := func(id, text string) []string {
+	response := func(id, text string, inputTokens, outputTokens int) []string {
 		created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
 		delta := fmt.Sprintf(`{"type":"response.output_text.delta","delta":%q}`, fixtureAssistantContent)
-		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":7,"output_tokens":3}}}`, id, text)
+		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":%d,"output_tokens":%d}}}`, id, text, inputTokens, outputTokens)
 		return []string{"event: response.created\ndata: " + created + "\n\n",
 			"event: response.output_text.delta\ndata: " + delta + "\n\n",
 			"event: response.done\ndata: " + done + "\n\n"}
 	}
 	switch shape {
 	case "large":
-		return response("first", strings.Repeat("a", (1<<20)+1))
+		return response("first", strings.Repeat("a", (1<<20)+1), 7, 3)
 	case "trailing":
-		return append(response("first", "one"), "event: rate_limits.updated\ndata: {\"type\":\"rate_limits.updated\",\"rate_limits\":[]}\n\n")
+		return append(response("first", "one", 7, 3), "event: rate_limits.updated\ndata: {\"type\":\"rate_limits.updated\",\"rate_limits\":[]}\n\n")
 	case "multiple":
-		return append(response("first", "one"), response("second", "two")...)
+		return append(response("first", "one", 2, 1), response("second", "two", 7, 3)...)
 	default:
 		panic("unknown realtime fixture shape: " + shape)
 	}
@@ -62,7 +62,7 @@ func TestAccountingRealtimeTerminalBoundaries(t *testing.T) {
 			healthy := s.reqPrefix + "healthy-" + shape
 			body := requestBoundarySession(t, s, healthy, wire)
 			require.Equal(t, sha256.Sum256([]byte(strings.Join(wire, ""))), sha256.Sum256([]byte(body)), "healthy stream bytes or event order changed")
-			s.requireDurableControlEvidence(t, "realtime", shape, healthy, fixtureCompletionTokens)
+			s.requireNativeSettled(t, "realtime", shape, healthy, "/v1/realtime")
 			failed := requestBoundarySession(t, s, targets[i], wire)
 			requireDirectTerminalFailure(t, s, "realtime sse", http.StatusOK, failed)
 		})
