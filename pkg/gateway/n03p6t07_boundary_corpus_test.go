@@ -24,7 +24,6 @@ package cli
 // and Chat must withhold the invalid charge after the paid dispatch.
 
 import (
-	"math"
 	"net/http"
 	"net/http/httptest"
 	"sync/atomic"
@@ -159,17 +158,18 @@ func TestN03P6T07_MalformedCachedOverPrompt_ClampNeverNegativeBill(t *testing.T)
 	assert.InDelta(t, wantBilled, ev.CounterfactualCostUSD, 1e-15)
 }
 
+func requireInvalidUsageRejected(t *testing.T, rec *httptest.ResponseRecorder, cap *goldenCapture, calls int32) {
+	t.Helper()
+	require.EqualValues(t, 1, calls)
+	require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+	assert.Contains(t, rec.Body.String(), accountingCommitFailedCode)
+	assert.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
+	assert.Empty(t, cap.all(), "invalid usage must not publish a completion")
+}
+
 // Invalid cache counters can reverse or inflate the bill. Exercise both
 // protocols at the HTTP boundary and check that neither publishes a charge.
 func TestN03P6T07_NegativeProviderFields_DefectPin_D1(t *testing.T) {
-	checkRejected := func(t *testing.T, rec *httptest.ResponseRecorder, cap *goldenCapture, calls int32) {
-		t.Helper()
-		require.EqualValues(t, 1, calls)
-		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
-		assert.Contains(t, rec.Body.String(), accountingCommitFailedCode)
-		assert.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
-		assert.Empty(t, cap.all(), "invalid usage must not publish a completion")
-	}
 
 	t.Run("anthropic-negative-creation", func(t *testing.T) {
 		const body = `{"model":"claude-sonnet-4-5","max_tokens":64,` +
@@ -189,7 +189,7 @@ func TestN03P6T07_NegativeProviderFields_DefectPin_D1(t *testing.T) {
 		cap := captureAll(t)
 
 		rec := postMessages(t, gw, body)
-		checkRejected(t, rec, cap, upstreamCalls.Load())
+		requireInvalidUsageRejected(t, rec, cap, upstreamCalls.Load())
 	})
 
 	t.Run("openai-negative-cached", func(t *testing.T) {
@@ -209,20 +209,18 @@ func TestN03P6T07_NegativeProviderFields_DefectPin_D1(t *testing.T) {
 		cap := captureAll(t)
 
 		rec := n03p6t06PostChat(t, gw, body)
-		checkRejected(t, rec, cap, upstreamCalls.Load())
+		requireInvalidUsageRejected(t, rec, cap, upstreamCalls.Load())
 	})
 }
 
-// TestN03P6T07_OverflowBoundary_NeverNegativeBill: a hostile provider
-// reports cache_read_input_tokens = math.MaxInt64. The canonical prompt
-// count wraps (int64 overflow in the parser) but the cost arithmetic
-// double-wraps back — the input term recovers the true value and the bill
-// stays POSITIVE (absurdly large, but never a credit). The wrapped token
-// count itself is mirrored verbatim (D1-adjacent, same fix locus).
+// The provider's cache-read count plus the input count exceeds int64.
+// The wrapped total must never produce a published bill.
 func TestN03P6T07_OverflowBoundary_NeverNegativeBill(t *testing.T) {
 	const body = `{"model":"claude-sonnet-4-5","max_tokens":64,` +
 		`"messages":[{"role":"user","content":"overflow"}]}`
+	var upstreamCalls atomic.Int32
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		upstreamCalls.Add(1)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"id":"msg_1","type":"message","role":"assistant",` +
 			`"model":"claude-sonnet-4-5","content":[{"type":"text","text":"ok"}],` +
@@ -235,23 +233,7 @@ func TestN03P6T07_OverflowBoundary_NeverNegativeBill(t *testing.T) {
 	cap := captureAll(t)
 
 	rec := postMessages(t, gw, body)
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-	assert.Equal(t, "hit", rec.Header().Get(PromptCacheHeader),
-		"a positive (overflowing) read count still reports the provider hit honestly")
-
-	ev := cap.last(t)
-	maxTok := int64(math.MaxInt64)
-	wrappedPrompt := maxTok + 1000 // runtime int64 wrap: 1000 + MaxInt64
-	assert.Equal(t, wrappedPrompt, ev.TokensIn,
-		"DEFECT-adjacent pin: the canonical prompt count wraps verbatim (parser int64 add)")
-	assert.Equal(t, maxTok, ev.CacheReadTokens)
-
-	// Mirror ComputeCost's exact term order: the non-cache input term
-	// double-wraps back to the true 1000, so the bill is positive.
-	want := 3.0/1e6*1000 + 15.0/1e6*50 + 3.75/1e6*0 + 0.3/1e6*float64(maxTok)
-	assert.InDelta(t, want, ev.EstimatedCostUSD, 1e-15)
-	assert.Positive(t, ev.EstimatedCostUSD,
-		"the overflow boundary must never produce a negative bill (harm direction is overcharge only)")
+	requireInvalidUsageRejected(t, rec, cap, upstreamCalls.Load())
 }
 
 // TestN03P6T07_ZeroUsageBlock_ProviderMissZeroBill: a present-but-empty
