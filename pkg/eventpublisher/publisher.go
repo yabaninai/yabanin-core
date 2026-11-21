@@ -22,6 +22,7 @@ type Event struct {
 	// event still carries a usable timestamp. Serialized as "ts".
 	TS             int64  `json:"ts,omitempty"`
 	RequestID      string `json:"request_id,omitempty"`
+	InvocationID   string `json:"invocation_id,omitempty"`
 	SessionID      string `json:"session_id"`
 	Payload        string `json:"payload"`
 	OrgID          string `json:"org_id"`

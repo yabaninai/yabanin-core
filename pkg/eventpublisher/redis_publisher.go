@@ -193,50 +193,23 @@ func (r *RedisPublisher) Publish(ctx context.Context, event *Event) error {
 	}
 
 	values := map[string]interface{}{
-		"event_type":              event.EventType,
 		"source":                  event.Source,
-		"ts":                      ts,
-		"request_id":              event.RequestID,
-		"session_id":              event.SessionID,
 		"payload":                 payload,
-		"org_id":                  event.OrgID,
-		"model_requested":         event.ModelRequested,
-		"model_used":              event.ModelUsed,
 		"upstream_url":            upstreamURL,
-		"status_code":             event.StatusCode,
-		"duration_ms":             event.DurationMs,
-		"tokens_in":               event.TokensIn,
-		"tokens_out":              event.TokensOut,
 		"method":                  event.Method,
 		"error":                   errorText,
-		"cache_hit_type":          event.CacheHitType,
 		"cache_similarity":        event.CacheSimilarity,
-		"counterfactual_cost_usd": event.CounterfactualCostUSD,
-		"estimated_cost_usd":      event.EstimatedCostUSD,
-		"resale_cost_usd":         event.ResaleCostUSD,
-		"tier_used":               event.TierUsed,
 		"classifier_class":        event.ClassifierClass,
 		"classifier_confidence":   event.ClassifierConfidence,
 		"classifier_source":       event.ClassifierSource,
-		"cache_read_tokens":       event.CacheReadTokens,
-		"cache_creation_tokens":   event.CacheCreationTokens,
-		"endpoint":                event.Endpoint,
-		"usage_source":            event.UsageSource,
-		"cost_status":             event.CostStatus,
 		"evalgate_sampled":        event.EvalgateSampled,
 		"evalgate_should_upgrade": event.EvalgateShouldUpgrade,
-		"ab_group":                event.ABGroup,
-		"team_id":                 event.TeamID,
 		"routing_decision":        event.RoutingDecision,
 		"upstream_payload":        event.UpstreamPayload,
 		"upstream_response":       event.UpstreamResponse,
 		// FIX-20: processed, client-facing response envelope. PROCESSED
 		// content class — kept under retention OFF, dropped when strict.
 		"processed_response":                   event.ProcessedResponse,
-		"agent_id":                             event.AgentID,
-		"task_id":                              event.TaskID,
-		"reservations":                         event.Reservations,
-		"termination":                          event.Termination,
 		"labels":                               labelsValue(event.Labels),
 		events.FieldInferenceRegion:            event.InferenceRegion,
 		events.FieldRegionEvidence:             event.RegionEvidence,
@@ -246,16 +219,18 @@ func (r *RedisPublisher) Publish(ctx context.Context, event *Event) error {
 		events.FieldAttestationHash:            event.AttestationHash,
 		events.FieldAttestationSignature:       event.AttestationSignature,
 		events.FieldAttestationKeyID:           event.AttestationKeyID,
-		"first_token_ms":                       event.FirstTokenMs,
-		"attempt_count":                        event.AttemptCount,
-		"retry_count":                          event.RetryCount,
-		// W-BYOK-CORE: BYOK attribution (bool → "true"/"" for the string
-		// stream wire, matching the omitempty JSON contract).
-		"used_org_key": boolStreamValue(event.UsedOrgKey),
 		// OP-8: policy-pipeline decision record (JSON array contract on
 		// the Event struct).
 		"policy": event.Policy,
 	}
+	accounting, err := event.accountingForPublish(ts)
+	if err != nil {
+		return err
+	}
+	for key, value := range accounting {
+		values[key] = value
+	}
+
 	if strict {
 		// profile and the correlation digest ride instead.
 		delete(values, "payload")
