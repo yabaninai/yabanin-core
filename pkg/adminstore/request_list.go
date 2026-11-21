@@ -185,9 +185,6 @@ func (p *requestListPredicate) scope(f RequestListFilters) {
 	if !f.OrgWideMetadata && f.OwnerUserID != "" {
 		p.add("(user_id::text = $%d AND agent_id IS NULL AND api_key_id IS NULL)", f.OwnerUserID)
 	}
-}
-
-func (p *requestListPredicate) identityAndStatus(f RequestListFilters) {
 	if f.RequestID != "" {
 		p.add("request_id = $%d", f.RequestID)
 	}
@@ -196,6 +193,9 @@ func (p *requestListPredicate) identityAndStatus(f RequestListFilters) {
 		// the immutable row key addresses one row (see RequestListFilters).
 		p.add("id = $%d", f.RowKey)
 	}
+}
+
+func (p *requestListPredicate) identityAndStatus(f RequestListFilters) {
 	if f.RuleID != "" {
 		// pg_input_is_valid + CASE guard the legacy TEXT column (PG16 core,
 		// non-raising): rows holding NULL, empty or malformed decision
