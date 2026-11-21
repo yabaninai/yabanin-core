@@ -1378,7 +1378,7 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: request_id, in: path, required: true, schema: { type: string } }
-        - { name: row_key, in: query, description: Physical row selector — the list row's row_key as a decimal string; must name a row of the path org AND correlation (else 404). Blank, repeated or non-positive values are a 400; under a payload grant it must exactly match the grant's bound row (else a pre-consume 400), schema: { type: string } }
+        - { name: row_key, in: query, description: "Physical row selector — the list row's row_key as a decimal string; must name a row of the path org AND correlation (else 404). Blank, repeated or non-positive values are a 400; under a payload grant it must exactly match the grant's bound row (else a pre-consume 400)", schema: { type: string } }
         - { name: payload_grant, in: query, description: Single-use request-bound bearer grant; alternatively send X-Request-Payload-Grant, schema: { type: string } }
         - { name: scope, in: query, description: Grant scope; payload.read_originals requires effective original retention, schema: { type: string, enum: [payload.read, payload.read_originals] } }
       responses:
@@ -1387,7 +1387,7 @@ paths:
             Request detail. For a redeemed grant the 200 commit is final: an
             encode/write failure after the consume can only truncate the body
             and the grant stays consumed (no refund, no re-serve).
-        "400": { description: Invalid grant scope; a malformed row_key selector (blank, repeated, non-positive/non-decimal); or a row_key that does not exactly name a payload grant's bound row. None of these consume the grant }
+        "400": { description: "Invalid grant scope; a malformed row_key selector (blank, repeated, non-positive/non-decimal); or a row_key that does not exactly name a payload grant's bound row. None of these consume the grant" }
         "403":
           description: >
             Fail-closed denial, one of: the payload grant cannot be used
