@@ -537,6 +537,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	flusher, ok = r.w.(http.Flusher)
 	if !ok {
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		apierrors.Write(r.w, http.StatusNotImplemented, apierrors.ErrorCodeAPI,
 			"streaming not supported by server")
 		return flusher, false
@@ -553,6 +554,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	if err != nil {
 		r.l.Warn("guard hooks denied stream request", "error", err)
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		writeSSEError(r.w, "guard_denied", "request blocked by guard hooks: sensitive data detected")
 		return flusher, false
 	}
@@ -569,6 +571,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	if err := r.gw.checkBreaker(); err != nil {
 		r.l.Error("circuit breaker open, rejecting stream", "error", err)
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		writeSSEError(r.w, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
 		return flusher, false
 	}
@@ -671,8 +674,9 @@ func (r *streamRun) finishConnectFailure() {
 	// parity of the admit-time rejection: the same 503 SSE frame, no
 	// analytics event, the escrow settles locally. No endpoint was dialed,
 	// so this is not an upstream failure to record.
-	if r.lastCode == http.StatusServiceUnavailable && int(r.openHops.Load()) == len(r.attempts) {
+	if allCircuitsOpen(r.lastCode, int(r.openHops.Load()), len(r.attempts)) {
 		r.gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		r.l.Error("circuit breaker open, rejecting stream (all candidate endpoints open)",
 			"attempts", len(r.attempts))
 		writeSSEError(r.w, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
