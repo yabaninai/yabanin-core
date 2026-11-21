@@ -91,42 +91,59 @@ func (h *AdminHandlers) Me() http.HandlerFunc {
 			h.respondError(w, r, err, http.StatusInternalServerError)
 			return
 		}
-
-		orgIDs := make([]string, 0, len(roles))
-		for id := range roles {
-			orgIDs = append(orgIDs, id)
+		orgs, err := h.meOrganizations(r.Context(), roles)
+		if err != nil {
+			h.respondError(w, r, err, http.StatusInternalServerError)
+			return
 		}
-		sort.Strings(orgIDs) // deterministic payload (map iteration is random)
-
-		for _, id := range orgIDs {
-			role := roles[id]
-			perms := make([]adminstore.Permission, 0, len(adminstore.AllPermissions()))
-			for _, p := range adminstore.AllPermissions() {
-				if adminstore.RoleHas(string(role), p) {
-					perms = append(perms, p)
-				}
-			}
-			org, err := h.store.GetOrganizationByID(r.Context(), id)
-			if err != nil {
-				if errors.Is(err, adminstore.ErrNotFound) {
-					continue // orphaned membership — the org is gone
-				}
-				h.respondError(w, r, err, http.StatusInternalServerError)
-				return
-			}
-			resp.Organizations = append(resp.Organizations, meOrganization{
-				ID:          id,
-				Name:        org.Name,
-				Role:        role,
-				Permissions: perms,
-				Slug:        org.Slug,
-				Currency:    org.Currency,
-				Timezone:    org.Timezone,
-			})
-		}
+		resp.Organizations = orgs
 
 		writeJSON(w, http.StatusOK, resp)
 	}
+}
+
+// meRolePermissions lists the permissions RequireOrgPermission enforces for
+// one role, in adminstore.AllPermissions order (the payload's canonical order).
+func meRolePermissions(role adminstore.OrgRole) []adminstore.Permission {
+	perms := make([]adminstore.Permission, 0, len(adminstore.AllPermissions()))
+	for _, p := range adminstore.AllPermissions() {
+		if adminstore.RoleHas(string(role), p) {
+			perms = append(perms, p)
+		}
+	}
+	return perms
+}
+
+// meOrganizations builds the caller's org entries in id order. An orphaned
+// membership (the org is gone) is skipped; any other store failure aborts the
+// whole response so the payload never understates the caller's rights.
+func (h *AdminHandlers) meOrganizations(ctx context.Context, roles map[string]adminstore.OrgRole) ([]meOrganization, error) {
+	orgIDs := make([]string, 0, len(roles))
+	for id := range roles {
+		orgIDs = append(orgIDs, id)
+	}
+	sort.Strings(orgIDs) // deterministic payload (map iteration is random)
+
+	orgs := make([]meOrganization, 0, len(orgIDs))
+	for _, id := range orgIDs {
+		org, err := h.store.GetOrganizationByID(ctx, id)
+		if err != nil {
+			if errors.Is(err, adminstore.ErrNotFound) {
+				continue // orphaned membership — the org is gone
+			}
+			return nil, err
+		}
+		orgs = append(orgs, meOrganization{
+			ID:          id,
+			Name:        org.Name,
+			Role:        roles[id],
+			Permissions: meRolePermissions(roles[id]),
+			Slug:        org.Slug,
+			Currency:    org.Currency,
+			Timezone:    org.Timezone,
+		})
+	}
+	return orgs, nil
 }
 
 // onboardingStore is the W-WELCOME capability interface for the per-org

@@ -111,6 +111,27 @@ func decodeMe(t *testing.T, body string) meJSON {
 	return me
 }
 
+// assertMePresentation checks one /api/me org entry against the expected
+// authoritative presentation values ("" = field omitted).
+func assertMePresentation(t *testing.T, org meOrgJSON, slug, currency, timezone, why string) {
+	t.Helper()
+	if org.Slug != slug || org.Currency != currency || org.Timezone != timezone {
+		t.Errorf("%s presentation = slug %q currency %q timezone %q, want %q/%q/%q (%s)",
+			org.ID, org.Slug, org.Currency, org.Timezone, slug, currency, timezone, why)
+	}
+}
+
+// assertBodyOmits fails when any marker string appears in the body: a
+// foreign org's identity or presentation values must never leak.
+func assertBodyOmits(t *testing.T, body string, markers ...string) {
+	t.Helper()
+	for _, leak := range markers {
+		if strings.Contains(body, leak) {
+			t.Errorf("payload leaked foreign-org data (%q): %s", leak, body)
+		}
+	}
+}
+
 const meSecret = "test-session-secret" // #nosec G101 -- test-only HMAC key
 
 func TestMe_RootBypassesMembership(t *testing.T) {
@@ -293,17 +314,9 @@ func TestMe_MemberPresentationScopedToOwnOrgs(t *testing.T) {
 	if a.ID != "org-a" {
 		t.Fatalf("first entry = %+v, want org-a", a)
 	}
-	if a.Slug != "acme" || a.Currency != "EUR" || a.Timezone != "Europe/Berlin" {
-		t.Errorf("org-a presentation = slug %q currency %q timezone %q, want acme/EUR/Europe/Berlin (authoritative store values)", a.Slug, a.Currency, a.Timezone)
-	}
-	if c.Slug != "" || c.Currency != "" || c.Timezone != "" {
-		t.Errorf("org-c presentation = %+v, want omitted (client applies defaults)", c)
-	}
-	for _, leak := range []string{"org-b", "Org B", "foreign", "JPY", "Asia/Tokyo"} {
-		if strings.Contains(body, leak) {
-			t.Errorf("payload leaked foreign-org data (%q): %s", leak, body)
-		}
-	}
+	assertMePresentation(t, a, "acme", "EUR", "Europe/Berlin", "authoritative store values")
+	assertMePresentation(t, c, "", "", "", "client applies defaults")
+	assertBodyOmits(t, body, "org-b", "Org B", "foreign", "JPY", "Asia/Tokyo")
 }
 
 // No-widening control: the org directory stays root-only. A member session
