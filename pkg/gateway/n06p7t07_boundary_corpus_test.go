@@ -67,6 +67,10 @@ func t07SpeechGateway(t *testing.T) (*gateway, func() *eventpub.Event, *atomic.I
 	t.Cleanup(server.Close)
 
 	gw := newAudioGateway(t, audioTestModel(server.URL))
+	// Legitimate paid auth for the routed speech posts: resolve the bearer
+	// to a test org exactly like production org-key auth — durable
+	// accounting fail-closes an org-less paid dispatch (503).
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-t07", nil))
 	gw.unitPricer = operatorUnitsForTest(t)
 	return gw, unitEventCapture(gw), &hits
 }
@@ -297,7 +301,7 @@ func TestN06P7T07_DegenerateKeyBoundFailsClosedAtGateway(t *testing.T) {
 	// the cap (1 000 000 µUSD) is far from the 75 µUSD actually spent.
 	require.Contains(t, rec.Body.String(), `refusing new key \"fresh\"`)
 	require.Equal(t, int64(1), hits.Load(), "key-bound refusal must be pre-wire")
-	require.Equal(t, money.MicroUSD(0), l.Spent("", "fresh"), "refused key must stay untracked")
+	require.Equal(t, money.MicroUSD(0), l.Spent("org-t07", "fresh"), "refused key must stay untracked in the tenant window the request addressed")
 
 	rec = t07PostSpeech(t, gw, "hello", "held")
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
