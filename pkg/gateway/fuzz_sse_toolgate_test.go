@@ -181,7 +181,8 @@ func choiceIndex(c []byte) string {
 // sseGenStreamOracle holds the independent invariants for generated streams:
 // the active gate must never release denied-tool bytes under ANY framing or
 // chunk split (and must have counted the drop when one was declared), every
-// released data line stays valid JSON, and the inactive writer is a strict
+// released data line stays valid JSON except the generator's two genuinely
+// non-JSON passthrough payloads, and the inactive writer is a strict
 // byte-identical passthrough.
 func sseGenStreamOracle(t *testing.T, out string, active, sawDenied bool, deniedCount int) {
 	t.Helper()
@@ -198,11 +199,12 @@ func sseGenStreamOracle(t *testing.T, out string, active, sawDenied bool, denied
 		if !ok || d == "" {
 			continue
 		}
-		if d == "{bad" || d == "}" || d == "5" {
-			// Generator-injected non-JSON payloads exercising the
-			// fail-open/first-token/scalar passthrough paths; their
-			// byte-identity is asserted by the writer, not by JSON
-			// parsing here.
+		if d == "{bad" || d == "}" {
+			// Exactly the generator's two non-JSON payloads are exempt
+			// from this parse check: "{bad" (malformed body) and "}"
+			// (invalid first JSON token) exercise the fail-open and
+			// first-token passthrough arms. The scalar "5" arm is valid
+			// JSON and must pass json.Valid below like any released line.
 			continue
 		}
 		if !json.Valid([]byte(d)) {
