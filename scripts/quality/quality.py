@@ -36,7 +36,7 @@ PROFILES = {
     # `full`: the acceptance evidence (full) does not depend on the browser
     # runtime, while web-profile runs and changed-file runs that touch
     # e2e/** / e2e-journey/** get the gates.
-    "web": ["dashboard", "site", "design", "browser", "journey"],
+    "web": ["dashboard", "site", "design", "browser", "journey", "orgpresentation"],
     "sdk": ["node-sdk", "python-sdk", "bridge", "go-sdk"],
     "docs": ["docs"],
     # Private planning data does not change the product. Keep its validator
@@ -65,9 +65,9 @@ RELEASE_PLAN_DATA = {RELEASE_PLAN_DIR + "PLAN-DATA.md"}
 # suites, image builds, disposable PG drills). Docker Desktop runs the daemon
 # in a CPU-limited VM; overlapping them starves time-sensitive tests into
 # flakes (observed 2026-10-06: slowlog/timing failures under jobs=4). They
-HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity", "journey"}
+HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity", "journey", "orgpresentation"}
 LIGHT_GATES = LEAVES - HEAVY_GATES
-DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan", "journey"}
+DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan", "journey", "orgpresentation"}
 # NEXT-14b: ordering constraints for the parallel scheduler. The browser gate
 # serves the production builds produced by dashboard/site; those builds wipe
 # their output directories mid-run (Makefile re-stamps the fingerprint after
@@ -75,7 +75,7 @@ DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package",
 # failures (observed 2026-10-13 under jobs=3). In serial reference mode the
 # gate order already guarantees this; the map only constrains jobs>1.
 # The journey gate serves the same dashboard artifact: same constraint.
-GATE_ORDER = {"browser": ("dashboard", "site"), "journey": ("dashboard",)}
+GATE_ORDER = {"browser": ("dashboard", "site"), "journey": ("dashboard",), "orgpresentation": ("dashboard",)}
 
 
 def git(root, *args):
@@ -200,6 +200,27 @@ def classify_product_paths(paths):
                     "pkg/adminstore/request_detail.go",
                 )):
             add(["journey"], path)
+        # CV-03 org-presentation acceptance scope: the browser acceptance
+        # certifies org presentation end to end, so it runs for its harness
+        # (suite, Playwright config, Go stand) AND the bounded product
+        # sources it exercises: the presentation hook and its formatters,
+        # the org picker/scope bar, the two pages under test and the /api/me
+        # presentation fields. Bounded and non-consuming as for journey.
+        if (path.startswith(("web/dashboard/e2e-orgpresentation/",
+                             "services/admin/handlers/cv03"))
+                or path in (
+                    "web/dashboard/playwright.orgpresentation.config.ts",
+                    "web/dashboard/src/i18n/useOrgPresentation.ts",
+                    "web/dashboard/src/i18n/money.ts",
+                    "web/dashboard/src/i18n/date.ts",
+                    "web/dashboard/src/i18n/format.ts",
+                    "web/dashboard/src/components/OrgSelect.tsx",
+                    "web/dashboard/src/components/GlobalScopeBar.tsx",
+                    "web/dashboard/src/pages/CreditsPage.tsx",
+                    "web/dashboard/src/pages/AnalyticsExplorerPage.tsx",
+                    "services/admin/handlers/me.go",
+                )):
+            add(["orgpresentation"], path)
         # Package names cannot reliably identify trust boundaries. Go changes
         # conservatively receive all cumulative mandatory Go gates.
         if path.endswith("_test.go") and ("integration" in Path(path).parent.name or path.endswith(("integration_test.go", "updown_test.go", "rls_verify_test.go", "drill_test.go", "e2e_test.go"))):
@@ -901,6 +922,10 @@ def gate_entry(gate, directory):
         # Isolate this run's fixture/stand receipts (stand-summary.json,
         # playwright.out, screenshots) in the evidence dir.
         entry["command"] = ["env", "CV02_JOURNEY_OUT=" + str(directory / "journey")] + entry["command"]
+    elif gate == "orgpresentation":
+        # Same receipt isolation for the CV-03 stand (stand-summary.json,
+        # playwright.out, barrier state) in the evidence dir.
+        entry["command"] = ["env", "CV03_ORG_PRESENTATION_OUT=" + str(directory / "orgpresentation")] + entry["command"]
     return entry
 
 
