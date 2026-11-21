@@ -586,7 +586,7 @@ func TestRT03_EvalgateDispatchesSelectedRegionalModel(t *testing.T) {
 	gw.residencyEnforcer = fakeResidency{dec: policy.Decision{Allowed: true, Region: "SG", RemappedModel: "regional"}}
 	cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "regional-comparison", body: nonStreamBody("cheap", mediumPrompt)}
 	cc.req.Model = "cheap"
-	gw.evalgateJudge(cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+	gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
 	require.Equal(t, 0, original.totalCalls())
 	require.Equal(t, 1, regional.totalCalls())
 	require.Equal(t, "regional", regional.callAt(0).Model)
@@ -627,7 +627,7 @@ func TestRT03_EvalgateStartFailurePreventsPaidCall(t *testing.T) {
 			gw.invocations = accounting
 			cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "fault-comparison", body: nonStreamBody("cheap", mediumPrompt)}
 			cc.req.Model = "cheap"
-			gw.evalgateJudge(cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+			gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
 			assert.Equal(t, tc.refuseAt, accounting.attempts)
 			assert.Equal(t, tc.premiumCalls, premium.totalCalls())
 			assert.Equal(t, int32(0), judgeHits)

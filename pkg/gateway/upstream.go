@@ -503,6 +503,9 @@ func (gw *gateway) callUpstreamSingle(ctx context.Context, info resolver.ModelIn
 		"messages": extractChatMessages(body),
 	})
 
+	if err := gw.confirmPaidInvocation(ctx, invocationKindJudge); err != nil {
+		return nil, err
+	}
 	resp, err := client.ForwardJSON(ctx, reqBody, info.ModelName, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("upstream call failed: %w", err)

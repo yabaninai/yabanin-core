@@ -1672,16 +1672,16 @@ func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, fin
 		gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
 
 		// Run judge evaluation asynchronously (non-blocking).
-		go gw.evalgateJudge(cc, gateID, userPrompt, string(resp), cheapModelName, premiumModelName, conf) //nolint:contextcheck // detached by design: judge evaluation must survive request cancellation; internal 15s timeout governs it
+		go gw.evalgateJudge(context.WithoutCancel(ctx), cc, gateID, userPrompt, string(resp), cheapModelName, premiumModelName, conf)
 	}
 }
 
 // evalgateJudge is the detached evalgate comparison: a real premium provider
 // attempt under the request's trusted identity, judged against the served
 // cheap response, with the verdict persisted for calibration.
-func (gw *gateway) evalgateJudge(cc *chatContext, gateID candidateIdentity, prompt, cheapResp, cheapModelName, premiumModelName string, conf float64) {
+func (gw *gateway) evalgateJudge(ctx context.Context, cc *chatContext, gateID candidateIdentity, prompt, cheapResp, cheapModelName, premiumModelName string, conf float64) {
 	orgID, l := cc.orgID, cc.l
-	judgeCtx, jcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	judgeCtx, jcancel := context.WithTimeout(ctx, 15*time.Second)
 	defer jcancel()
 
 	// RT-03: the optional premium comparison is a real provider attempt —
@@ -1699,13 +1699,18 @@ func (gw *gateway) evalgateJudge(cc *chatContext, gateID candidateIdentity, prom
 	}
 
 	// Call premium model for comparison
-	premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumInfo, cc.body)
+	premiumID := newInvocationIdentity(orgID, cc.reqID, cc.sessionID, cc.apiKeyID, eventSessionID(ctx), premiumInfo.ModelName)
+	premiumCtx := withInvocationIdentity(judgeCtx, premiumID)
+	premiumResp, perr := gw.callUpstreamSingle(premiumCtx, premiumInfo, cc.body)
 	if perr != nil {
 		l.Debug("evalgate: premium response failed", "error", perr)
 		return
 	}
 
-	v, err := gw.judge.Evaluate(judgeCtx, prompt, cheapResp, string(premiumResp))
+	v, _, err := gw.judge.EvaluateMeasured(judgeCtx, prompt, cheapResp, string(premiumResp), func(ctx context.Context, model string) error {
+		judgeID := newInvocationIdentity(orgID, cc.reqID, cc.sessionID, cc.apiKeyID, eventSessionID(ctx), model)
+		return judgeID.beginPaidDispatch(ctx, gw.invocations, invocationKindJudge)
+	})
 	if err != nil {
 		l.Debug("evalgate judge failed", "error", err)
 		return
