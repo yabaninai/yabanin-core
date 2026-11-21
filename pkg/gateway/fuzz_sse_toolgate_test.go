@@ -711,6 +711,20 @@ func fuzzSSE19(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	tail := &ssePassthroughTail{w: rec}
+	fuzzSSE19HeaderStatus(t, tail, rec)
+	fuzzSSE19TornLifecycle(t, tail)
+	if got := rec.Body.String(); got != "data: x\n\n" {
+		t.Fatalf("SSE-19: passthrough must stay byte-identical, got %q", got)
+	}
+}
+
+// fuzzSSE19HeaderStatus pins the ssePassthroughTail header/status
+// delegation: Header returns the wrapped writer's header map and
+// WriteHeader forwards the status code unchanged (stream.go
+// ssePassthroughTail.Header, WriteHeader).
+func fuzzSSE19HeaderStatus(t *testing.T, tail *ssePassthroughTail, rec *httptest.ResponseRecorder) {
+	t.Helper()
+
 	tail.Header().Set("X-Tail-Probe", "1")
 	if got := rec.Header().Get("X-Tail-Probe"); got != "1" {
 		t.Fatalf("SSE-19: Header must delegate to the wrapped writer, got %q", got)
@@ -719,6 +733,15 @@ func fuzzSSE19(t *testing.T) {
 	if rec.Code != http.StatusTeapot {
 		t.Fatalf("SSE-19: WriteHeader must delegate, got %d", rec.Code)
 	}
+}
+
+// fuzzSSE19TornLifecycle pins the ssePassthroughTail torn-tail predicate in
+// both polarities around the byte-exact write passthrough: an empty tail is
+// not torn, a written data line without its blank separator is, and the
+// completed frame clears it again (stream.go ssePassthroughTail.torn, Write).
+func fuzzSSE19TornLifecycle(t *testing.T, tail *ssePassthroughTail) {
+	t.Helper()
+
 	if tail.torn() {
 		t.Fatal("SSE-19: nothing written must not be torn")
 	}
@@ -733,9 +756,6 @@ func fuzzSSE19(t *testing.T) {
 	}
 	if tail.torn() {
 		t.Fatal("SSE-19: a completed frame must not be torn")
-	}
-	if got := rec.Body.String(); got != "data: x\n\n" {
-		t.Fatalf("SSE-19: passthrough must stay byte-identical, got %q", got)
 	}
 }
 

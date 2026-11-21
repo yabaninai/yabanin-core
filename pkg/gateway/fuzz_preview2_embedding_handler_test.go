@@ -35,8 +35,6 @@ import (
 //	pick 4 — finishCompletion over a canceled request context (§5.3
 //	         client-cancel termination) with the hook order.
 func FuzzEmbeddingsHappyPathForwarding(f *testing.F) {
-	const upstreamBody = `{"object":"list","data":[],"usage":{"prompt_tokens":3,"total_tokens":3}}`
-
 	// Two distinct valid seeds that must stay distinguishable on the wire,
 	// plus a long base64-run body (critical-go: the reservation input
 	// profile's base64-strip accounting loop, exercised through the real
@@ -62,47 +60,60 @@ func FuzzEmbeddingsHappyPathForwarding(f *testing.F) {
 			// unknown pins (only reachable under -fuzz) run the regular body
 		}
 
-		text := "embedding: " + strings.ToValidUTF8(in, "�")
-		body, err := json.Marshal(struct {
-			Model string `json:"model"`
-			Input string `json:"input"`
-		}{"m", text})
-		if err != nil {
-			t.Fatalf("marshal request: %v", err)
-		}
-
-		var wire atomic.Value
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if r.URL.Path != "/v1/embeddings" {
-				t.Errorf("upstream path %s", r.URL.Path)
-			}
-			raw, _ := io.ReadAll(r.Body)
-			wire.Store(string(raw))
-			w.Header().Set("Content-Type", "application/json")
-			_, _ = w.Write([]byte(upstreamBody))
-		}))
-		defer server.Close()
-
-		info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
-		gw := &gateway{
-			cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-			log:  slog.Default(),
-			auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-			res:  stubModelResolver{"m": info},
-			pool: upstream.NewPool(upstream.Options{}),
-		}
-		var ev *eventpub.Event
-		gw.eventNote = func(e *eventpub.Event) { ev = e }
-
-		rec := postEmbeddings(t, gw, string(body))
-		validateEmbeddingsResponse(t, rec, upstreamBody)
-
-		validateEmbeddingsForwardedContent(t, &wire, "embed-a", text)
-
-		if ev == nil || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
-			t.Fatalf("event %+v", ev)
-		}
+		fuzzEmbeddingsForwarded(t, in)
 	})
+}
+
+// fuzzEmbeddingsForwarded executes the regular happy-path body of
+// FuzzEmbeddingsHappyPathForwarding for the non-pinned picks: normal
+// generated text is JSON-marshaled as the "input" string, forwarded to the
+// local mock upstream, and forwarded content, response body and usage
+// accounting are verified deterministically for every input.
+func fuzzEmbeddingsForwarded(t *testing.T, in string) {
+	t.Helper()
+
+	const upstreamBody = `{"object":"list","data":[],"usage":{"prompt_tokens":3,"total_tokens":3}}`
+
+	text := "embedding: " + strings.ToValidUTF8(in, "�")
+	body, err := json.Marshal(struct {
+		Model string `json:"model"`
+		Input string `json:"input"`
+	}{"m", text})
+	if err != nil {
+		t.Fatalf("marshal request: %v", err)
+	}
+
+	var wire atomic.Value
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/v1/embeddings" {
+			t.Errorf("upstream path %s", r.URL.Path)
+		}
+		raw, _ := io.ReadAll(r.Body)
+		wire.Store(string(raw))
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(upstreamBody))
+	}))
+	defer server.Close()
+
+	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
+	gw := &gateway{
+		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:  slog.Default(),
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:  stubModelResolver{"m": info},
+		pool: upstream.NewPool(upstream.Options{}),
+	}
+	var ev *eventpub.Event
+	gw.eventNote = func(e *eventpub.Event) { ev = e }
+
+	rec := postEmbeddings(t, gw, string(body))
+	validateEmbeddingsResponse(t, rec, upstreamBody)
+
+	validateEmbeddingsForwardedContent(t, &wire, "embed-a", text)
+
+	if ev == nil || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
+		t.Fatalf("event %+v", ev)
+	}
 }
 
 // TestEmbeddingsSessionAffinityRecorded pins the session-affinity recording
