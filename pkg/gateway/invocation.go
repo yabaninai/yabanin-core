@@ -627,7 +627,7 @@ func (gw *gateway) confirmPaidInvocation(ctx context.Context, kind string) error
 func writeInvocationStartRefusal(w http.ResponseWriter, err error) {
 	if errors.Is(err, ErrInvocationStoreUnavailable) {
 		apierrors.WriteWithCode(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable,
-			"durable request accounting temporarily unavailable — new requests are refused until admission writes are guaranteed (see YABANIN_HISTORY_MODE)",
+			"durable request accounting temporarily unavailable: the paid call was not sent because its start could not be confirmed",
 			"history_unavailable")
 		return
 	}
