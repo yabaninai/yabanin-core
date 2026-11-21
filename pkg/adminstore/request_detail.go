@@ -232,7 +232,7 @@ const requestDetailRowSelect = `
 	       first_token_ms,
 	       attempt_count,
 	       retry_count,
-	       COALESCE(labels, '{}'::jsonb), user_id::text
+	       COALESCE(labels, '{}'::jsonb), user_id::text, invocation_id::text
 	FROM request_logs
 	WHERE `
 
@@ -251,9 +251,9 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 // getRequestDetailOnKey loads one authorized request detail addressed by the
 // immutable request_logs.id row key (org_id + id): the exact-row identity the
 // export walk uses, so every emitted detail is the very row the list page
-// selected even when several rows share the client correlation. Because
-// tool_calls/tool_call_invocations are keyed by correlation only, their facts
-// attach only when the correlation is unambiguous within the org (see
+// selected even when several rows share the client correlation. Tool facts
+// bind by invocation identity where the row carries one (0030); a legacy
+// NULL-invocation row keeps the correlation-uniqueness guard (see
 // loadRequestDetail).
 func getRequestDetailOnKey(ctx context.Context, ex exportQueryRunner, orgID string, rowKey int64) (*RequestDetail, error) {
 	if orgID == "" || rowKey <= 0 {
@@ -264,12 +264,14 @@ func getRequestDetailOnKey(ctx context.Context, ex exportQueryRunner, orgID stri
 
 // loadRequestDetail runs the shared authorized projection under the caller's
 // key predicate and applies the payload boundary decision. guardCorrelation
-// (the exact-row path) additionally guards the tool-child association: child
-// tables are keyed by (org_id, request_id) — a correlation two legitimate
-// invocations may share (0028) — so when the org holds more than one row
-// carrying this row's correlation, child facts are not attributable to this
-// physical row and attach NONE of them rather than silently attaching the
-// sibling invocation's children to both rows.
+// (the exact-row path) additionally guards the LEGACY tool-child association:
+// legacy child rows are keyed by (org_id, request_id) only — a correlation two
+// legitimate invocations may share (0028) — so for a legacy row (no
+// invocation identity) whose org holds more than one row carrying that
+// correlation, child facts are not attributable to this physical row and NONE
+// of them attach rather than silently attaching a sibling invocation's
+// children to both rows. Invocation-bearing rows bind children exactly by
+// invocation identity and need no guard.
 func loadRequestDetail(ctx context.Context, ex exportQueryRunner, keyWhere, orgID string, key interface{}, guardCorrelation bool) (*RequestDetail, error) {
 	access, _ := ctx.Value(requestPayloadAccessKey{}).(RequestPayloadAccess)
 	payloadUserID := access.UserID
@@ -291,13 +293,14 @@ func loadRequestDetail(ctx context.Context, ex exportQueryRunner, keyWhere, orgI
 	var d RequestDetail
 	var labelsRaw []byte
 	var ownerID *string
+	var invocationID *string
 	err := ex.QueryRow(ctx, q, args...).Scan(
 		&d.RequestID, &d.OrgID, &d.ModelRequested, &d.ModelUsed, &d.UpstreamURL,
 		&d.Method, &d.StatusCode, &d.DurationMs, &d.TokensIn, &d.TokensOut,
 		&d.Error, &d.CreatedAt, &d.PromptHash, &d.Response, &d.UpstreamRequest, &d.UpstreamResponse, &d.CacheHitType,
 		&d.Counterfactual, &d.CostUSD, &d.ClassifierClass, &d.ClassifierConfidence,
 		&d.ClassifierSource, &d.TierUsed, &d.ABGroup, &d.TaskID, &d.AgentID, &d.SessionID,
-		&d.RoutingDecision, &d.HomeRegion, &d.FirstTokenMs, &d.AttemptCount, &d.RetryCount, &labelsRaw, &ownerID,
+		&d.RoutingDecision, &d.HomeRegion, &d.FirstTokenMs, &d.AttemptCount, &d.RetryCount, &labelsRaw, &ownerID, &invocationID,
 	)
 	if err != nil {
 		if IsNotFound(err) {
@@ -314,21 +317,22 @@ func loadRequestDetail(ctx context.Context, ex exportQueryRunner, keyWhere, orgI
 	if requestDetailHidden(access, payloadDeny, payloadOwner, owned, delegated, payloadUserID, ownerID) {
 		return nil, ErrNotFound
 	}
-	attachChildren, err := requestChildrenAdmissible(ctx, ex, orgID, d.RequestID, guardCorrelation)
+	uniqueCarrier, err := uniqueCorrelationCarrier(ctx, ex, orgID, d.RequestID)
 	if err != nil {
 		return nil, err
 	}
-	return finalizeRequestDetail(ctx, ex, &d, orgID, payloadDeny, owned, payloadGrantSQL, attachChildren)
+	return finalizeRequestDetail(ctx, ex, &d, orgID, payloadDeny, owned, payloadGrantSQL, invocationID, uniqueCarrier)
 }
 
-// requestChildrenAdmissible decides whether the correlation-keyed tool-child
-// tables may attach to this row: the exact-row path (guardCorrelation, 0028
-// semantics) attaches them only when the row is the org's ONLY carrier of
-// the correlation — otherwise the children belong to no ONE row and must not
-// be attributed to any of them.
-func requestChildrenAdmissible(ctx context.Context, ex exportQueryRunner, orgID, requestID string, guardCorrelation bool) (bool, error) {
-	if !guardCorrelation {
-		return true, nil
+// uniqueCorrelationCarrier reports whether the org holds exactly one
+// request_logs row carrying this correlation: the precondition for
+// associating NULL-invocation tool facts (legacy rows, or facts a pre-0030
+// writer mode emitted for a minted request) with that row. An empty/NULL
+// correlation can never be unique-carrier (tool facts carry NOT NULL
+// request_ids and cannot reference it at all).
+func uniqueCorrelationCarrier(ctx context.Context, ex exportQueryRunner, orgID, requestID string) (bool, error) {
+	if requestID == "" {
+		return false, nil
 	}
 	var correlated int
 	if err := ex.QueryRow(ctx,
@@ -339,16 +343,16 @@ func requestChildrenAdmissible(ctx context.Context, ex exportQueryRunner, orgID,
 	return correlated == 1, nil
 }
 
-// finalizeRequestDetail applies the children gate and returns the finished
-// detail: without payload authorization (or when children are inadmissible)
-// it returns metadata only — empty child lists, never related payload rows.
-func finalizeRequestDetail(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, payloadDeny, owned, payloadGrantSQL, attachChildren bool) (*RequestDetail, error) {
-	if payloadDeny || (!owned && !payloadGrantSQL) || !attachChildren {
+// finalizeRequestDetail returns the finished detail: without payload
+// authorization it returns metadata only — empty child lists, never related
+// payload rows.
+func finalizeRequestDetail(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, payloadDeny, owned, payloadGrantSQL bool, invocationID *string, uniqueCarrier bool) (*RequestDetail, error) {
+	if payloadDeny || (!owned && !payloadGrantSQL) {
 		d.ToolCalls = []RequestToolCall{}
 		d.ToolCallInvocations = []RequestToolCallInvocation{}
 		return d, nil
 	}
-	return attachRequestChildren(ctx, ex, d, orgID)
+	return attachRequestChildren(ctx, ex, d, orgID, invocationID, uniqueCarrier)
 }
 
 // requestDetailHidden enforces the post-load visibility boundary: an explicit
@@ -363,17 +367,22 @@ func requestDetailHidden(access RequestPayloadAccess, payloadDeny, payloadOwner,
 	return !owned && !delegated && !access.Grant && !access.OrgWideMetadata
 }
 
-// attachRequestChildren loads the correlation-keyed tool facts for d — the
-// distinct tool names and the per-occurrence invocations — org-scoped exactly
-// like the main row, sourced pre-truncation by loggerd. An empty result is a
-// valid "none recorded" state; a transport/scan failure is surfaced, not
-// swallowed.
-func attachRequestChildren(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string) (*RequestDetail, error) {
+// attachRequestChildren loads the tool facts for d — the distinct tool names
+// and the per-occurrence invocations — org-scoped exactly like the main row,
+// sourced pre-truncation by loggerd. The bind predicate is the single
+// association rule of this package (toolFactMatchesRow, 0030): invocation-
+// bearing facts bind exactly to their own invocation ($3, NULL = never), and
+// NULL-invocation facts (legacy, or pre-0030 writer mode) bind only when
+// this row is the org's unique carrier of the correlation ($4). An empty
+// result is a valid "none recorded" state; a transport/scan failure is
+// surfaced, not swallowed.
+func attachRequestChildren(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, invocationID *string, uniqueCarrier bool) (*RequestDetail, error) {
 	d.ToolCalls = []RequestToolCall{}
 	tcRows, err := ex.Query(ctx, `
 		SELECT tool_name FROM tool_calls
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY id`, orgID, d.RequestID)
+		  AND (invocation_id = $3::uuid OR (invocation_id IS NULL AND $4::boolean))
+		ORDER BY id`, orgID, d.RequestID, invocationID, uniqueCarrier)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool calls: %w", err)
 	}
@@ -388,13 +397,15 @@ func attachRequestChildren(ctx context.Context, ex exportQueryRunner, d *Request
 	if err := tcRows.Err(); err != nil {
 		return nil, fmt.Errorf("request detail tool calls rows: %w", err)
 	}
-	// Per-occurrence invocations with arguments (0014), same org scoping.
-	// Rows only exist for post-0014 requests; empty = legacy/sample-only.
+	// Per-occurrence invocations with arguments (0014), same org scoping and
+	// association rule as the distinct-name query above. Rows only exist for
+	// post-0014 requests; empty = legacy/sample-only.
 	d.ToolCallInvocations = []RequestToolCallInvocation{}
 	invRows, err := ex.Query(ctx, `
 		SELECT seq, call_id, tool_name, arguments FROM tool_call_invocations
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY seq, id`, orgID, d.RequestID)
+		  AND (invocation_id = $3::uuid OR (invocation_id IS NULL AND $4::boolean))
+		ORDER BY seq, id`, orgID, d.RequestID, invocationID, uniqueCarrier)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool call invocations: %w", err)
 	}
