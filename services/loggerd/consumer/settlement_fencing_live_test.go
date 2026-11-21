@@ -65,7 +65,7 @@ func fencingSeedInvocationJob(ctx context.Context, t *testing.T, pool *pgxpool.P
 // states, so every field is captured by value and compared structurally.
 type fencingJobSnapshot struct {
 	status      string
-	attempts    int
+	attempts    int32
 	lastError   *string
 	nextAttempt string
 	leaseUntil  *string
@@ -128,7 +128,7 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, claimed, 3)
 	for _, job := range claimed {
-		require.Equal(t, 1, job.Attempts, "first claim holds token 1")
+		require.Equal(t, int32(1), job.Attempts, "first claim holds token 1")
 		require.NotNil(t, job.InvocationID, "claim projects the invocation identity")
 	}
 	groups := groupJobsByOrg(claimed)
@@ -158,7 +158,7 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	assert.Equal(t, staleMicro, micro)
 	for _, s := range staleSnap {
 		assert.Equal(t, "processing", s.status, "rightful claim's state untouched")
-		assert.Equal(t, 2, s.attempts)
+		assert.Equal(t, int32(2), s.attempts)
 	}
 
 	// The RIGHTFUL worker settles the re-claimed group exactly once:
@@ -175,13 +175,13 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	for _, id := range jobIDs {
 		s := fencingSnapshot(ctx, t, pool, id)
 		require.Equal(t, "retry", s.status)
-		require.Equal(t, 2, s.attempts, "recovery does not bump attempts")
+		require.Equal(t, int32(2), s.attempts, "recovery does not bump attempts")
 	}
 	reclaimed, err = w2.claimBatch(ctx)
 	require.NoError(t, err)
 	require.Len(t, reclaimed, 3)
 	for _, job := range reclaimed {
-		require.Equal(t, 3, job.Attempts, "re-claim holds token 3")
+		require.Equal(t, int32(3), job.Attempts, "re-claim holds token 3")
 	}
 	groups2 := groupJobsByOrg(reclaimed)
 	require.Len(t, groups2, 1)
@@ -239,7 +239,7 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, claimed, 2)
 	for _, job := range claimed {
-		require.Equal(t, 1, job.Attempts)
+		require.Equal(t, int32(1), job.Attempts)
 		require.NotNil(t, job.InvocationID)
 	}
 	groups := groupJobsByOrg(claimed)
@@ -307,7 +307,7 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	require.NoError(t, err)
 	require.Len(t, reclaimed, 2)
 	for _, job := range reclaimed {
-		require.Equal(t, 2, job.Attempts)
+		require.Equal(t, int32(2), job.Attempts)
 	}
 	groups2 := groupJobsByOrg(reclaimed)
 	require.Len(t, groups2, 1)

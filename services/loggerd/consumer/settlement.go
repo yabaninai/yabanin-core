@@ -390,7 +390,7 @@ type settlementJob struct {
 	AmountMicro money.MicroUSD
 	AmountCents int64
 	Payload     []byte
-	Attempts    int
+	Attempts    int32
 	NextBackoff time.Duration // filled at claim time for observability
 	// InvocationID is the billed invocation identity on 0028+ schemas
 	// (nil for legacy-domain rows); it keys the resale deduction's
@@ -600,7 +600,7 @@ func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settleme
 			// The claim's post-increment attempts value IS the fencing
 			// token: a newer claim of the same job bumps it, and the batch
 			// refuses to settle under a stale token (SettleEntry doc).
-			FencingToken: int32(job.Attempts),
+			FencingToken: job.Attempts,
 			RequestID:    job.RequestID,
 			InvocationID: invocation,
 			Kind:         job.ChargeKind,
@@ -736,7 +736,7 @@ func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, err
 			return nil, fmt.Errorf("scan settlement job: %w", err)
 		}
 		job.AmountMicro = money.MicroUSD(amountMicro)
-		job.NextBackoff = w.backoff(job.Attempts)
+		job.NextBackoff = w.backoff(int(job.Attempts))
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
@@ -770,7 +770,7 @@ func (w *SettlementWorker) executeJob(ctx context.Context, job *settlementJob) {
 		return
 	}
 
-	disposition, reason := w.classifyFailure(err, job.Attempts)
+	disposition, reason := w.classifyFailure(err, int(job.Attempts))
 	if disposition == "retry" {
 		metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "retry").Inc()
 		w.markRetry(ctx, job, err)
@@ -859,7 +859,7 @@ func (w *SettlementWorker) markSettledWithRelease(ctx context.Context, tx pgx.Tx
 	if decrement > 0 {
 		decAmt = decrement
 	}
-	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt, int32(job.Attempts))
+	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt, job.Attempts)
 	if err != nil {
 		return fmt.Errorf("mark settled: %w", err)
 	}
@@ -1025,7 +1025,7 @@ func (w *SettlementWorker) settle(ctx context.Context, job *settlementJob) {
 }
 
 func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, execErr error) {
-	tag, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr), int32(job.Attempts))
+	tag, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr), job.Attempts)
 	if err != nil {
 		// The lease will expire and recovery re-queues the job — the retry
 		// is not lost, only delayed past the lease TTL.
@@ -1041,7 +1041,7 @@ func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, ex
 		// a job it no longer owns; the rightful owner decides.
 		w.logger.Warn("settlement retry mark skipped — claim lost",
 			slog.Int64("job_id", job.ID),
-			slog.Int("attempts", job.Attempts),
+			slog.Int64("attempts", int64(job.Attempts)),
 		)
 		return
 	}
@@ -1050,14 +1050,14 @@ func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, ex
 		slog.String("charge_kind", job.ChargeKind),
 		slog.String("org_id", job.OrgID),
 		slog.String("request_id", job.RequestID),
-		slog.Int("attempts", job.Attempts),
+		slog.Int64("attempts", int64(job.Attempts)),
 		slog.Duration("backoff", job.NextBackoff),
 		slog.String("error", execErr.Error()),
 	)
 }
 
 func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settlementJob, execErr error, reason string) {
-	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr), int32(job.Attempts))
+	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr), job.Attempts)
 	if err != nil {
 		w.logger.Error("settlement requires-attention mark failed",
 			slog.Int64("job_id", job.ID),
@@ -1073,7 +1073,7 @@ func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settl
 		// lost or doubled by skipping this mark).
 		w.logger.Warn("settlement requires-attention mark skipped — claim lost",
 			slog.Int64("job_id", job.ID),
-			slog.Int("attempts", job.Attempts),
+			slog.Int64("attempts", int64(job.Attempts)),
 		)
 		return
 	}
@@ -1083,7 +1083,7 @@ func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settl
 		slog.String("org_id", job.OrgID),
 		slog.String("request_id", job.RequestID),
 		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-		slog.Int("attempts", job.Attempts),
+		slog.Int64("attempts", int64(job.Attempts)),
 		slog.String("reason", reason),
 		slog.String("error", execErr.Error()),
 	)
