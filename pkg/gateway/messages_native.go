@@ -107,6 +107,14 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 		gw.messagesNativeStream(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, upstreamURL, extra, started)
 		return
 	}
+	gw.messagesNativeJSON(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, upstreamURL, extra, started, l)
+}
+
+// messagesNativeJSON serves the non-streaming native /v1/messages request:
+// one whole-request upstream roundtrip with timeout, usage and post-
+// upstream policy applied to the buffered reply, durable settlement before
+// the client sees a payable success, and the byte-identical forward.
+func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, extra http.Header, started time.Time, l *slog.Logger) {
 	timeout := admitted.Info.UpstreamTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -208,7 +216,12 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 		defer idle.Stop()
 		body = idle
 	}
-	usage, _ := relayAnthropicSSE(w, body)
+	// The success terminal is ordered after the terminal-facts commit
+	// (Preview2 central binding): the relay writes through the terminal
+	// hold, which forwards nonterminal frames immediately and buffers
+	// message_stop at the seam until finishNativeMessages commits.
+	hold := gw.armNativeTerminalHold(w, rctx, nativeEventName, anthNativeSuccessTerminals, anthNativeFailureTerminals)
+	usage, _ := relayAnthropicSSE(hold, body)
 	// N03-P06-T02: SSE headers are already committed; the provider
 	// prompt-cache outcome rides the HTTP trailer (usage is final here).
 	// The settlement keeps the D1 canon on every end: an explicit upstream
@@ -222,11 +235,166 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 		// stream, and the terminal accounting failure closes it with the
 		// protocol-shaped error event carrying accounting_commit_failed
 		// (the chat stream canon: NOT safe to retry — support reconciles
-		// the charge). The withheld event never reaches the consumer.
+		// the charge). The withheld event never reaches the consumer;
+		// when the relay already delivered a terminal error frame the
+		// stream ended client-side and the commit failure is log-only —
+		// never a second terminal.
 		l.Error("terminal facts commit failed after streamed dispatch", "error", ferr)
-		writeAnthropicStreamAccountingFailure(w)
+		hold.fail()
+		if !hold.failureSeen() {
+			writeAnthropicStreamAccountingFailure(w)
+		}
+		return
+	}
+	hold.release()
+}
+
+// Terminal event names for the native relays: the success terminal whose
+// client delivery must follow the durable terminal-facts commit, and the
+// failure terminals that end the stream in-protocol and must never be
+// followed by a second terminal.
+var (
+	anthNativeSuccessTerminals = map[string]bool{"message_stop": true}
+	anthNativeFailureTerminals = map[string]bool{"error": true}
+
+	respNativeSuccessTerminals = map[string]bool{
+		"response.completed":  true,
+		"response.incomplete": true,
+	}
+	respNativeFailureTerminals = map[string]bool{"response.failed": true}
+)
+
+// anthNativeSuccessTerminals etc. classify through nativeEventName
+// (shared with the responses relay): event field first, JSON type
+// fallback — data-only terminals hold the same as event-field ones.
+
+// nativeTerminalHold orders the client-visible success terminal of a
+// native SSE relay after the durable terminal-facts commit (the native
+// twin of the chat drain's doneWatch, stream.go sseTerminalWatch):
+// records flush through while the first success terminal is buffered at
+// this seam. release writes the held record once the facts are
+// committed; fail drops it, letting the caller's accounting-failure
+// frame close the stream as its single terminal. Failure terminals pass
+// through unheld and set sawFailure — the caller then suppresses the
+// accounting frame, and a success terminal buffered before that failure
+// is dropped, so every end path leaves exactly one client terminal.
+// Classification runs the records the relays dispatch through the
+// shared apiformat.SSEParser (the relays' own wire semantics, including
+// split data lines); records that complete no event — heartbeat
+// comments, blank separators, frame partials — pass through at once, so
+// heartbeats never wait on an event separator, nothing accumulates, and
+// a released stream is byte-identical to an unheld relay.
+type nativeTerminalHold struct {
+	http.ResponseWriter
+	name    func(apiformat.SSEEvent) string
+	success map[string]bool
+	failure map[string]bool
+	flusher http.Flusher
+	armed   bool
+
+	held       []byte // buffered success terminal, pending the facts commit
+	sawFailure bool   // a failure terminal was forwarded; stream ended client-side
+}
+
+// armNativeTerminalHold wraps the stream's writer when the success
+// terminal must follow the facts commit: an admitted invocation with a
+// live durable store (the chat drain's doneWatch arming rule). Streams
+// outside that scope pass straight through and the hold methods are
+// no-ops.
+func (gw *gateway) armNativeTerminalHold(w http.ResponseWriter, ctx context.Context, name func(apiformat.SSEEvent) string, success, failure map[string]bool) *nativeTerminalHold {
+	h := &nativeTerminalHold{ResponseWriter: w, name: name, success: success, failure: failure}
+	if f, ok := w.(http.Flusher); ok {
+		h.flusher = f
+	}
+	if id := invocationIdentityFrom(ctx); id != nil && id.Admitted() && gw.invocations != nil {
+		h.armed = true
+	}
+	return h
+}
+
+// Write routes one relay dispatch. The relays emit bounded complete
+// records per Write (frames whole via apiformat.SSEFrameBuffer, comment
+// lines standalone), so a fresh parser's Feed+Flush resolves exactly
+// the record p carried — including the lone-CR terminator dialect,
+// whose trailing CR Feed alone would hold for the next chunk — without
+// ever completing record N's classification on record N+1's bytes. A
+// Write classifying to no event holds no terminal and passes through
+// unchanged.
+func (h *nativeTerminalHold) Write(p []byte) (int, error) {
+	if !h.armed {
+		return h.ResponseWriter.Write(p)
+	}
+	var classifier apiformat.SSEParser
+	events := append(classifier.Feed(p), classifier.Flush()...)
+	if len(events) == 0 {
+		_, err := h.ResponseWriter.Write(p)
+		return len(p), err
+	}
+	if err := h.dispatch(p, h.name(events[0])); err != nil {
+		return 0, err
+	}
+	return len(p), nil
+}
+
+// dispatch routes one complete record by its event name: failure
+// terminals pass through and end the stream in-protocol (a buffered
+// success is dropped so it cannot follow the client's terminal), the
+// first success terminal is held for the facts commit, later ones are
+// dropped as post-terminal duplicates, and every other record passes
+// through.
+func (h *nativeTerminalHold) dispatch(p []byte, name string) error {
+	switch {
+	case h.failure[name]:
+		h.sawFailure = true
+		h.held = nil
+		_, err := h.ResponseWriter.Write(p)
+		return err
+	case h.success[name] && h.held == nil && !h.sawFailure:
+		h.held = append([]byte(nil), p...)
+		return nil
+	case h.success[name]:
+		return nil
+	}
+	_, err := h.ResponseWriter.Write(p)
+	return err
+}
+
+// Flush passes client flushes through; the held terminal stays at the
+// seam until the facts commit releases it.
+func (h *nativeTerminalHold) Flush() {
+	if h.flusher != nil {
+		h.flusher.Flush()
 	}
 }
+
+// release writes the held success terminal after the terminal facts
+// committed, then disarms the hold.
+func (h *nativeTerminalHold) release() {
+	if !h.armed {
+		return
+	}
+	h.armed = false
+	if h.held != nil {
+		_, _ = h.ResponseWriter.Write(h.held)
+		h.held = nil
+	}
+	if h.flusher != nil {
+		h.flusher.Flush()
+	}
+}
+
+// fail drops the held terminal after an uncommittable facts record; the
+// caller's accounting-failure frame is then the stream's single
+// terminal.
+func (h *nativeTerminalHold) fail() {
+	h.armed = false
+	h.held = nil
+}
+
+// failureSeen reports whether a failure terminal was already forwarded:
+// the client's stream ended in-protocol and no accounting frame may
+// stack a second terminal on it.
+func (h *nativeTerminalHold) failureSeen() bool { return h.sawFailure }
 
 // relayAnthropicSSE forwards the upstream Anthropic SSE stream to the client
 // byte-identically while accounting usage. It returns the provider usage
@@ -249,84 +417,124 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 // the adapted writer's D2 closing in emitStreamErrorLocked).
 // message_stop is never fabricated and an explicit upstream error event
 // is never duplicated. A blob ending in a lone CR leaves its event
-// pending in the parser until more bytes arrive or the final Flush; the
-// Flush events settle under the same delivered rule (written bytes
-// only), so terminator dialects cannot desynchronize lifecycle tracking
-// from what the client saw.
-func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Usage, err error) {
-	// The relay writes through the tail tracker so a torn last event is
-	// closed before the synthesized terminal frames compose (chat F2 canon).
-	tail := &ssePassthroughTail{w: w}
-	w = tail
-	reader := bufio.NewReader(body)
-	var parser apiformat.SSEParser
-	var acc anthStreamUsage
-	open := map[int]struct{}{}
-	sawStop, sawError := false, false
-	var flusher http.Flusher
+// pending in the parser until more bytes arrive or the final Flush; each
+// dispatched record is finalized through Feed+Flush, so a complete
+// record's event — including the lone-CR separator dialect — settles
+// within its own dispatch instead of on the next chunk. The drain stops
+// at the authoritative delivered terminal (message_stop, or an error
+// event): everything after it is not part of the message, and the relay
+// never waits on physical EOF to settle usage and lifecycle.
+// anthBlockLifecycle tracks the client-visible lifecycle of a native
+// /v1/messages stream: which content blocks the client saw open, and
+// whether a terminal — message_stop, or an error event closing the stream
+// in-protocol — was delivered. Tracking is delivered-only: an event the
+// client never received never happened.
+type anthBlockLifecycle struct {
+	open     map[int]struct{}
+	sawStop  bool
+	sawError bool
+}
+
+// note applies one delivered event's lifecycle effect. Same name semantics
+// as the terminal hold: the event field, else the data payload's type
+// member — a data-only terminal ends the stream identically (no
+// synthesized error after it, and no error synthesized twice).
+func (lc *anthBlockLifecycle) note(ev apiformat.SSEEvent) {
+	switch nativeEventName(ev) {
+	case "content_block_start":
+		var doc struct {
+			Index *int `json:"index"`
+		}
+		// A start frame without an explicit index is a malformed block
+		// declaration: tracking it would invent index 0 and synthesize a
+		// content_block_stop for a block the upstream never declared.
+		if json.Unmarshal([]byte(ev.Data), &doc) == nil && doc.Index != nil {
+			lc.open[*doc.Index] = struct{}{}
+		}
+	case "content_block_stop":
+		var doc struct {
+			Index int `json:"index"`
+		}
+		if json.Unmarshal([]byte(ev.Data), &doc) == nil {
+			delete(lc.open, doc.Index)
+		}
+	case "message_stop":
+		lc.sawStop = true
+	case "error":
+		lc.sawError = true
+	}
+}
+
+// terminal reports whether a delivered event ended the stream in-protocol:
+// everything after it is not part of the message.
+func (lc anthBlockLifecycle) terminal() bool {
+	return lc.sawStop || lc.sawError
+}
+
+// anthStreamRelay carries one native /v1/messages drain's state (the
+// streamRun canon): the client write path, the event parser, the usage and
+// lifecycle observers, the frame accumulator, and the first client-write
+// failure that stops further provider pulls.
+type anthStreamRelay struct {
+	w         http.ResponseWriter
+	flusher   http.Flusher
+	parser    apiformat.SSEParser
+	acc       anthStreamUsage
+	lifecycle anthBlockLifecycle
+	frames    apiformat.SSEFrameBuffer
+	werr      error // first client-write failure; writes stop and no further provider bytes are pulled (usage is read-based)
+}
+
+func newAnthStreamRelay(w http.ResponseWriter) *anthStreamRelay {
+	rl := &anthStreamRelay{w: w, lifecycle: anthBlockLifecycle{open: map[int]struct{}{}}}
 	if f, ok := w.(http.Flusher); ok {
-		flusher = f
+		rl.flusher = f
 	}
-	var werr error // first client-write failure; writes stop and no further provider bytes are pulled (usage is read-based)
-	track := func(ev apiformat.SSEEvent) {
-		switch ev.Event {
-		case "content_block_start":
-			var doc struct {
-				Index *int `json:"index"`
-			}
-			// A start frame without an explicit index is a malformed block
-			// declaration: tracking it would invent index 0 and synthesize a
-			// content_block_stop for a block the upstream never declared.
-			if json.Unmarshal([]byte(ev.Data), &doc) == nil && doc.Index != nil {
-				open[*doc.Index] = struct{}{}
-			}
-		case "content_block_stop":
-			var doc struct {
-				Index int `json:"index"`
-			}
-			if json.Unmarshal([]byte(ev.Data), &doc) == nil {
-				delete(open, doc.Index)
-			}
-		case "message_stop":
-			sawStop = true
-		case "error":
-			sawError = true
+	return rl
+}
+
+// writeFrame delivers one complete upstream record — a comment line or a
+// whole frame, separator included — to the client and settles its parsed
+// usage and delivered lifecycle effects. Frames are dispatched whole: an
+// event is only decodable once its blank separator has arrived, so lines
+// of an unterminated frame are held back and only a decodable event
+// missing just the separator is salvaged on a boundary-aligned end
+// (apiformat.SSEFrameBuffer).
+func (rl *anthStreamRelay) writeFrame(blob []byte) {
+	if len(blob) == 0 {
+		return
+	}
+	delivered := rl.werr == nil
+	if delivered {
+		if _, e := rl.w.Write(blob); e != nil {
+			rl.werr, delivered = e, false
+		} else if rl.flusher != nil {
+			rl.flusher.Flush()
 		}
 	}
-	// Frames are dispatched whole: an event is only decodable once its
-	// blank separator has arrived, so lines of an unterminated frame are
-	// held back and only a decodable event missing just the separator is
-	// salvaged on a boundary-aligned end (apiformat.SSEFrameBuffer).
-	var frames apiformat.SSEFrameBuffer
-	writeFrame := func(blob []byte) {
-		if len(blob) == 0 {
-			return
-		}
-		delivered := werr == nil
+	// Usage is fed from what was read; lifecycle tracking only from
+	// what the client actually received.
+	for _, ev := range append(rl.parser.Feed(blob), rl.parser.Flush()...) {
+		rl.acc.note(ev)
 		if delivered {
-			if _, e := w.Write(blob); e != nil {
-				werr, delivered = e, false
-			} else if flusher != nil {
-				flusher.Flush()
-			}
-		}
-		// Usage is fed from what was read; lifecycle tracking only from
-		// what the client actually received.
-		for _, ev := range parser.Feed(blob) {
-			acc.note(ev)
-			if delivered {
-				track(ev)
-			}
+			rl.lifecycle.note(ev)
 		}
 	}
-	lr := apiformat.NewSSELineReader(reader, apiformat.SSEStreamLineLimit)
+}
+
+// drain pumps the upstream line reader until the stream ends: a
+// client-write failure (after the already-buffered paid bytes settle), an
+// oversized line or frame, an upstream break, a clean EOF, or the
+// authoritative delivered terminal.
+func (rl *anthStreamRelay) drain(lr *apiformat.SSELineReader) {
 	for {
-		if werr != nil && !lr.Buffered() {
+		if rl.werr != nil && !lr.Buffered() {
 			// The client write failed: stop pulling provider bytes — a
 			// streaming upstream on the live connection would keep doing
 			// paid work for a client that is gone. Frames already read
-			// still settle usage; the parser flush below applies the
-			// same delivered rule to lifecycle tracking.
+			// still settle usage; the settle flush below applies the
+			// same delivered rule to lifecycle tracking. No buffered
+			// bytes means nothing already-paid remains.
 			break
 		}
 		line, err := lr.ReadLine()
@@ -351,8 +559,8 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Us
 			// the parser emits it here, delivered or not. Otherwise it
 			// is dropped so the synthesis below composes at an event
 			// boundary.
-			if len(line) == 0 && frames.Salvageable() {
-				writeFrame(append(frames.Take(), '\r', '\n'))
+			if len(line) == 0 && rl.frames.Salvageable() {
+				rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
 			}
 			break
 		}
@@ -360,10 +568,10 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Us
 			// Keepalive comments ride no event: forward them immediately
 			// instead of frame-batching them; the buffer holds only
 			// field lines.
-			writeFrame(line)
+			rl.writeFrame(line)
 			continue
 		}
-		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
+		blank, overflow := rl.frames.Add(line, apiformat.SSEStreamLineLimit)
 		if overflow {
 			slog.Debug("native relay dropped oversized upstream frame", "limit_bytes", apiformat.SSEStreamLineLimit)
 			break
@@ -371,27 +579,52 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Us
 		if blank {
 			// Blank separator: the frame is complete — dispatch it whole,
 			// verbatim, separator included.
-			writeFrame(append(frames.Take(), line...))
+			rl.writeFrame(append(rl.frames.Take(), line...))
+			if rl.lifecycle.terminal() {
+				// The provider declared the authoritative terminal
+				// (message_stop ends the message; an error event closes
+				// the stream in-protocol): settle the known usage and
+				// stop pulling upstream bytes — a provider that holds
+				// the connection open after the final event must not
+				// delay the client's terminal or the facts commit on
+				// physical EOF. Post-terminal bytes are not part of the
+				// message, there is no re-dispatch, and the caller's
+				// deferred body close aborts the connection.
+				break
+			}
 		}
 	}
-	// The parser may still hold the last frame's event: a blob ending in
-	// a lone CR leaves its separator pending until the next bytes or this
-	// flush. Those bytes were written unless the client write already
-	// failed, so lifecycle tracking applies with the same delivered rule.
-	delivered := werr == nil
-	for _, ev := range parser.Flush() {
-		acc.note(ev)
+}
+
+// settle applies the drain's end: the parser's pending event (a blob
+// ending in a lone CR leaves the separator pending until this flush,
+// under the same delivered rule), the tail tracker's close of a torn last
+// event, and — only when no terminal was delivered — the synthesized
+// close of still-open content blocks.
+func (rl *anthStreamRelay) settle(tail *ssePassthroughTail) (provider.Usage, error) {
+	delivered := rl.werr == nil
+	for _, ev := range rl.parser.Flush() {
+		rl.acc.note(ev)
 		if delivered {
-			track(ev)
+			rl.lifecycle.note(ev)
 		}
 	}
 	// Close a torn tail (dangling line or cut mid-line) before the
 	// synthesized stop/error frames glue into it; no-op on whole-frame tails.
 	tail.complete()
-	if !sawStop && !sawError {
-		closeOpenAnthropicBlocks(w, flusher, open)
+	if !rl.lifecycle.terminal() {
+		closeOpenAnthropicBlocks(rl.w, rl.flusher, rl.lifecycle.open)
 	}
-	return acc.usage(), werr
+	return rl.acc.usage(), rl.werr
+}
+
+func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Usage, err error) {
+	// The relay writes through the tail tracker so a torn last event is
+	// closed before the synthesized terminal frames compose (chat F2 canon).
+	tail := &ssePassthroughTail{w: w}
+	rl := newAnthStreamRelay(tail)
+	rl.drain(apiformat.NewSSELineReader(bufio.NewReader(body), apiformat.SSEStreamLineLimit))
+	return rl.settle(tail)
 }
 
 // closeOpenAnthropicBlocks terminates a truncated native stream: every
@@ -439,7 +672,7 @@ type anthStreamUsage struct {
 }
 
 func (u *anthStreamUsage) note(ev apiformat.SSEEvent) {
-	name := ev.Event
+	name := nativeEventName(ev)
 	if name != "message_start" && name != "message_delta" {
 		return
 	}
