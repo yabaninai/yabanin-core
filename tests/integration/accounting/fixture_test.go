@@ -3,6 +3,7 @@
 package accounting
 
 import (
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"net"
@@ -43,6 +44,7 @@ type fixtureBody struct {
 	Model    string `json:"model"`
 	Stream   bool   `json:"stream"`
 	Input    any    `json:"input"`
+	Prompt   string `json:"prompt"`
 	Messages []struct {
 		Role    string `json:"role"`
 		Content string `json:"content"`
@@ -194,6 +196,10 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		f.serveModerationsJSON(w, rid, body.Model, r.URL.Path)
 	case "/v1/rerank":
 		f.serveRerankJSON(w, rid, body.Model, r.URL.Path)
+	case "/v1/images/generations":
+		f.serveImagesJSON(w, rid, body.Model, r.URL.Path)
+	case "/v1/realtime":
+		f.serveRealtimeStream(w, rid, body.Model, r.URL.Path)
 	default:
 		// Chat-completions protocol, buffered or SSE: the default
 		// upstream family, including chat-adapted /v1/responses traffic.
@@ -347,6 +353,79 @@ func (f *fixture) serveResponsesStream(w http.ResponseWriter, rid, model, path s
 func responsesFrame(event string, payload any) string {
 	data, _ := json.Marshal(payload)
 	return "event: " + event + "\ndata: " + string(data) + "\n\n"
+}
+
+// fixtureImageB64 is the deterministic base64 payload returned for image
+// generations: 16 opaque bytes. The accounting contract only needs a
+// non-empty decodable payload plus the known usage block.
+var fixtureImageB64 = func() string {
+	raw := []byte("fixture-image-bytes")
+	return base64.StdEncoding.EncodeToString(raw)
+}()
+
+// serveImagesJSON delivers a protocol-valid images-generation reply: a
+// created stamp, one b64_json datum and the known token usage block
+// (images_endpoint.go parses exactly this shape; unpriced replies fall
+// back to per-image catalog rates, which the fixture avoids by always
+// carrying usage).
+func (f *fixture) serveImagesJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"created": time.Now().Unix(),
+		"data": []map[string]any{
+			{"b64_json": fixtureImageB64},
+		},
+		"usage": map[string]any{
+			"input_tokens":  fixturePromptTokens,
+			"output_tokens": fixtureCompletionTokens,
+			"total_tokens":  fixturePromptTokens + fixtureCompletionTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: images write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveRealtimeStream delivers a protocol-valid realtime SSE session:
+// response.created, one output_text.delta and the terminal response.done
+// whose NESTED response.usage carries the known input/output tokens —
+// the exact branch realtimeUsageFromEvent parses for realtime sessions.
+// No [DONE] sentinel: the gateway relays the session byte-honestly.
+func (f *fixture) serveRealtimeStream(w http.ResponseWriter, rid, model, path string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		responsesFrame("response.created", map[string]any{
+			"type":     "response.created",
+			"response": map[string]any{"id": "resp-rt-fixture-" + rid, "status": "in_progress"},
+		}),
+		responsesFrame("response.output_text.delta", map[string]any{
+			"type":  "response.output_text.delta",
+			"delta": fixtureAssistantContent,
+		}),
+		responsesFrame("response.done", map[string]any{
+			"type": "response.done",
+			"response": map[string]any{
+				"id": "resp-rt-fixture-" + rid, "status": "completed",
+				"usage": map[string]any{"input_tokens": fixturePromptTokens, "output_tokens": fixtureCompletionTokens},
+			},
+		}),
+	}
+	for _, frame := range frames {
+		if _, err := w.Write([]byte(frame)); err != nil {
+			f.t.Logf("fixture: realtime stream write failed for %s (client gone): %v", rid, err)
+			return
+		}
+		flusher.Flush()
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
 }
 
 // serveCompletionsJSON delivers a protocol-valid legacy text-completion
