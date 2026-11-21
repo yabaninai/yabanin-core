@@ -216,6 +216,9 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.serveAccepted(w, r.URL.Path, rid, body)
 }
 
+// serveAccepted routes an authenticated, dispatched request to its
+// protocol family. Streaming-capable families stay here; the simple JSON
+// families continue in serveAcceptedExtra.
 func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fixtureBody) {
 	switch path {
 	case "/v1/audio/speech":
@@ -223,17 +226,18 @@ func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fi
 	case "/v1/embeddings":
 		f.serveEmbeddings(w, rid, body.Model, path)
 	case "/v1/responses":
-		if body.Stream {
-			f.serveResponsesStream(w, rid, body.Model, path)
-			return
-		}
-		f.serveResponsesJSON(w, rid, body.Model, path)
+		f.serveResponses(w, rid, body.Model, path, body.Stream)
 	case "/v1/messages":
-		if body.Stream {
-			f.serveMessagesStream(w, rid, body.Model, path)
-			return
-		}
-		f.serveMessagesJSON(w, rid, body.Model, path)
+		f.serveMessages(w, rid, body.Model, path, body.Stream)
+	default:
+		f.serveAcceptedExtra(w, path, rid, body)
+	}
+}
+
+// serveAcceptedExtra continues routing for the simple JSON families;
+// chat remains the default surface.
+func (f *fixture) serveAcceptedExtra(w http.ResponseWriter, path, rid string, body fixtureBody) {
+	switch path {
 	case "/v1/completions":
 		f.serveCompletionsJSON(w, rid, body.Model, path)
 	case "/v1/moderations":
@@ -247,6 +251,24 @@ func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fi
 	default:
 		f.serveChat(w, rid, path, body)
 	}
+}
+
+// serveResponses and serveMessages split the buffered and streaming
+// variants of each native surface, mirroring serveChat.
+func (f *fixture) serveResponses(w http.ResponseWriter, rid, model, path string, stream bool) {
+	if stream {
+		f.serveResponsesStream(w, rid, model, path)
+		return
+	}
+	f.serveResponsesJSON(w, rid, model, path)
+}
+
+func (f *fixture) serveMessages(w http.ResponseWriter, rid, model, path string, stream bool) {
+	if stream {
+		f.serveMessagesStream(w, rid, model, path)
+		return
+	}
+	f.serveMessagesJSON(w, rid, model, path)
 }
 
 func (f *fixture) serveChat(w http.ResponseWriter, rid, path string, body fixtureBody) {
