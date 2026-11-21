@@ -864,6 +864,13 @@ func (f *fixture) append(name string, rec fixtureRecord) {
 	default:
 		panic(fmt.Sprintf("fixture: unknown ledger %q", name))
 	}
+	f.mirrorLedgerLine(name, rec)
+}
+
+// mirrorLedgerLine appends one record as a JSONL line to the ledger's
+// evidence file. The first failure is latched into writeErr so
+// VerifyEvidence reports it; later failures stay silent. Callers hold f.mu.
+func (f *fixture) mirrorLedgerLine(name string, rec fixtureRecord) {
 	line, err := json.Marshal(rec)
 	if err != nil {
 		if f.writeErr == nil {
