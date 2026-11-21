@@ -23,7 +23,6 @@ func postEmbeddings(t *testing.T, gw *gateway, body string) *httptest.ResponseRe
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/embeddings", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -50,7 +49,7 @@ func TestEmbeddings_HappyPathUsageAndEvent(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": info},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -74,7 +73,7 @@ func TestEmbeddings_UnsupportedProvider(t *testing.T) {
 	gw := &gateway{
 		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key"},
 		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:  stubModelResolver{"m": {ModelName: "m", Provider: "anthropic", Enabled: true}},
 	}
 	rec := postEmbeddings(t, gw, `{"model":"m","input":"hello"}`)
@@ -98,7 +97,7 @@ func TestEmbeddings_WhitelistDeny(t *testing.T) {
 	gw := &gateway{
 		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key"},
 		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:  stubModelResolver{"m": {ModelName: "m", Provider: "openai", Enabled: true}},
 		wl:   fakeAccess{allowed: false},
 	}
@@ -116,7 +115,7 @@ func TestEmbeddings_Upstream500(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -150,7 +149,7 @@ func TestEmbeddings_EstimatedUsage(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -178,7 +177,7 @@ func TestEmbeddings_BodyTooLargeThroughMaxBody(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": info},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -189,7 +188,6 @@ func TestEmbeddings_BodyTooLargeThroughMaxBody(t *testing.T) {
 
 	big := `{"model":"m","input":"` + strings.Repeat("a", 10*1024*1024) + `"}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/embeddings", strings.NewReader(big))
-	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -214,7 +212,7 @@ func TestEmbeddings_OversizedResponse(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": info},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -242,7 +240,7 @@ func TestEmbeddings_AtCapResponsePasses(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": info},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},

@@ -9,6 +9,8 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -353,7 +355,6 @@ func TestRealtime_ClientCancelSettlesConsumedPrefix(t *testing.T) {
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/realtime", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -397,5 +398,112 @@ func TestRealtime_ClientCancelSettlesConsumedPrefix(t *testing.T) {
 	}
 	if !strings.Contains(rec.Body.String(), "input_tokens") {
 		t.Fatalf("consumed prefix not relayed: %q", rec.Body.String())
+	}
+}
+
+// realtimeBoundaryWire mirrors the durable-accounting integration
+// boundary shapes (tests/integration/accounting, commit 182e218): a
+// single completed response whose terminal frame exceeds the hold's
+// 1 MiB RAM window (temp-file spill path), a completed response
+// followed by trailing metadata, and two completed responses in one
+// session. Every response.done carries usage 7/3 with status
+// completed, so each shape arms the terminal hold.
+func realtimeBoundaryWire(t *testing.T, shape string) string {
+	t.Helper()
+	response := func(id, text string) string {
+		created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
+		delta := `{"type":"response.output_text.delta","delta":"assistant text"}`
+		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":7,"output_tokens":3}}}`, id, text)
+		return "event: response.created\ndata: " + created + "\n\n" +
+			"event: response.output_text.delta\ndata: " + delta + "\n\n" +
+			"event: response.done\ndata: " + done + "\n\n"
+	}
+	switch shape {
+	case "large":
+		return response("first", strings.Repeat("a", (1<<20)+1))
+	case "trailing":
+		return response("first", "one") +
+			"event: rate_limits.updated\ndata: {\"type\":\"rate_limits.updated\",\"rate_limits\":[]}\n\n"
+	case "multiple":
+		return response("first", "one") + response("second", "two")
+	default:
+		t.Fatalf("unknown realtime boundary shape %q", shape)
+		return ""
+	}
+}
+
+// TestRealtime_TerminalBoundaryHoldShapes pins the terminal hold at the
+// gateway level for every boundary shape: a healthy facts commit
+// replays the deferred suffix byte-for-byte after it lands (7/3
+// terminal facts, stream admission), while a facts-commit failure
+// withholds every completed terminal and closes the stream with
+// accounting_commit_failed followed by [DONE] — the client never sees
+// a success terminator for an unaccounted session.
+func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
+	for _, shape := range []string{"large", "trailing", "multiple"} {
+		for _, commitFails := range []bool{false, true} {
+			name := shape + "/healthy"
+			if commitFails {
+				name = shape + "/facts-failure"
+			}
+			t.Run(name, func(t *testing.T) {
+				wire := realtimeBoundaryWire(t, shape)
+				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					w.Header().Set("Content-Type", "text/event-stream")
+					_, _ = w.Write([]byte(wire))
+				}))
+				defer server.Close()
+
+				store := &fakeInvocationStore{}
+				if commitFails {
+					store.factsErr = errors.New("terminal facts insert failed")
+				}
+				gw := r105TestGateway(t, realtimeTestModel(server.URL))
+				gw.invocations = store
+
+				rec := postR105(t, gw, "/v1/realtime", `{"model":"m","input":"boundary"}`, nil)
+				if rec.Code != http.StatusOK {
+					t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
+				}
+				if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
+					t.Fatalf("content type %q", got)
+				}
+				if len(store.admitted) != 1 {
+					t.Fatalf("admissions: %d, want 1", len(store.admitted))
+				}
+				if store.admitted[0].Kind != invocationKindStream {
+					t.Fatalf("admission kind %q, want %q", store.admitted[0].Kind, invocationKindStream)
+				}
+				if store.factsCalls == 0 {
+					t.Fatal("terminal facts were never committed")
+				}
+				body := rec.Body.String()
+				if commitFails {
+					if strings.Contains(body, `"type":"response.done"`) {
+						t.Fatal("a completed terminal reached the client despite the facts-commit failure")
+					}
+					if !strings.Contains(body, accountingCommitFailedCode) {
+						t.Fatalf("no accounting_commit_failed frame in body %q", body)
+					}
+					if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+						t.Fatalf("stream does not end with [DONE]: %q", body)
+					}
+					return
+				}
+				if body != wire {
+					t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+				}
+				if len(store.facts) != 1 {
+					t.Fatalf("terminal facts rows: %d, want 1", len(store.facts))
+				}
+				f := store.facts[0]
+				if f.Kind != invocationKindStream || f.OrgID != "org-test" {
+					t.Fatalf("facts kind/org: %+v", f)
+				}
+				if f.Fields["tokens_in"] != "7" || f.Fields["tokens_out"] != "3" {
+					t.Fatalf("facts tokens %q/%q, want 7/3", f.Fields["tokens_in"], f.Fields["tokens_out"])
+				}
+			})
+		}
 	}
 }

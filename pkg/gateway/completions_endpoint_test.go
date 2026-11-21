@@ -22,7 +22,6 @@ func postCompletions(t *testing.T, gw *gateway, body string) *httptest.ResponseR
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -50,7 +49,7 @@ func TestCompletions_NonStreamSuffixAndEvent(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -90,7 +89,7 @@ func TestCompletions_StreamPassthroughSuppressesUsage(t *testing.T) {
 	gw := &gateway{
 		cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:                  slog.Default(),
-		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool:                 upstream.NewPool(upstream.Options{}),
 		invocations:          &fakeInvocationStore{},
@@ -143,7 +142,7 @@ func TestCompletions_StreamOutlivesTimeout(t *testing.T) {
 			gw := &gateway{
 				cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 				log:                  slog.Default(),
-				auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+				auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 				res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, UpstreamTimeout: tc.upstreamTimeout, Enabled: true}},
 				pool:                 upstream.NewPool(upstream.Options{}),
 				invocations:          &fakeInvocationStore{},
@@ -172,7 +171,7 @@ func TestCompletions_NonStreamUpstreamTimeout(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, UpstreamTimeout: time.Second, Enabled: true}},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -299,7 +298,7 @@ func TestCompletions_JSON_CachedTokensHitHeader(t *testing.T) {
 	gw := &gateway{
 		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:         stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool:        upstream.NewPool(upstream.Options{}),
 		invocations: &fakeInvocationStore{},
@@ -342,7 +341,7 @@ func TestCompletions_JSON_ClientHint_BillFollowsProviderCacheOnly(t *testing.T) 
 		gw := &gateway{
 			cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 			log:         slog.Default(),
-			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 			res:         stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 			pool:        upstream.NewPool(upstream.Options{}),
 			invocations: &fakeInvocationStore{},
@@ -383,7 +382,7 @@ func TestCompletions_JSON_ClientHint_BillFollowsProviderCacheOnly(t *testing.T) 
 		gw := &gateway{
 			cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 			log:         slog.Default(),
-			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 			res:         stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 			pool:        upstream.NewPool(upstream.Options{}),
 			invocations: &fakeInvocationStore{},
@@ -454,7 +453,7 @@ func TestCompletions_Stream_ClientHint_TrailerAndBillFollowProviderCacheOnly(t *
 			gw := &gateway{
 				cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
 				log:                  slog.Default(),
-				auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+				auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 				res:                  stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 				pool:                 upstream.NewPool(upstream.Options{}),
 				invocations:          &fakeInvocationStore{},
