@@ -701,6 +701,7 @@ func (s *stand) killGatewaySIGKILL() {
 		s.t.Fatal("harness: gateway did not exit after SIGKILL")
 	}
 	s.gatewayCmd = nil
+	s.fixture.waitForHeldDisconnects()
 	s.t.Logf("harness: gateway killed; storage and loggerd untouched")
 }
 

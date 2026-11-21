@@ -35,7 +35,7 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 
 	rid := s.reqPrefix + "tgt-unresolved"
 	before := s.fixture.Snapshot()
-	disconnected := s.fixture.Hold(rid)
+	s.fixture.Hold(rid)
 
 	type chatResult struct {
 		status int
@@ -81,7 +81,7 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	// client path. The dispatch stands; the receipt never lands (the dead
 	// gateway cannot receive the provider's bytes).
 	s.killGatewaySIGKILL()
-	s.fixture.releaseAfterDisconnect(disconnected)
+	s.fixture.ReleaseAll()
 	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 0 {
 		t.Fatalf("target: ledger after crash arr/disp/recv = %d/%d/%d, want 1/1/0 (dispatch stands, client gone)", delta.arrivals, delta.dispatches, delta.receipts)
 	}

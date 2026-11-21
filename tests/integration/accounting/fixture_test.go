@@ -729,23 +729,32 @@ func (f *fixture) waitForResponseRelease(r *http.Request, rid string) bool {
 	}
 }
 
-// Hold arms the response barrier and returns the peer-disconnect observation.
-func (f *fixture) Hold(rid string) <-chan struct{} {
+// Hold arms the response barrier for rid.
+func (f *fixture) Hold(rid string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	if f.hold[rid] == nil {
 		f.hold[rid] = &responseHold{release: make(chan struct{}), disconnected: make(chan struct{})}
 	}
-	return f.hold[rid].disconnected
 }
 
-func (f *fixture) releaseAfterDisconnect(disconnected <-chan struct{}) {
+// waitForHeldDisconnects synchronizes SIGKILL with the upstream peer before
+// any test can release a held response. A socket write alone cannot prove
+// that the gateway was still alive to receive it.
+func (f *fixture) waitForHeldDisconnects() {
 	f.t.Helper()
-	select {
-	case <-disconnected:
-		f.ReleaseAll()
-	case <-time.After(10 * time.Second):
-		f.t.Fatal("fixture: provider did not observe peer disconnect while response was held")
+	f.mu.Lock()
+	var held []*responseHold
+	for _, hold := range f.hold {
+		held = append(held, hold)
+	}
+	f.mu.Unlock()
+	for _, hold := range held {
+		select {
+		case <-hold.disconnected:
+		case <-time.After(10 * time.Second):
+			f.t.Fatal("fixture: provider did not observe peer disconnect while response was held")
+		}
 	}
 }
 

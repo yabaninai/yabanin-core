@@ -165,7 +165,7 @@ func TestFixtureHeldPeerDisconnect(t *testing.T) {
 	f := startFixture(t, t.TempDir(), "unit-token")
 	t.Cleanup(f.stop)
 	const rid = "held-cancelled"
-	disconnected := f.Hold(rid)
+	f.Hold(rid)
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.baseURL()+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
@@ -186,13 +186,20 @@ func TestFixtureHeldPeerDisconnect(t *testing.T) {
 		t.Fatal("request never reached the held provider")
 	}
 	cancel()
-	f.releaseAfterDisconnect(disconnected)
+	f.waitForHeldDisconnects()
+	f.ReleaseAll()
 	if err := <-done; err == nil {
 		t.Fatal("held request received a response after cancellation")
 	}
 	if a, d, r := f.Counts(rid); a != 1 || d != 1 || r != 0 {
 		t.Fatalf("cancelled request arrivals/dispatches/receipts = %d/%d/%d, want 1/1/0", a, d, r)
 	}
+	requireHealthyFixtureRetry(t, f, rid)
+	f.VerifyEvidence()
+}
+
+func requireHealthyFixtureRetry(t *testing.T, f *fixture, rid string) {
+	t.Helper()
 	// A new invocation with the same correlation must proceed normally after
 	// the disconnected one, as in the client-retry recovery scenario.
 	status, _, err := httpPostJSON(5*time.Second, f.baseURL()+"/v1/chat/completions", "unit-token", rid, `{"model":"m"}`)
@@ -202,5 +209,4 @@ func TestFixtureHeldPeerDisconnect(t *testing.T) {
 	if a, d, r := f.Counts(rid); a != 2 || d != 2 || r != 1 {
 		t.Fatalf("after healthy retry arrivals/dispatches/receipts = %d/%d/%d, want 2/2/1", a, d, r)
 	}
-	f.VerifyEvidence()
 }

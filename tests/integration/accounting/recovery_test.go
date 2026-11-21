@@ -34,7 +34,7 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	s.controlRequest(t, "pre-crash")
 
 	rid := s.reqPrefix + "tgt-recovery"
-	disconnected := s.fixture.Hold(rid)
+	s.fixture.Hold(rid)
 
 	type chatResult struct {
 		status int
@@ -72,7 +72,7 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 
 	// Release the held response: the dead gateway cannot receive it. The
 	// dispatch stands, the client gets its connection torn down.
-	s.fixture.releaseAfterDisconnect(disconnected)
+	s.fixture.ReleaseAll()
 	select {
 	case r := <-result:
 		if r.err == nil && r.status == httpOK {

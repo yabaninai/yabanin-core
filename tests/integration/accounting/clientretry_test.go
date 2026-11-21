@@ -38,7 +38,7 @@ func TestAccountingCrashClientRetrySingleCharge(t *testing.T) {
 
 	rid := s.reqPrefix + "tgt-redelivery"
 	before := s.fixture.Snapshot()
-	disconnected := s.fixture.Hold(rid)
+	s.fixture.Hold(rid)
 
 	type chatResult struct {
 		status int
@@ -73,7 +73,7 @@ func TestAccountingCrashClientRetrySingleCharge(t *testing.T) {
 
 	// Crash invocation 1 mid-flight (after dispatch, before finalize).
 	s.killGatewaySIGKILL()
-	s.fixture.releaseAfterDisconnect(disconnected)
+	s.fixture.ReleaseAll()
 	select {
 	case r := <-clientDone:
 		if r.err == nil && r.status == httpOK {

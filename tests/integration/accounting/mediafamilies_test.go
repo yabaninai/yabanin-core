@@ -504,7 +504,7 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 
 	speech := mediaFamilies()[0]
 	rid := s.reqPrefix + "tgt-media-recovery"
-	disconnected := s.fixture.Hold(rid)
+	s.fixture.Hold(rid)
 
 	result := make(chan mediaReply, 1)
 	go func() {
@@ -534,7 +534,7 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 	s.killGatewaySIGKILL()
 
 	// Release the held response: the dead gateway cannot receive it.
-	s.fixture.releaseAfterDisconnect(disconnected)
+	s.fixture.ReleaseAll()
 	select {
 	case r := <-result:
 		if r.err == nil && r.status == httpOK {
