@@ -72,12 +72,59 @@ func (s *Store) CreateRequestPayloadGrant(orgID, requestID, rootID string, ttl t
 // CreateRequestPayloadGrantScope stores a one-time grant for exactly one
 // payload scope. Original access is a distinct capability and is never
 // implied by payload.read.
-func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope string, ttl time.Duration, now time.Time) (RequestPayloadGrant, error) {
+// validateRequestPayloadGrantIssue enforces the static issue contract:
+// non-empty parties, a bounded TTL and a known scope.
+func validateRequestPayloadGrantIssue(orgID, requestID, rootID, scope string, ttl time.Duration) error {
 	if orgID == "" || requestID == "" || rootID == "" || ttl <= 0 || ttl > MaxRequestPayloadGrantTTL {
-		return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
+		return ErrInvalidRequestPayloadGrant
 	}
 	if scope != RequestPayloadScopeRead && scope != RequestPayloadScopeOriginals {
-		return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
+		return ErrInvalidRequestPayloadGrant
+	}
+	return nil
+}
+
+// enforceActiveRequestGrantCap denies issuance past the per-root active
+// budget, counted inside the issuance transaction.
+func enforceActiveRequestGrantCap(ctx context.Context, tx auditTx, rootID string, now time.Time) error {
+	var active int
+	if err := tx.QueryRow(ctx, `SELECT count(*) FROM request_payload_grants WHERE grantor_root=$1::uuid AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > $2`, rootID, now).Scan(&active); err != nil {
+		return fmt.Errorf("count active payload grants: %w", err)
+	}
+	if active >= MaxActiveRequestGrants {
+		return ErrInvalidRequestPayloadGrant
+	}
+	return nil
+}
+
+// resolveRequestPayloadGrantTarget binds a new grant to exactly one physical
+// request_logs row: the client correlation alone is not row identity (0028
+// allows two invocations to share it), so issuance resolves the carrier
+// inside the same locked transaction and refuses fail-closed when the
+// target is gone or ambiguous rather than minting an addressable-wider
+// grant.
+func resolveRequestPayloadGrantTarget(ctx context.Context, tx auditTx, orgID, requestID string) (int64, error) {
+	var carriers int
+	var rowKey int64
+	if err := tx.QueryRow(ctx, `SELECT count(*), COALESCE(MIN(id), 0) FROM request_logs WHERE org_id=$1::uuid AND request_id=$2`, orgID, requestID).Scan(&carriers, &rowKey); err != nil {
+		return 0, fmt.Errorf("resolve payload grant target: %w", err)
+	}
+	switch {
+	case carriers == 0:
+		return 0, ErrRequestPayloadGrantTargetMissing
+	case carriers > 1:
+		return 0, ErrRequestPayloadGrantTargetAmbiguous
+	}
+	return rowKey, nil
+}
+
+// CreateRequestPayloadGrantScope issues a durable single-request bearer
+// grant bound to exactly one physical request_logs row. Issuance refuses
+// fail-closed when the target is gone or ambiguous rather than minting an
+// addressable-wider grant.
+func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope string, ttl time.Duration, now time.Time) (RequestPayloadGrant, error) {
+	if err := validateRequestPayloadGrantIssue(orgID, requestID, rootID, scope, ttl); err != nil {
+		return RequestPayloadGrant{}, err
 	}
 	if s == nil || s.db == nil {
 		return RequestPayloadGrant{}, ErrRequestPayloadGrantUnavailable
@@ -97,30 +144,13 @@ func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope s
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, rootID); err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("lock payload grants: %w", err)
 	}
-	var active int
-	if err := tx.QueryRow(ctx, `SELECT count(*) FROM request_payload_grants WHERE grantor_root=$1::uuid AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > $2`, rootID, now).Scan(&active); err != nil {
-		return RequestPayloadGrant{}, fmt.Errorf("count active payload grants: %w", err)
+	if err := enforceActiveRequestGrantCap(ctx, tx, rootID, now); err != nil {
+		return RequestPayloadGrant{}, err
 	}
-	if active >= MaxActiveRequestGrants {
-		return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
+	if grant.RowKey, err = resolveRequestPayloadGrantTarget(ctx, tx, orgID, requestID); err != nil {
+		return RequestPayloadGrant{}, err
 	}
-	// Bind the grant to exactly one physical request_logs row: the client
-	// correlation alone is not row identity (0028 allows two invocations to
-	// share it), so issuance resolves the carrier inside the same locked
-	// transaction and refuses fail-closed when the target is gone or
-	// ambiguous rather than minting an addressable-wider grant.
-	var carriers int
-	if err := tx.QueryRow(ctx, `SELECT count(*), COALESCE(MIN(id), 0) FROM request_logs WHERE org_id=$1::uuid AND request_id=$2`, orgID, requestID).Scan(&carriers, &grant.RowKey); err != nil {
-		return RequestPayloadGrant{}, fmt.Errorf("resolve payload grant target: %w", err)
-	}
-	switch {
-	case carriers == 0:
-		return RequestPayloadGrant{}, ErrRequestPayloadGrantTargetMissing
-	case carriers > 1:
-		return RequestPayloadGrant{}, ErrRequestPayloadGrantTargetAmbiguous
-	}
-	_, err = tx.Exec(ctx, `INSERT INTO request_payload_grants (id, token_hash, grantor_root, grantee, org_id, request_id, request_row_key, scope, expires_at, created_at) VALUES ($1::uuid, $2, $3::uuid, $3::uuid, $4::uuid, $5, $6::bigint, $7, $8, $9)`, grant.ID, hash[:], rootID, orgID, requestID, grant.RowKey, grant.Scope, grant.ExpiresAt, now)
-	if err != nil {
+	if _, err = tx.Exec(ctx, `INSERT INTO request_payload_grants (id, token_hash, grantor_root, grantee, org_id, request_id, request_row_key, scope, expires_at, created_at) VALUES ($1::uuid, $2, $3::uuid, $3::uuid, $4::uuid, $5, $6::bigint, $7, $8, $9)`, grant.ID, hash[:], rootID, orgID, requestID, grant.RowKey, grant.Scope, grant.ExpiresAt, now); err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("persist payload grant: %w", err)
 	}
 	if err := tx.Commit(ctx); err != nil {
