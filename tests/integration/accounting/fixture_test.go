@@ -29,7 +29,25 @@ const (
 	// zero-markup resale provisioning, the wallet debit equals this value
 	// (signed negative), not a marked-up retail price.
 	fixtureMicroUSDCost = 7*2 + 3*6
+
+	// fixtureEmbedDims is the vector dimension of fixture embeddings
+	// replies. The value is arbitrary but fixed: the family controls
+	// assert protocol shape, not vector semantics.
+	fixtureEmbedDims = 8
 )
+
+// fixtureBody is the superset request probe the fixture decodes for every
+// route. Fields beyond the chat trio feed the non-chat dispatch families
+// (embeddings input, native Responses input/stream).
+type fixtureBody struct {
+	Model    string `json:"model"`
+	Stream   bool   `json:"stream"`
+	Input    any    `json:"input"`
+	Messages []struct {
+		Role    string `json:"role"`
+		Content string `json:"content"`
+	} `json:"messages"`
+}
 
 // fixtureRecord is one ledger entry. Arrival entries are written for every
 // request that reaches the provider over the wire — including unauthorized
@@ -143,16 +161,13 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	var body struct {
-		Model    string `json:"model"`
-		Stream   bool   `json:"stream"`
-		Messages []struct {
-			Role    string `json:"role"`
-			Content string `json:"content"`
-		} `json:"messages"`
-	}
+	var body fixtureBody
 	if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 		http.Error(w, "invalid body", http.StatusBadRequest)
+		return
+	}
+	if body.Model == "" {
+		http.Error(w, "model is required", http.StatusBadRequest)
 		return
 	}
 
@@ -164,16 +179,39 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		<-ch
 	}
 
-	if body.Stream {
-		f.serveStream(w, rid, body.Model, r.URL.Path)
-		return
+	switch r.URL.Path {
+	case "/v1/embeddings":
+		f.serveEmbeddings(w, rid, body.Model, r.URL.Path)
+	case "/v1/responses":
+		if body.Stream {
+			f.serveResponsesStream(w, rid, body.Model, r.URL.Path)
+			return
+		}
+		f.serveResponsesJSON(w, rid, body.Model, r.URL.Path)
+	case "/v1/completions":
+		f.serveCompletionsJSON(w, rid, body.Model, r.URL.Path)
+	case "/v1/moderations":
+		f.serveModerationsJSON(w, rid, body.Model, r.URL.Path)
+	case "/v1/rerank":
+		f.serveRerankJSON(w, rid, body.Model, r.URL.Path)
+	default:
+		// Chat-completions protocol, buffered or SSE: the default
+		// upstream family, including chat-adapted /v1/responses traffic.
+		if body.Stream {
+			f.serveStream(w, rid, body.Model, r.URL.Path)
+			return
+		}
+		f.serveChatJSON(w, rid, body.Model, r.URL.Path)
 	}
+}
 
+// serveChatJSON delivers the buffered chat-completions reply.
+func (f *fixture) serveChatJSON(w http.ResponseWriter, rid, model, path string) {
 	resp := map[string]any{
 		"id":      "chatcmpl-fixture-" + rid,
 		"object":  "chat.completion",
 		"created": time.Now().Unix(),
-		"model":   body.Model,
+		"model":   model,
 		"choices": []map[string]any{{
 			"index":         0,
 			"message":       map[string]any{"role": "assistant", "content": fixtureAssistantContent},
@@ -193,7 +231,199 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		f.t.Logf("fixture: response write failed for %s (client gone): %v", rid, err)
 		return
 	}
-	f.append("receipts", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: true})
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveEmbeddings delivers a protocol-valid openai-compat embeddings
+// reply: a list object whose data entries carry fixed-dimension vectors,
+// with the known input-token usage. Embeddings have no generated output,
+// mirroring the product's out_cap=0 reservation bound for the family.
+func (f *fixture) serveEmbeddings(w http.ResponseWriter, rid, model, path string) {
+	vec := make([]float64, fixtureEmbedDims)
+	for i := range vec {
+		vec[i] = float64(i) / 10
+	}
+	resp := map[string]any{
+		"object": "list",
+		"model":  model,
+		"data": []map[string]any{
+			{"object": "embedding", "index": 0, "embedding": vec},
+			{"object": "embedding", "index": 1, "embedding": vec},
+		},
+		"usage": map[string]any{
+			"prompt_tokens": fixturePromptTokens,
+			"total_tokens":  fixturePromptTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: embeddings write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveResponsesJSON delivers a protocol-valid native Responses reply:
+// one completed response object with a message output item carrying the
+// fixture text, and the known input/output token usage at the top level.
+func (f *fixture) serveResponsesJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"id":         "resp-fixture-" + rid,
+		"object":     "response",
+		"created_at": time.Now().Unix(),
+		"status":     "completed",
+		"model":      model,
+		"output": []map[string]any{{
+			"type": "message",
+			"id":   "msg-fixture-" + rid,
+			"role": "assistant",
+			"content": []map[string]any{{
+				"type":        "output_text",
+				"text":        fixtureAssistantContent,
+				"annotations": []any{},
+			}},
+		}},
+		"usage": map[string]any{
+			"input_tokens":  fixturePromptTokens,
+			"output_tokens": fixtureCompletionTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: responses write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveResponsesStream delivers the native Responses family as SSE: a
+// response.created event (input-token prefix usage, so a mid-stream break
+// still bills the prefix), one output_text delta, and the terminal
+// response.completed event carrying the full known usage. The stream ends
+// after the terminal event — the Responses protocol has no [DONE]
+// sentinel — so a clean EOF is the expected drain end. The receipt ledger
+// entry is appended only after every frame was written successfully,
+// keeping the ledgers comparable across families and delivery modes.
+func (f *fixture) serveResponsesStream(w http.ResponseWriter, rid, model, path string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		responsesFrame("response.created", map[string]any{
+			"type": "response.created",
+			"response": map[string]any{
+				"id": "resp-fixture-" + rid, "object": "response", "status": "in_progress", "model": model,
+				"usage": map[string]any{"input_tokens": fixturePromptTokens, "output_tokens": 0},
+			},
+		}),
+		responsesFrame("response.output_text.delta", map[string]any{
+			"type":  "response.output_text.delta",
+			"delta": fixtureAssistantContent,
+		}),
+		responsesFrame("response.completed", map[string]any{
+			"type": "response.completed",
+			"response": map[string]any{
+				"id": "resp-fixture-" + rid, "object": "response", "status": "completed", "model": model,
+				"usage": map[string]any{"input_tokens": fixturePromptTokens, "output_tokens": fixtureCompletionTokens},
+			},
+		}),
+	}
+	for _, frame := range frames {
+		if _, err := w.Write([]byte(frame)); err != nil {
+			f.t.Logf("fixture: responses stream write failed for %s (client gone): %v", rid, err)
+			return
+		}
+		flusher.Flush()
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// responsesFrame encodes one named SSE event from a JSON payload.
+func responsesFrame(event string, payload any) string {
+	data, _ := json.Marshal(payload)
+	return "event: " + event + "\ndata: " + string(data) + "\n\n"
+}
+
+// serveCompletionsJSON delivers a protocol-valid legacy text-completion
+// reply with the known usage.
+func (f *fixture) serveCompletionsJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"id":      "cmpl-fixture-" + rid,
+		"object":  "text_completion",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []map[string]any{{
+			"index":         0,
+			"text":          fixtureAssistantContent,
+			"finish_reason": "stop",
+		}},
+		"usage": map[string]any{
+			"prompt_tokens":     fixturePromptTokens,
+			"completion_tokens": fixtureCompletionTokens,
+			"total_tokens":      fixturePromptTokens + fixtureCompletionTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: completions write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveModerationsJSON delivers a protocol-valid moderations reply: one
+// unflagged result per input with the known input-token usage.
+func (f *fixture) serveModerationsJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"id":    "mod-fixture-" + rid,
+		"model": model,
+		"results": []map[string]any{
+			{"index": 0, "flagged": false, "categories": map[string]bool{}, "category_scores": map[string]float64{}},
+			{"index": 1, "flagged": false, "categories": map[string]bool{}, "category_scores": map[string]float64{}},
+		},
+		"usage": map[string]any{
+			"prompt_tokens": fixturePromptTokens,
+			"total_tokens":  fixturePromptTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: moderations write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveRerankJSON delivers a protocol-valid rerank reply: relevance
+// scores plus the known input-token usage (rerank has no generated
+// output).
+func (f *fixture) serveRerankJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"id":    "rr-fixture-" + rid,
+		"model": model,
+		"results": []map[string]any{
+			{"index": 0, "relevance_score": 0.98},
+			{"index": 1, "relevance_score": 0.42},
+		},
+		"usage": map[string]any{
+			"prompt_tokens": fixturePromptTokens,
+			"total_tokens":  fixturePromptTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: rerank write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
 }
 
 // serveStream delivers the same fixed completion as server-sent-events
@@ -307,6 +537,22 @@ func (f *fixture) Counts(rid string) (arrivals, dispatches, receipts int) {
 		return n
 	}
 	return count(f.arrivals), count(f.dispatches), count(f.receipts)
+}
+
+// ArrivalPaths returns the upstream paths every arrival ledger entry
+// recorded for rid, in order. Family controls use it to prove WHICH
+// upstream protocol served the request (e.g. native /v1/responses vs the
+// chat-adapted translation), not merely that contact happened.
+func (f *fixture) ArrivalPaths(rid string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var paths []string
+	for _, r := range f.arrivals {
+		if r.RequestID == rid {
+			paths = append(paths, r.Path)
+		}
+	}
+	return paths
 }
 
 // WaitForDispatch blocks until rid has a dispatch ledger entry or the

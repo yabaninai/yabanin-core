@@ -113,6 +113,10 @@ type stand struct {
 	gatewayCmd *exec.Cmd
 	loggerdCmd *exec.Cmd
 
+	// extraGatewayEnv holds route-family gates (e.g. native Responses
+	// dispatch) appended to the fixed gateway environment.
+	extraGatewayEnv []string
+
 	gatewayEnv []string
 	loggerdEnv []string
 }
@@ -175,6 +179,18 @@ func repoRoot(t *testing.T) string {
 // carry the "harness:" prefix.
 func startStand(t *testing.T) *stand {
 	t.Helper()
+	return startStandWithGatewayEnv(t)
+}
+
+// startStandWithGatewayEnv brings up the same stand as startStand with
+// additional gateway environment entries appended after the fixed set.
+// It exists for cases that exercise route families whose product
+// behavior is env-gated (e.g. native /v1/responses dispatch for a
+// non-default provider name). Callers must not repeat a fixed key: the
+// process environment would then carry the key twice and the effective
+// value would be implementation-defined.
+func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
+	t.Helper()
 
 	s := &stand{t: t}
 	s.runID = newRunID(t)
@@ -183,6 +199,7 @@ func startStand(t *testing.T) *stand {
 	s.model = "acc-model-" + s.runID
 	s.pricingInputPerM = 2.0
 	s.pricingOutputPerM = 6.0
+	s.extraGatewayEnv = extraGatewayEnv
 
 	// Runtime temp outside every Git worktree: the acceptance standard
 	// requires that repository metadata is not discoverable from the
@@ -378,7 +395,7 @@ func startStand(t *testing.T) *stand {
 		"YABANIN_CACHE_HMAC_SECRET=" + hex.EncodeToString(keyRaw),
 		"YABANIN_LOG_LEVEL=info",
 		"YABANIN_LOG_FORMAT=text",
-	}, appEnv...)
+	}, append(s.extraGatewayEnv, appEnv...)...)
 	s.loggerdEnv = append([]string{
 		"YABANIN_LOGGERD_LISTEN=127.0.0.1:" + fmt.Sprint(ldPort),
 		"YABANIN_LOGGERD_STREAM=" + s.eventStream,
