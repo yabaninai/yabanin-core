@@ -2610,7 +2610,87 @@ def collect_containers() -> list:
     return out
 
 
-def collect_distribution() -> dict:
+def collect_quickstart_build(root: Path, head: str):
+    """Retained BuildKit receipts -> the bound quickstart image record.
+
+    Generator side of the receipt verifier: for each built subject the
+    retained OCI receipt store must contain EXACTLY ONE index blob that
+    oci_build_receipt.check_image accepts for THIS candidate (platform,
+    head, build recipe, pinned bases). Anything else -- no store, no
+    verifying index, several candidates, or inputs the verifier itself
+    cannot re-derive -- leaves the images unbound, so absence stays the
+    recorded PENDING gap instead of an invented row. Returns the
+    quickstart_images rows plus the quickstart_build record, or None.
+
+    Capture recipe (genuine engine outputs; executed only in the
+    authorized bounded docker-build lane, never fabricated here): per
+    subject, at the exact candidate head,
+
+      docker buildx build --provenance=mode=max \\
+        --file <recipe> <context> --output=type=oci,dest=/tmp/<role>.oci.tar
+      tar -xf /tmp/<role>.oci.tar -C /tmp/<role>-layout
+      # index.json's first manifest descriptor digest IS the image id;
+      # blobs/sha256/<hex> are the raw index/manifest/config/statement
+      # bytes the engine produced and signed into the layout.
+      cp /tmp/<role>-layout/blobs/sha256/* \\
+         artifacts/release-evidence/build-receipts/<role>/
+
+    Readback (this checkout, offline, no engine): 'release_evidence.py
+    generate' binds the rows from those bytes alone, and 'verify'
+    re-checks every descriptor digest, the BuildKit-recorded vcs
+    revision/context/dockerfile, the target platform and the pinned
+    bases against the live tree. Test fixtures simulate only the byte
+    SHAPE of that capture; nothing here substitutes for running it.
+
+    Scope: this binds the RETAINED BUILD ARTIFACTS' facts (source head,
+    platform, recipe, bases, image id). It does not establish which
+    image a STARTED Compose service ran -- the running services'
+    physical image ids are an independent engine-side inspection
+    (docker compose ps / docker inspect readback) that belongs to the
+    deployment lane, not to this collector."""
+    services, errors = _compose_model(root)
+    if errors:
+        return None
+    pins = pinned_builders(root)
+    rows, subjects, platforms = [], {}, {}
+    for role in _QUICKSTART_IMAGE_SUBJECTS:
+        store = root / oci_build_receipt.STORE / role
+        bound = []
+        if store.is_dir():
+            for receipt in sorted(store.iterdir()):
+                if not re.fullmatch(r"[0-9a-f]{64}", receipt.name) or not receipt.is_file():
+                    continue
+                image_id = "sha256:" + receipt.name
+                try:
+                    oci_build_receipt.check_image(root, role, image_id,
+                                                  _QS_PLATFORM, head, pins)
+                except (ValueError, KeyError, AttributeError, TypeError,
+                        OSError, RuntimeError):
+                    continue
+                bound.append(image_id)
+        if len(bound) != 1:
+            return None
+        subjects[role] = bound[0]
+        platforms[role] = _QS_PLATFORM
+        rows.append({"name": role, "image_id": bound[0], "platform": _QS_PLATFORM})
+    tree = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
+                           f"{head}^{{tree}}"], check=False, capture_output=True,
+                          text=True)
+    if tree.returncode:
+        return None
+    return {"quickstart_images": rows,
+            "quickstart_build": {"head": head,
+                                 "tree_sha256": tree.stdout.strip(),
+                                 "inputs": {"compose_build_services":
+                                            sorted(s for s, svc in services.items()
+                                                   if svc["build"]),
+                                            "pinned_builders":
+                                            sorted(list(p) for p in pins)},
+                                 "platforms": platforms,
+                                 "subjects": subjects}}
+
+
+def collect_distribution(head: str | None = None) -> dict:
     dist = ROOT / "dist/release"
     sums = {}
     for line in (dist / "SHA256SUMS").read_text().splitlines():
@@ -2625,27 +2705,50 @@ def collect_distribution() -> dict:
                          "buildinfo_sha256": sha256_file(dist / f"{name}.buildinfo"),
                          "notices_payload": str(payload.relative_to(ROOT)),
                          "notices_files": len(inv.get("files", []))})
-    return {"binaries": binaries,
-            "notice_draft": "dist/release/THIRD-PARTY-NOTICES.md",
-            "notice_draft_sha256": sha256_file(dist / "THIRD-PARTY-NOTICES.md"),
-            "notice_draft_identifier_only": True,
-            "full_texts_via": "artifacts/release-evidence/image-notices/<binary>/ (build-info driven)",
-            "recipe_sha256": sha256_file(dist / "recipe.json"),
-            "unsigned": True,
-            "quickstart_images": [],
-            "quickstart_images_note": "not docker-built in this evidence lane; binding via "
-                                      "Dockerfile pins + base digests only; exact image "
-                                      "digests pending a bounded docker-build follow-up",
-            "pulled_images_verified_via_registry": [
-                "pgvector/pgvector:pg16", "redis:7.2-alpine",
-                "gcr.io/distroless/static-debian12:nonroot"]}
+    out = {"binaries": binaries,
+           "notice_draft": "dist/release/THIRD-PARTY-NOTICES.md",
+           "notice_draft_sha256": sha256_file(dist / "THIRD-PARTY-NOTICES.md"),
+           "notice_draft_identifier_only": True,
+           "full_texts_via": "artifacts/release-evidence/image-notices/<binary>/ (build-info driven)",
+           "recipe_sha256": sha256_file(dist / "recipe.json"),
+           "unsigned": True,
+           "pulled_images_verified_via_registry": [
+               "pgvector/pgvector:pg16", "redis:7.2-alpine",
+               "gcr.io/distroless/static-debian12:nonroot"]}
+    if head is None:
+        head = git_out("rev-parse", "HEAD").strip()
+    bound = collect_quickstart_build(ROOT, head)
+    if bound is None:
+        # No genuine retained receipts for this head: the rows stay empty and
+        # the build record absent -- verify reports the PENDING gap, never a
+        # self-consistent invented record.
+        out["quickstart_images"] = []
+        out["quickstart_build"] = None
+        out["quickstart_images_note"] = ("no BuildKit receipts retained for this "
+                                         "head under artifacts/release-evidence/"
+                                         "build-receipts/; exact image digests "
+                                         "pending the bounded docker-build "
+                                         "evidence lane")
+    else:
+        out.update(bound)
+        out["quickstart_images_note"] = ("bound to retained BuildKit receipts "
+                                         "(artifacts/release-evidence/"
+                                         "build-receipts/<subject>/): each image "
+                                         "id re-verified offline against this "
+                                         "candidate's head, platform, build "
+                                         "recipe and pinned bases; the physical "
+                                         "image ids of STARTED compose services "
+                                         "are an independent engine-side check, "
+                                         "not asserted here")
+    return out
 
 
 def generate() -> int:
     assets = load_json(ARTS / "dashboard-assets.json")
+    head = git_out("rev-parse", "HEAD").strip()
     ev = {"schema": "yabanin.release-evidence/1",
           "task_base": TASK_BASE,
-          "head": git_out("rev-parse", "HEAD").strip(),
+          "head": head,
           "generated_at": datetime.now(timezone.utc).isoformat(),
           "freshness": git_state(),
           "containers": collect_containers(),
@@ -2664,7 +2767,7 @@ def generate() -> int:
           "assets_gaps": assets.get("unresolved", []),
           "provenance": {"base": TASK_BASE, "added": provenance_added(),
                          "note": "DCO signoff presence is not proof of employer rights"},
-          "distribution": collect_distribution(),
+          "distribution": collect_distribution(head),
           "notice_reconciliation": {"notice_sha256": sha256_file(ROOT / "NOTICE"),
                                     "enterprise_reference_removed": True,
                                     "basis": "root LICENSING.md: project-authored Core "

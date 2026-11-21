@@ -2893,5 +2893,109 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
             "task_base mismatch")
 
 
+class QuickstartBuildCollectionTest(unittest.TestCase):
+    """Generate lane for R4-IMAGE-01: collect_quickstart_build binds the
+    quickstart images only from genuine retained BuildKit receipts -- using
+    the verifier itself as the oracle, never a reimplementation -- and
+    leaves the recorded PENDING gap (no invented rows) otherwise."""
+
+    def _gap(self, td, dist, head):
+        return re_ev._quickstart_images_gap(
+            td, {"distribution": dist, "freshness": {"head": head}})
+
+    def test_round_trip_binds_retained_receipts(self):
+        # what generate collects from the retained store is exactly what the
+        # fixture wired by hand from the same store, and it passes the real
+        # verifier gap unchanged (generate -> verify round trip)
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_images"],
+                             ev["distribution"]["quickstart_images"])
+            build = collected["quickstart_build"]
+            self.assertEqual(build, ev["distribution"]["quickstart_build"])
+            # exact source: the record's head/tree ARE this fixture repo's
+            tree = subprocess.run(["git", "-C", str(td), "rev-parse", "--verify",
+                                   f"{head}^{{tree}}"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            self.assertEqual(build["head"], head)
+            self.assertEqual(build["tree_sha256"], tree)
+            # exact platform and subject binding, per row, all three roles
+            store_root = td / "artifacts/release-evidence/build-receipts"
+            for row in collected["quickstart_images"]:
+                role = row["name"]
+                self.assertEqual(row["platform"], "linux/amd64")
+                self.assertEqual(build["platforms"][role], row["platform"])
+                self.assertEqual(build["subjects"][role], row["image_id"])
+                # the image id names the retained engine blob it claims
+                self.assertTrue((store_root / role / row["image_id"][7:]).is_file())
+            # the retained statement itself carries the engine-recorded
+            # source revision and target platform for the core subject
+            index = re_ev.oci_build_receipt.blob(td, "core", build["subjects"]["core"])
+            child = re_ev.oci_build_receipt.platform_image(td, "core", index,
+                                                           "linux/amd64")
+            predicate = re_ev.oci_build_receipt.statement(td, "core", index, child)
+            vcs = predicate["runDetails"]["metadata"]["buildkit_metadata"]["vcs"]
+            self.assertEqual(vcs["revision"], head)
+            self.assertEqual(predicate["buildDefinition"]["internalParameters"]
+                             ["targetPlatform"], "linux/amd64")
+            # generate output passes the real verifier gap unchanged
+            self.assertEqual(self._gap(td, collected, head), [])
+
+    def test_absent_store_stays_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+            # generate's fallback emission keeps the documented pending gap
+            gap = self._gap(td, {"quickstart_images": [], "quickstart_build": None},
+                            head)
+            self.assertEqual(len(gap), 1)
+            self.assertTrue(gap[0].startswith(
+                "PENDING gap: quickstart built images"))
+
+    def test_foreign_head_receipts_not_bound(self):
+        # receipts minted for another revision never bind this candidate
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            fixture_image(td, "core", "e" * 40, ".", "Dockerfile")
+            fixture_image(td, "mock-provider", "e" * 40, "deploy/mock-provider",
+                          "deploy/mock-provider/Dockerfile")
+            fixture_image(td, "dashboard", "e" * 40, ".", "web/dashboard/Dockerfile")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_ambiguous_duplicate_receipts_not_bound(self):
+        # a second, equally verifying index for one subject is ambiguity,
+        # not a choice: nothing is bound rather than one id being picked
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            record = json.loads((store / index_digest[7:]).read_text())
+            record["annotations"] = {"fixture": "duplicate candidate"}
+            data = json.dumps(record, sort_keys=True).encode()
+            (store / hashlib.sha256(data).hexdigest()).write_bytes(data)
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_wrong_platform_receipts_not_bound(self):
+        # arm64 receipts cannot pose as the recorded linux/amd64 candidate
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts/core")
+            fixture_image(td, "core", head, ".", "Dockerfile",
+                          selected_platform="arm64")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
