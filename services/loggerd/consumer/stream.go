@@ -1,10 +1,13 @@
 package consumer
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,10 +64,32 @@ const (
 	// amount_cents keeps the rounded compatibility projection; the exact
 	// charge amount lives in amount_micro_usd (AF-05) and is what settlement
 	// execution must bill (AF-06).
+	//
+	// Intent statements come in three shapes and the exact bytes must match
+	// the live schema's unique indexes:
+	//   - bare legacy arbiter (org_id, request_id, charge_kind): the only
+	//     valid form on a pre-0028 schema — there, any WHERE invocation_id
+	//     predicate is a 42703 error before index inference even runs.
+	//   - partial legacy arbiter: the same columns plus
+	//     "WHERE invocation_id IS NULL", required once 0028's
+	//     uniq_settlement_jobs_request_legacy exists, because Postgres
+	//     infers a partial index ONLY from an arbiter with the matching
+	//     predicate.
+	//   - invocation arbiter (org_id, invocation_id, charge_kind) with
+	//     "WHERE invocation_id IS NOT NULL" for invocation-domain events
+	//     (0028+ only).
 	settlementIntentQuery = `INSERT INTO settlement_jobs
 		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
 		 VALUES ($1, $2, $3, $4, $5, 'pending', $6)
 		 ON CONFLICT (org_id, request_id, charge_kind) DO NOTHING`
+	settlementIntentLegacyPartialQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
+		 VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+		 ON CONFLICT (org_id, request_id, charge_kind) WHERE invocation_id IS NULL DO NOTHING`
+	settlementIntentInvocationQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
+		 VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+		 ON CONFLICT (org_id, invocation_id, charge_kind) WHERE invocation_id IS NOT NULL DO NOTHING`
 	// The reservation-linked variant (NEXT-18d, ADR-0001 §13) additionally
 	// records the allocation whose reserve the settle decrements. Only
 	// intent inserts carrying a reserve tuple use it, so a pre-reservation
@@ -73,6 +98,14 @@ const (
 		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload, allowance_id)
 		 VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
 		 ON CONFLICT (org_id, request_id, charge_kind) DO NOTHING`
+	settlementIntentWithAllowanceLegacyPartialQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload, allowance_id)
+		 VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7)
+		 ON CONFLICT (org_id, request_id, charge_kind) WHERE invocation_id IS NULL DO NOTHING`
+	settlementIntentWithAllowanceInvocationQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload, allowance_id)
+		 VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+		 ON CONFLICT (org_id, invocation_id, charge_kind) WHERE invocation_id IS NOT NULL DO NOTHING`
 	// a settlement_jobs row in the non-claimable 'pending_price' state,
 	// written in the SAME delivery transaction as the request log. It is
 	// never billed (the claim query only takes pending/retry) and never a
@@ -82,7 +115,66 @@ const (
 		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
 		 VALUES ($1, $2, $3, 0, 0, 'pending_price', $4)
 		 ON CONFLICT (org_id, request_id, charge_kind) DO NOTHING`
+	pendingPriceIntentLegacyPartialQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
+		 VALUES ($1, $2, $3, 0, 0, 'pending_price', $4)
+		 ON CONFLICT (org_id, request_id, charge_kind) WHERE invocation_id IS NULL DO NOTHING`
+	pendingPriceIntentInvocationQuery = `INSERT INTO settlement_jobs
+		 (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
+		 VALUES ($1, $2, $3, $4, 0, 0, 'pending_price', $5)
+		 ON CONFLICT (org_id, invocation_id, charge_kind) WHERE invocation_id IS NOT NULL DO NOTHING`
 )
+
+// settlementIntentStatements selects the exact INSERT bytes for one intent
+// row from the live schema (hasColumn — the cached 0028 probe) and the
+// event's identity domain (invocation nil = legacy). An invocation-domain
+// event on a pre-0028 schema keeps the invocation bytes and fails loudly
+// in the request_logs insert before this choice matters.
+func settlementIntentStatements(hasColumn bool, invocation any) (plain, withAllowance string) {
+	if invocation == nil {
+		if hasColumn {
+			return settlementIntentLegacyPartialQuery, settlementIntentWithAllowanceLegacyPartialQuery
+		}
+		return settlementIntentQuery, settlementIntentWithAllowanceQuery
+	}
+	return settlementIntentInvocationQuery, settlementIntentWithAllowanceInvocationQuery
+}
+
+// pendingPriceIntentStatement is the pending_price sibling of
+// settlementIntentStatements.
+func pendingPriceIntentStatement(hasColumn bool, invocation any) string {
+	if invocation == nil {
+		if hasColumn {
+			return pendingPriceIntentLegacyPartialQuery
+		}
+		return pendingPriceIntentQuery
+	}
+	return pendingPriceIntentInvocationQuery
+}
+
+// settlementSchemaProbeQuery reports whether the live schema carries the
+// invocation_id column on settlement_jobs (migration 0028+). column_name is
+// a bind parameter so schema-less test doubles answer 0 (int scan) instead
+// of echoing a probe row back as truth.
+const settlementSchemaProbeQuery = `SELECT count(*) FROM information_schema.columns
+	WHERE table_schema = current_schema() AND table_name = 'settlement_jobs' AND column_name = $1`
+
+// settlementInvocationSchema resolves (once per consumer) whether intent
+// statements may carry the invocation predicates. A probe error resolves
+// false: on a genuinely pre-0028 schema the WHERE-qualified arbiters are
+// invalid SQL, so the legacy bytes are the only safe fallback.
+func (c *StreamConsumer) settlementInvocationSchema(ctx context.Context) bool {
+	c.schemaOnce.Do(func() {
+		if c.dbPool == nil {
+			return
+		}
+		var n int
+		if err := c.dbPool.QueryRow(ctx, settlementSchemaProbeQuery, "invocation_id").Scan(&n); err == nil && n > 0 {
+			c.settlementHasInvocationID = true
+		}
+	})
+	return c.settlementHasInvocationID
+}
 
 // Reservations modes of an organization (ADR-0001 §9). The consumer reads
 // the mode only to decide partial-usage billing of request.failed events;
@@ -178,6 +270,16 @@ type StreamConsumer struct {
 	outagePause  time.Duration
 	reclaimIdle  time.Duration
 	reclaimEvery time.Duration
+
+	// schemaOnce caches the settlement schema probe — whether
+	// settlement_jobs carries the invocation_id column (migration 0028).
+	// The exact ON CONFLICT bytes must match the live schema: on a
+	// pre-0028 schema a WHERE-qualified arbiter is invalid SQL (42703,
+	// the predicate references a missing column), while on a 0028+
+	// schema the partial unique indexes are only inferable from an
+	// arbiter carrying the matching predicate.
+	schemaOnce                sync.Once
+	settlementHasInvocationID bool
 }
 
 // redisXAckWrapper bridges *redis.Client's variadic XAck to our interface.
@@ -572,6 +674,22 @@ func (c *StreamConsumer) processMessage(ctx context.Context, msg redis.XMessage)
 func (c *StreamConsumer) deliverEventPolicy(ctx context.Context, msg redis.XMessage, eventType string, policy deliveryPolicy) error {
 	fields := msg.Values
 
+	// Invocation identity gate: only an ABSENT invocation_id may take the
+	// legacy dedupe domain. A present malformed value (wrong JSON type,
+	// empty, non-canonical spelling) parks via the standard retry→DLQ
+	// machinery instead of silently downgrading — a downgrade could
+	// double-bill or suppress a genuine invocation.
+	if strings.HasPrefix(eventType, "request.") {
+		if raw, _, malformed := invocationField(fields); malformed {
+			c.logger.Error("malformed invocation_id — parking event",
+				slog.String("event_type", eventType),
+				slog.String("invocation_id_raw", raw),
+				slog.String("request_id", eventString(fields, "request_id")),
+			)
+			return errMalformedInvocationID
+		}
+	}
+
 	switch eventType {
 	case "request.completed":
 		return c.handleRequestCompleteProfile(ctx, msg, policy)
@@ -633,6 +751,9 @@ func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context,
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := budgetRequestLogRow(ev, sessionIDStr, errorMsg)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
+	// Budget-refused requests carry no gateway-minted invocation today; the
+	// binding is purely defensive and never downgrades to the legacy domain.
+	row.setInvocation(ev.invocationIDValue)
 
 	if _, err := tx.Exec(ctx, row.insertSQL(), row.args()...); err != nil {
 		return fmt.Errorf("insert request_log for budget_exceeded event: %w", err)
@@ -756,15 +877,42 @@ func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEven
 // After the commit it reports the uncharged-unknown signal exactly once
 // per committed delivery (N06-P04-T08).
 func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, msg redis.XMessage, ev requestEvent, plan []scopeCharge, chargeState money.QuoteState, absorbedUpstream bool, policy deliveryPolicy) error {
+	// The admission binding parks before any write when the event would
+	// charge an org other than the one that admitted the invocation, or
+	// claims a positive charge with no bound admission at all.
+	if _, err := c.bindAdmission(ctx, tx, ev, plan); err != nil {
+		return err
+	}
+
 	// request.failed keeps the raw error text and the raw status code: a
 	// failed event with status 0 stores 0, and an absent error stores '' —
 	// the failed-shape contract, unchanged.
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := fullRequestLogRow(ev, sessionIDStr, ev.errorMsg, ev.statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
+	row.setInvocation(ev.invocationIDValue)
 
-	if _, err := tx.Exec(ctx, row.insertSQL(), row.args()...); err != nil {
+	result, err := tx.Exec(ctx, row.insertSQL(), row.args()...)
+	if err != nil {
 		return fmt.Errorf("insert request_log for failed event: %w", err)
+	}
+
+	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
+		// Duplicate invocation: the row and every charge intent are already
+		// durable — enrich optional history only, never recharge.
+		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
+			return err
+		}
+		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit delivery transaction: %w", err)
+		}
+		c.logger.Info("duplicate invocation delivery (failed event) — optional history enriched, no recharge",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return nil
 	}
 
 	// OP-9: the policy decision (when the event carries one) commits with
@@ -776,7 +924,7 @@ func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, 
 	// Partial-usage intents (enforce only) commit with the log — a request
 	// whose provider cost was already incurred bills exactly once.
 	for _, sc := range plan {
-		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
+		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, ev.invocationIDValue, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
 			return err
 		}
 	}
@@ -869,12 +1017,40 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
+	// Shadow admissions bind like primary ones (the gateway admits the
+	// shadow dispatch before mirroring); the shadow plan never charges, so
+	// the paid-without-admission gate cannot fire here — an org conflict or
+	// a voided mirror still parks.
+	if _, err := c.bindAdmission(ctx, tx, ev, nil); err != nil {
+		return err
+	}
+
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := shadowRequestLogRow(ev, sessionIDStr, statusCode)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
+	row.setInvocation(ev.invocationIDValue)
 
-	if _, err := tx.Exec(ctx, row.insertSQL(), row.args()...); err != nil {
+	result, err := tx.Exec(ctx, row.insertSQL(), row.args()...)
+	if err != nil {
 		return fmt.Errorf("insert shadow request_log: %w", err)
+	}
+
+	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
+		// Duplicate invocation: the mirror row is already durable — enrich
+		// the shadow policy decision only when absent, never anything else.
+		if err := c.enrichPolicyDecisionIfAbsent(ctx, tx, ev); err != nil {
+			return err
+		}
+		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit delivery transaction: %w", err)
+		}
+		c.logger.Info("duplicate shadow invocation delivery — policy decision guarded, no recharge",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return nil
 	}
 
 	// OP-9: shadow decisions are the whole point of shadow mode ("what would
@@ -882,6 +1058,8 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 	if err := c.insertPolicyDecision(ctx, tx, ev); err != nil {
 		return err
 	}
+
+	c.transitionAdmissionDelivered(ctx, tx, ev)
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delivery transaction: %w", err)
@@ -1087,12 +1265,41 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
+	// The admission binding parks before any write when the event would
+	// charge an org other than the one that admitted the invocation, or
+	// claims a positive charge with no bound admission at all.
+	if _, err := c.bindAdmission(ctx, tx, ev, plan); err != nil {
+		return err
+	}
+
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := fullRequestLogRow(ev, sessionIDStr, ev.errorOptional(), statusCode)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
+	row.setInvocation(ev.invocationIDValue)
 	result, err := tx.Exec(ctx, row.insertSQL(), row.args()...)
 	if err != nil {
 		return fmt.Errorf("insert request_log: %w", err)
+	}
+
+	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
+		// Duplicate invocation (fresh Redis entry id, consumer restart, DLQ
+		// replay): the row and every charge intent are already durable — a
+		// prior live delivery or the recovery materialization committed
+		// them. Enrich optional history only, transition the admission,
+		// ACK; never re-emit intents, never recharge.
+		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
+			return err
+		}
+		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := tx.Commit(ctx); err != nil {
+			return fmt.Errorf("commit delivery transaction: %w", err)
+		}
+		c.logger.Info("duplicate invocation delivery — optional history enriched, no recharge",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return nil
 	}
 
 	// Tool-call aggregate (fail-soft like the budget roll below): the calls
@@ -1110,7 +1317,7 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 	// wallet, team_month, agent_day and session. Each intent commits with
 	// the log or the whole delivery fails and is retried.
 	for _, sc := range plan {
-		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
+		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, ev.invocationIDValue, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
 			return err
 		}
 	}
@@ -1120,6 +1327,8 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 	if err := c.insertPendingPriceIntent(ctx, tx, ev, chargeState); err != nil {
 		return err
 	}
+
+	c.transitionAdmissionDelivered(ctx, tx, ev)
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delivery transaction: %w", err)
@@ -1319,6 +1528,268 @@ func (c *StreamConsumer) beginDelivery(ctx context.Context, eventID string) (Inb
 	return tx, true, nil
 }
 
+// ---------------------------------------------------------------------------
+// Invocation admission binding (Preview2)
+//
+// Live terminal events for invocation-domain requests bind to the durable
+// admission the gateway wrote before the first paid provider call. The
+// binding enforces two owner invariants:
+//
+//  1. A charged event may only book against the org that admitted the
+//     invocation: a cross-org event parks (typed error → retry → DLQ) and
+//     never charges a different tenant. A terminal event for a voided
+//     invocation is a contradiction and parks the same way.
+//  2. Only an ABSENT invocation_id may take the legacy dedupe domain
+//     (malformed nonempty values park at dispatch). A present canonical
+//     identity that would create a positive wallet charge without any
+//     bound admission parks too: the gateway admits every paid dispatch
+//     fail-closed, so such an event is a defect. Cache hits legitimately
+//     mint an identity with no admission row and never carry a charge —
+//     their history still records under the event's own org, keeping the
+//     established cache accounting.
+// ---------------------------------------------------------------------------
+
+const admissionLookupQuery = `SELECT org_id, state FROM request_admissions WHERE invocation_id = $1`
+
+// admissionResolveEventQuery is the consumer-owned guarded transition after
+// a live delivery committed the accounting. The state guard makes it a
+// no-op when recovery already reconciled the admission, and 'voided' rows
+// are terminal and never touched here.
+const admissionResolveEventQuery = `UPDATE request_admissions
+	SET state = 'reconciled', resolved_at = now(), resolve_reason = 'event_delivered'
+	WHERE invocation_id = $1 AND state IN ('admitted', 'unresolved')`
+
+// invocationEnrichmentLockQuery serializes duplicate-invocation enrichment
+// against concurrent redeliveries (reclaim overlap): the second delivery
+// waits for the first enrichment to commit, then its existence probes see
+// the committed side-table rows and skip. Same per-key pattern as the
+// credits store's deduct serialization.
+const invocationEnrichmentLockQuery = `SELECT pg_advisory_xact_lock(hashtext($1))`
+
+var (
+	// errMalformedInvocationID parks events whose nonempty invocation_id is
+	// not a canonical UUID: silently downgrading them to the legacy dedupe
+	// domain could double-bill or suppress a genuine invocation.
+	errMalformedInvocationID = errors.New("invocation_id present but not a canonical UUID")
+	errAdmissionOrgConflict  = errors.New("invocation admission belongs to a different org")
+	errAdmissionVoided       = errors.New("terminal event for a voided invocation admission")
+	errPaidWithoutAdmission  = errors.New("positive charge without a bound invocation admission")
+)
+
+// admissionBinding is the resolved durable admission of one event.
+type admissionBinding struct {
+	orgID string
+	state string
+	found bool
+}
+
+// resolveAdmission reads the admission row bound to the event's invocation,
+// if any. A pre-0028 schema (no request_admissions table) counts as unbound;
+// every other read error fails the delivery.
+func (c *StreamConsumer) resolveAdmission(ctx context.Context, tx InboxTx, ev requestEvent) (admissionBinding, error) {
+	if ev.invocationIDValue == nil {
+		return admissionBinding{}, nil
+	}
+	var b admissionBinding
+	err := tx.QueryRow(ctx, admissionLookupQuery, ev.invocationID).Scan(&b.orgID, &b.state)
+	if err == nil {
+		b.found = true
+		return b, nil
+	}
+	if errors.Is(err, pgx.ErrNoRows) {
+		return admissionBinding{}, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
+		return admissionBinding{}, nil
+	}
+	return admissionBinding{}, fmt.Errorf("resolve invocation admission: %w", err)
+}
+
+// bindAdmission resolves and enforces the admission binding before any
+// accounting write in the delivery transaction. Legacy-domain events (no
+// invocation id) have no admission by definition and pass untouched.
+func (c *StreamConsumer) bindAdmission(ctx context.Context, tx InboxTx, ev requestEvent, plan []scopeCharge) (admissionBinding, error) {
+	if ev.invocationIDValue == nil {
+		return admissionBinding{}, nil
+	}
+	b, err := c.resolveAdmission(ctx, tx, ev)
+	if err != nil {
+		return b, err
+	}
+	if !b.found {
+		if c.chargePlanCarriesCharge(plan) {
+			c.logger.Error("positive charge without a bound invocation admission — parking (the gateway admits every paid dispatch before any provider call)",
+				slog.String("invocation_id", ev.invocationID),
+				slog.String("request_id", ev.requestID),
+				slog.String("org_id", ev.orgID),
+			)
+			return b, errPaidWithoutAdmission
+		}
+		// Cache-hit identities: record the history under the event's own
+		// org — no charge exists to bind.
+		c.logger.Info("invocation event without admission — recording history without charge (cache-hit identity)",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return b, nil
+	}
+	if b.orgID != ev.orgID {
+		c.logger.Error("invocation admission org differs from the event org — parking, never charging a different tenant",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("admission_org_id", b.orgID),
+			slog.String("event_org_id", ev.orgID),
+		)
+		return b, errAdmissionOrgConflict
+	}
+	if b.state == "voided" {
+		c.logger.Error("terminal event for a voided invocation admission — parking",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return b, errAdmissionVoided
+	}
+	return b, nil
+}
+
+// chargePlanCarriesCharge reports whether the plan would create a positive
+// wallet (resale_deduction) intent — the one scope that moves money. It
+// mirrors the insertScopeIntent gate exactly, so "carries a charge" and
+// "would write a charge intent" can never disagree.
+func (c *StreamConsumer) chargePlanCarriesCharge(plan []scopeCharge) bool {
+	if c.creditStore == nil {
+		return false
+	}
+	for _, sc := range plan {
+		if sc.kind == ChargeKindResaleDeduction && sc.amount > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// transitionAdmissionDelivered moves the bound admission to 'reconciled'
+// inside the delivery transaction. Fail-soft by contract: the accounting
+// writes are already committed-or-committing and the reconciler's grace
+// sweep is the backstop, so a failure here only logs.
+func (c *StreamConsumer) transitionAdmissionDelivered(ctx context.Context, tx InboxTx, ev requestEvent) {
+	if ev.invocationIDValue == nil {
+		return
+	}
+	if _, err := tx.Exec(ctx, admissionResolveEventQuery, ev.invocationID); err != nil {
+		c.logger.Warn("admission transition to reconciled failed — reconciler backstop will retry",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("error", err.Error()),
+		)
+	}
+}
+
+// enrichDuplicateInvocation fills optional history for a duplicate
+// invocation delivery: the request row and every charge intent are already
+// durable (a prior live delivery, or the recovery materialization from
+// request_terminal_facts), so this path only enriches content and side
+// tables the recovery projection cannot know. It never re-emits intents,
+// never writes pending_price, never re-charges, and never downgrades the
+// identity to the legacy domain.
+func (c *StreamConsumer) enrichDuplicateInvocation(ctx context.Context, tx InboxTx, ev requestEvent) error {
+	if ev.invocationIDValue == nil {
+		return nil
+	}
+	if _, err := tx.Exec(ctx, invocationEnrichmentLockQuery, ev.invocationID); err != nil {
+		return fmt.Errorf("lock duplicate invocation enrichment: %w", err)
+	}
+	if err := c.enrichRequestLogContent(ctx, tx, ev); err != nil {
+		return err
+	}
+	c.enrichToolCallsIfAbsent(ctx, tx, ev)
+	return c.enrichPolicyDecisionIfAbsent(ctx, tx, ev)
+}
+
+// enrichRequestLogContent fills only the optional content columns that are
+// still empty on the existing row (fill-NULL; labels additionally only
+// replace the '{}' default). Existing values are never overwritten — the
+// first materialization stays authoritative.
+func (c *StreamConsumer) enrichRequestLogContent(ctx context.Context, tx InboxTx, ev requestEvent) error {
+	type setCol struct {
+		col string
+		val any
+	}
+	var sets []setCol
+	appendIf := func(col string, v any) {
+		if v != nil {
+			sets = append(sets, setCol{col, v})
+		}
+	}
+	appendIf("response", ev.responseJSON)
+	appendIf("upstream_request", ev.upstreamReqJSON)
+	appendIf("upstream_response", ev.upstreamRespJSON)
+	appendIf("prompt_hash", ev.promptHash)
+	if len(ev.labels) > 0 && !bytes.Equal(ev.labels, []byte("{}")) {
+		sets = append(sets, setCol{"labels", ev.labels})
+	}
+	if len(sets) == 0 {
+		return nil
+	}
+	var sb strings.Builder
+	sb.WriteString("UPDATE request_logs SET ")
+	args := make([]any, 0, len(sets)+1)
+	for i, s := range sets {
+		if i > 0 {
+			sb.WriteString(", ")
+		}
+		n := len(args) + 1
+		if s.col == "labels" {
+			// labels defaults to '{}' rather than NULL: fill only the
+			// empty object, never a populated set.
+			fmt.Fprintf(&sb, "labels = CASE WHEN labels = '{}'::jsonb THEN $%d ELSE labels END", n)
+		} else {
+			fmt.Fprintf(&sb, "%s = COALESCE(%s, $%d)", s.col, s.col, n)
+		}
+		args = append(args, s.val)
+	}
+	fmt.Fprintf(&sb, " WHERE invocation_id = $%d", len(args)+1)
+	args = append(args, ev.invocationID)
+	if _, err := tx.Exec(ctx, sb.String(), args...); err != nil {
+		return fmt.Errorf("enrich duplicate invocation content: %w", err)
+	}
+	return nil
+}
+
+// enrichToolCallsIfAbsent replays the fail-soft tool-call extraction only
+// when no tool_calls row exists for the request yet (the first live
+// delivery or a recovery replay may have written them).
+func (c *StreamConsumer) enrichToolCallsIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) {
+	var one int
+	if err := tx.QueryRow(ctx,
+		`SELECT 1 FROM tool_calls WHERE request_id = $1 AND org_id = $2 LIMIT 1`,
+		ev.requestID, ev.orgID,
+	).Scan(&one); err == nil {
+		return
+	}
+	c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse)
+}
+
+// enrichPolicyDecisionIfAbsent commits the policy decision with the
+// enrichment only when no decision row exists for the request yet. The
+// org GUC is pinned first because policy_decisions carries the org
+// isolation RLS posture and a bare probe would read zero rows.
+func (c *StreamConsumer) enrichPolicyDecisionIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) error {
+	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_org', $1, true)", ev.orgID); err != nil {
+		return fmt.Errorf("pin policy decision org GUC: %w", err)
+	}
+	var one int
+	if err := tx.QueryRow(ctx,
+		`SELECT 1 FROM policy_decisions WHERE org_id = $1 AND request_id = $2 LIMIT 1`,
+		ev.orgID, ev.requestID,
+	).Scan(&one); err == nil {
+		return nil
+	}
+	return c.insertPolicyDecision(ctx, tx, ev)
+}
+
 // resaleDeductionMicro resolves the exact charge amount for a completed
 // request, mirroring the legacy selection contract with exact units: a
 // positive resale_cost_usd wins (org-facing price); otherwise a positive
@@ -1359,7 +1830,7 @@ func resaleDeductionMicro(cost, resale money.MicroUSD, costState, resaleState mo
 // Conflicting re-delivery (same identity, different amount): the first
 // amount stays authoritative, the second is never charged — the conflict is
 // reported (warn log + metric) instead of silently ignored.
-func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgID, requestID string, sc scopeCharge, tokensIn, tokensOut int64, costUSD, resaleUSD float64, modelUsed string) error {
+func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgID, requestID string, invocation any, sc scopeCharge, tokensIn, tokensOut int64, costUSD, resaleUSD float64, modelUsed string) error {
 	if orgID == "" {
 		return nil
 	}
@@ -1417,19 +1888,30 @@ func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgI
 		payloadBytes = []byte("{}")
 	}
 
+	// The invocation-domain statements carry invocation_id in their column
+	// list; the legacy statements keep the exact pre-invocation bytes and
+	// argument vector.
+	plainStmt, withAllowanceStmt := settlementIntentStatements(c.settlementInvocationSchema(ctx), invocation)
 	var tag pgconn.CommandTag
-	if sc.link.AllowanceID > 0 {
-		tag, err = tx.Exec(ctx, settlementIntentWithAllowanceQuery,
+	switch {
+	case invocation != nil && sc.link.AllowanceID > 0:
+		tag, err = tx.Exec(ctx, withAllowanceStmt,
+			orgID, requestID, invocation, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes, sc.link.AllowanceID)
+	case invocation != nil:
+		tag, err = tx.Exec(ctx, plainStmt,
+			orgID, requestID, invocation, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes)
+	case sc.link.AllowanceID > 0:
+		tag, err = tx.Exec(ctx, withAllowanceStmt,
 			orgID, requestID, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes, sc.link.AllowanceID)
-	} else {
-		tag, err = tx.Exec(ctx, settlementIntentQuery,
+	default:
+		tag, err = tx.Exec(ctx, plainStmt,
 			orgID, requestID, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes)
 	}
 	if err != nil {
 		return fmt.Errorf("insert %s settlement intent: %w", sc.kind, err)
 	}
 	if tag.RowsAffected() == 0 {
-		c.diagnoseIntentAmountConflict(ctx, tx, orgID, requestID, sc.kind, sc.amount)
+		c.diagnoseIntentAmountConflict(ctx, tx, orgID, requestID, invocation, sc.kind, sc.amount)
 	}
 	return nil
 }
@@ -1463,24 +1945,40 @@ func (c *StreamConsumer) insertPendingPriceIntent(ctx context.Context, tx InboxT
 	if err != nil {
 		payload = []byte("{}")
 	}
-	if _, err := tx.Exec(ctx, pendingPriceIntentQuery, ev.orgID, ev.requestID, ChargeKindPendingPrice, payload); err != nil {
-		return fmt.Errorf("insert pending_price settlement record: %w", err)
+	stmt := pendingPriceIntentStatement(c.settlementInvocationSchema(ctx), ev.invocationIDValue)
+	var execErr error
+	if ev.invocationIDValue != nil {
+		_, execErr = tx.Exec(ctx, stmt, ev.orgID, ev.requestID, ev.invocationIDValue, ChargeKindPendingPrice, payload)
+	} else {
+		_, execErr = tx.Exec(ctx, stmt, ev.orgID, ev.requestID, ChargeKindPendingPrice, payload)
+	}
+	if execErr != nil {
+		return fmt.Errorf("insert pending_price settlement record: %w", execErr)
 	}
 	return nil
 }
 
 // settlementExistingAmountQuery reads the amount of an already-known
-// settlement identity for the conflict diagnostic.
+// settlement identity for the conflict diagnostic. The invocation-domain
+// variant matches on the minted identity; the plain variant serves both
+// legacy domains (a plain SELECT needs no index inference).
 const settlementExistingAmountQuery = `SELECT amount_micro_usd FROM settlement_jobs
 	WHERE org_id = $1 AND request_id = $2 AND charge_kind = $3`
+const settlementExistingAmountInvocationQuery = `SELECT amount_micro_usd FROM settlement_jobs
+	WHERE org_id = $1 AND invocation_id = $2 AND charge_kind = $3`
 
 // diagnoseIntentAmountConflict reports a duplicate settlement identity whose
 // event carries a different amount than the already-known job. The known
 // job stays authoritative and only it will settle; the conflict is a
 // diagnostic (warn + metric), never a second charge.
-func (c *StreamConsumer) diagnoseIntentAmountConflict(ctx context.Context, tx InboxTx, orgID, requestID, chargeKind string, amountMicro money.MicroUSD) {
+func (c *StreamConsumer) diagnoseIntentAmountConflict(ctx context.Context, tx InboxTx, orgID, requestID string, invocation any, chargeKind string, amountMicro money.MicroUSD) {
 	var existing int64
-	err := tx.QueryRow(ctx, settlementExistingAmountQuery, orgID, requestID, chargeKind).Scan(&existing)
+	var err error
+	if invocation != nil {
+		err = tx.QueryRow(ctx, settlementExistingAmountInvocationQuery, orgID, invocation, chargeKind).Scan(&existing)
+	} else {
+		err = tx.QueryRow(ctx, settlementExistingAmountQuery, orgID, requestID, chargeKind).Scan(&existing)
+	}
 	if err != nil {
 		// The duplicate row exists (the claim insert said so); a read
 		// failure must not fail the delivery — log and move on.

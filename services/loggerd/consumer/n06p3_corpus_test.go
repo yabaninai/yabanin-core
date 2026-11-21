@@ -205,7 +205,7 @@ func TestPendingPriceInterruptionCorpus(t *testing.T) {
 		require.Equal(t, int64(7), plan[0].link.AllowanceID, "the reserve linkage rides the charge")
 
 		tx := &ppCaptureTx{}
-		require.NoError(t, ppBillingConsumer().insertScopeIntent(ctx, tx, "org-n06", ev.requestID,
+		require.NoError(t, ppBillingConsumer().insertScopeIntent(ctx, tx, "org-n06", ev.requestID, nil,
 			plan[0], 10, 20, 0.012, 0.012, "stub-model"))
 		execs := tx.recorded()
 		require.Len(t, execs, 1)
