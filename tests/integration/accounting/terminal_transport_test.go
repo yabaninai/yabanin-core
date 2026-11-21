@@ -27,18 +27,21 @@ func TestAccountingTerminalConnectionLoss(t *testing.T) {
 	require.NoError(t, sibling.PingContext(t.Context()))
 	s.controlRequest(t, "terminal-transport-pre")
 	s.oracleExec(t, "install selected terminal insert barrier", `
-		CREATE TABLE acc_terminal_transport_target (rid text PRIMARY KEY);
+		CREATE TABLE acc_terminal_transport_target (rid text PRIMARY KEY, change_facts boolean NOT NULL);
 		CREATE FUNCTION acc_hold_terminal() RETURNS trigger LANGUAGE plpgsql AS $$
 		BEGIN
 			IF EXISTS (SELECT 1 FROM acc_terminal_transport_target WHERE rid=NEW.client_request_id) THEN
 				PERFORM pg_advisory_xact_lock(1921,113);
+				IF (SELECT change_facts FROM acc_terminal_transport_target WHERE rid=NEW.client_request_id) THEN
+					NEW.event := jsonb_set(NEW.event, '{ts}', to_jsonb(((NEW.event->>'ts')::bigint + 1)::text));
+				END IF;
 			END IF;
 			RETURN NEW;
 		END $$;
 		CREATE TRIGGER acc_hold_terminal BEFORE INSERT ON request_terminal_facts
 		FOR EACH ROW EXECUTE FUNCTION acc_hold_terminal()`)
 	start := s.fixture.Snapshot()
-	modes := []string{"forward", "before-commit", "after-commit"}
+	modes := []string{"forward", "before-commit", "after-commit", "divergent"}
 	for _, mode := range modes {
 		rid := s.reqPrefix + "terminal-" + mode
 		s.exerciseTerminalTransport(t, relay, sibling, rid, mode)
@@ -48,13 +51,13 @@ func TestAccountingTerminalConnectionLoss(t *testing.T) {
 	for _, mode := range modes {
 		s.verifyTerminalTransport(t, s.reqPrefix+"terminal-"+mode)
 	}
-	require.Equal(t, fixtureTotals{4, 4, 4}, s.fixture.Since(start))
+	require.Equal(t, fixtureTotals{5, 5, 5}, s.fixture.Since(start))
 	s.fixture.VerifyEvidence()
 }
 
 func (s *stand) exerciseTerminalTransport(t *testing.T, relay *ackRelay, sibling *sql.Conn, rid, mode string) {
 	t.Helper()
-	s.oracleExec(t, "select terminal transport target", "INSERT INTO acc_terminal_transport_target VALUES ($1)", rid)
+	s.oracleExec(t, "select terminal transport target", "INSERT INTO acc_terminal_transport_target VALUES ($1,$2)", rid, mode == "divergent")
 	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
 	defer cancel()
 	lock, err := s.oracleDB.db.BeginTx(ctx, nil)
@@ -95,7 +98,7 @@ func (s *stand) exerciseTerminalTransport(t *testing.T, relay *ackRelay, sibling
 		require.Equal(t, 1, s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID))
 		require.Empty(t, result, "client completed before commit acknowledgment")
 		cut.forward <- mode == "forward"
-		if mode == "after-commit" {
+		if mode != "forward" {
 			select {
 			case cutAt = <-cut.discarded:
 			case <-ctx.Done():
@@ -108,20 +111,27 @@ func (s *stand) exerciseTerminalTransport(t *testing.T, relay *ackRelay, sibling
 	require.NoError(t, resp.err)
 	require.False(t, resp.at.IsZero())
 	require.False(t, resp.at.Before(cutAt))
-	if resp.status == http.StatusOK {
-		require.Contains(t, resp.body, fixtureAssistantContent)
-		require.Equal(t, 1, s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID))
-	} else {
-		require.NotEqual(t, "forward", mode, resp.body)
-		require.GreaterOrEqual(t, resp.status, 500, resp.body)
-		code, ok := decodeErrorCode(resp.body)
-		require.True(t, ok)
-		require.NotEmpty(t, code)
-	}
+	s.requireTerminalTransportResponse(t, rid, mode, resp)
 	s.verifyTerminalTransport(t, rid)
 	after := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 	require.Len(t, after, 1)
 	require.Equal(t, before[0].InvocationID, after[0].InvocationID)
+}
+
+// Once the acknowledgment is lost, a fresh connection can verify the actual
+// committed row. Opposite payload controls must yield opposite client outcomes.
+func (s *stand) requireTerminalTransportResponse(t *testing.T, rid, mode string, resp ackResponse) {
+	t.Helper()
+	if mode == "divergent" {
+		require.GreaterOrEqual(t, resp.status, 500, resp.body)
+		code, ok := decodeErrorCode(resp.body)
+		require.True(t, ok)
+		require.Equal(t, "accounting_commit_failed", code)
+		return
+	}
+	require.Equal(t, http.StatusOK, resp.status, resp.body)
+	require.Contains(t, resp.body, fixtureAssistantContent)
+	require.Equal(t, 1, s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID))
 }
 
 func (s *stand) verifyTerminalTransport(t *testing.T, rid string) {
