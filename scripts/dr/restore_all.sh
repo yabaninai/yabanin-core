@@ -13,17 +13,17 @@ psql_cmd() {  # runs psql args on the target URI
 }
 
 existing="$(psql_cmd -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
-if [ "${existing:-0}" != "0" ]; then
+if [ "${existing}" != "0" ]; then
   echo "refusing to restore: target has $existing table(s) in public schema" >&2
   exit 1
 fi
 
 start="$(date +%s)"
 if command -v pg_restore >/dev/null 2>&1; then
-  pg_restore --dbname="$uri" --no-owner --exit-on-error "$dump"
+  pg_restore --dbname="$uri" --no-owner --single-transaction --exit-on-error "$dump"
 else
   docker run --rm -i --network host -v "$(cd "$(dirname "$dump")" && pwd)":/backup:ro \
-    pgvector/pgvector:pg16 pg_restore --dbname="$uri" --no-owner --exit-on-error "/backup/$(basename "$dump")"
+    pgvector/pgvector:pg16 pg_restore --dbname="$uri" --no-owner --single-transaction --exit-on-error "/backup/$(basename "$dump")"
 fi
 end="$(date +%s)"
 

@@ -55,36 +55,22 @@ extensions as the source. Use a new cluster/database/volume with an identity tha
 cannot be confused with production. Set protected connection credentials through
 your approved mechanism; avoid literal passwords in command history.
 
-For an operator-supplied empty target URI and custom-format dump, the essential
-host-tool sequence is:
+Verify the selected dump against its recorded checksum. Provision the cluster roles
+referenced by its policies and grants, including `yabanin_app`, on the empty
+target. Keep migration credentials separate from runtime credentials.
 
 ```bash
 set -euo pipefail
-# Set RESTORE_URI and DUMP_FILE to the disposable target and selected dump first.
 : "${RESTORE_URI:?Set the URI of the disposable empty database}"
 : "${DUMP_FILE:?Set the path to the selected custom-format dump}"
-DR_TABLES=$(psql "$RESTORE_URI" -v ON_ERROR_STOP=1 -Atc \
-  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
-test "$DR_TABLES" = 0
-pg_restore --dbname="$RESTORE_URI" --no-owner --no-acl \
-  --exit-on-error "$DUMP_FILE"
+scripts/dr/restore_all.sh "$RESTORE_URI" "$DUMP_FILE"
 ```
 
-Use a script or terminal with failure handling enabled so a failed empty-target
-check stops execution. The full local rehearsal includes this safeguard. The
-`--dbname` option is required: a connection URI as an unflagged `pg_restore`
-argument is interpreted as an input filename, not the target database.
-
-The current `scripts/dr/restore.sh` and `restore_all.sh` wrappers omit that option
-and must not be treated as a working restore procedure in this version.
-`restore_all.sh --backup-ts ...` is also not a supported interface: its declared
-arguments are a target URI and dump path. Use the explicit procedure above or the
-local rehearsal until the wrappers are corrected and tested.
-
-A custom dump restored with `--no-owner --no-acl` deliberately omits ownership and
-grants. Establish the reviewed application role and permissions separately. Keep
-migration credentials separate from least-privileged runtime credentials. Apply
-only migrations required by the selected target application version.
+The wrapper uses local PostgreSQL clients when available and Docker as a
+fallback. It checks for existing tables in the public schema, then restores
+the dump in one transaction with its grants. If a referenced role is missing,
+provision the role and retry the same dump on the same empty target.
+The host-only `scripts/dr/restore.sh` accepts the same arguments.
 
 ## Bring up the recovered application
 

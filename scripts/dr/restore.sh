@@ -5,16 +5,16 @@
 # against a database that already has Yabanin tables (fail-closed).
 set -euo pipefail
 
-uri="${1:?usage: restore.sh <pg-uri> <empty-db> <dump>}"
-dump="${2:?usage: restore.sh <pg-uri> <empty-db> <dump>}"
+uri="${1:?usage: restore.sh <pg-uri-to-empty-db> <dump-file>}"
+dump="${2:?usage: restore.sh <pg-uri-to-empty-db> <dump-file>}"
 
 existing="$(psql "$uri" -tAc "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")"
-if [ "${existing:-0}" != "0" ]; then
+if [ "${existing}" != "0" ]; then
   echo "refusing to restore: target database has $existing table(s) in public" >&2
   exit 1
 fi
 
 start="$(date +%s)"
-pg_restore --dbname="$uri" --no-owner --exit-on-error "$dump"
+pg_restore --dbname="$uri" --no-owner --single-transaction --exit-on-error "$dump"
 end="$(date +%s)"
 echo "restore completed in $((end - start))s"

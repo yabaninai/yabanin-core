@@ -156,14 +156,24 @@ docker exec "$PG" bash /tmp/backup_all.sh "$uri" /tmp/dr-backup
 docker exec "$PG" sh -ec 'sha256sum -c /tmp/dr-backup/*.sha256 && cp /tmp/dr-backup/*.dump /tmp/dr.dump'
 docker cp "$PG:/tmp/dr.dump" "/tmp/dr-$$-host.dump"
 docker cp "/tmp/dr-$$-host.dump" "$PG2:/tmp/dr.dump"
-# yabanin_app, but roles are cluster-level objects that a database dump does
-# not carry. A DR target therefore must provision the role before restore
-# (same shape as migration 0022; production runbooks do this out-of-band).
+docker cp scripts/dr/restore_all.sh "$PG2:/tmp/restore_all.sh"
+# The dump references the cluster role provisioned by migration 0022.
+# Withhold it on the clean target to force an error inside pg_restore.
+if failure=$(docker exec "$PG2" bash /tmp/restore_all.sh "$uri" /tmp/dr.dump 2>&1); then
+  echo "FAIL: restore succeeded without the application role"; exit 1
+fi
+if [[ $failure != *'role "yabanin_app" does not exist'* ]]; then
+  echo "FAIL: unexpected missing-role restore error: $failure"; exit 1
+fi
+remaining=$(docker exec "$PG2" psql -U yabanin -d yabanin -Atc \
+  "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
+[[ $remaining == 0 ]] || { echo "FAIL: failed restore left $remaining tables"; exit 1; }
+
+# Provision the role and retry the same dump on the same target.
 docker exec "$PG2" psql -U yabanin -d yabanin -qc "DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'yabanin_app') THEN
     CREATE ROLE yabanin_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
   END IF; END \$\$;"
-docker cp scripts/dr/restore_all.sh "$PG2:/tmp/restore_all.sh"
 docker exec "$PG2" bash /tmp/restore_all.sh "$uri" /tmp/dr.dump
 
 snapshot "$PG2" "$SNAP_DST"
