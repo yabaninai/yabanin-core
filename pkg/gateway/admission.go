@@ -147,6 +147,35 @@ type admissionCore struct {
 // Residency and the RT-02 final-candidate gate stay with the callers: chat
 // runs them after routing, non-chat immediately after the core.
 func (gw *gateway) admissionCore(w http.ResponseWriter, r *http.Request, l *slog.Logger, in admissionCoreInput) (admissionCore, bool) {
+	out := gw.newAdmissionIdentity(r, in.Model)
+	if !gw.applyAdmissionGuards(w, l, in, &out) {
+		return admissionCore{}, false
+	}
+	if !gw.resolveAdmissionModel(w, r, l, in, &out) {
+		return admissionCore{}, false
+	}
+	if !gw.resolveAdmissionTasking(w, r, &out) {
+		return admissionCore{}, false
+	}
+	if !gw.checkAdmissionWhitelist(w, r, l, in, &out) {
+		return admissionCore{}, false
+	}
+	if !gw.checkAdmissionSpend(w, r, l, in, &out) {
+		return admissionCore{}, false
+	}
+	if !gw.acquireFairAdmission(w, r, l, &out) {
+		return admissionCore{}, false
+	}
+
+	return out, true
+}
+
+// newAdmissionIdentity mints the request identity and the per-invocation
+// durable-accounting holder (uuid) at the shared admission choke point,
+// before any guard outcome can branch the pipeline. IO-free; the kind binds
+// later at the first paid dispatch, so every pipeline sharing this core
+// gets one holder.
+func (gw *gateway) newAdmissionIdentity(r *http.Request, model string) admissionCore {
 	out := admissionCore{
 		RequestID:    logctx.RequestID(r.Context()),
 		SessionID:    r.Header.Get("X-Session-Id"),
@@ -157,45 +186,47 @@ func (gw *gateway) admissionCore(w http.ResponseWriter, r *http.Request, l *slog
 		AgentID:      r.Header.Get("X-Agent-Id"),
 		UserID:       r.Header.Get("X-User-Id"),
 	}
-
-	// Preview2 durable accounting: mint the per-invocation identity (uuid)
-	// at the shared admission choke point, before any guard outcome can
-	// branch the pipeline. IO-free; the kind binds later at the first paid
-	// dispatch, so every pipeline sharing this core gets one holder.
 	out.Invocation = newInvocationIdentity(
 		out.OrgID, out.RequestID, out.SessionID,
-		out.APIKeyID, out.SessionKeyID, in.Model)
+		out.APIKeyID, out.SessionKeyID, model)
+	return out
+}
 
-	// U1: pre-egress guard hooks (deterministic PII/secrets/injection). Runs
-	// once per request, before routing/forwarding. deny → 400, no forward;
-	// redact → body is rewritten; log/off → pass-through.
+// applyAdmissionGuards runs the U1 pre-egress guard hooks (deterministic
+// PII/secrets/injection) once per request, before routing/forwarding.
+// deny → 400, no forward; redact → body is rewritten; log/off → pass-through.
+// RT-04 (chat): the typed projection is rebuilt from the GUARDED body before
+// anything downstream consumes it.
+func (gw *gateway) applyAdmissionGuards(w http.ResponseWriter, l *slog.Logger, in admissionCoreInput, out *admissionCore) bool {
 	body, err := gw.applyEgressGuards(in.Body)
 	if err != nil {
 		l.Warn("guard hooks denied request", "error", err)
 		apierrors.Write(w, http.StatusBadRequest, "guard_denied",
 			"request blocked by guard hooks: sensitive data detected")
-		return admissionCore{}, false
+		return false
 	}
 	out.Body = body
 
-	// RT-04 (chat): rebuild the typed projection from the GUARDED body
-	// before anything downstream consumes it.
 	if in.Rebuild != nil {
 		if rerr := in.Rebuild(body); rerr != nil {
 			l.Warn("guarded body is not a valid chat completion request", "error", rerr)
 			apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"malformed JSON: "+rerr.Error())
-			return admissionCore{}, false
+			return false
 		}
 	}
+	return true
+}
 
+// resolveAdmissionModel resolves the model (RT-06: a registry outage or a
+// cancelled request is terminal — no fallback substitution, no routing
+// continuation, no upstream call) and applies the unknown-model policy.
+func (gw *gateway) resolveAdmissionModel(w http.ResponseWriter, r *http.Request, l *slog.Logger, in admissionCoreInput, out *admissionCore) bool {
 	info, resErr := gw.resolveModelInfo(r.Context(), in.Model)
 	if resErr != nil {
-		// RT-06: a registry outage or a cancelled request is terminal — no
-		// fallback substitution, no routing continuation, no upstream call.
 		l.Warn("model resolution unavailable, denying request", "error", resErr, "requested", in.Model)
 		writeResolutionUnavailable(w)
-		return admissionCore{}, false
+		return false
 	}
 	if info.Fallback && gw.unknownModelPolicy == "reject" {
 		msg := fmt.Sprintf("model %q is not available on this gateway", in.Model)
@@ -204,199 +235,235 @@ func (gw *gateway) admissionCore(w http.ResponseWriter, r *http.Request, l *slog
 			EventType:      "request.invalid",
 			RequestID:      out.RequestID,
 			SessionID:      out.SessionID,
-			Payload:        string(body),
+			Payload:        string(out.Body),
 			OrgID:          out.OrgID,
 			TeamID:         out.TeamID,
 			ModelRequested: in.Model,
 			Error:          msg,
 			Labels:         labelsFrom(r.Context()),
 		}.build())
-		return admissionCore{}, false
+		return false
 	}
 	if info.Fallback {
 		w.Header().Set("X-Yabanin-Model-Fallback", in.Model+"->"+info.ModelName)
 	}
 	out.Info = info
 	out.Fallback = info.Fallback
+	return true
+}
 
+// resolveAdmissionTasking validates and derives the chargeback dimensions:
+// the task tag (with the ADL-01 deployment-level default for requests that
+// carry no X-Yabanin-Task header of their own — an explicit header always
+// wins) and the workload key.
+//
+// N06-P07-T04: X-Yabanin-Workload is a CALLER-ASSERTED attribution label,
+// not a verified identity: any well-formed key is accepted and rides the
+// caller's own org namespace in the cap ledger. It gates spend attribution,
+// never authorization. Because explicit keys are taken verbatim, an explicit
+// key shaped like a derived form ("team:x", "agent:y") lands in the same
+// window as the derivation that would produce it — deliberate (one naming
+// scheme, one window per shape), and safe because the org component keeps
+// it inside the caller's own tenant.
+//
+// An explicit header wins; otherwise the key is derived from the
+// agent/team/task identity the request already carries, so every request —
+// batch lines included, which synthesize only X-Yabanin-Task — is
+// attributable and cannot bypass the dimension. A malformed explicit key is
+// a 400, the same shape as the task tag. The resolved key rides the
+// request's label context (metaLabelWorkload), which is how it reaches every
+// settle event downstream — the durable chargeback record.
+func (gw *gateway) resolveAdmissionTasking(w http.ResponseWriter, r *http.Request, out *admissionCore) bool {
 	taskID := r.Header.Get("X-Yabanin-Task")
 	if !budget.ValidTaskID(taskID) {
 		apierrors.Write(w, http.StatusBadRequest, "invalid_task_id",
 			"X-Yabanin-Task must match [A-Za-z0-9._:-]{1,128}")
-		return admissionCore{}, false
+		return false
 	}
-	// ADL-01: CI task tag — a deployment-level default for requests that carry
-	// no X-Yabanin-Task header of their own. An explicit per-request header
-	// always wins.
 	if taskID == "" && gw.taskTag != "" {
 		taskID = gw.taskTag
 	}
 	out.TaskID = taskID
 
-	// N06-P07-T04: workload identity — the chargeback dimension.
-	//
-	// X-Yabanin-Workload is a CALLER-ASSERTED attribution label, not a
-	// verified identity: any well-formed key is accepted and rides the
-	// caller's own org namespace in the cap ledger. It gates spend
-	// attribution, never authorization. Because explicit keys are taken
-	// verbatim, an explicit key shaped like a derived form ("team:x",
-	// "agent:y") lands in the same window as the derivation that would
-	// produce it — deliberate (one naming scheme, one window per shape),
-	// and safe because the org component keeps it inside the caller's own
-	// tenant.
-	//
-	// An explicit header wins; otherwise the key is derived from the
-	// agent/team/task identity the request already carries, so every
-	// request — batch lines included, which synthesize only X-Yabanin-Task —
-	// is attributable and cannot bypass the dimension. A malformed explicit
-	// key is a 400, the same shape as the task tag. The resolved key rides
-	// the request's label context (metaLabelWorkload), which is how it
-	// reaches every settle event downstream — the durable chargeback record.
 	workloadID := r.Header.Get("X-Yabanin-Workload")
 	if workloadID != "" && !budget.ValidWorkloadKey(workloadID) {
 		apierrors.Write(w, http.StatusBadRequest, "invalid_workload_id",
 			"X-Yabanin-Workload must match [A-Za-z0-9._:-]{1,128}")
-		return admissionCore{}, false
+		return false
 	}
 	out.WorkloadID = budget.DeriveWorkloadKey(out.AgentID, out.TeamID, taskID, workloadID)
 	setWorkloadLabel(r, out.WorkloadID)
+	return true
+}
 
-	// P1.1: Whitelist enforcement — check model access before cache/routing.
-	// Fail-closed: a datastore error must NOT admit a request whose model may
-	// be restricted. The whitelist sees the alias-aware registry name (RT-02):
-	// an alias is checked as its canonical target, matching chat.go and the
-	// non-chat endpoints — the same alias must not behave differently per
-	// endpoint. The RT-02 final gate re-checks the candidate after residency
-	// remap.
+// checkAdmissionWhitelist enforces P1.1 model access before cache/routing.
+// Fail-closed: a datastore error must NOT admit a request whose model may
+// be restricted. The whitelist sees the alias-aware registry name (RT-02):
+// an alias is checked as its canonical target, matching chat.go and the
+// non-chat endpoints — the same alias must not behave differently per
+// endpoint. The RT-02 final gate re-checks the candidate after residency
+// remap.
+func (gw *gateway) checkAdmissionWhitelist(w http.ResponseWriter, r *http.Request, l *slog.Logger, in admissionCoreInput, out *admissionCore) bool {
 	if gw.wl != nil {
-		allowed, err := gw.wl.Check(r.Context(), out.APIKeyID, out.TeamID, whitelistModel(info, in.Model))
+		allowed, err := gw.wl.Check(r.Context(), out.APIKeyID, out.TeamID, whitelistModel(out.Info, in.Model))
 		if err != nil {
-			l.Warn("whitelist check failed, denying request", "error", err, "key_id", out.APIKeyID, "model", info.ModelName)
+			l.Warn("whitelist check failed, denying request", "error", err, "key_id", out.APIKeyID, "model", out.Info.ModelName)
 			metrics.WlCheckErrors.Inc()
 			apierrors.Write(w, http.StatusServiceUnavailable, "whitelist_check_unavailable",
 				"whitelist check temporarily unavailable")
-			return admissionCore{}, false
+			return false
 		}
 		if !allowed {
 			apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
 				fmt.Sprintf("model %q is not allowed for this API key", in.Model))
-			return admissionCore{}, false
+			return false
 		}
 	}
+	return true
+}
 
-	if !in.SkipSpendChecks {
-		// P6.10: Team budget enforcement. Fail-safe semantics:
-		//   ErrNoBudget (no row) -> 403, ErrBudgetExceeded -> 429,
-		//   any other (datastore error) -> 503. Never allow spend when the
-		//   budget store is degraded.
-		if gw.budgetEnforcer != nil && out.TeamID != "" {
-			if err := gw.budgetEnforcer.CheckBudget(r.Context(), out.TeamID); err != nil {
-				switch {
-				case errors.Is(err, budget.ErrNoBudget):
-					apierrors.Write(w, http.StatusForbidden, "budget_not_configured",
-						"team has no budget configured — spending is disabled until a budget is set")
-				case errors.Is(err, budget.ErrBudgetExceeded):
-					apierrors.Write(w, http.StatusTooManyRequests, "budget_exceeded",
-						fmt.Sprintf("team budget limit reached: %v", err))
-					publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-						EventType:      "request.budget_exceeded",
-						RequestID:      out.RequestID,
-						SessionID:      out.SessionID,
-						Payload:        string(body),
-						OrgID:          out.OrgID,
-						TeamID:         out.TeamID,
-						UserID:         out.budgetEventUser(in.BudgetEventUser),
-						ModelRequested: info.ModelName,
-						Error:          err.Error(),
-						Labels:         labelsFrom(r.Context()),
-					}.build())
-				default:
-					apierrors.Write(w, http.StatusServiceUnavailable, "budget_check_unavailable",
-						fmt.Sprintf("budget check temporarily unavailable: %v", err))
-				}
-				return admissionCore{}, false
-			}
-		}
-		// G2: per-agent budget enforcement (fail-safe, mirrors the team
-		// budget). Only runs for requests that carry an agent identity AND
-		// have a configured agent budget row; agents without a row
-		// (ErrNoAgentBudget) are denied.
-		if gw.agentEnforcer != nil && out.AgentID != "" {
-			if err := gw.agentEnforcer.CheckAgentBudget(r.Context(), out.AgentID); err != nil {
-				switch {
-				case errors.Is(err, budget.ErrNoAgentBudget):
-					apierrors.Write(w, http.StatusForbidden, "agent_budget_not_configured",
-						"agent has no budget configured — spending is disabled until a budget is set")
-				case errors.Is(err, budget.ErrAgentBudgetExceeded):
-					apierrors.Write(w, http.StatusTooManyRequests, "agent_budget_exceeded",
-						fmt.Sprintf("agent daily budget limit reached: %v", err))
-				default:
-					apierrors.Write(w, http.StatusServiceUnavailable, "agent_budget_check_unavailable",
-						fmt.Sprintf("agent budget check temporarily unavailable: %v", err))
-				}
-				return admissionCore{}, false
-			}
-		}
-		// N06-P07-T04: workload cap (opt-in, per-replica). Fail-closed over
-		// cap → 429, the same refusal shape as the team/agent budget areas;
-		// a disabled ledger or an unattributable request is a no-op. The
-		// window is namespaced by the AUTHENTICATED org (out.OrgID, as set
-		// by the auth middleware — NEXT-02/F02 precedent): identical
-		// workload names across orgs never share a counter, so one tenant's
-		// charges can never 429 another tenant.
-		if err := sharedWorkloadLedger().Admit(out.OrgID, out.WorkloadID, 0); err != nil {
-			apierrors.Write(w, http.StatusTooManyRequests, "workload_budget_exceeded",
-				fmt.Sprintf("workload budget limit reached: %v", err))
-			return admissionCore{}, false
-		}
-		// G3: per-task / per-session token budgets (opt-in). 429 on exceed;
-		// X-Yabanin-Budget-Warning when at/near cap. No-op when both caps 0.
-		if !gw.checkTokenBudget(w, r, out.OrgID, taskID, out.SessionID) || !gw.checkSessionBudget(w, r) {
-			return admissionCore{}, false
-		}
+// checkAdmissionSpend runs the spend gates (team budget, agent budget,
+// workload cap, task/session token budgets) unless the caller opted out
+// (count_tokens is not spend).
+func (gw *gateway) checkAdmissionSpend(w http.ResponseWriter, r *http.Request, l *slog.Logger, in admissionCoreInput, out *admissionCore) bool {
+	if in.SkipSpendChecks {
+		return true
 	}
-
-	// RATELIMIT-FALLBACK P3: per-replica fair admission in front of
-	// upstream dispatch (opt-in; nil = off). This one site covers every
-	// request the gateway admits — chat (JSON and stream share it) and all
-	// non-chat endpoints — so the concurrency bounds cannot be routed
-	// around by a different endpoint family. The ticket is released when
-	// the request ends: the chat path releases it synchronously on handler
-	// return (F1, batch lines are in-process and cannot absorb the async
-	// fire), the AfterFunc below is the backstop that frees the slot early
-	// on mid-request client disconnect, and non-chat endpoints release on
-	// ServeHTTP return. FairTicket.Release is exactly-once (sync.Once), so
-	// double release across the anchors is impossible and no handler
-	// learns about the controller.
-	if gw.fair != nil {
-		ticket, err := gw.fair.Admit(r.Context(), out.OrgID, out.WorkloadID)
-		if err != nil {
-			var shed *router.FairShedError
-			if errors.As(err, &shed) {
-				secs := fairShedRetryAfterSeconds(shed.RetryAfter)
-				if secs > 0 {
-					w.Header().Set("Retry-After", strconv.Itoa(secs))
-				}
-				l.Warn("fair admission shed request",
-					"reason", string(shed.Reason), "retry_after", shed.RetryAfter.String())
-				apierrors.WriteWithCode(w, http.StatusTooManyRequests,
-					apierrors.ErrorCodeRateLimitExceeded,
-					fairShedMessage(secs, shed.Reason),
-					"rate_limit_exceeded")
-				return admissionCore{}, false
-			}
-			// Dead context (client disconnect / timeout middleware): the
-			// response belongs to whoever canceled. Best-effort no write —
-			// a superfluous WriteHeader here would race the deadline
-			// writer; the request simply ends.
-			l.Debug("fair admission refused canceled request", "error", err)
-			return admissionCore{}, false
-		}
-		out.FairTicket = ticket
-		context.AfterFunc(r.Context(), ticket.Release)
+	if !gw.checkTeamBudget(w, r, l, in, out) {
+		return false
 	}
+	if !gw.checkAgentBudget(w, r, out) {
+		return false
+	}
+	if !gw.checkWorkloadCap(w, out) {
+		return false
+	}
+	if !gw.checkTokenBudget(w, r, out.OrgID, out.TaskID, out.SessionID) {
+		return false
+	}
+	return gw.checkSessionBudget(w, r)
+}
 
-	return out, true
+// checkTeamBudget enforces the P6.10 team budget. Fail-safe semantics:
+// ErrNoBudget (no row) -> 403, ErrBudgetExceeded -> 429, any other
+// (datastore error) -> 503. Never allow spend when the budget store is
+// degraded.
+func (gw *gateway) checkTeamBudget(w http.ResponseWriter, r *http.Request, l *slog.Logger, in admissionCoreInput, out *admissionCore) bool {
+	if gw.budgetEnforcer == nil || out.TeamID == "" {
+		return true
+	}
+	if err := gw.budgetEnforcer.CheckBudget(r.Context(), out.TeamID); err != nil {
+		switch {
+		case errors.Is(err, budget.ErrNoBudget):
+			apierrors.Write(w, http.StatusForbidden, "budget_not_configured",
+				"team has no budget configured — spending is disabled until a budget is set")
+		case errors.Is(err, budget.ErrBudgetExceeded):
+			apierrors.Write(w, http.StatusTooManyRequests, "budget_exceeded",
+				fmt.Sprintf("team budget limit reached: %v", err))
+			publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+				EventType:      "request.budget_exceeded",
+				RequestID:      out.RequestID,
+				SessionID:      out.SessionID,
+				Payload:        string(out.Body),
+				OrgID:          out.OrgID,
+				TeamID:         out.TeamID,
+				UserID:         out.budgetEventUser(in.BudgetEventUser),
+				ModelRequested: out.Info.ModelName,
+				Error:          err.Error(),
+				Labels:         labelsFrom(r.Context()),
+			}.build())
+		default:
+			apierrors.Write(w, http.StatusServiceUnavailable, "budget_check_unavailable",
+				fmt.Sprintf("budget check temporarily unavailable: %v", err))
+		}
+		return false
+	}
+	return true
+}
+
+// checkAgentBudget enforces the G2 per-agent budget (fail-safe, mirrors the
+// team budget). Only runs for requests that carry an agent identity AND
+// have a configured agent budget row; agents without a row
+// (ErrNoAgentBudget) are denied.
+func (gw *gateway) checkAgentBudget(w http.ResponseWriter, r *http.Request, out *admissionCore) bool {
+	if gw.agentEnforcer == nil || out.AgentID == "" {
+		return true
+	}
+	if err := gw.agentEnforcer.CheckAgentBudget(r.Context(), out.AgentID); err != nil {
+		switch {
+		case errors.Is(err, budget.ErrNoAgentBudget):
+			apierrors.Write(w, http.StatusForbidden, "agent_budget_not_configured",
+				"agent has no budget configured — spending is disabled until a budget is set")
+		case errors.Is(err, budget.ErrAgentBudgetExceeded):
+			apierrors.Write(w, http.StatusTooManyRequests, "agent_budget_exceeded",
+				fmt.Sprintf("agent daily budget limit reached: %v", err))
+		default:
+			apierrors.Write(w, http.StatusServiceUnavailable, "agent_budget_check_unavailable",
+				fmt.Sprintf("agent budget check temporarily unavailable: %v", err))
+		}
+		return false
+	}
+	return true
+}
+
+// checkWorkloadCap enforces the N06-P07-T04 workload cap (opt-in,
+// per-replica). Fail-closed over cap → 429, the same refusal shape as the
+// team/agent budget areas; a disabled ledger or an unattributable request
+// is a no-op. The window is namespaced by the AUTHENTICATED org
+// (out.OrgID, as set by the auth middleware — NEXT-02/F02 precedent):
+// identical workload names across orgs never share a counter, so one
+// tenant's charges can never 429 another tenant.
+func (gw *gateway) checkWorkloadCap(w http.ResponseWriter, out *admissionCore) bool {
+	if err := sharedWorkloadLedger().Admit(out.OrgID, out.WorkloadID, 0); err != nil {
+		apierrors.Write(w, http.StatusTooManyRequests, "workload_budget_exceeded",
+			fmt.Sprintf("workload budget limit reached: %v", err))
+		return false
+	}
+	return true
+}
+
+// acquireFairAdmission takes the RATELIMIT-FALLBACK P3 per-replica fair
+// admission ticket in front of upstream dispatch (opt-in; nil = off). This
+// one site covers every request the gateway admits — chat (JSON and stream
+// share it) and all non-chat endpoints — so the concurrency bounds cannot
+// be routed around by a different endpoint family. The ticket is released
+// when the request ends: the chat path releases it synchronously on handler
+// return (F1, batch lines are in-process and cannot absorb the async
+// fire), the AfterFunc below is the backstop that frees the slot early on
+// mid-request client disconnect, and non-chat endpoints release on
+// ServeHTTP return. FairTicket.Release is exactly-once (sync.Once), so
+// double release across the anchors is impossible and no handler learns
+// about the controller.
+func (gw *gateway) acquireFairAdmission(w http.ResponseWriter, r *http.Request, l *slog.Logger, out *admissionCore) bool {
+	if gw.fair == nil {
+		return true
+	}
+	ticket, err := gw.fair.Admit(r.Context(), out.OrgID, out.WorkloadID)
+	if err != nil {
+		var shed *router.FairShedError
+		if errors.As(err, &shed) {
+			secs := fairShedRetryAfterSeconds(shed.RetryAfter)
+			if secs > 0 {
+				w.Header().Set("Retry-After", strconv.Itoa(secs))
+			}
+			l.Warn("fair admission shed request",
+				"reason", string(shed.Reason), "retry_after", shed.RetryAfter.String())
+			apierrors.WriteWithCode(w, http.StatusTooManyRequests,
+				apierrors.ErrorCodeRateLimitExceeded,
+				fairShedMessage(secs, shed.Reason),
+				"rate_limit_exceeded")
+			return false
+		}
+		// Dead context (client disconnect / timeout middleware): the
+		// response belongs to whoever canceled. Best-effort no write —
+		// a superfluous WriteHeader here would race the deadline
+		// writer; the request simply ends.
+		l.Debug("fair admission refused canceled request", "error", err)
+		return false
+	}
+	out.FairTicket = ticket
+	context.AfterFunc(r.Context(), ticket.Release)
+	return true
 }
 
 // fairShedRetryAfterSeconds converts the shed hint into whole seconds for
