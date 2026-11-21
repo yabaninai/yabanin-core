@@ -114,10 +114,6 @@ func TestSSELineSplitter_Terminators(t *testing.T) {
 	if len(got) != 1 || string(got[0]) != "data: c\r" {
 		t.Fatalf("lone cr line: %q", got)
 	}
-	// Comment lines are classified from their first byte.
-	if !SSECommentLine([]byte(": ping\n")) || SSECommentLine([]byte("data: x\n")) || SSECommentLine(nil) {
-		t.Fatalf("comment classification")
-	}
 	// Flush: a trailing CR is a complete line; otherwise the remainder is
 	// the unterminated partial.
 	lines, partial := s.Flush()
@@ -132,6 +128,13 @@ func TestSSELineSplitter_Terminators(t *testing.T) {
 	lines, partial = s2.Flush()
 	if len(lines) != 0 || string(partial) != "data: cut" {
 		t.Fatalf("flush unterminated: %q %q", lines, partial)
+	}
+}
+
+func TestSSECommentLine(t *testing.T) {
+	// Comment lines are classified from their first byte.
+	if !SSECommentLine([]byte(": ping\n")) || SSECommentLine([]byte("data: x\n")) || SSECommentLine(nil) {
+		t.Fatalf("comment classification")
 	}
 }
 

@@ -468,30 +468,8 @@ func (rl *responsesStreamRelay) drain(lr *apiformat.SSELineReader) (stopErr erro
 	// After a client write fails, finish accounting for buffered bytes only.
 	for rl.werr == nil || lr.Buffered() {
 		line, rerr := lr.ReadLine()
-		if rerr == apiformat.ErrSSELineLimit {
-			// Oversized upstream line: drop it and the held frame; the
-			// caller's response.failed frame closes the client stream.
-			return apiformat.ErrSSELineLimit, false
-		}
-		if rerr != nil && !errors.Is(rerr, io.EOF) {
-			// Broken upstream (cut mid-line): the unterminated partial is
-			// withheld; salvage a boundary-aligned decodable frame closed
-			// with its separator so the failure frame composes at an
-			// event boundary.
-			if len(line) == 0 && rl.frames.Salvageable() {
-				rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
-			}
-			if rl.werr != nil {
-				return rl.werr, false
-			}
-			return rerr, false
-		}
 		if rerr != nil {
-			// io.EOF — clean end, same boundary-aligned salvage.
-			if len(line) == 0 && rl.frames.Salvageable() {
-				rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
-			}
-			break
+			return rl.finishRead(line, rerr)
 		}
 		if apiformat.SSECommentLine(line) {
 			// Keepalive comments ride no event: forward immediately
@@ -521,6 +499,24 @@ func (rl *responsesStreamRelay) drain(lr *apiformat.SSELineReader) (stopErr erro
 		}
 	}
 	return nil, true
+}
+
+// finishRead may close a complete final event missing its separator. A
+// partially read or oversized line cannot establish an event boundary.
+func (rl *responsesStreamRelay) finishRead(line []byte, err error) (error, bool) {
+	if err == apiformat.ErrSSELineLimit {
+		return err, false
+	}
+	if len(line) == 0 && rl.frames.Salvageable() {
+		rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
+	}
+	if errors.Is(err, io.EOF) {
+		return nil, true
+	}
+	if rl.werr != nil {
+		return rl.werr, false
+	}
+	return err, false
 }
 
 // flushParser settles the parser's pending event at a clean end: a blob
