@@ -104,6 +104,10 @@ func (event *Event) TerminalAccountingFields() (map[string]string, error) {
 	if err != nil {
 		return nil, err
 	}
+	return event.terminalFields(reservations), nil
+}
+
+func (event *Event) terminalFields(reservations string) map[string]string {
 	fields := event.accountingFields(event.TS)
 	fields["reservations"] = reservations
 	fields["invocation_id"] = event.InvocationID
@@ -111,7 +115,7 @@ func (event *Event) TerminalAccountingFields() (map[string]string, error) {
 	fields["session_key_id"] = event.SessionKeyID
 	fields["user_id"] = event.UserID
 	fields["prompt_hash"] = ResolvePromptHash(event.PromptHash, event.Payload)
-	return fields, nil
+	return fields
 }
 
 func validTerminalCosts(amounts ...float64) bool {
