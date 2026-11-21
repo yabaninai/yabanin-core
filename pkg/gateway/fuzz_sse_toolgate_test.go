@@ -92,54 +92,81 @@ func sseGenName(b byte) string {
 func sseGenFrames(p []byte) (frames []string, sawDenied bool) {
 	for i := 0; i+3 < len(p); i += 4 {
 		c := p[i : i+4]
-		name := sseGenName(c[0])
 		if c[0]&3 == 3 { // non-data line: keepalive/comment passthrough
-			frames = append(frames, ": keepalive "+fmt.Sprintf("%02x", c[1])+"\n\n")
+			frames = append(frames, sseGenKeepAlive(c))
 			continue
 		}
-		switch {
-		case c[3]&0x40 != 0:
-			frames = append(frames, "data: }\n\n") // first JSON token itself invalid
-			continue
-		case c[3]&0x04 != 0 && c[3]&0x08 == 0:
-			frames = append(frames, "data: {bad\n\n") // malformed JSON payload
-			continue
-		case c[3]&0x04 != 0:
-			frames = append(frames, "data: 5\n\n") // scalar JSON payload
-			continue
-		case c[3]&0x10 != 0:
-			frames = append(frames, fmt.Sprintf(`data: {"choices":[{"index":%d,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n", c[1]%2))
+		if frame, special := sseGenSpecialFrame(c); special {
+			frames = append(frames, frame)
 			continue
 		}
-		// Only call frames can carry (and leak) a denied name; nameless
-		// frames omit the name key, so no denial is declared either.
-		nameless := c[0]&0x04 != 0
-		if name == "secret_tool" && !nameless {
-			sawDenied = true
-		}
-		argsBytes, _ := json.Marshal(string(c[1:])) // infallible for strings; valid JSON fragment
-		if c[0]&0x08 != 0 {                         // non-string argument form: refused fail-closed
-			argsBytes = []byte(`{"fuzz":true}`)
-		}
-		fn := fmt.Sprintf(`"arguments":%s`, string(argsBytes))
-		if !nameless {
-			fn = fmt.Sprintf(`"name":%q,`+fn, name)
-		}
-		choice := fmt.Sprintf(`{"index":%s,"delta":{"tool_calls":[{"index":%d,"function":{%s}}]}}`,
-			choiceIndex(c), c[2]%3, fn)
-		if c[0]&0x20 != 0 { // duplicate choice: the same wire index twice in one frame
-			choice += "," + choice
-		}
-		choices := choice
-		if c[3]&0x20 != 0 { // null choice member inside an indexed frame
-			choices = "null," + choices
-		}
-		frames = append(frames, fmt.Sprintf(`data: {"choices":[%s]}`+"\n\n", choices))
+		frame, denied := sseGenCallFrame(c, sseGenName(c[0]))
+		frames = append(frames, frame)
+		sawDenied = sawDenied || denied
 	}
-	if len(p) > 0 && p[len(p)-1]&0x80 != 0 {
+	if sseGenHasTerminalFrame(p) {
 		frames = append(frames, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
 	}
 	return frames, sawDenied
+}
+
+// sseGenKeepAlive renders the non-data passthrough line (name arm 3): a
+// comment frame the gate must forward untouched.
+func sseGenKeepAlive(c []byte) string {
+	return ": keepalive " + fmt.Sprintf("%02x", c[1]) + "\n\n"
+}
+
+// sseGenSpecialFrame renders the payload-shape arms that bypass the
+// tool-call construction (frame-shape bits on c[3]), in arm priority
+// order: invalid-first-token, malformed, scalar, indexed terminal.
+// ok=false leaves the group to the ordinary call-frame path.
+func sseGenSpecialFrame(c []byte) (frame string, ok bool) {
+	switch {
+	case c[3]&0x40 != 0:
+		return "data: }\n\n", true // first JSON token itself invalid
+	case c[3]&0x04 != 0 && c[3]&0x08 == 0:
+		return "data: {bad\n\n", true // malformed JSON payload
+	case c[3]&0x04 != 0:
+		return "data: 5\n\n", true // scalar JSON payload
+	case c[3]&0x10 != 0:
+		return fmt.Sprintf(`data: {"choices":[{"index":%d,"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n", c[1]%2), true
+	}
+	return "", false
+}
+
+// sseGenCallFrame renders one tool-call data frame from a 4-byte group:
+// name/arguments payload plus the duplicate-choice (c[0]&0x20) and
+// null-choice-member (c[3]&0x20) arms. The bool reports a declared denied
+// name — only a named call frame can carry (and leak) one; nameless frames
+// omit the name key, so no denial is declared either.
+func sseGenCallFrame(c []byte, name string) (string, bool) {
+	nameless := c[0]&0x04 != 0
+	denied := name == "secret_tool" && !nameless
+	argsBytes, _ := json.Marshal(string(c[1:])) // infallible for strings; valid JSON fragment
+	if c[0]&0x08 != 0 {                         // non-string argument form: refused fail-closed
+		argsBytes = []byte(`{"fuzz":true}`)
+	}
+	fn := fmt.Sprintf(`"arguments":%s`, string(argsBytes))
+	if !nameless {
+		fn = fmt.Sprintf(`"name":%q,`+fn, name)
+	}
+	choice := fmt.Sprintf(`{"index":%s,"delta":{"tool_calls":[{"index":%d,"function":{%s}}]}}`,
+		choiceIndex(c), c[2]%3, fn)
+	if c[0]&0x20 != 0 { // duplicate choice: the same wire index twice in one frame
+		choice += "," + choice
+	}
+	choices := choice
+	if c[3]&0x20 != 0 { // null choice member inside an indexed frame
+		choices = "null," + choices
+	}
+	return fmt.Sprintf(`data: {"choices":[%s]}`+"\n\n", choices), denied
+}
+
+// sseGenHasTerminalFrame reports the historical finish derivation: a
+// stream whose final byte has bit 0x80 set appends an index-less terminal
+// frame after the per-group frames.
+func sseGenHasTerminalFrame(p []byte) bool {
+	return len(p) > 0 && p[len(p)-1]&0x80 != 0
 }
 
 // choiceIndex renders the SSE choice index: a whole number unless the
