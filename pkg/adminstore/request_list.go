@@ -10,6 +10,21 @@ import (
 	"github.com/jackc/pgx/v5"
 )
 
+// toolFactMatchesRow is the single association rule binding retained tool
+// facts (tc) to a physical request_logs row (rl), applied identically by
+// the list projection, the YQL tool filters and the request-count aggregate
+// (0028/0030): an invocation-bearing fact binds exactly to the row carrying
+// the same invocation identity; a NULL-invocation fact (legacy, or emitted
+// by a pre-0030 writer mode for a minted request) associates only when rl
+// is the org's unique carrier of the correlation — a correlation carried by
+// multiple rows associates its NULL facts to none of them. The carrier
+// count stays org-scoped, so the same correlation string in another org
+// never steals facts. (The detail path applies the parameterized equivalent
+// with uniqueCorrelationCarrier.)
+const toolFactMatchesRow = "((tc.invocation_id IS NOT NULL AND tc.invocation_id = rl.invocation_id) OR " +
+	"(tc.invocation_id IS NULL AND " +
+	"(SELECT COUNT(*) FROM request_logs c WHERE c.org_id = tc.org_id AND c.request_id = tc.request_id) = 1))"
+
 // RequestListFilters narrows the request-log list query. All fields optional
 // except OrgID; a zero filter returns the newest rows for the org.
 // The numeric ranges mirror the Bifrost log explorer (min/max latency,
@@ -330,15 +345,17 @@ func listRequestsOn(ctx context.Context, ex exportQueryRunner, f RequestListFilt
 	}
 
 	// The tool_calls column is an org-scoped correlated subquery, not a
-	// join: rows of a foreign org that merely shadow the same request_id
-	// can never leak names into this org's list (mirror of the detail
-	// view's org scoping, and its regression test).
+	// join: rows of a foreign org that merely shadow the request_id can
+	// never leak names into this org's list (mirror of the detail view's
+	// org scoping, and its regression test). Names bind by invocation
+	// identity (0030): an invocation-bearing row lists only its own
+	// invocation's tools; a legacy row lists only legacy facts.
 	q := "SELECT rl.id, COALESCE(rl.request_id, ''), COALESCE(rl.org_id::text, ''), COALESCE(rl.model_requested, ''), " +
 		"COALESCE(rl.model_used, ''), rl.status_code, COALESCE(rl.cost_in_usd, 0), COALESCE(rl.tokens_in, 0), COALESCE(rl.tokens_out, 0), " +
 		"COALESCE(rl.task_id, ''), COALESCE(rl.session_id::text, ''), COALESCE(rl.duration_ms, 0), COALESCE(rl.cache_hit_type, ''), " +
 		"rl.first_token_ms, rl.attempt_count, rl.retry_count, COALESCE(rl.error, ''), rl.created_at, " +
 		"COALESCE((SELECT array_agg(DISTINCT tc.tool_name ORDER BY tc.tool_name) FROM tool_calls tc " +
-		"WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id), '{}'), COALESCE(rl.labels, '{}'::jsonb), COALESCE(rl.user_id::text, '') " +
+		"WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND " + toolFactMatchesRow + "), '{}'), COALESCE(rl.labels, '{}'::jsonb), COALESCE(rl.user_id::text, '') " +
 		", (rl.agent_id IS NULL AND rl.api_key_id IS NULL), COALESCE(rl.agent_id::text, '') " +
 		"FROM request_logs rl WHERE " + w + " ORDER BY " + orderSQL + " LIMIT $" + fmt.Sprint(len(args)+1) +
 		" OFFSET $" + fmt.Sprint(len(args)+2)
