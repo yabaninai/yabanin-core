@@ -109,8 +109,15 @@ func TestAccountingRefusalFamiliesBeforeDispatch(t *testing.T) {
 	// defect in the sweep below must not leave them unexercised).
 	s.classifyRemainingSurfaces(t)
 
+	for _, table := range []string{"request_admissions", "request_terminal_facts"} {
+		if !s.oracleTableExists(t, table) {
+			t.Fatalf("candidate is missing required accounting table %s", table)
+		}
+	}
+	start := s.fixture.Snapshot()
+	families := refusalFamilies()
 	var targetRids []string
-	for _, fam := range refusalFamilies() {
+	for _, fam := range families {
 		fam := fam
 		t.Run(fam.name, func(t *testing.T) {
 			s.controlFamily(t, fam, "pre")
@@ -130,7 +137,12 @@ func TestAccountingRefusalFamiliesBeforeDispatch(t *testing.T) {
 		})
 	}
 
+	s.requireGroupDrainedWithin(t, s.redisClient(t), 2*time.Minute)
 	s.requireNoLateContactOrRetroBilling(t, targetRids)
+	want := 2 * len(families) // one healthy control on each side of every fault
+	if got := s.fixture.Since(start); got != (fixtureTotals{arrivals: want, dispatches: want, receipts: want}) {
+		t.Fatalf("unexpected provider contact across all refusal windows: got %+v, want %d healthy round trips", got, want)
+	}
 }
 
 // refusalFamilies enumerates the synchronous dispatch families with
@@ -794,8 +806,7 @@ func httpPostJSONFull(timeout time.Duration, url, apiKey, requestID, payload str
 // controlFamily proves the family's healthy round trip around a fault
 // window: HTTP 200, an independently validated protocol reply, exactly
 // one whole-ledger contact on the family's OWN upstream path, retained
-// evidence, a durable request_logs row AND — on durable-accounting
-// builds — a durable confirmed admission plus a matching
+// evidence, a durable request_logs row, a confirmed admission and a matching
 // request_terminal_facts row (request_logs alone can be legacy
 // dual-write). It is the route-specific validity oracle: without it, a
 // family's refusal window could be excused as an unusable route rather
@@ -832,13 +843,9 @@ func (s *stand) controlFamily(t *testing.T, fam refusalFamily, phase string) {
 // control on durable-accounting builds: exactly one admission row in a
 // confirmed state (admitted, or reconciled once the consumer settled
 // it — never voided or unresolved) and exactly one matching
-// request_terminal_facts row. On baseline builds without those tables
-// the durable request_logs row above is the whole available surface.
+// request_terminal_facts row and log under that same invocation.
 func (s *stand) requireDurableControlEvidence(t *testing.T, family, phase, rid string) {
 	t.Helper()
-	if !s.oracleTableExists(t, "request_admissions") {
-		return
-	}
 	rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 	if len(rows) != 1 {
 		t.Fatalf("product: %s control %s: %d admission row(s), want exactly 1 — the healthy dispatch was not durably confirmed", family, phase, len(rows))
@@ -851,9 +858,12 @@ func (s *stand) requireDurableControlEvidence(t *testing.T, family, phase, rid s
 	if a.InvocationID == "" {
 		t.Fatalf("product: %s control %s: admission row carries no invocation id", family, phase)
 	}
-	if s.oracleTableExists(t, "request_terminal_facts") {
-		requireEventually(t, 60*time.Second, 500*time.Millisecond, func() bool {
-			return s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID) == 1
-		}, "product: %s control %s never wrote exactly one matching request_terminal_facts row", family, phase)
+	const linked = `SELECT count(*) FROM request_terminal_facts f
+		JOIN request_logs l ON l.invocation_id = f.invocation_id AND l.org_id::text = f.org_id
+		WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3
+		AND l.request_id=$3 AND f.event->>'invocation_id'=f.invocation_id::text
+		AND f.event->>'org_id'=f.org_id AND f.event->>'request_id'=f.client_request_id`
+	if n := s.oracleCount(t, linked, a.InvocationID, s.oracleDB.orgID, rid); n != 1 {
+		t.Fatalf("product: %s control %s: expected one matching terminal fact and log under admission %s, got %d", family, phase, a.InvocationID, n)
 	}
 }
