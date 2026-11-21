@@ -150,3 +150,38 @@ func TestOpenAIStreamSuppressesUsageWithNullError(t *testing.T) {
 	require.Equal(t, terminal, out.String())
 	require.Equal(t, int64(7), u.TotalTokens)
 }
+
+func TestLegacyCompletionsRecoversOnlyCompleteDataLine(t *testing.T) {
+	const data = "data: {\"choices\":[{\"text\":\"ll\"}]}\n"
+	for _, tc := range []struct{ name, wire, want string }{
+		{"complete JSON line", data, data + "\n"},
+		{"missing line ending", strings.TrimSuffix(data, "\n"), ""},
+		{"partial following line", data + "dat", ""},
+		{"undelimited terminal", "data: [DONE]\n", ""},
+		{"incomplete JSON", "data: {\n", ""},
+		{"partial heartbeat", ": keep", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, buf := newRecorder()
+			resp := &http.Response{Body: io.NopCloser(&errReader{data: []byte(tc.wire), err: io.ErrUnexpectedEOF})}
+			defer resp.Body.Close()
+			h := NewStreamHandlerWithOptions("openai", "m", StreamOptions{RecoverLegacyCompletionLine: true})
+			_, err := h.HandleStream(t.Context(), w, w, resp)
+			require.ErrorIs(t, err, io.ErrUnexpectedEOF)
+			require.Equal(t, tc.want, buf.String())
+		})
+	}
+}
+
+func TestLegacyRecoveryFlushCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	w, buf := newRecorder()
+	const line = "data: {}\n"
+	resp := &http.Response{Body: io.NopCloser(&errReader{data: []byte(line), err: io.ErrUnexpectedEOF})}
+	defer resp.Body.Close()
+	h := NewStreamHandlerWithOptions("openai", "m", StreamOptions{RecoverLegacyCompletionLine: true})
+	_, err := h.HandleStream(ctx, w, cancelStreamFlusher{cancel}, resp)
+	require.ErrorIs(t, err, context.Canceled)
+	require.Equal(t, line+"\n", buf.String())
+}

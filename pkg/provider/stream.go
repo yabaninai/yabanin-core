@@ -60,6 +60,9 @@ type StreamOptions struct {
 	// stream_options.include_usage. The chunk is still parsed for Usage —
 	// only the client-facing bytes are suppressed.
 	SuppressUsageOnlyChunk bool
+	// RecoverLegacyCompletionLine keeps a complete JSON data line received
+	// by /v1/completions just before a transport failure at the separator.
+	RecoverLegacyCompletionLine bool
 	// RequestBytes is the upstream request body length. When a stream ends
 	// without provider usage, prompt tokens are estimated as ceil(RequestBytes/4).
 	RequestBytes int
@@ -90,6 +93,7 @@ func NewStreamHandlerWithOptions(providerName, model string, opts StreamOptions)
 	}
 	return &openAIStreamHandler{
 		suppressUsageOnlyChunk: opts.SuppressUsageOnlyChunk,
+		recoverLegacyLine:      opts.RecoverLegacyCompletionLine,
 		requestBytes:           opts.RequestBytes,
 	}
 }
@@ -109,6 +113,7 @@ type openAIStreamHandler struct {
 	// for. Set via NewStreamHandlerWithOptions to drop that chunk from the
 	// client bytes while still parsing its usage.
 	suppressUsageOnlyChunk bool
+	recoverLegacyLine      bool
 	requestBytes           int
 }
 
@@ -121,6 +126,9 @@ func (h *openAIStreamHandler) HandleStream(ctx context.Context, w http.ResponseW
 	first := true
 	var run openAIStreamRun
 	for scanner.Scan() {
+		if lines.unterminated && scanner.Err() != nil {
+			break
+		}
 		if err := ctx.Err(); err != nil {
 			return h.withByteEstimate(run.usage, run.completionBytes), err
 		}
@@ -133,16 +141,16 @@ func (h *openAIStreamHandler) HandleStream(ctx context.Context, w http.ResponseW
 			return h.withByteEstimate(run.usage, run.completionBytes), err
 		}
 	}
-	err := run.finish(ctx, scanner.Err(), w, flusher, h.suppressUsageOnlyChunk)
+	err := run.finish(ctx, scanner.Err(), w, flusher, h.suppressUsageOnlyChunk, h.recoverLegacyLine && !lines.unterminated)
 	return h.withByteEstimate(run.usage, run.completionBytes), err
 }
 
-func (r *openAIStreamRun) finish(ctx context.Context, readErr error, w io.Writer, flusher http.Flusher, suppressUsage bool) error {
+func (r *openAIStreamRun) finish(ctx context.Context, readErr error, w io.Writer, flusher http.Flusher, suppressUsage, recoverLegacyLine bool) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
 	if readErr != nil {
-		return fmt.Errorf("stream read failed: %w", readErr)
+		return r.finishReadFailure(ctx, readErr, w, flusher, suppressUsage, recoverLegacyLine)
 	}
 	// Some providers omit the blank line after their final JSON or [DONE].
 	if len(r.frame) > 0 {
@@ -159,9 +167,24 @@ func (r *openAIStreamRun) finish(ctx context.Context, readErr error, w io.Writer
 	return nil
 }
 
+func (r *openAIStreamRun) finishReadFailure(ctx context.Context, readErr error, w io.Writer, flusher http.Flusher, suppressUsage, recoverLegacyLine bool) error {
+	if recoverLegacyLine && r.hasRecoverableJSONLine(readErr) {
+		if err := r.emit(w, flusher, suppressUsage, true); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("stream read failed: %w", readErr)
+}
+
 // A CR ends a line immediately. A following LF belongs to the same
 // terminator even if it arrives in a later read.
-type streamLineSplitter struct{ afterCR bool }
+type streamLineSplitter struct {
+	afterCR      bool
+	unterminated bool
+}
 
 func (s *streamLineSplitter) split(data []byte, atEOF bool) (int, []byte, error) {
 	start := 0
@@ -174,6 +197,7 @@ func (s *streamLineSplitter) split(data []byte, atEOF bool) (int, []byte, error)
 	i := bytes.IndexAny(data[start:], "\r\n")
 	if i < 0 {
 		if atEOF && len(data) > start {
+			s.unterminated = true
 			return len(data), data[start:], nil
 		}
 		return start, nil, nil
@@ -188,6 +212,12 @@ type openAIStreamRun struct {
 	usage           Usage
 	completionBytes int
 	sawDone         bool
+}
+
+func (r *openAIStreamRun) hasRecoverableJSONLine(readErr error) bool {
+	line := bytes.TrimSuffix(r.frame, []byte("\n"))
+	payload, isData := bytes.CutPrefix(line, []byte("data:"))
+	return !errors.Is(readErr, bufio.ErrTooLong) && isData && !bytes.ContainsRune(line, '\n') && json.Valid(payload)
 }
 
 func (r *openAIStreamRun) line(line []byte, w io.Writer, flusher http.Flusher, suppressUsage bool) error {
