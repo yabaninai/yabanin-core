@@ -1725,6 +1725,18 @@ func (m *mockStore) ListRequests(_ context.Context, f adminstore.RequestListFilt
 	}, 1, nil
 }
 
+func (r mockRequestRow) matchesRequestList(f adminstore.RequestListFilters) bool {
+	return (f.OrgID == "" || r.OrgID == f.OrgID) &&
+		(f.RequestID == "" || r.RequestID == f.RequestID) &&
+		(f.Model == "" || r.ModelUsed == f.Model) &&
+		(f.RowKey <= 0 || r.RowKey == f.RowKey) &&
+		r.visibleToListOwner(f)
+}
+
+func (r mockRequestRow) visibleToListOwner(f adminstore.RequestListFilters) bool {
+	return f.OwnerUserID == "" || f.OrgWideMetadata || r.OwnerUserID == f.OwnerUserID || r.AgentID == f.OwnerUserID
+}
+
 // listFixtureRows applies the durable list predicate over the richer row
 // fixture: organization, request correlation, model, the row-key pin and the
 // owner scoping request_list.go applies without org-wide metadata. The total
@@ -1732,19 +1744,7 @@ func (m *mockStore) ListRequests(_ context.Context, f adminstore.RequestListFilt
 func (m *mockStore) listFixtureRows(f adminstore.RequestListFilters) ([]adminstore.RequestListRow, int, error) {
 	rows := []adminstore.RequestListRow{}
 	for _, r := range m.requestRows {
-		if f.OrgID != "" && r.OrgID != f.OrgID {
-			continue
-		}
-		if f.RequestID != "" && r.RequestID != f.RequestID {
-			continue
-		}
-		if f.Model != "" && r.ModelUsed != f.Model {
-			continue
-		}
-		if f.RowKey > 0 && r.RowKey != f.RowKey {
-			continue
-		}
-		if f.OwnerUserID != "" && !f.OrgWideMetadata && r.OwnerUserID != f.OwnerUserID && r.AgentID != f.OwnerUserID {
+		if !r.matchesRequestList(f) {
 			continue
 		}
 		rows = append(rows, adminstore.RequestListRow{

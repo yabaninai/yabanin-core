@@ -61,9 +61,6 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 		orgID := chi.URLParam(r, "id")
 		requestID := requestIDParam(r)
 		userID := requestUserID(r)
-		orgWideMetadata := h.hasOrgWideRequestMetadata(r, orgID)
-		subject, hasSubject := adminstore.RequestPayloadSubjectFromContext(r.Context())
-		human := !hasSubject || subject.Type == "" || subject.Type == adminstore.RequestPayloadHuman
 		// ---- Phase: prechecks (read-only, no disclosure, grant untouched) ----
 		// FIX-08 detail symmetry: a request without a bearer token takes
 		// the metadata-only path and never consumes.
@@ -72,36 +69,7 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 			return
 		}
 		token := requestPayloadGrantToken(r)
-		delegRead, delegPayload := false, false
-		if !human {
-			// N04-P05 T03: a marked agent/CI subject acts under a live
-			// principal delegation, or not at all. The delegation can only
-			// ever surface the subject's OWN attributed rows (the store pins
-			// the lookup), and originals are never delegatable.
-			delegRead, delegPayload = h.evaluateSubjectDelegation(r, orgID, subject)
-		}
-		verdict := h.authorizeRequestContent(r, orgID, requestID, grant, delegRead || delegPayload)
-		role, member := h.callerRoleOnOrg(r, orgID)
-		roleGrant := human && member && adminstore.RoleHas(string(role), adminstore.PermRequestsPayloads)
-		var access adminstore.RequestPayloadAccess
-		switch {
-		case !human && delegRead && verdict.Allowed:
-			access = adminstore.RequestPayloadAccess{
-				Grant: delegPayload, Delegated: true, DenyOwnHistory: false,
-				SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID,
-			}
-		case !human:
-			// No delegation: the legacy fail-closed path (deny-own-history,
-			// no bearer grant, 404 unless another visibility branch applies).
-			access = adminstore.RequestPayloadAccess{
-				Grant: grant, DenyOwnHistory: true, SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID,
-			}
-		default:
-			access = adminstore.RequestPayloadAccess{
-				UserID: userID, Grant: verdict.Allowed && (grant || roleGrant), Originals: verdict.Allowed && originalsGrant, DenyOwnHistory: adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context()),
-				SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID, OrgWideMetadata: orgWideMetadata,
-			}
-		}
+		access := h.requestDetailAccess(r, orgID, requestID, userID, grant, originalsGrant)
 		// ---- Phase: pre-consume target resolution and row read (the discarded read) ----
 		ctx := adminstore.WithRequestPayloadAccess(r.Context(), access)
 		d, rowKey, ok := h.readRequestDetailRow(ctx, w, r, orgID, requestID, userID, token, grantScope, selectedKey)
@@ -122,6 +90,34 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 			auditRequestDetailDecision(h, r, orgID, requestID, grantScope, true, 1, "completed")
 		}
 	}
+}
+
+// requestDetailAccess builds the store visibility predicate for the authenticated subject.
+func (h *AdminHandlers) requestDetailAccess(r *http.Request, orgID, requestID, userID string, grant, originalsGrant bool) adminstore.RequestPayloadAccess {
+	subject, _ := adminstore.RequestPayloadSubjectFromContext(r.Context())
+	access := adminstore.RequestPayloadAccess{SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID}
+	if subject.Type != "" && subject.Type != adminstore.RequestPayloadHuman {
+		read, payload := h.evaluateSubjectDelegation(r, orgID, subject)
+		verdict := h.authorizeRequestContent(r, orgID, requestID, grant, read || payload)
+		if read && verdict.Allowed {
+			access.Grant = payload
+			access.Delegated = true
+		} else {
+			access.Grant = grant
+			access.DenyOwnHistory = true
+		}
+		return access
+	}
+
+	verdict := h.authorizeRequestContent(r, orgID, requestID, grant, false)
+	role, member := h.callerRoleOnOrg(r, orgID)
+	roleGrant := member && adminstore.RoleHas(string(role), adminstore.PermRequestsPayloads)
+	access.UserID = userID
+	access.Grant = verdict.Allowed && (grant || roleGrant)
+	access.Originals = verdict.Allowed && originalsGrant
+	access.DenyOwnHistory = adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context())
+	access.OrgWideMetadata = member && adminstore.RoleHas(string(role), adminstore.PermRequestsRead)
+	return access
 }
 
 // authorizeRequestDetailGrant runs the non-disclosing grant prechecks (scope
