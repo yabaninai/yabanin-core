@@ -145,6 +145,9 @@ SNAP_SRC="$(mktemp /tmp/dr-drill-src.XXXXXX)"; SNAP_DST="$(mktemp /tmp/dr-drill-
 cleanup_snapshots() { rm -f "$SNAP_SRC" "$SNAP_DST"; cleanup; }
 trap cleanup_snapshots EXIT
 
+# Rehearse the quickstart after its documented post-migration role bootstrap.
+docker exec -i "$PG" psql -X -v ON_ERROR_STOP=1 -U yabanin -d yabanin \
+  < deploy/quickstart/bootstrap-app-role.sql >/dev/null
 snapshot "$PG" "$SNAP_SRC"
 SRC_MIG="$(head -1 "$SNAP_SRC")"
 SRC_TABLES=$(grep -c '|BASE TABLE' "$SNAP_SRC" || true)
@@ -157,7 +160,7 @@ docker exec "$PG" sh -ec 'sha256sum -c /tmp/dr-backup/*.sha256 && cp /tmp/dr-bac
 docker cp "$PG:/tmp/dr.dump" "/tmp/dr-$$-host.dump"
 docker cp "/tmp/dr-$$-host.dump" "$PG2:/tmp/dr.dump"
 docker cp scripts/dr/restore_all.sh "$PG2:/tmp/restore_all.sh"
-# The dump references the cluster role provisioned by migration 0022.
+# The dump carries ACLs granted to the quickstart application role.
 # Withhold it on the clean target to force an error inside pg_restore.
 if failure=$(docker exec "$PG2" bash /tmp/restore_all.sh "$uri" /tmp/dr.dump 2>&1); then
   echo "FAIL: restore succeeded without the application role"; exit 1
@@ -176,6 +179,11 @@ docker exec "$PG2" psql -U yabanin -d yabanin -qc "DO \$\$ BEGIN
   END IF; END \$\$;"
 docker exec "$PG2" bash /tmp/restore_all.sh "$uri" /tmp/dr.dump
 
+# The restored ACL must grant application writes and withhold table ownership rights.
+restored_acl=$(docker exec "$PG2" psql -X -U yabanin -d yabanin -Atc \
+  "SELECT has_table_privilege('yabanin_app','public.request_logs','INSERT')
+      AND NOT has_table_privilege('yabanin_app','public.request_logs','TRUNCATE')")
+[[ $restored_acl == t ]] || { echo "FAIL: restored application table privileges differ"; exit 1; }
 snapshot "$PG2" "$SNAP_DST"
 DST_MIG="$(head -1 "$SNAP_DST")"
 DST_TABLES=$(grep -c '|BASE TABLE' "$SNAP_DST" || true)
