@@ -31,7 +31,10 @@ import (
 //
 // Mid-stream errors (malformed events, upstream disconnect) are surfaced as
 // the returned error; the caller is responsible for emitting a terminal SSE
-// error event + [DONE] since partial data has already been flushed.
+// error event + [DONE] since partial data has already been flushed. The relay
+// emits only complete SSE frames: under cancel/error a dangling partial line
+// is NOT completed at handler level — the gateway tail-completion owns it
+// (pkg/gateway/stream.go completePassthroughTail).
 //
 // Saw-terminal contract (H3, audit extra §R-1): a stream that ends at EOF
 // without its provider terminal event ([DONE] line, anthropic message_stop,
