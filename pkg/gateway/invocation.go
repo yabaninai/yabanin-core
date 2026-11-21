@@ -488,6 +488,7 @@ func (s pgInvocationStore) RecordTerminalFacts(ctx context.Context, rec terminal
 			SET committed_at = request_terminal_facts.committed_at
 			WHERE request_terminal_facts.org_id = EXCLUDED.org_id
 			  AND request_terminal_facts.kind   = EXCLUDED.kind
+			  AND request_terminal_facts.client_request_id IS NOT DISTINCT FROM EXCLUDED.client_request_id
 			  AND request_terminal_facts.event  = EXCLUDED.event
 		RETURNING invocation_id`,
 		rec.InvocationID, rec.OrgID, rec.Kind, nullIfEmpty(rec.ClientRequestID), event)
@@ -545,17 +546,19 @@ const (
 // outside any transaction — a plain read suffices because the row, once
 // committed, is immutable.
 func (s pgInvocationStore) verifyTerminalFacts(ctx context.Context, rec terminalFactsRecord, event []byte) (terminalVerifyState, error) {
-	var orgID, kind, storedEvent string
-	err := s.pool.QueryRow(ctx,
-		`SELECT org_id, kind, event::text FROM request_terminal_facts WHERE invocation_id = $1`,
-		rec.InvocationID).Scan(&orgID, &kind, &storedEvent)
+	var identical bool
+	err := s.pool.QueryRow(ctx, `
+		SELECT org_id = $2 AND kind = $3 AND client_request_id IS NOT DISTINCT FROM $4::text
+		       AND event = $5::jsonb
+		FROM request_terminal_facts WHERE invocation_id = $1`,
+		rec.InvocationID, rec.OrgID, rec.Kind, nullIfEmpty(rec.ClientRequestID), event).Scan(&identical)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return terminalVerifyAbsent, nil
 	}
 	if err != nil {
 		return terminalVerifyAbsent, fmt.Errorf("verify terminal facts %s: %w", rec.InvocationID, err)
 	}
-	if orgID == rec.OrgID && kind == rec.Kind && storedEvent == string(event) {
+	if identical {
 		return terminalVerifyIdentical, nil
 	}
 	return terminalVerifyDivergent, nil
