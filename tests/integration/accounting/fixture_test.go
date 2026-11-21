@@ -87,13 +87,14 @@ type fixture struct {
 	token     string
 	ledgerDir string
 
-	mu         sync.Mutex
-	arrivals   []fixtureRecord
-	dispatches []fixtureRecord
-	receipts   []fixtureRecord
-	hold       map[string]*responseHold
-	postTerm   map[string]chan struct{}
-	writeErr   error
+	mu             sync.Mutex
+	arrivals       []fixtureRecord
+	dispatches     []fixtureRecord
+	receipts       []fixtureRecord
+	hold           map[string]*responseHold
+	postTerm       map[string]chan struct{}
+	realtimeFrames map[string][]string
+	writeErr       error
 
 	srv *http.Server
 }
@@ -104,11 +105,12 @@ type fixture struct {
 func startFixture(t *testing.T, runDir string, token string) *fixture {
 	t.Helper()
 	f := &fixture{
-		t:         t,
-		token:     token,
-		ledgerDir: filepath.Join(runDir, "fixture-ledgers"),
-		hold:      map[string]*responseHold{},
-		postTerm:  map[string]chan struct{}{},
+		t:              t,
+		token:          token,
+		ledgerDir:      filepath.Join(runDir, "fixture-ledgers"),
+		hold:           map[string]*responseHold{},
+		postTerm:       map[string]chan struct{}{},
+		realtimeFrames: make(map[string][]string),
 	}
 	if err := os.MkdirAll(f.ledgerDir, 0o750); err != nil {
 		t.Fatalf("harness: fixture ledger dir: %v", err)
@@ -575,6 +577,11 @@ func (f *fixture) serveRealtimeStream(w http.ResponseWriter, rid, model, path st
 			},
 		}),
 	}
+	f.mu.Lock()
+	if configured, ok := f.realtimeFrames[rid]; ok {
+		frames = configured
+	}
+	f.mu.Unlock()
 	for _, frame := range frames {
 		if _, err := w.Write([]byte(frame)); err != nil {
 			f.t.Logf("fixture: realtime stream write failed for %s (client gone): %v", rid, err)

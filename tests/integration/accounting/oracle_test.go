@@ -5,6 +5,7 @@ package accounting
 import (
 	"database/sql"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"strings"
@@ -26,6 +27,10 @@ func httpGet(timeout time.Duration, url string) (*http.Response, error) {
 // the decoded status and body. The X-Request-ID is run-namespaced for
 // ledger/database filtering, but no window assertion depends on it.
 func httpPostJSON(timeout time.Duration, url, apiKey, requestID, payload string) (int, string, error) {
+	return httpPostJSONBounded(timeout, url, apiKey, requestID, payload, 1<<20)
+}
+
+func httpPostJSONBounded(timeout time.Duration, url, apiKey, requestID, payload string, limit int64) (int, string, error) {
 	client := &http.Client{Timeout: timeout}
 	req, err := http.NewRequest(http.MethodPost, url, strings.NewReader(payload))
 	if err != nil {
@@ -39,9 +44,12 @@ func httpPostJSON(timeout time.Duration, url, apiKey, requestID, payload string)
 		return 0, "", err
 	}
 	defer resp.Body.Close()
-	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
 		return resp.StatusCode, "", err
+	}
+	if int64(len(body)) > limit {
+		return resp.StatusCode, "", fmt.Errorf("response exceeds %d-byte test reader limit", limit)
 	}
 	return resp.StatusCode, string(body), nil
 }
