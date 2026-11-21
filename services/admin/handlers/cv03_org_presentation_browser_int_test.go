@@ -767,33 +767,11 @@ func TestCV03OrgPresentationBrowserAcceptance(t *testing.T) {
 
 	code, body = getJSON("/api/me", cookieMember)
 	require.Equal(t, http.StatusOK, code, "cv03 preflight: member /api/me (body: %s)", cv02Tail(body, 300))
-	var memberMe struct {
-		Orgs []struct {
-			ID       string `json:"id"`
-			Currency string `json:"currency"`
-			Timezone string `json:"timezone"`
-		} `json:"orgs"`
-	}
-	require.NoError(t, json.Unmarshal(body, &memberMe), "cv03 preflight: member me JSON")
-	require.Len(t, memberMe.Orgs, 1, "cv03 preflight: member must have exactly one org")
-	require.Equal(t, memberOrg.ID, memberMe.Orgs[0].ID, "cv03 preflight: member me org")
-	require.Equal(t, "JPY", memberMe.Orgs[0].Currency, "cv03 preflight: member me org must be JPY")
-	require.Equal(t, "Asia/Tokyo", memberMe.Orgs[0].Timezone, "cv03 preflight: member me org must be Asia/Tokyo")
+	cv03RequireMeOrg(t, body, memberOrg.ID, "JPY", "Asia/Tokyo")
 
 	code, body = getJSON("/api/me", cookieReader)
 	require.Equal(t, http.StatusOK, code, "cv03 preflight: reader /api/me (body: %s)", cv02Tail(body, 300))
-	var readerMe struct {
-		Orgs []struct {
-			ID       string `json:"id"`
-			Currency string `json:"currency"`
-			Timezone string `json:"timezone"`
-		} `json:"orgs"`
-	}
-	require.NoError(t, json.Unmarshal(body, &readerMe), "cv03 preflight: reader me JSON")
-	require.Len(t, readerMe.Orgs, 1, "cv03 preflight: reader must have exactly one org")
-	require.Equal(t, readerOrg.ID, readerMe.Orgs[0].ID, "cv03 preflight: reader me org")
-	require.Equal(t, "EUR", readerMe.Orgs[0].Currency, "cv03 preflight: reader me org must be EUR")
-	require.Equal(t, "Europe/Berlin", readerMe.Orgs[0].Timezone, "cv03 preflight: reader me org must be Europe/Berlin")
+	cv03RequireMeOrg(t, body, readerOrg.ID, "EUR", "Europe/Berlin")
 
 	walletPreflight := func(name, orgID string, cents int64, stamp string, cookie *http.Cookie) {
 		code, body := getJSON("/api/orgs/"+orgID+"/credits/balance", cookie)
@@ -930,4 +908,21 @@ func TestCV03OrgPresentationBrowserAcceptance(t *testing.T) {
 		t.Fatalf("cv03 org-presentation browser acceptance FAILED — see %s (receipt %s)", artifacts, receipt)
 	}
 	t.Logf("cv03 org-presentation browser acceptance PASSED — receipt %s", receipt)
+}
+
+func cv03RequireMeOrg(t *testing.T, body []byte, orgID, currency, timezone string) {
+	t.Helper()
+	var me struct {
+		Organizations []struct {
+			ID       string `json:"id"`
+			Currency string `json:"currency"`
+			Timezone string `json:"timezone"`
+		} `json:"organizations"`
+	}
+	require.NoError(t, json.Unmarshal(body, &me))
+	require.Len(t, me.Organizations, 1, "cv03: /api/me memberships for %s", orgID)
+	org := me.Organizations[0]
+	require.Equal(t, orgID, org.ID)
+	require.Equal(t, currency, org.Currency)
+	require.Equal(t, timezone, org.Timezone)
 }
