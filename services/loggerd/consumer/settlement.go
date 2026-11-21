@@ -743,7 +743,7 @@ func (w *SettlementWorker) executeResaleDeduction(ctx context.Context, job *sett
 	}
 	var payload resaleChargePayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode resale payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode resale payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	invocation := ""
 	if job.InvocationID != nil {
@@ -821,7 +821,7 @@ func (w *SettlementWorker) executeAgentSpend(ctx context.Context, job *settlemen
 	}
 	var payload agentSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode agent spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode agent spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.AgentID == "" {
 		return fmt.Errorf("%w: agent spend job %d carries no agent id", ErrPoisonJob, job.ID)
@@ -852,7 +852,7 @@ func (w *SettlementWorker) executeAgentSpend(ctx context.Context, job *settlemen
 func (w *SettlementWorker) executeTeamSpend(ctx context.Context, job *settlementJob) error {
 	var payload teamSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode team spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode team spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.TeamID == "" {
 		return fmt.Errorf("%w: team spend job %d carries no team id", ErrPoisonJob, job.ID)
@@ -887,7 +887,7 @@ func (w *SettlementWorker) executeTeamSpend(ctx context.Context, job *settlement
 func (w *SettlementWorker) executeSessionSpend(ctx context.Context, job *settlementJob) error {
 	var payload sessionSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode session spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode session spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.SessionKeyID == "" {
 		return fmt.Errorf("%w: session spend job %d carries no session key id", ErrPoisonJob, job.ID)
