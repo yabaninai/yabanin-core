@@ -220,7 +220,7 @@ func TestCompletions_StreamBreakTornTailCompletesBeforeError(t *testing.T) {
 	gw := &gateway{
 		cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: upstreamSrv.URL},
 		log:                  slog.Default(),
-		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: upstreamSrv.URL, Enabled: true}},
 		pool:                 upstreampkg.NewPool(upstreampkg.Options{}),
 		invocations:          &fakeInvocationStore{},
@@ -260,7 +260,7 @@ func TestCompletions_StreamBreakMidLineWithholdsPartialLine(t *testing.T) {
 	gw := &gateway{
 		cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: upstreamSrv.URL},
 		log:                  slog.Default(),
-		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: upstreamSrv.URL, Enabled: true}},
 		pool:                 upstreampkg.NewPool(upstreampkg.Options{}),
 		invocations:          &fakeInvocationStore{},
