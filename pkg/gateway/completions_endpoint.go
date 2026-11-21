@@ -223,6 +223,13 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	handler := provider.NewStreamHandlerWithOptions("openai", admitted.Info.ModelName, provider.StreamOptions{
 		SuppressUsageOnlyChunk: !clientWantsUsage,
 		RequestBytes:           len(upstreamBody),
+		// Legacy completions canon: a complete JSON data line that lost
+		// only its blank separator to a transport cut is still dispatched
+		// whole before the drain-failure error frame ([DONE], torn lines,
+		// cancellation and policy-wrapped chat stay excluded — provider
+		// scoping). The other three relays implement the same salvage at
+		// the gateway frame buffer (apiformat.SSEFrameBuffer).
+		RecoverLegacyCompletionLine: true,
 	})
 	// N03-P01: watch the terminal — a late failure after the client already
 	// saw the [DONE] terminator must not emit a second terminal event. The
