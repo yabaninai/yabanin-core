@@ -194,6 +194,14 @@ func sseGenStreamOracle(t *testing.T, out string, active, sawDenied bool, denied
 			t.Fatal("sse gen: denied fragment was held but never counted as dropped")
 		}
 	}
+	sseAssertReleasedLinesValid(t, out)
+}
+
+// sseAssertReleasedLinesValid checks the released-stream JSON invariant: every
+// non-empty "data: " line must parse as JSON, with the two generator
+// passthrough payloads exempted.
+func sseAssertReleasedLinesValid(t *testing.T, out string) {
+	t.Helper()
 	for _, line := range strings.Split(out, "\n") {
 		d, ok := strings.CutPrefix(line, "data: ")
 		if !ok || d == "" {
