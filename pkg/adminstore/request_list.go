@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // RequestListFilters narrows the request-log list query. All fields optional
@@ -72,8 +74,14 @@ type RequestListFilters struct {
 
 // RequestListRow is one request_logs row as returned to the request explorer.
 type RequestListRow struct {
-	RequestID      string  `json:"request_id"`
-	OrgID          string  `json:"org_id"`
+	RequestID string `json:"request_id"`
+	OrgID     string `json:"org_id"`
+	// RowKey is the immutable request_logs.id of this physical row. The
+	// client-supplied RequestID is a correlation field only (0028): two
+	// legitimate invocations sharing it bill and log as independent rows,
+	// so exact-row consumers (the export walk) address rows by RowKey.
+	// Internal — never serialized.
+	RowKey         int64   `json:"-"`
 	ModelRequested string  `json:"model_requested,omitempty"`
 	ModelUsed      string  `json:"model_used"`
 	StatusCode     int     `json:"status_code"`
@@ -313,17 +321,19 @@ func listRequestsOn(ctx context.Context, ex exportQueryRunner, f RequestListFilt
 
 	// Deterministic ordering: YQL's ORDER BY when present (parse-validated
 	// against the field whitelist), newest-first otherwise, always with the
-	// request_id tiebreak so equal keys page stably.
-	orderSQL := "rl.created_at DESC, rl.request_id"
+	// request_id tiebreak and the immutable row key as the FINAL tiebreak
+	// so equal keys page stably — two physical rows may legitimately share
+	// both created_at and request_id (0028 correlation semantics).
+	orderSQL := "rl.created_at DESC, rl.request_id, rl.id"
 	if f.Query != nil && f.Query.Order != nil {
-		orderSQL = f.Query.Order.sql()
+		orderSQL = f.Query.Order.sql() + ", rl.id"
 	}
 
 	// The tool_calls column is an org-scoped correlated subquery, not a
 	// join: rows of a foreign org that merely shadow the same request_id
 	// can never leak names into this org's list (mirror of the detail
 	// view's org scoping, and its regression test).
-	q := "SELECT COALESCE(rl.request_id, ''), COALESCE(rl.org_id::text, ''), COALESCE(rl.model_requested, ''), " +
+	q := "SELECT rl.id, COALESCE(rl.request_id, ''), COALESCE(rl.org_id::text, ''), COALESCE(rl.model_requested, ''), " +
 		"COALESCE(rl.model_used, ''), rl.status_code, COALESCE(rl.cost_in_usd, 0), COALESCE(rl.tokens_in, 0), COALESCE(rl.tokens_out, 0), " +
 		"COALESCE(rl.task_id, ''), COALESCE(rl.session_id::text, ''), COALESCE(rl.duration_ms, 0), COALESCE(rl.cache_hit_type, ''), " +
 		"rl.first_token_ms, rl.attempt_count, rl.retry_count, COALESCE(rl.error, ''), rl.created_at, " +
@@ -341,26 +351,36 @@ func listRequestsOn(ctx context.Context, ex exportQueryRunner, f RequestListFilt
 	defer rows.Close()
 	var out []RequestListRow
 	for rows.Next() {
-		var r RequestListRow
-		var labelsRaw []byte
-		var ownerID string
-		var humanRequest bool
-		var agentID string
-		if err := rows.Scan(&r.RequestID, &r.OrgID, &r.ModelRequested, &r.ModelUsed, &r.StatusCode, &r.CostUSD,
-			&r.TokensIn, &r.TokensOut, &r.TaskID, &r.SessionID, &r.DurationMs, &r.CacheHitType,
-			&r.FirstTokenMs, &r.AttemptCount, &r.RetryCount, &r.ErrorMsg, &r.CreatedAt, &r.ToolCalls, &labelsRaw, &ownerID, &humanRequest, &agentID); err != nil {
-			return nil, 0, fmt.Errorf("request list scan: %w", err)
+		r, err := scanRequestListRow(rows, f)
+		if err != nil {
+			return nil, 0, err
 		}
-		r.Labels = decodeLabels(labelsRaw)
-		// Payload visibility per row: a human's own rows, or — under a live
-		// delegation carrying the payload scope — the delegated subject's own
-		// attributed rows. A deny never marks rows as owned.
-		r.PayloadOwned = !f.PayloadDenied &&
-			((humanRequest && f.PayloadUserID != "" && ownerID == f.PayloadUserID) ||
-				(f.DelegateAgentID != "" && f.DelegatePayload && agentID == f.DelegateAgentID))
 		out = append(out, r)
 	}
 	return out, total, rows.Err()
+}
+
+// scanRequestListRow decodes one physical list row — the immutable row key
+// first — including the per-row payload ownership flag derived from the
+// boundary decision: a human's own rows, or — under a live delegation
+// carrying the payload scope — the delegated subject's own attributed rows.
+// A deny never marks rows as owned.
+func scanRequestListRow(rows pgx.Rows, f RequestListFilters) (RequestListRow, error) {
+	var r RequestListRow
+	var labelsRaw []byte
+	var ownerID string
+	var humanRequest bool
+	var agentID string
+	if err := rows.Scan(&r.RowKey, &r.RequestID, &r.OrgID, &r.ModelRequested, &r.ModelUsed, &r.StatusCode, &r.CostUSD,
+		&r.TokensIn, &r.TokensOut, &r.TaskID, &r.SessionID, &r.DurationMs, &r.CacheHitType,
+		&r.FirstTokenMs, &r.AttemptCount, &r.RetryCount, &r.ErrorMsg, &r.CreatedAt, &r.ToolCalls, &labelsRaw, &ownerID, &humanRequest, &agentID); err != nil {
+		return RequestListRow{}, fmt.Errorf("request list scan: %w", err)
+	}
+	r.Labels = decodeLabels(labelsRaw)
+	r.PayloadOwned = !f.PayloadDenied &&
+		((humanRequest && f.PayloadUserID != "" && ownerID == f.PayloadUserID) ||
+			(f.DelegateAgentID != "" && f.DelegatePayload && agentID == f.DelegateAgentID))
+	return r, nil
 }
 
 func decodeLabels(raw []byte) map[string]string {

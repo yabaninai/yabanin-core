@@ -24,8 +24,10 @@ func (s *Store) SearchRequestArchive(ctx context.Context, filters RequestListFil
 // requestExportPage fetches one validated page of request rows.
 type requestExportPage func(context.Context, RequestListFilters) ([]RequestListRow, int, error)
 
-// requestExportDetail loads one authorized request detail.
-type requestExportDetail func(context.Context, string, string) (*RequestDetail, error)
+// requestExportDetail loads one authorized request detail by its immutable
+// request_logs row key (org + id), so every emitted record is the exact
+// physical row the list page selected.
+type requestExportDetail func(context.Context, string, int64) (*RequestDetail, error)
 
 // exportQueryRunner is the read surface the export runs on. It is satisfied
 // both by the pool adapter (pgxdb) and by pgx.Tx, so the whole walk — count,
@@ -71,8 +73,8 @@ func (s *Store) StreamRequestExport(ctx context.Context, filters RequestListFilt
 		func(ctx context.Context, f RequestListFilters) ([]RequestListRow, int, error) {
 			return listRequestsOn(ctx, tx, f)
 		},
-		func(ctx context.Context, orgID, requestID string) (*RequestDetail, error) {
-			return getRequestDetailOn(ctx, tx, orgID, requestID)
+		func(ctx context.Context, orgID string, rowKey int64) (*RequestDetail, error) {
+			return getRequestDetailOnKey(ctx, tx, orgID, rowKey)
 		},
 		filters, access, maxRows, emit)
 	if err != nil {
@@ -87,18 +89,48 @@ func (s *Store) StreamRequestExport(ctx context.Context, filters RequestListFilt
 // streamRequestExport is the storage-independent export walk, so the paging,
 // cap, and boundary semantics stay unit-testable without a live database.
 //
+// Row identity is EXACT: the client-supplied request id is a correlation
+// field only (0028) — two legitimate invocations may share it, each billing
+// and logging as its own request_logs row — so the walk addresses every
+// detail by the immutable row key the list selected and emits each physical
+// row independently.
+//
 // The list fetcher is expected to serve a stable snapshot (the store-backed
 // path pins one with a REPEATABLE READ transaction). On top of that contract
-// the walk adds two backend-independent guarantees. First, a request ID is
+// the walk adds two backend-independent guarantees. First, a physical row is
 // never emitted twice, even if a non-snapshot page source drifts under it —
-// safe because detail loads address rows by (org, request_id), so a repeated
-// ID could only ever produce identical detail content. Second, the ACTUAL
-// emitted count never exceeds maxRows: seeing a (maxRows+1)-th candidate row
-// fails the export with ErrRequestExportTooLarge instead of emitting past
-// the cap.
-func streamRequestExport(ctx context.Context, list requestExportPage, detail requestExportDetail, filters RequestListFilters, access RequestPayloadAccess, maxRows int, emit func(*RequestDetail) error) (int, error) {
+// detail loads address rows by (org, row key), so a repeated key could only
+// ever produce identical detail content. Second, the ACTUAL emitted count
+// never exceeds maxRows: seeing a (maxRows+1)-th candidate row fails the
+// export with ErrRequestExportTooLarge instead of emitting past the cap.
+// validateExportOptions rejects the degenerate walk configurations before
+// any page or detail read happens.
+func validateExportOptions(maxRows int, emit func(*RequestDetail) error, list requestExportPage, detail requestExportDetail) error {
 	if maxRows < 1 || emit == nil || list == nil || detail == nil {
-		return 0, fmt.Errorf("invalid request export options")
+		return fmt.Errorf("invalid request export options")
+	}
+	return nil
+}
+
+// emitExportRow loads one row's detail by its immutable row key and emits it.
+// A row whose detail vanished (ErrNotFound) is skipped, not fatal: the walk
+// continues with the next row. The boundary decision travels in ctx so the
+// loader re-applies it for this row.
+func emitExportRow(ctx context.Context, detail requestExportDetail, orgID string, row RequestListRow, access RequestPayloadAccess, emit func(*RequestDetail) error) error {
+	detailCtx := WithRequestPayloadAccess(ctx, access)
+	d, err := detail(detailCtx, orgID, row.RowKey)
+	if IsNotFound(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	return emit(d)
+}
+
+func streamRequestExport(ctx context.Context, list requestExportPage, detail requestExportDetail, filters RequestListFilters, access RequestPayloadAccess, maxRows int, emit func(*RequestDetail) error) (int, error) {
+	if err := validateExportOptions(maxRows, emit, list, detail); err != nil {
+		return 0, err
 	}
 	filters.Page = 1
 	filters.PageSize = exportPageSize
@@ -110,7 +142,7 @@ func streamRequestExport(ctx context.Context, list requestExportPage, detail req
 		return total, ErrRequestExportTooLarge
 	}
 	emitted := 0
-	seen := make(map[string]struct{}, total)
+	seen := make(map[int64]struct{}, total)
 	for page := 1; page <= (total+exportPageSize-1)/exportPageSize; page++ {
 		filters.Page = page
 		rows, _, err := list(ctx, filters)
@@ -123,19 +155,11 @@ func streamRequestExport(ctx context.Context, list requestExportPage, detail req
 				// allows: fail loudly instead of emitting past maxRows.
 				return total, ErrRequestExportTooLarge
 			}
-			if _, dup := seen[row.RequestID]; dup {
+			if _, dup := seen[row.RowKey]; dup {
 				continue
 			}
-			seen[row.RequestID] = struct{}{}
-			detailCtx := WithRequestPayloadAccess(ctx, access)
-			d, err := detail(detailCtx, filters.OrgID, row.RequestID)
-			if IsNotFound(err) {
-				continue
-			}
-			if err != nil {
-				return total, err
-			}
-			if err := emit(d); err != nil {
+			seen[row.RowKey] = struct{}{}
+			if err := emitExportRow(ctx, detail, filters.OrgID, row, access, emit); err != nil {
 				return total, err
 			}
 			emitted++

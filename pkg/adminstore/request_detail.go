@@ -193,13 +193,84 @@ func (s *Store) GetRequestDetail(ctx context.Context, orgID, requestID string) (
 	return getRequestDetailOn(ctx, s.db, orgID, requestID)
 }
 
+// requestDetailRowSelect is the shared authorized detail projection. The
+// WHERE clause is caller-supplied: $1 = org_id, $2 = the row identity (the
+// client correlation for the legacy path, the immutable request_logs.id for
+// the exact-row path), $3 = payload user id, $4 = payload grant, $5 =
+// deny-own-history, $6 = owner-scope eligibility, $7 = originals. A delegated
+// subject pin is appended as $8 by loadRequestDetail.
+const requestDetailRowSelect = `
+	SELECT COALESCE(request_id, ''),
+	       COALESCE(org_id::text, ''),
+	       COALESCE(model_requested, ''),
+	       COALESCE(model_used, ''),
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN COALESCE(upstream_url, '') ELSE '' END,
+	       COALESCE(method, 'POST'),
+	       status_code,
+	       COALESCE(duration_ms, 0),
+	       COALESCE(tokens_in, 0),
+	       COALESCE(tokens_out, 0),
+	       CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN COALESCE(error, '') ELSE '' END,
+	       to_jsonb(created_at),
+	       COALESCE(prompt_hash, ''),
+	       COALESCE(CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN response ELSE NULL END, 'null'::jsonb),
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_request ELSE NULL END,
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_response ELSE NULL END,
+	       COALESCE(cache_hit_type, ''),
+	       COALESCE(counterfactual_cost_usd, 0),
+	       COALESCE(cost_in_usd, 0),
+	       COALESCE(classifier_class, ''),
+	       COALESCE(classifier_confidence, 0),
+	       COALESCE(classifier_source, ''),
+	       COALESCE(tier_used, ''),
+	       COALESCE(ab_group, ''),
+	       COALESCE(task_id, ''),
+	       COALESCE(agent_id::text, ''),
+	       COALESCE(session_id::text, ''),
+	       COALESCE(routing_decision, ''),
+	       COALESCE(home_region, ''),
+	       first_token_ms,
+	       attempt_count,
+	       retry_count,
+	       COALESCE(labels, '{}'::jsonb), user_id::text
+	FROM request_logs
+	WHERE `
+
 // getRequestDetailOn loads one authorized request detail on the given
-// executor — the pool or an export snapshot transaction — so the export walk
-// reads each detail from the same snapshot its pages came from.
+// executor — the pool or an export snapshot transaction — addressed by the
+// legacy correlation key (org_id + request_id). When several physical rows
+// share the correlation (legitimate per 0028) the database picks one
+// arbitrarily; that ambiguity is inherent to the correlation address itself.
 func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, requestID string) (*RequestDetail, error) {
 	if orgID == "" || requestID == "" {
 		return nil, ErrNotFound
 	}
+	return loadRequestDetail(ctx, ex, "org_id = $1::uuid AND request_id = $2", orgID, requestID, false)
+}
+
+// getRequestDetailOnKey loads one authorized request detail addressed by the
+// immutable request_logs.id row key (org_id + id): the exact-row identity the
+// export walk uses, so every emitted detail is the very row the list page
+// selected even when several rows share the client correlation. Because
+// tool_calls/tool_call_invocations are keyed by correlation only, their facts
+// attach only when the correlation is unambiguous within the org (see
+// loadRequestDetail).
+func getRequestDetailOnKey(ctx context.Context, ex exportQueryRunner, orgID string, rowKey int64) (*RequestDetail, error) {
+	if orgID == "" || rowKey <= 0 {
+		return nil, ErrNotFound
+	}
+	return loadRequestDetail(ctx, ex, "org_id = $1::uuid AND id = $2::bigint", orgID, rowKey, true)
+}
+
+// loadRequestDetail runs the shared authorized projection under the caller's
+// key predicate and applies the payload boundary decision. guardCorrelation
+// (the exact-row path) additionally guards the tool-child association: child
+// tables are keyed by (org_id, request_id) — a correlation two legitimate
+// invocations may share (0028) — so when the org holds more than one row
+// carrying this row's correlation, child facts are not attributable to this
+// physical row and attach NONE of them rather than silently attaching the
+// sibling invocation's children to both rows.
+func loadRequestDetail(ctx context.Context, ex exportQueryRunner, keyWhere, orgID string, key interface{}, guardCorrelation bool) (*RequestDetail, error) {
 	access, _ := ctx.Value(requestPayloadAccessKey{}).(RequestPayloadAccess)
 	payloadUserID := access.UserID
 	human := access.SubjectType == "" || access.SubjectType == RequestPayloadHuman
@@ -209,43 +280,8 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	// attribution, and the payload columns additionally require the delegated
 	// payload scope. An explicit deny still overrides the delegation.
 	delegated, payloadGrantSQL := resolveDelegatedRowAccess(access)
-	q := `
-		SELECT COALESCE(request_id, ''),
-		       COALESCE(org_id::text, ''),
-		       COALESCE(model_requested, ''),
-		       COALESCE(model_used, ''),
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN COALESCE(upstream_url, '') ELSE '' END,
-		       COALESCE(method, 'POST'),
-		       status_code,
-		       COALESCE(duration_ms, 0),
-		       COALESCE(tokens_in, 0),
-		       COALESCE(tokens_out, 0),
-		       CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN COALESCE(error, '') ELSE '' END,
-		       to_jsonb(created_at),
-		       COALESCE(prompt_hash, ''),
-		       COALESCE(CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN response ELSE NULL END, 'null'::jsonb),
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_request ELSE NULL END,
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_response ELSE NULL END,
-		       COALESCE(cache_hit_type, ''),
-		       COALESCE(counterfactual_cost_usd, 0),
-		       COALESCE(cost_in_usd, 0),
-		       COALESCE(classifier_class, ''),
-		       COALESCE(classifier_confidence, 0),
-		       COALESCE(classifier_source, ''),
-		       COALESCE(tier_used, ''),
-		       COALESCE(ab_group, ''),
-		       COALESCE(task_id, ''),
-		       COALESCE(agent_id::text, ''),
-		       COALESCE(session_id::text, ''),
-		       COALESCE(routing_decision, ''),
-		       COALESCE(home_region, ''),
-		       first_token_ms,
-		       attempt_count,
-		       retry_count,
-		       COALESCE(labels, '{}'::jsonb), user_id::text
-	FROM request_logs
-	WHERE org_id = $1::uuid AND request_id = $2`
-	args := []interface{}{orgID, requestID, payloadUserID, payloadGrantSQL, payloadDeny, payloadOwner, access.Originals}
+	q := requestDetailRowSelect + keyWhere
+	args := []interface{}{orgID, key, payloadUserID, payloadGrantSQL, payloadDeny, payloadOwner, access.Originals}
 	if delegated {
 		// Scope-pin the lookup to the delegated subject's own attribution: a
 		// delegated agent/CI subject can never address another subject's row.
@@ -274,32 +310,70 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	// it is a v1 model-response envelope; legacy rows and denied/absent
 	// values stay nil (the raw Response field is unchanged either way).
 	d.ResponseView = ParseResponseEnvelope(d.Response)
-	if payloadDeny && payloadOwner && ownerID != nil && *ownerID == payloadUserID {
-		// Deny-own-history removes the resource itself from the caller's view;
-		// returning metadata would still disclose that their history exists.
-		return nil, ErrNotFound
-	}
 	owned := ownerID != nil && payloadOwner && *ownerID == payloadUserID
-	if !owned && !delegated && !access.Grant && !access.OrgWideMetadata {
+	if requestDetailHidden(access, payloadDeny, payloadOwner, owned, delegated, payloadUserID, ownerID) {
 		return nil, ErrNotFound
 	}
-	if payloadDeny || (!owned && !payloadGrantSQL) {
-		// Return metadata without selecting related payload rows. The main-row
-		// projection above also returns only redacted payload columns.
+	attachChildren, err := requestChildrenAdmissible(ctx, ex, orgID, d.RequestID, guardCorrelation)
+	if err != nil {
+		return nil, err
+	}
+	return finalizeRequestDetail(ctx, ex, &d, orgID, payloadDeny, owned, payloadGrantSQL, attachChildren)
+}
+
+// requestChildrenAdmissible decides whether the correlation-keyed tool-child
+// tables may attach to this row: the exact-row path (guardCorrelation, 0028
+// semantics) attaches them only when the row is the org's ONLY carrier of
+// the correlation — otherwise the children belong to no ONE row and must not
+// be attributed to any of them.
+func requestChildrenAdmissible(ctx context.Context, ex exportQueryRunner, orgID, requestID string, guardCorrelation bool) (bool, error) {
+	if !guardCorrelation {
+		return true, nil
+	}
+	var correlated int
+	if err := ex.QueryRow(ctx,
+		"SELECT COUNT(*) FROM request_logs WHERE org_id = $1::uuid AND request_id = $2",
+		orgID, requestID).Scan(&correlated); err != nil {
+		return false, fmt.Errorf("request detail correlation count: %w", err)
+	}
+	return correlated == 1, nil
+}
+
+// finalizeRequestDetail applies the children gate and returns the finished
+// detail: without payload authorization (or when children are inadmissible)
+// it returns metadata only — empty child lists, never related payload rows.
+func finalizeRequestDetail(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, payloadDeny, owned, payloadGrantSQL, attachChildren bool) (*RequestDetail, error) {
+	if payloadDeny || (!owned && !payloadGrantSQL) || !attachChildren {
 		d.ToolCalls = []RequestToolCall{}
 		d.ToolCallInvocations = []RequestToolCallInvocation{}
-		return &d, nil
+		return d, nil
 	}
-	// Tool calls recorded for this request, org-scoped exactly like the row
-	// above. Sourced from the tool_calls table (populated pre-truncation by
-	// loggerd), so names survive when the stored upstream_response sample is
-	// cut before the tool-call fragments. An empty result is a valid "none
-	// recorded" state; a transport/scan failure is surfaced, not swallowed.
+	return attachRequestChildren(ctx, ex, d, orgID)
+}
+
+// requestDetailHidden enforces the post-load visibility boundary: an explicit
+// deny-own-history removes the caller's own resource entirely (metadata would
+// still disclose that their history exists), and a caller holding neither
+// ownership, delegation, grant nor org-wide metadata sees nothing at all —
+// ErrNotFound both ways, so existence never leaks.
+func requestDetailHidden(access RequestPayloadAccess, payloadDeny, payloadOwner, owned, delegated bool, payloadUserID string, ownerID *string) bool {
+	if payloadDeny && payloadOwner && ownerID != nil && *ownerID == payloadUserID {
+		return true
+	}
+	return !owned && !delegated && !access.Grant && !access.OrgWideMetadata
+}
+
+// attachRequestChildren loads the correlation-keyed tool facts for d — the
+// distinct tool names and the per-occurrence invocations — org-scoped exactly
+// like the main row, sourced pre-truncation by loggerd. An empty result is a
+// valid "none recorded" state; a transport/scan failure is surfaced, not
+// swallowed.
+func attachRequestChildren(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string) (*RequestDetail, error) {
 	d.ToolCalls = []RequestToolCall{}
 	tcRows, err := ex.Query(ctx, `
 		SELECT tool_name FROM tool_calls
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY id`, orgID, requestID)
+		ORDER BY id`, orgID, d.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool calls: %w", err)
 	}
@@ -320,7 +394,7 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	invRows, err := ex.Query(ctx, `
 		SELECT seq, call_id, tool_name, arguments FROM tool_call_invocations
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY seq, id`, orgID, requestID)
+		ORDER BY seq, id`, orgID, d.RequestID)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool call invocations: %w", err)
 	}
@@ -335,5 +409,5 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	if err := invRows.Err(); err != nil {
 		return nil, fmt.Errorf("request detail tool call invocations rows: %w", err)
 	}
-	return &d, nil
+	return d, nil
 }
