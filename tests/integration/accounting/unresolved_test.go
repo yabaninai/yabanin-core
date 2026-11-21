@@ -30,8 +30,18 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	s := startStand(t)
 
 	// Chargeability precondition + healthy paid control.
-	balanceBefore := s.assertWalletConfigured(t, s.oracleDB.orgID, "pre-control")
+	s.assertWalletConfigured(t, s.oracleDB.orgID, "pre-control")
+	hasAdmissions := s.oracleTableExists(t, "request_admissions")
 	s.controlRequest(t, "unresolved-pre")
+	var balanceBefore walletSnapshot
+	if hasAdmissions {
+		controlID := s.reqPrefix + "ctl-unresolved-pre"
+		requireEventually(t, 60*time.Second, 500*time.Millisecond, func() bool {
+			return s.oracleCreditTotals(t, controlID, s.oracleDB.orgID).UsageRows > 0
+		}, "pre-control debit did not settle before measuring the fault window")
+		s.requireWalletChargedExactlyOnce(t, controlID, s.oracleDB.orgID, "unresolved pre-control")
+		balanceBefore = s.exactWalletSnapshot(t)
+	}
 
 	rid := s.reqPrefix + "tgt-unresolved"
 	before := s.fixture.Snapshot()
@@ -63,7 +73,6 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	// grace expiry and the post-restart terminal state — is bound to this
 	// exact UUID, so a duplicate mint under the same call cannot hide
 	// behind a first-row read.
-	hasAdmissions := s.oracleTableExists(t, "request_admissions")
 	admAtBarrier := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 	if hasAdmissions && len(admAtBarrier) != 1 {
 		t.Fatalf("durable start: dispatch observed for %s but admissions at barrier = %d (%s), want exactly 1", rid, len(admAtBarrier), fmtAdmissions(admAtBarrier))
@@ -97,7 +106,7 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 
 	// Deterministic grace expiry (after the crash, target-only).
 	if hasAdmissions {
-		s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
+		s.ageAdmissionByInvocationPastGrace(t, targetUUID, s.oracleDB.orgID)
 	}
 
 	s.restartGateway()
@@ -119,37 +128,65 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	// mint under the single HTTP invocation.
 	pollUntil(t, 15*time.Minute, "target admission reaches 'unresolved'", func() error {
 		rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-		switch {
-		case len(rows) == 0:
-			return errTransient("no admission rows after restart")
-		case len(rows) > 1:
-			return abortf("duplicate admissions minted under one HTTP invocation: %s (captured UUID %s)", fmtAdmissions(rows), targetUUID)
-		}
-		a := rows[0]
-		if a.InvocationID != targetUUID {
-			return abortf("admission UUID changed across the restart: barrier %s, now %s", targetUUID, a.InvocationID)
-		}
-		requireAdmissionVocabulary(t, a)
-		switch a.State {
-		case "unresolved":
-			if !a.ResolveReason.Valid || a.ResolveReason.String != reasonGraceElapsed {
-				return abortf("unresolved with wrong resolve_reason: %s", fmtAdmissions(rows))
-			}
-			if !a.ResolvedAt.Valid {
-				return abortf("unresolved without resolved_at: %s", fmtAdmissions(rows))
-			}
-			return nil
-		case "admitted":
-			return errTransient("still admitted (reconciler sweep has not run or grace not honored): " + fmtAdmissions(rows))
-		case "voided":
-			return abortf("voided claims proven-never-dispatched, but the fixture observed the dispatch: %s", fmtAdmissions(rows))
-		case "reconciled":
-			return abortf("reconciled claims terminal evidence that does not exist: %s", fmtAdmissions(rows))
-		}
-		return errTransient("no terminal state recognized: " + fmtAdmissions(rows))
+		return unresolvedState(t, rows, targetUUID)
 	})
 	t.Logf("target: admission %s reached 'unresolved' with reason %s", targetUUID, reasonGraceElapsed)
 
+	s.requireUnresolvedEvidence(t, rid, balanceBefore)
+
+	// Post-recovery control: the system still serves and charges exactly once.
+	s.controlRequest(t, "unresolved-post")
+}
+
+type walletSnapshot struct {
+	Cents             int64
+	RemainderMicroUSD int64
+}
+
+func (s *stand) exactWalletSnapshot(t *testing.T) walletSnapshot {
+	t.Helper()
+	var snapshot walletSnapshot
+	err := s.oracleDB.db.QueryRow("SELECT balance_cents, remainder_micro_usd FROM org_credits WHERE org_id=$1", s.oracleDB.orgID).Scan(&snapshot.Cents, &snapshot.RemainderMicroUSD)
+	if err != nil {
+		t.Fatalf("read exact wallet balance: %v", err)
+	}
+	return snapshot
+}
+
+func unresolvedState(t *testing.T, rows []admissionRow, targetUUID string) error {
+	t.Helper()
+	switch {
+	case len(rows) == 0:
+		return errTransient("no admission rows after restart")
+	case len(rows) > 1:
+		return abortf("duplicate admissions minted under one HTTP invocation: %s (captured UUID %s)", fmtAdmissions(rows), targetUUID)
+	}
+	a := rows[0]
+	if a.InvocationID != targetUUID {
+		return abortf("admission UUID changed across the restart: barrier %s, now %s", targetUUID, a.InvocationID)
+	}
+	requireAdmissionVocabulary(t, a)
+	switch a.State {
+	case "unresolved":
+		if !a.ResolveReason.Valid || a.ResolveReason.String != reasonGraceElapsed {
+			return abortf("unresolved with wrong resolve_reason: %s", fmtAdmissions(rows))
+		}
+		if !a.ResolvedAt.Valid {
+			return abortf("unresolved without resolved_at: %s", fmtAdmissions(rows))
+		}
+		return nil
+	case "admitted":
+		return errTransient("still admitted (reconciler sweep has not run or grace not honored): " + fmtAdmissions(rows))
+	case "voided":
+		return abortf("voided claims proven-never-dispatched, but the fixture observed the dispatch: %s", fmtAdmissions(rows))
+	case "reconciled":
+		return abortf("reconciled claims terminal evidence that does not exist: %s", fmtAdmissions(rows))
+	}
+	return errTransient("no terminal state recognized: " + fmtAdmissions(rows))
+}
+
+func (s *stand) requireUnresolvedEvidence(t *testing.T, rid string, balanceBefore walletSnapshot) {
+	t.Helper()
 	// Tenant binding: the unresolved row must surface only under this
 	// stand's org — the same correlation id read under a foreign tenant
 	// must return nothing (storage-level tenant scope; org-facing API
@@ -167,8 +204,8 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 
 	// No invented usage, no wallet debit, no fabricated request_logs claim.
 	s.requireNoWalletDebit(t, rid, s.oracleDB.orgID, "unresolved")
-	if balanceAfter, _ := s.oracleWalletBalance(t, s.oracleDB.orgID); balanceAfter != balanceBefore {
-		t.Fatalf("unresolved: wallet balance moved %d -> %d with no chargeable evidence for %s", balanceBefore, balanceAfter, rid)
+	if balanceAfter := s.exactWalletSnapshot(t); balanceAfter != balanceBefore {
+		t.Fatalf("unresolved: wallet balance moved %+v -> %+v with no chargeable evidence for %s", balanceBefore, balanceAfter, rid)
 	}
 	logRows := s.oracleRequestLogRows(t, rid, s.oracleDB.orgID)
 	requireNoFabricatedRequestLogRows(t, rid, s.oracleDB.orgID, logRows, "unresolved")
@@ -181,8 +218,6 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 		t.Fatalf("unresolved: %d settlement job(s) for %s although zero terminal facts exist — settlement without evidence", jobs, rid)
 	}
 
-	// Post-recovery control: the system still serves and charges exactly once.
-	s.controlRequest(t, "unresolved-post")
 }
 
 // errTransient wraps a not-yet state for pollUntil (opposite of abortf).
