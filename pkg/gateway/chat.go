@@ -1149,18 +1149,12 @@ func (gw *gateway) rejectChatAttempt(ctx context.Context, cc *chatContext, lastE
 // true = the request was answered from the cache (including a terminal
 // policy denial of the cached document).
 func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
-	w, l := cc.w, cc.l
+	if !gw.chatCacheEligible(cc) {
+		return false
+	}
+	l := cc.l
 	orgID := cc.orgID
 
-	if gw.cache == nil || orgID == "" || cc.cacheDisabled {
-		return false
-	}
-	// Stream-cache kill-switch (W-STCACHE): when cache_stream_enabled is off,
-	// streaming requests never get answers from (possibly stale, pre-fix)
-	// stream-cache entries; non-stream lookups are unaffected.
-	if cc.req.Stream && !gw.cfg.CacheStreamEnabled {
-		return false
-	}
 	ri := cache.RouteIdentity{
 		OrgID:     orgID,
 		Model:     cc.model,
@@ -1170,161 +1164,200 @@ func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
 	hit, err := gw.cache.LookupWithResult(ctx, ri, cc.body)
 	var sseBody []byte
 	if err == nil && hit != nil {
-		// time and must never bypass the CURRENT post-upstream control.
-		// The cached document (exact, semantic, and the SSE replay of
-		// either) is evaluated exactly like a fresh upstream body: a mask
-		// replaces what the client sees, a deny answers the terminal
-		// content_policy_violation envelope and no cached byte is written.
-		// This closes the "entry created before a policy change" gap —
-		// the tenant boundary itself is already enforced below this point
-		// (the cache service verified the sealed provenance against this
-		// request's org, so a foreign org's entry degrades to a miss).
-		served, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
-		if postEvent != "" {
-			cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
-		}
-		if denied {
-			gw.serveChatCachePolicyDenied(ctx, cc, hit, postEvent)
+		if gw.governChatCacheHit(ctx, cc, hit) {
 			return true
 		}
-		hit.Data = served
-		if cc.req.Stream {
-			// Stream-attached policies (stream_prefix/stream_final) never
-			// run at post_upstream — re-govern the replay with them before
-			// any frame is converted, or a deny tightened after the entry
-			// was cached would serve forbidden content (N03-P02-T02).
-			// A replay has issued no bytes, so a stream_final deny stays
-			// terminal here (live streams can only flag after issuance).
-			streamServed, streamEvents, streamDenied := gw.policyReplayStreamCheck(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
-			if streamEvents != "" {
-				cc.policyEvent = appendPolicyEvents(cc.policyEvent, streamEvents)
-			}
-			if streamDenied {
-				gw.serveChatCachePolicyDenied(ctx, cc, hit, cc.policyEvent)
-				return true
-			}
-			hit.Data = streamServed
-		}
-		// N03-P02-T08: the entry survived governance and is about to be
-		// served — it must decode as a completion document. A torn cache
-		// value (sealed envelope and provenance intact, completion document
-		// truncated or corrupted inside) degrades to a miss here, never
-		// broken bytes; the refetch below re-serves fresh and the writer
-		// overwrites the broken value at the same key (self-healing). The
-		// guard sits AFTER enforcement on purpose: a corrupt entry whose
-		// governed verdict is a terminal deny never reaches this point, so
-		// corruption cannot bypass enforcement and a denial does not
-		// trigger an upstream refetch.
-		// FIX-10 (N03-P02-T10): the probe uses the shared usable-completion
-		// contract, so a document that decodes but carries no choices
-		// (`{}`, `{"choices":[]}`) degrades to a miss on the nonstream path
-		// exactly like the streaming replay always did — never served with
-		// X-Cache attribution.
-		if _, probeErr := cachedCompletionUsable(hit.Data); probeErr != nil {
-			l.Warn("cache hit is not a usable completion document — serving from upstream",
-				"error", probeErr, "org_id", orgID)
-			hit = nil
-		}
-	}
-	if err == nil && hit != nil && cc.req.Stream {
-		// Streaming clients must receive SSE frames, never a raw JSON
-		// completion document — OpenAI-compatible SDKs block waiting for
-		// `data:` lines and the caller appears hung. Convert before any
-		// header is written; on conversion failure treat the entry as a
-		// miss so the request is served fresh instead of broken.
-		sseBody, err = sseReplayFrames(hit.Data)
-		if err != nil {
-			l.Warn("cache hit is not a replayable completion document — serving from upstream",
-				"error", err, "org_id", orgID)
+		var usable bool
+		sseBody, usable = validateChatCacheReplay(l, orgID, hit, cc.req.Stream)
+		if !usable {
 			hit = nil
 		}
 	}
 	if err == nil && hit != nil {
-		// Honest attribution: provenance of the entry — the model that
-		// actually generated the cached response (verified against this
-		// route by the cache service).
-		modelUsed := hit.ModelUsed
-		if modelUsed == "" {
-			modelUsed = cc.model
-		}
-		if eff := gw.effortForCandidate(cc.info, classifier.Class(cc.classifierClass)); eff != "" {
-			cc.dec.Effort = eff
-		}
-		l.Debug("cache hit", "org_id", orgID, "model", cc.model, "model_used", modelUsed, "source", hit.SourceType, "stream", cc.req.Stream)
-		// Counterfactual for a cache hit: what the request would have
-		// cost had it gone upstream. The cached completion document
-		// carries the original usage, so price it with the winning
-		// model's adapter. Without usable usage the counterfactual stays
-		// 0 — the savings percentage degrades to 0 instead of lying.
-		cacheCounterfactual := cachedUsageCounterfactual(hit.Data, cc.info.Provider, modelUsed)
-		// Cache hits are counted by pkg/cache itself
-		// (cache_hits_total{type}, misses included) — do not
-		// double-count here.
-		if cc.req.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("X-Accel-Buffering", "no")
-		} else {
-			w.Header().Set("Content-Type", "application/json")
-		}
-		w.Header().Set("X-Cache", strings.ToUpper(hit.SourceType))
-		if hit.Similarity > 0 {
-			w.Header().Set("X-Cache-Similarity", fmt.Sprintf("%.4f", hit.Similarity))
-		}
-		w.WriteHeader(http.StatusOK)
-		payload := hit.Data
-		if cc.req.Stream {
-			payload = sseBody
-		}
-		if _, err := w.Write(payload); err != nil {
-			l.Error("cache hit write failed", "error", err, "org_id", orgID)
-		}
-		if cc.req.Stream {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-
-		// P4.13: Publish cache-aware analytics event for savings tracking.
-		gw.finishRequestLogged(ctx, cc.l, requestFinish{
-			base: eventBase{
-				EventType: "request.completed",
-				RequestID: cc.reqID,
-				SessionID: cc.sessionID,
-				Payload:   string(cc.body),
-				// FIX-20: the served document IS the processed response on a
-				// cache hit (stream replay and JSON alike) — envelope from it.
-				ProcessedResponse:     envelopeFromCompletionDoc(hit.Data, modelUsed).marshal(),
-				OrgID:                 orgID,
-				TeamID:                cc.teamID,
-				ModelRequested:        cc.requestedModel,
-				ModelUsed:             modelUsed,
-				UpstreamURL:           cc.info.UpstreamURL,
-				StatusCode:            http.StatusOK,
-				Method:                "POST",
-				Endpoint:              endpointFrom(ctx, "chat.completions"),
-				UsageSource:           "none",
-				CostStatus:            costStatus(true, "none", false),
-				CacheHitType:          hit.SourceType,
-				CacheSimilarity:       hit.Similarity,
-				CounterfactualCostUSD: cacheCounterfactual,
-				TierUsed:              cc.tierUsed,
-				ClassifierClass:       cc.classifierClass,
-				ClassifierConfidence:  cc.classifierConfidence,
-				ClassifierSource:      cc.classifierSource,
-				RoutingDecision:       gw.decisionJSON(decisionSourceCacheHit(hit.SourceType), cc.dec),
-				Policy:                cc.policyEvent,
-				Labels:                labelsFrom(ctx),
-			},
-			// Cache hits never reserve: publish without a settle.
-			noSettle: true,
-			info:     cc.info,
-		})
-
+		gw.finishChatCacheHit(ctx, cc, hit, sseBody)
 		return true
 	}
 	l.Debug("cache miss — forwarding to upstream", "org_id", orgID)
 	return false
+}
+
+// validateChatCacheReplay enforces that a governed hit is servable before
+// any header is written, degrading to a miss (ok=false) instead of broken
+// bytes; the upstream refetch re-serves fresh and the writer overwrites the
+// broken value at the same key (self-healing). Both guards sit AFTER
+// enforcement on purpose: a corrupt entry whose governed verdict is a
+// terminal deny never reaches this point, so corruption cannot bypass
+// enforcement and a denial does not trigger an upstream refetch.
+func validateChatCacheReplay(l *slog.Logger, orgID string, hit *cache.CacheHit, stream bool) (sseBody []byte, ok bool) {
+	// N03-P02-T08: the entry survived governance and is about to be served —
+	// it must decode as a completion document. A torn cache value (sealed
+	// envelope and provenance intact, completion document truncated or
+	// corrupted inside) never serves broken bytes.
+	// FIX-10 (N03-P02-T10): the probe uses the shared usable-completion
+	// contract, so a document that decodes but carries no choices
+	// (`{}`, `{"choices":[]}`) degrades to a miss on the nonstream path
+	// exactly like the streaming replay always did — never served with
+	// X-Cache attribution.
+	if _, probeErr := cachedCompletionUsable(hit.Data); probeErr != nil {
+		l.Warn("cache hit is not a usable completion document — serving from upstream",
+			"error", probeErr, "org_id", orgID)
+		return nil, false
+	}
+	if !stream {
+		return nil, true
+	}
+	// Streaming clients must receive SSE frames, never a raw JSON completion
+	// document — OpenAI-compatible SDKs block waiting for `data:` lines and
+	// the caller appears hung. Convert before any header is written; on
+	// conversion failure treat the entry as a miss so the request is served
+	// fresh instead of broken.
+	sseBody, err := sseReplayFrames(hit.Data)
+	if err != nil {
+		l.Warn("cache hit is not a replayable completion document — serving from upstream",
+			"error", err, "org_id", orgID)
+		return nil, false
+	}
+	return sseBody, true
+}
+
+// chatCacheEligible is the cache lookup gate: no cache service, no org
+// tenant, an org that disabled caching, or — W-STCACHE — a streaming request
+// while cache_stream_enabled is off (streaming must never be answered from
+// possibly stale, pre-fix stream-cache entries; non-stream lookups are
+// unaffected).
+func (gw *gateway) chatCacheEligible(cc *chatContext) bool {
+	return !(gw.cache == nil || cc.orgID == "" || cc.cacheDisabled ||
+		(cc.req.Stream && !gw.cfg.CacheStreamEnabled))
+}
+
+// governChatCacheHit re-governs a cached document with the CURRENT
+// post-upstream policy: a cache entry was written under an earlier policy
+// regime and must never bypass it. The cached document (exact, semantic,
+// and the SSE replay of either) is evaluated exactly like a fresh upstream
+// body: a mask replaces what the client sees, a deny answers the terminal
+// content_policy_violation envelope and no cached byte is written. This
+// closes the "entry created before a policy change" gap — the tenant
+// boundary itself is already enforced below this point (the cache service
+// verified the sealed provenance against this request's org, so a foreign
+// org's entry degrades to a miss). Returns true when the request was
+// answered terminally (policy denial); the hit's Data carries the governed
+// body otherwise.
+func (gw *gateway) governChatCacheHit(ctx context.Context, cc *chatContext, hit *cache.CacheHit) bool {
+	served, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
+	if postEvent != "" {
+		cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
+	}
+	if denied {
+		gw.serveChatCachePolicyDenied(ctx, cc, hit, postEvent)
+		return true
+	}
+	hit.Data = served
+	if cc.req.Stream {
+		// Stream-attached policies (stream_prefix/stream_final) never run at
+		// post_upstream — re-govern the replay with them before any frame is
+		// converted, or a deny tightened after the entry was cached would
+		// serve forbidden content (N03-P02-T02). A replay has issued no
+		// bytes, so a stream_final deny stays terminal here (live streams
+		// can only flag after issuance).
+		streamServed, streamEvents, streamDenied := gw.policyReplayStreamCheck(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
+		if streamEvents != "" {
+			cc.policyEvent = appendPolicyEvents(cc.policyEvent, streamEvents)
+		}
+		if streamDenied {
+			gw.serveChatCachePolicyDenied(ctx, cc, hit, cc.policyEvent)
+			return true
+		}
+		hit.Data = streamServed
+	}
+	return false
+}
+
+// finishChatCacheHit serves a governed cache hit: honest attribution headers
+// (the model that actually generated the response, the entry's source type),
+// the payload (SSE frames for streaming clients), and the cache-aware
+// request.completed event. Cache hits never reserve: publish without a
+// settle. Cache hits are counted by pkg/cache itself — do not double-count.
+func (gw *gateway) finishChatCacheHit(ctx context.Context, cc *chatContext, hit *cache.CacheHit, sseBody []byte) {
+	w, l := cc.w, cc.l
+	orgID := cc.orgID
+
+	// Honest attribution: provenance of the entry — the model that
+	// actually generated the cached response (verified against this
+	// route by the cache service).
+	modelUsed := hit.ModelUsed
+	if modelUsed == "" {
+		modelUsed = cc.model
+	}
+	if eff := gw.effortForCandidate(cc.info, classifier.Class(cc.classifierClass)); eff != "" {
+		cc.dec.Effort = eff
+	}
+	l.Debug("cache hit", "org_id", orgID, "model", cc.model, "model_used", modelUsed, "source", hit.SourceType, "stream", cc.req.Stream)
+	// Counterfactual for a cache hit: what the request would have cost had
+	// it gone upstream. The cached completion document carries the original
+	// usage, so price it with the winning model's adapter. Without usable
+	// usage the counterfactual stays 0 — the savings percentage degrades
+	// to 0 instead of lying.
+	cacheCounterfactual := cachedUsageCounterfactual(hit.Data, cc.info.Provider, modelUsed)
+	if cc.req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.Header().Set("X-Cache", strings.ToUpper(hit.SourceType))
+	if hit.Similarity > 0 {
+		w.Header().Set("X-Cache-Similarity", fmt.Sprintf("%.4f", hit.Similarity))
+	}
+	w.WriteHeader(http.StatusOK)
+	payload := hit.Data
+	if cc.req.Stream {
+		payload = sseBody
+	}
+	if _, err := w.Write(payload); err != nil {
+		l.Error("cache hit write failed", "error", err, "org_id", orgID)
+	}
+	if cc.req.Stream {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	// P4.13: Publish cache-aware analytics event for savings tracking.
+	gw.finishRequestLogged(ctx, cc.l, requestFinish{
+		base: eventBase{
+			EventType: "request.completed",
+			RequestID: cc.reqID,
+			SessionID: cc.sessionID,
+			Payload:   string(cc.body),
+			// FIX-20: the served document IS the processed response on a
+			// cache hit (stream replay and JSON alike) — envelope from it.
+			ProcessedResponse:     envelopeFromCompletionDoc(hit.Data, modelUsed).marshal(),
+			OrgID:                 orgID,
+			TeamID:                cc.teamID,
+			ModelRequested:        cc.requestedModel,
+			ModelUsed:             modelUsed,
+			UpstreamURL:           cc.info.UpstreamURL,
+			StatusCode:            http.StatusOK,
+			Method:                "POST",
+			Endpoint:              endpointFrom(ctx, "chat.completions"),
+			UsageSource:           "none",
+			CostStatus:            costStatus(true, "none", false),
+			CacheHitType:          hit.SourceType,
+			CacheSimilarity:       hit.Similarity,
+			CounterfactualCostUSD: cacheCounterfactual,
+			TierUsed:              cc.tierUsed,
+			ClassifierClass:       cc.classifierClass,
+			ClassifierConfidence:  cc.classifierConfidence,
+			ClassifierSource:      cc.classifierSource,
+			RoutingDecision:       gw.decisionJSON(decisionSourceCacheHit(hit.SourceType), cc.dec),
+			Policy:                cc.policyEvent,
+			Labels:                labelsFrom(ctx),
+		},
+		// Cache hits never reserve: publish without a settle.
+		noSettle: true,
+		info:     cc.info,
+	})
 }
 
 // serveChatCachePolicyDenied ends a cache-hit request whose document the
@@ -1394,29 +1427,14 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// (usage.input_tokens) shapes since the adapter knows its provider's
 	// response schema. ComputeCost turns tokens into an estimated USD amount
 	// using pkg/pricing.
-	adapter, adapterErr := provider.New(finalInfo.Provider)
-	if adapterErr != nil {
-		l.Warn("usage accounting skipped: unknown provider", "provider", finalInfo.Provider, "error", adapterErr)
-		adapter = provider.OpenAI{}
-	}
-	usage := adapter.ParseUsage(resp)
+	usage := chatUsageAdapter(finalInfo, l).ParseUsage(resp)
 	ext := provider.ComputeCost(usage, finalInfo.Provider, finalModelName)
 
-	// OP-8: post-upstream policy hook. Usage was parsed from the ORIGINAL
-	// upstream body (the tokens were consumed regardless of the verdict); a
-	// mask replaces the body every downstream consumer sees (client, cache,
-	// tool gate); a deny answers 400 instead of the upstream body while the
-	// accounting still records the spend that left the org.
-	if gw.policyRuntime != nil {
-		masked, postEvent, denied := gw.policyPostUpstream(r, "chat", finalModelName, finalInfo.Provider, resp)
-		if postEvent != "" {
-			cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
-		}
-		if denied {
-			gw.finishPolicyDeniedJSON(ctx, cc, finalInfo, usage, ext, ex, masked)
-			return
-		}
-		resp = masked
+	// OP-8: post-upstream policy hook — a deny answers 400 and finishes the
+	// request with the spend accounted (see applyChatPostUpstreamPolicy).
+	resp, handled := gw.applyChatPostUpstreamPolicy(ctx, cc, ex, usage, ext, resp)
+	if handled {
+		return
 	}
 
 	// G3: record final token usage against task/session budgets, correct the
@@ -1435,121 +1453,19 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// Compute resale cost with markup for reseller billing.
 	resaleCostUSD := gw.resaleCostUSD(ctx, orgID, finalInfo.Provider, finalModelName, usage)
 
-	// P5.9: Evalgate sampling — for Medium/low-confidence requests, sample a
-	// fraction to run LLM-as-judge comparing cheap vs premium responses.
-	// Results feed into evalgate_results table and calibration refresher.
-	// Runs through the finishRequest pre-attestation hook: EvalgateSampled is
-	// stamped synchronously before lineage/publish (no race with publishEvent).
-	var evalgateHook func(*eventpub.Event)
-	if gw.judge != nil && gw.evalStore != nil && orgID != "" {
-		evalgateHook = func(ev *eventpub.Event) {
-			classLabel := cc.classifierClass
-			conf := cc.classifierConfidence
-
-			// Check if this request matches sampling criteria: Medium class, low confidence
-			isMediumLowConf := classLabel == "medium" && conf < 0.7
-			if isMediumLowConf && gw.cfg.EvalgateSampleRate > 0 && rand.Float64() < gw.cfg.EvalgateSampleRate { //nolint:gosec // evalgate sampling, not cryptography
-				// TP-04: a judge pair needs the cheap answer as full comparable
-				// text. Tool-only, empty or unparseable bodies must not produce a
-				// fabricated verdict — skip judging and record why.
-				if _, ok := comparableCheapResponse(resp); !ok {
-					l.Debug("evalgate: cheap response unavailable (tool-only, empty or unparseable), judge skipped",
-						"org_id", orgID, "request_id", cc.reqID)
-				} else {
-					l.Debug("evalgate sampling triggered", "org_id", orgID, "class", classLabel, "confidence", conf)
-
-					// Store original prompt for judge
-					userPrompt := extractUserPrompt(cc.req.Messages)
-					cheapModelName := finalModelName
-
-					// Determine premium model from tier router
-					var premiumModelName string
-					if gw.tierRouter != nil {
-						premiumSel, perr := gw.tierRouter.SelectModel(ctx, classifier.ClassHard, orgID)
-						if perr == nil && premiumSel.Name != "" {
-							premiumModelName = premiumSel.Name
-						} else {
-							premiumModelName = "gpt-4o" // fallback
-						}
-					} else {
-						premiumModelName = "gpt-4o"
-					}
-
-					// Mark as sampled synchronously to avoid data race with publishEvent.
-					ev.EvalgateSampled = true
-
-					// RT-03: the optional premium comparison runs under the same
-					// trusted identity as the main chain (captured once above).
-					gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
-
-					// Run judge evaluation asynchronously (non-blocking).
-					go func(prompt, cheapResp string) { //nolint:contextcheck // detached by design: judge evaluation must survive request cancellation; internal 15s timeout governs it
-						judgeCtx, jcancel := context.WithTimeout(context.Background(), 15*time.Second)
-						defer jcancel()
-
-						// RT-03: the optional premium comparison is a real
-						// provider attempt — gate it like every other candidate.
-						// A denied/unavailable premium target makes no call and
-						// no verdict (nothing is fabricated from a missing
-						// response — the TP-03/04 contract is preserved).
-						premiumInfo, perr2 := gw.resolveModelInfo(judgeCtx, premiumModelName)
-						if perr2 != nil {
-							l.Debug("evalgate: premium model resolution failed", "error", perr2)
-							return
-						}
-						if _, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo); pol != nil {
-							return
-						}
-
-						// Call premium model for comparison
-						premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumModelName, cc.body)
-						if perr != nil {
-							l.Debug("evalgate: premium response failed", "error", perr)
-							return
-						}
-
-						v, err := gw.judge.Evaluate(judgeCtx, prompt, cheapResp, string(premiumResp))
-						if err != nil {
-							l.Debug("evalgate judge failed", "error", err)
-							return
-						}
-
-						// Store verdict (including ShouldUpgrade flag for calibration).
-						// N02-P06 T06: the judge prompt is the PRE-MASK original —
-						// its persistence is retention-gated like every other
-						// original capture (fail-closed OFF stores the verdict
-						// metadata without the prompt text). The gate routes
-						// through the retention-policy seam (gw's one in-process
-						// boundary decision: strict profile first, then the
-						// installed policy / boolean default — FIX-07/OBS-02).
-						storedPrompt := prompt
-						if !gw.originalRetentionEnabled(judgeCtx, orgID) {
-							storedPrompt = ""
-						}
-						err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumModelName, v, conf)
-						if err != nil {
-							l.Debug("evalgate store failed", "error", err)
-						}
-					}(userPrompt, string(resp))
-				}
-			}
-		}
-	}
-
 	// TOOL-02: strip tool_calls the org policy denies BEFORE the client (or
 	// the cache) sees them. No deny policies → one cached bool, zero parsing.
-	// FIX-20: the gate moved above the event build so the processed-response
+	// FIX-20: the gate runs above the event build so the processed-response
 	// envelope captures the POST-gate body — the envelope must describe what
-	// the client receives, and denied tool calls never reach it. The evalgate
-	// judge above is deliberately unaffected: it snapshots `resp` inside its
-	// block (pre-gate), unchanged behavior.
-	if gw.toolPolicies != nil {
-		var deniedTools []string
-		resp, deniedTools = gw.gateToolCallsJSON(ctx, orgID, agentSubject(r), resp)
-		if len(deniedTools) > 0 {
-			l.Warn("tool policy denied model tool_calls", "org", orgID, "tools", toolNamesFromDenied(deniedTools))
-		}
-	}
+	// the client receives, and denied tool calls never reach it.
+	resp = gw.gateChatToolCalls(ctx, r, l, orgID, resp)
+
+	// P5.9: Evalgate sampling hook (see buildEvalgateHook). Built after the
+	// tool gate on purpose: the hook's judge arguments were previously
+	// evaluated when the hook ran inside finishRequest — i.e. on the
+	// post-gate body — and resp is never reassigned after the gate, so
+	// building here with the post-gate resp is behaviorally identical.
+	evalgateHook := gw.buildEvalgateHook(ctx, cc, finalModelName, resp)
 
 	// Build the completed-request event (the single builder) and finish:
 	// evalgate hook → lineage attestation → reservation settle → publish.
@@ -1627,35 +1543,12 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 		return
 	}
 
-	// P4/RT-05: write to cache asynchronously (non-blocking) under the route
-	// identity of the model that ACTUALLY generated the response (the winning
-	// fallback candidate, not the routed primary) — an entry may only ever be
-	// served under the identity it was generated with.
-	// Skip caching for error responses, no-store headers, or disabled orgs.
-	// RT-07: no-store must also skip the WRITE — the lookup guard above is
-	// not enough, or a response the client forbade storing still lands in the
-	// shared cache and is served to the next request without the header.
-	// a warm hit is re-governed by the CURRENT post-upstream policy at the
-	// out of the cache raw in the first place.
-	if gw.cache != nil && orgID != "" && !cc.cacheDisabled && shouldCache(resp) {
-		ri := cache.RouteIdentity{
-			OrgID:     orgID,
-			Model:     finalModelName,
-			GenParams: gw.effortForCandidate(finalInfo, classifier.Class(cc.classifierClass)),
-			Upstream:  gw.cacheUpstreamFP(finalInfo), // H1: bind the entry to the endpoint that generated it
-		}
-		gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)) //nolint:errcheck,gosec // async cache write: a miss is non-fatal, the next request repopulates
-	}
+	// P4/RT-05: write to cache asynchronously under the route identity of
+	// the model that ACTUALLY generated the response (see
+	// writeChatCacheAsync).
+	gw.writeChatCacheAsync(ctx, cc, finalInfo, finalModelName, resp, usage)
 
-	// prompt-cache outcome (hit|miss) from the same usage fields that bill
-	// (CacheReadTokens). Absent when no provider usage was parsed.
-	if outcome := promptCacheOutcome(usage); outcome != "" {
-		w.Header().Set(PromptCacheHeader, outcome)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(resp); err != nil {
-		l.Error("write response failed", "error", err, "final_model", finalModelName)
-	}
+	writeChatJSONClient(w, l, usage, resp, finalModelName)
 
 	gw.recordBreakerSuccess()
 
@@ -1664,6 +1557,211 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// passthrough). It only mirrors the request to a candidate model for
 	// real-cost/latency accounting.
 	gw.maybeShadow(r, cc.body, finalModelName, orgID, cc.teamID, sessionID, cc.reqID)
+}
+
+// chatUsageAdapter resolves the usage parser for the final-attempt provider
+// (P3.11: the adapter knows its provider's response schema), falling back to
+// the OpenAI shape when the provider is unknown so usage accounting degrades
+// instead of disappearing.
+func chatUsageAdapter(finalInfo resolver.ModelInfo, l *slog.Logger) provider.Provider {
+	adapter, err := provider.New(finalInfo.Provider)
+	if err != nil {
+		l.Warn("usage accounting skipped: unknown provider", "provider", finalInfo.Provider, "error", err)
+		return provider.OpenAI{}
+	}
+	return adapter
+}
+
+// applyChatPostUpstreamPolicy runs the OP-8 post-upstream hook. Usage was
+// parsed from the ORIGINAL upstream body (the tokens were consumed
+// regardless of the verdict); a mask replaces the body every downstream
+// consumer sees (client, cache, tool gate); a deny answers 400 instead of the
+// upstream body while the accounting still records the spend that left the
+// org (finishPolicyDeniedJSON carries that terminal path). Returns the
+// governed body and whether the request was answered terminally.
+func (gw *gateway) applyChatPostUpstreamPolicy(ctx context.Context, cc *chatContext, ex *chatExecution, usage provider.Usage, ext provider.ExtendedUsage, resp []byte) ([]byte, bool) {
+	if gw.policyRuntime == nil {
+		return resp, false
+	}
+	masked, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", ex.finalInfo.ModelName, ex.finalInfo.Provider, resp)
+	if postEvent != "" {
+		cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
+	}
+	if denied {
+		gw.finishPolicyDeniedJSON(ctx, cc, ex.finalInfo, usage, ext, ex, masked)
+		return masked, true
+	}
+	return masked, false
+}
+
+// gateChatToolCalls applies TOOL-02: strip tool_calls the org policy denies
+// before the client (or the cache) sees them. No deny policies → one cached
+// bool, zero parsing inside the gate.
+func (gw *gateway) gateChatToolCalls(ctx context.Context, r *http.Request, l *slog.Logger, orgID string, resp []byte) []byte {
+	if gw.toolPolicies == nil {
+		return resp
+	}
+	var deniedTools []string
+	resp, deniedTools = gw.gateToolCallsJSON(ctx, orgID, agentSubject(r), resp)
+	if len(deniedTools) > 0 {
+		l.Warn("tool policy denied model tool_calls", "org", orgID, "tools", toolNamesFromDenied(deniedTools))
+	}
+	return resp
+}
+
+// buildEvalgateHook returns the P5.9 Evalgate sampling hook — for
+// Medium/low-confidence requests, sample a fraction to run LLM-as-judge
+// comparing cheap vs premium responses. Results feed into evalgate_results
+// table and calibration refresher. Runs through the finishRequest
+// pre-attestation hook: EvalgateSampled is stamped synchronously before
+// lineage/publish (no race with publishEvent). Returns nil when evalgate is
+// not configured for this request; finishRequest treats a nil hook as absent.
+func (gw *gateway) buildEvalgateHook(ctx context.Context, cc *chatContext, finalModelName string, resp []byte) func(*eventpub.Event) {
+	if gw.judge == nil || gw.evalStore == nil || cc.orgID == "" {
+		return nil
+	}
+	return func(ev *eventpub.Event) {
+		gw.maybeEvalgateSample(ctx, cc, finalModelName, resp, ev)
+	}
+}
+
+// maybeEvalgateSample applies the P5.9 sampling criteria — Medium class,
+// low confidence, configured rate — and spawns the detached judge
+// evaluation. EvalgateSampled is stamped synchronously here, before
+// lineage/publish, to avoid a data race with publishEvent.
+func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, finalModelName string, resp []byte, ev *eventpub.Event) {
+	orgID, l := cc.orgID, cc.l
+	classLabel := cc.classifierClass
+	conf := cc.classifierConfidence
+
+	// Check if this request matches sampling criteria: Medium class, low confidence
+	isMediumLowConf := classLabel == "medium" && conf < 0.7
+	if isMediumLowConf && gw.cfg.EvalgateSampleRate > 0 && rand.Float64() < gw.cfg.EvalgateSampleRate { //nolint:gosec // evalgate sampling, not cryptography
+		// TP-04: a judge pair needs the cheap answer as full comparable
+		// text. Tool-only, empty or unparseable bodies must not produce a
+		// fabricated verdict — skip judging and record why.
+		if _, ok := comparableCheapResponse(resp); !ok {
+			l.Debug("evalgate: cheap response unavailable (tool-only, empty or unparseable), judge skipped",
+				"org_id", orgID, "request_id", cc.reqID)
+			return
+		}
+		l.Debug("evalgate sampling triggered", "org_id", orgID, "class", classLabel, "confidence", conf)
+
+		// Store original prompt for judge
+		userPrompt := extractUserPrompt(cc.req.Messages)
+		cheapModelName := finalModelName
+
+		// Determine premium model from tier router
+		var premiumModelName string
+		if gw.tierRouter != nil {
+			premiumSel, perr := gw.tierRouter.SelectModel(ctx, classifier.ClassHard, orgID)
+			if perr == nil && premiumSel.Name != "" {
+				premiumModelName = premiumSel.Name
+			} else {
+				premiumModelName = "gpt-4o" // fallback
+			}
+		} else {
+			premiumModelName = "gpt-4o"
+		}
+
+		// Mark as sampled synchronously to avoid data race with publishEvent.
+		ev.EvalgateSampled = true
+
+		// RT-03: the optional premium comparison runs under the same
+		// trusted identity as the main chain (captured once here).
+		gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
+
+		// Run judge evaluation asynchronously (non-blocking).
+		go gw.evalgateJudge(cc, gateID, userPrompt, string(resp), cheapModelName, premiumModelName, conf) //nolint:contextcheck // detached by design: judge evaluation must survive request cancellation; internal 15s timeout governs it
+	}
+}
+
+// evalgateJudge is the detached evalgate comparison: a real premium provider
+// attempt under the request's trusted identity, judged against the served
+// cheap response, with the verdict persisted for calibration.
+func (gw *gateway) evalgateJudge(cc *chatContext, gateID candidateIdentity, prompt, cheapResp, cheapModelName, premiumModelName string, conf float64) {
+	orgID, l := cc.orgID, cc.l
+	judgeCtx, jcancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer jcancel()
+
+	// RT-03: the optional premium comparison is a real provider attempt —
+	// gate it like every other candidate. A denied/unavailable premium
+	// target makes no call and no verdict (nothing is fabricated from a
+	// missing response — the TP-03/04 contract is preserved).
+	premiumInfo, perr2 := gw.resolveModelInfo(judgeCtx, premiumModelName)
+	if perr2 != nil {
+		l.Debug("evalgate: premium model resolution failed", "error", perr2)
+		return
+	}
+	if _, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo); pol != nil {
+		return
+	}
+
+	// Call premium model for comparison
+	premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumModelName, cc.body)
+	if perr != nil {
+		l.Debug("evalgate: premium response failed", "error", perr)
+		return
+	}
+
+	v, err := gw.judge.Evaluate(judgeCtx, prompt, cheapResp, string(premiumResp))
+	if err != nil {
+		l.Debug("evalgate judge failed", "error", err)
+		return
+	}
+
+	// Store verdict (including ShouldUpgrade flag for calibration).
+	// N02-P06 T06: the judge prompt is the PRE-MASK original — its
+	// persistence is retention-gated like every other original capture
+	// (fail-closed OFF stores the verdict metadata without the prompt
+	// text). The gate routes through the retention-policy seam (gw's one
+	// in-process boundary decision: strict profile first, then the
+	// installed policy / boolean default — FIX-07/OBS-02).
+	storedPrompt := prompt
+	if !gw.originalRetentionEnabled(judgeCtx, orgID) {
+		storedPrompt = ""
+	}
+	err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumModelName, v, conf)
+	if err != nil {
+		l.Debug("evalgate store failed", "error", err)
+	}
+}
+
+// writeChatCacheAsync implements P4/RT-05: write to cache asynchronously
+// (non-blocking) under the route identity of the model that ACTUALLY
+// generated the response (the winning fallback candidate, not the routed
+// primary) — an entry may only ever be served under the identity it was
+// generated with. Skip caching for error responses, no-store headers, or
+// disabled orgs. RT-07: no-store must also skip the WRITE — the lookup guard
+// at serve time is not enough, or a response the client forbade storing
+// still lands in the shared cache and is served to the next request without
+// the header. A warm hit is re-governed by the CURRENT post-upstream policy
+// at lookup, so a stale entry never bypasses enforcement.
+func (gw *gateway) writeChatCacheAsync(ctx context.Context, cc *chatContext, finalInfo resolver.ModelInfo, finalModelName string, resp []byte, usage provider.Usage) {
+	if gw.cache == nil || cc.orgID == "" || cc.cacheDisabled || !shouldCache(resp) {
+		return
+	}
+	ri := cache.RouteIdentity{
+		OrgID:     cc.orgID,
+		Model:     finalModelName,
+		GenParams: gw.effortForCandidate(finalInfo, classifier.Class(cc.classifierClass)),
+		Upstream:  gw.cacheUpstreamFP(finalInfo), // H1: bind the entry to the endpoint that generated it
+	}
+	gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)) //nolint:errcheck,gosec // async cache write: a miss is non-fatal, the next request repopulates
+}
+
+// writeChatJSONClient answers the JSON client after the terminal event has
+// been persisted: the prompt-cache outcome header (hit|miss from the same
+// usage fields that bill, CacheReadTokens; absent when no provider usage was
+// parsed) and the governed body.
+func writeChatJSONClient(w http.ResponseWriter, l *slog.Logger, usage provider.Usage, resp []byte, finalModelName string) {
+	if outcome := promptCacheOutcome(usage); outcome != "" {
+		w.Header().Set(PromptCacheHeader, outcome)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(resp); err != nil {
+		l.Error("write response failed", "error", err, "final_model", finalModelName)
+	}
 }
 
 // finishPolicyDeniedJSON ends a chat JSON request whose post-upstream policy
