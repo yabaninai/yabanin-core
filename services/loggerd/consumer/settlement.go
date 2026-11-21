@@ -159,11 +159,11 @@ const (
 	// decrement applied ($2 NULL — legacy/ledger-only settle — keeps the
 	// payload untouched), so the NEXT-18e reconcile sums the released
 	// remainder from keys that are atomic with status='settled'.
-	// W-LOGG: the update is conditioned on status='processing' — the state
-	// the claim lease holds — and the caller checks the affected row count:
-	// a lease lost to the expired-lease recovery between claim and settle
-	// must roll the whole settlement transaction back instead of settling
-	// (or double-settling) a job another worker already owns.
+	// W-LOGG: the update is conditioned on status='processing' AND the
+	// claim's fencing token (attempts) — a lease lost to recovery or a
+	// NEWER claim must roll the whole settlement transaction back instead
+	// of settling (or double-settling) a job another worker owns; a
+	// re-claim bumps attempts, so a stale token can never match.
 	markSettledQuery = `UPDATE settlement_jobs SET
 			status = 'settled',
 			lease_until = NULL,
@@ -171,7 +171,7 @@ const (
 			updated_at = now(),
 			payload = CASE WHEN $2::bigint IS NULL THEN payload
 				ELSE jsonb_set(COALESCE(payload, '{}'::jsonb), '{` + budget.ReconcileSettleKey + `}', to_jsonb($2::bigint), true) END
-		WHERE id = $1 AND status = 'processing'`
+		WHERE id = $1 AND status = 'processing' AND attempts = $3`
 
 	// settlementAdvisoryLockQuery is the per-org money-writer lock (§5.3):
 	// the same key DeductMicro, Grant, Return, SettleDecrement and the
@@ -179,20 +179,27 @@ const (
 	// never interleave with them on one scope row.
 	settlementAdvisoryLockQuery = `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`
 
+	// markRetryQuery and markRequiresAttentionQuery are fenced the same
+	// way as the settle mark: only the worker whose claim token
+	// (attempts) still matches AND whose 'processing' state still stands
+	// may transition the job. A stale worker that lost its lease to
+	// recovery or a newer claim can never undo a settled/processing job
+	// owned by someone else; a zero-row update means ownership moved on
+	// and the rightful owner (or lease expiry) decides the disposition.
 	markRetryQuery = `UPDATE settlement_jobs SET
 			status = 'retry',
 			next_attempt_at = now() + make_interval(secs => $2),
 			lease_until = NULL,
 			last_error = $3,
 			updated_at = now()
-		WHERE id = $1`
+		WHERE id = $1 AND status = 'processing' AND attempts = $4`
 
 	markRequiresAttentionQuery = `UPDATE settlement_jobs SET
 			status = 'requires_attention',
 			lease_until = NULL,
 			last_error = $2,
 			updated_at = now()
-		WHERE id = $1`
+		WHERE id = $1 AND status = 'processing' AND attempts = $3`
 
 	settlementBacklogQuery = `SELECT status, count(*) FROM settlement_jobs
 		WHERE status IN ('pending', 'retry', 'processing', 'requires_attention', 'pending_price', 'unknown')
@@ -483,10 +490,20 @@ func (w *SettlementWorker) tick(ctx context.Context) {
 		// ledger, spend upserts, job transitions and the reserve decrement
 		// commit together, semantically equivalent to the sequential
 		// per-job execution. Singletons and any failed batch fall back to
-		// the per-job executor, which is the reference semantics.
+		// the per-job executor, which is the reference semantics. The one
+		// exception is a fencing loss (budget.ErrStaleSettlementToken): a
+		// newer worker has re-claimed these jobs, so THIS worker must not
+		// touch them again — no batch retry, no unfenced per-job writes.
+		// The rightful owner settles them; jobs it never re-claimed return
+		// via this worker's expired lease (recoverExpiredLeases).
 		for _, group := range groupJobsByOrg(jobs) {
-			if len(group) > 1 && w.executeOrgBatch(ctx, group) {
-				continue
+			if len(group) > 1 {
+				switch w.executeOrgBatch(ctx, group) {
+				case orgBatchCommitted:
+					continue
+				case orgBatchStale:
+					continue
+				}
 			}
 			for i := range group {
 				w.executeJob(ctx, &group[i])
@@ -541,23 +558,56 @@ func groupJobsByOrg(jobs []settlementJob) [][]settlementJob {
 	return groups
 }
 
+// orgBatchResult is one org-group's batch outcome.
+type orgBatchResult int
+
+const (
+	// orgBatchFallback: nothing committed; the caller re-runs the group
+	// through the per-job executor (rollback makes that safe).
+	orgBatchFallback orgBatchResult = iota
+	// orgBatchCommitted: every disposition is durable.
+	orgBatchCommitted
+	// orgBatchStale: this worker lost the claim to a newer fencing token
+	// (budget.ErrStaleSettlementToken). Nothing committed, and the caller
+	// must NOT fall back to per-job execution — that would apply unfenced
+	// writes to jobs another worker owns. The rightful owner settles the
+	// re-claimed jobs; unaffected ones return via lease expiry.
+	orgBatchStale
+)
+
 // executeOrgBatch applies one org's claimed jobs through the §5.5 batch
-// executor and reports the committed dispositions. It returns true when the
-// batch transaction committed (the jobs are terminal — no per-job work is
-// left); false means the caller must fall back to the per-job executor
-// (nothing committed on an error path, so re-execution is safe).
-func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) bool {
+// executor and reports the committed dispositions. It reports orgBatchCommitted
+// when the batch transaction committed (the jobs are terminal — no per-job
+// work is left); orgBatchFallback means the caller must fall back to the
+// per-job executor (nothing committed on an error path, so re-execution is
+// safe); orgBatchStale means ownership was lost to a newer claim and the
+// jobs must be left alone entirely.
+func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) orgBatchResult {
 	entries := make([]budget.SettleEntry, 0, len(group))
 	for _, job := range group {
 		link := decodeSettleAllowanceLink(job.Payload)
+		invocation := ""
+		if job.InvocationID != nil {
+			// The billed invocation identity (0028+ claims project it;
+			// NULL = legacy-domain row): the batch keys the resale
+			// deduction's idempotency and ledger dedupe on it instead of
+			// the shared client request id — the same identity split as
+			// the per-job ProcessDeductionInvocation path.
+			invocation = *job.InvocationID
+		}
 		entries = append(entries, budget.SettleEntry{
-			JobID:       job.ID,
-			RequestID:   job.RequestID,
-			Kind:        job.ChargeKind,
-			Amount:      job.AmountMicro,
-			Payload:     job.Payload,
-			AllowanceID: link.AllowanceID,
-			Bound:       money.MicroUSD(link.BoundMicroUSD),
+			JobID: job.ID,
+			// The claim's post-increment attempts value IS the fencing
+			// token: a newer claim of the same job bumps it, and the batch
+			// refuses to settle under a stale token (SettleEntry doc).
+			FencingToken: int32(job.Attempts),
+			RequestID:    job.RequestID,
+			InvocationID: invocation,
+			Kind:         job.ChargeKind,
+			Amount:       job.AmountMicro,
+			Payload:      job.Payload,
+			AllowanceID:  link.AllowanceID,
+			Bound:        money.MicroUSD(link.BoundMicroUSD),
 		})
 	}
 
@@ -571,12 +621,24 @@ func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settleme
 
 	dispositions, err := budget.SettleOrgBatch(ctx, w.db, group[0].OrgID, floorCents, entries, budget.BatchSpenders{Agent: w.agentSpender})
 	if err != nil {
+		if errors.Is(err, budget.ErrStaleSettlementToken) {
+			// Ownership lost mid-batch: a newer worker holds the claims.
+			// Never retry here and never fall through to per-job writes —
+			// the rightful owner (or lease expiry for jobs it did not
+			// re-claim) is the only writer allowed to touch this group.
+			w.logger.Warn("settlement org batch abandoned — claim lost to a newer worker",
+				slog.String("org_id", group[0].OrgID),
+				slog.Int("jobs", len(group)),
+				slog.String("error", err.Error()),
+			)
+			return orgBatchStale
+		}
 		w.logger.Warn("settlement org batch failed — falling back to per-job execution",
 			slog.String("org_id", group[0].OrgID),
 			slog.Int("jobs", len(group)),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return orgBatchFallback
 	}
 	metrics.SettlementBatchSize.Observe(float64(len(entries)))
 
@@ -610,7 +672,7 @@ func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settleme
 			slog.String("reason", d.Reason),
 		)
 	}
-	return true
+	return orgBatchCommitted
 }
 
 func (w *SettlementWorker) recoverExpiredLeases(ctx context.Context) error {
@@ -797,7 +859,7 @@ func (w *SettlementWorker) markSettledWithRelease(ctx context.Context, tx pgx.Tx
 	if decrement > 0 {
 		decAmt = decrement
 	}
-	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt)
+	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt, int32(job.Attempts))
 	if err != nil {
 		return fmt.Errorf("mark settled: %w", err)
 	}
@@ -963,12 +1025,23 @@ func (w *SettlementWorker) settle(ctx context.Context, job *settlementJob) {
 }
 
 func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, execErr error) {
-	if _, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr)); err != nil {
+	tag, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr), int32(job.Attempts))
+	if err != nil {
 		// The lease will expire and recovery re-queues the job — the retry
 		// is not lost, only delayed past the lease TTL.
 		w.logger.Error("settlement retry mark failed (lease recovery will requeue)",
 			slog.Int64("job_id", job.ID),
 			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Fenced out: the claim token no longer matches (lease recovered
+		// or a newer worker re-claimed) — this worker must not transition
+		// a job it no longer owns; the rightful owner decides.
+		w.logger.Warn("settlement retry mark skipped — claim lost",
+			slog.Int64("job_id", job.ID),
+			slog.Int("attempts", job.Attempts),
 		)
 		return
 	}
@@ -984,10 +1057,23 @@ func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, ex
 }
 
 func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settlementJob, execErr error, reason string) {
-	if _, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr)); err != nil {
+	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr), int32(job.Attempts))
+	if err != nil {
 		w.logger.Error("settlement requires-attention mark failed",
 			slog.Int64("job_id", job.ID),
 			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Fenced out: the claim token no longer matches — parking a job
+		// another worker owns would be exactly the unfenced undo the
+		// fencing contract forbids; the rightful owner re-executes and
+		// re-classifies (money writes are idempotent, so no charge is
+		// lost or doubled by skipping this mark).
+		w.logger.Warn("settlement requires-attention mark skipped — claim lost",
+			slog.Int64("job_id", job.ID),
+			slog.Int("attempts", job.Attempts),
 		)
 		return
 	}
