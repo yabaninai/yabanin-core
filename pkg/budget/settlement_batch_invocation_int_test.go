@@ -294,8 +294,46 @@ func TestSettleOrgBatchFencingLostOwnership(t *testing.T) {
 		require.NoError(t, err, "token=0 skips fencing: documented direct-caller compatibility")
 		assert.True(t, disp[id1].Settled)
 		assert.True(t, disp[id2].Settled)
-		bal, _ := settlementWalletState(ctx, t, pool, org)
-		assert.EqualValues(t, 7_000, bal)
+
+		// Independent math (money.MicroPerCent = 10,000): each job charges
+		// 1,500,000 µUSD = 150 cents, so 10,000 cents becomes exactly 9,700
+		// with no sub-cent residue.
+		bal, rem := settlementWalletState(ctx, t, pool, org)
+		assert.EqualValues(t, 9_700, bal)
+		assert.EqualValues(t, 0, rem)
+
+		// Exact ledger effects: exactly two usage rows, each −1,500,000 µUSD
+		// (−150 cents), written in the batch's id-ordered carry — the first
+		// row's balance_after is 9,850, the second's 9,700 — and each row
+		// keeps its billed invocation identity.
+		inv1, inv2 := fencingIdentity(3)
+		ledger, err := pool.Query(ctx, `
+			SELECT amount_micro_usd, amount_cents, balance_after, invocation_id
+			FROM credit_transactions
+			WHERE org_id = $1 AND type = 'usage'
+			ORDER BY id`, org)
+		require.NoError(t, err)
+		defer ledger.Close()
+		var want = [][4]any{
+			{int64(-1_500_000), int64(-150), int64(9_850), inv1},
+			{int64(-1_500_000), int64(-150), int64(9_700), inv2},
+		}
+		scanned := 0
+		for ; ledger.Next(); scanned++ {
+			require.Less(t, scanned, len(want), "more usage rows than the two billed charges")
+			var gotMicro, gotCents, gotAfter int64
+			var gotInv string
+			require.NoError(t, ledger.Scan(&gotMicro, &gotCents, &gotAfter, &gotInv))
+			assert.EqualValues(t, want[scanned][0], gotMicro, "row %d micro amount", scanned)
+			assert.EqualValues(t, want[scanned][1], gotCents, "row %d cent amount", scanned)
+			assert.EqualValues(t, want[scanned][2], gotAfter, "row %d balance_after", scanned)
+			assert.Equal(t, want[scanned][3], gotInv, "row %d invocation identity", scanned)
+		}
+		require.NoError(t, ledger.Err())
+		require.Equal(t, 2, scanned, "exactly the two billed charges are in the ledger")
+		rows, micro := walletLedger(ctx, t, pool, org)
+		assert.EqualValues(t, 2, rows)
+		assert.EqualValues(t, -3_000_000, micro)
 	})
 }
 
