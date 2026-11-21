@@ -121,14 +121,15 @@ func TestRun_FailureBoundariesOnFreshDB(t *testing.T) {
 	require.NoError(t, err)
 	_, err = Run(ctx, connStr, "sg")
 	require.Error(t, err, "migrate must fail loudly on a dirty database")
-	require.Contains(t, err.Error(), "Dirty database version 29")
+	dirtyMessage := fmt.Sprintf("Dirty database version %d.", jointScenario.headVersion)
+	require.Contains(t, err.Error(), dirtyMessage)
 	var dirty bool
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT dirty FROM schema_migrations`).Scan(&dirty))
 	require.True(t, dirty, "a failed attempt must not auto-heal the dirty flag")
 	_, err = Run(ctx, connStr, "sg")
 	require.Error(t, err, "a second attempt must fail identically (no partial success)")
-	require.Contains(t, err.Error(), "Dirty database version 29")
+	require.Contains(t, err.Error(), dirtyMessage)
 	// Recovery is explicit: the operator resolves the state, not the tool.
 	_, err = ownerPool.Exec(ctx, `UPDATE schema_migrations SET dirty = false`)
 	require.NoError(t, err)

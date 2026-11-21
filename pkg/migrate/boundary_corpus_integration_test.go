@@ -158,7 +158,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 		reup, err := Run(ctx, dsn, "sg")
 		require.NoError(t, err, "re-upgrade between targets must succeed")
 		require.Equal(t, int64(jointScenario.headVersion), reup.Version)
-		t.Run("target 11 reverts the 0012..0029 span (reserved gaps skipped)", func(t *testing.T) {
+		t.Run("target 11 reverts all later migrations (reserved gaps skipped)", func(t *testing.T) {
 			res, err := Down(ctx, dsn, "sg", 11)
 			require.NoError(t, err)
 			require.Equal(t, int64(11), res.Version)
@@ -174,7 +174,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 		dsn, pool, _ := spinBaselineStand(t, ctx)
 		up, err := Run(ctx, dsn, "sg")
 		require.NoError(t, err)
-		require.Equal(t, int64(27), up.Version)
+		require.Equal(t, int64(jointScenario.headVersion), up.Version)
 		_, err = pool.Exec(ctx,
 			`INSERT INTO organizations (name, slug) VALUES ('Boundary Org', 'boundary-org')`)
 		require.NoError(t, err, "seeding the baseline probe row must succeed")
