@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -53,38 +54,53 @@ var (
 // D4 — guards scan the text fields, not the binary part), and the multipart
 // stream is rebuilt with the model field rewritten to the resolved registry
 // name before the upstream call.
-func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
-
+// readTranscriptionRequest stream-parses and validates the
+// /v1/audio/transcriptions multipart form. ok=false means the caller
+// already answered the client (or the client walked away — N3).
+func readTranscriptionRequest(w http.ResponseWriter, r *http.Request) (parts []audioFormPart, ok bool) {
 	mr, err := r.MultipartReader()
 	if err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 			"expected a multipart/form-data request")
-		return
+		return nil, false
 	}
-	parts, err := audioReadForm(mr)
+	parts, err = audioReadForm(mr)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// N3: the client walked away mid-upload — the response target is
 			// gone and writing the envelope would race the server's conn
 			// teardown (found by the wire test under -race)
-			return
+			return nil, false
 		}
 		writeAudioBodyError(w, err)
+		return nil, false
+	}
+	if audioFieldValue(parts, "model") == "" {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+		return nil, false
+	}
+	if audioFilePart(parts) == nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "file is required")
+		return nil, false
+	}
+	return parts, true
+}
+
+// multipart/form-data in, upstream JSON out byte-identical. The form is
+// stream-parsed (never ParseMultipartForm full-buffering), admission runs on
+// a metadata-only text projection (D3 — audio bytes are never persisted,
+// D4 — guards scan the text fields, not the binary part), and the multipart
+// stream is rebuilt with the model field rewritten to the resolved registry
+// name before the upstream call.
+func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	parts, ok := readTranscriptionRequest(w, r)
+	if !ok {
 		return
 	}
 	model := audioFieldValue(parts, "model")
-	if model == "" {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
-		return
-	}
 	filePart := audioFilePart(parts)
-	if filePart == nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "file is required")
-		return
-	}
-
 	admitted, ok := gw.admit(w, r, admitInput{
 		Endpoint: "audio.transcriptions",
 		Model:    model,
@@ -124,29 +140,11 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
-	defer cancel()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
+	ctx, cancel, client, apiKey, upstreamURL, ok := gw.mediaDispatch(w, rctx, l, gate, admitted)
+	if !ok {
 		return
 	}
+	defer cancel()
 	rebuilt, extra, err := audioRebuildForm(parts, admitted.Info.ModelName)
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
@@ -193,7 +191,14 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, status, errType, "upstream request failed")
 		return
 	}
+	gw.finishAudioTranscription(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, limited)
+}
 
+// finishAudioTranscription settles the served transcription durably —
+// provider usage or the T02 per-second fallback, the usage record,
+// terminal facts — then writes the upstream JSON byte-identical with the
+// upstream Content-Type.
+func (gw *gateway) finishAudioTranscription(rctx context.Context, w http.ResponseWriter, l *slog.Logger, admitted admitted, prov, upstreamURL string, resp *http.Response, started time.Time, limited []byte) {
 	// Usage is "provider" only when the upstream JSON carries a usage block
 	tokensIn, tokensOut, source := audioUsage(limited)
 	usage := provider.Usage{
@@ -202,7 +207,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      tokensIn + tokensOut,
 		Source:           source,
 	}
-	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
+	ext := provider.ComputeCost(usage, prov, admitted.Info.ModelName)
 	// T02: when the upstream reported no token usage and the pinned unit
 	// catalog prices the model per audio second, the cost is rate × the
 	// verbose_json duration. Responses without a duration (plain
@@ -210,7 +215,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	// size-derived reservation quantity is never reused for billing.
 	unitPriced := false
 	if source == "" && !ext.PriceKnown {
-		if entry, ok := gw.unitPrice(providerName, admitted.Info.ModelName, pricing.UnitPerAudioSecond); ok {
+		if entry, ok := gw.unitPrice(prov, admitted.Info.ModelName, pricing.UnitPerAudioSecond); ok {
 			if secs, ok := transcriptionResponseDuration(limited); ok {
 				ext.EstimatedCostUSD = entry.Rate * secs
 				ext.PriceKnown = true

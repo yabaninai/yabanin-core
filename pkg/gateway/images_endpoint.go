@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
@@ -24,38 +25,55 @@ const imagesResponseLimit = 64 << 20
 // non-streaming OpenAI-compat images pipeline. One egress to the resolved
 // upstream host (SSRF-gated by the upstream client); data[].url items are
 // never dereferenced (D5). Edits/streaming are not promised (D3).
-func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
+// imagesRequest is the validated /v1/images/generations JSON probe: the
+// fields the admission, reservation and settlement phases need. n/size are
+// upstream-owned semantics passed through verbatim (no per-parameter
+// validation).
+type imagesRequest struct {
+	Model  string `json:"model"`
+	Prompt string `json:"prompt"`
+	N      *int64 `json:"n"`
+}
+
+// readImagesRequest decodes and validates the /v1/images/generations
+// request body. ok=false means the caller already answered the client.
+func readImagesRequest(w http.ResponseWriter, r *http.Request) (req imagesRequest, body []byte, ok bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		// The 10 MiB gateway cap (httpmw.MaxBody) answers 413 — the
 		// anything else is a malformed body 400.
 		if httpmw.IsMaxBytesError(err) {
 			apierrors.Write(w, http.StatusRequestEntityTooLarge, apierrors.ErrorCodeInvalidRequest, "request body too large")
-			return
+			return req, nil, false
 		}
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "request body too large or malformed")
-		return
-	}
-	var req struct {
-		Model  string `json:"model"`
-		Prompt string `json:"prompt"`
-		N      *int64 `json:"n"`
+		return req, nil, false
 	}
 	if err := json.Unmarshal(body, &req); err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
-		return
+		return req, nil, false
 	}
 	if req.Model == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
-		return
+		return req, nil, false
 	}
 	if req.Prompt == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "prompt is required")
+		return req, nil, false
+	}
+	return req, body, true
+}
+
+// non-streaming OpenAI-compat images pipeline. One egress to the resolved
+// upstream host (SSRF-gated by the upstream client); data[].url items are
+// never dereferenced (D5). Edits/streaming are not promised (D3).
+func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	req, body, ok := readImagesRequest(w, r)
+	if !ok {
 		return
 	}
-
 	admitted, ok := gw.admit(w, r, admitInput{
 		Endpoint: "images.generation",
 		Model:    req.Model,
@@ -98,29 +116,11 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
-	defer cancel()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
+	ctx, cancel, client, apiKey, upstreamURL, ok := gw.mediaDispatch(w, rctx, l, gate, admitted)
+	if !ok {
 		return
 	}
+	defer cancel()
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
 	// Preview2 durable accounting: the confirmed start commits immediately
 	// BEFORE the first paid provider dispatch — after every fallible local
@@ -137,11 +137,7 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	resp, err := client.Do(ctx, "/v1/images/generations", upstreamBody, apiKey, false, nil)
 	if err != nil {
-		if resp != nil && resp.Body != nil {
-			if cerr := resp.Body.Close(); cerr != nil {
-				l.Debug("close upstream body", "error", cerr)
-			}
-		}
+		closeUpstream(l, resp)
 		gate.finalizeNoEvent(mediaTermination(rctx))
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
 		return
@@ -168,16 +164,22 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, status, errType, "upstream request failed")
 		return
 	}
+	gw.finishImagesGeneration(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, req, limited)
+}
 
+// finishImagesGeneration settles the served images response durably —
+// token usage or the T02 per-image fallback, the usage record, terminal
+// facts — then writes the upstream JSON byte-identical.
+func (gw *gateway) finishImagesGeneration(rctx context.Context, w http.ResponseWriter, l *slog.Logger, admitted admitted, prov, upstreamURL string, resp *http.Response, started time.Time, req imagesRequest, limited []byte) {
 	usage, source := imagesUsage(limited)
-	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
+	ext := provider.ComputeCost(usage, prov, admitted.Info.ModelName)
 	// T02: token-priced responses (usage blocks on gpt-image models) keep
 	// their token quote; unpriced ones bill n × the catalog per-image rate
 	// (cost_status "priced" even with no usage block). Without a per-image
 	// rate the legacy unknown-price settlement stands.
 	unitPriced := false
 	if !ext.PriceKnown {
-		if entry, ok := gw.unitPrice(providerName, admitted.Info.ModelName, pricing.UnitPerImage); ok {
+		if entry, ok := gw.unitPrice(prov, admitted.Info.ModelName, pricing.UnitPerImage); ok {
 			ext.EstimatedCostUSD = entry.Rate * imagesRequestCount(req.N)
 			ext.PriceKnown = true
 			unitPriced = true
