@@ -102,11 +102,14 @@ func btGenCaseFor(p []byte, srvURL string) btGenCase {
 	return c
 }
 
-// fuzzBuiltinGenerated drives the real builtinToolInvoke against a live
-// counting upstream with generated tool/org/URL/args and asserts the
-// authorization and SSRF invariants independently of the response prose:
-// policy-denied and SSRF-rejected invokes must never dial, an allowed
-// invoke dials the pinned server exactly once.
+// btGenerated drives the real builtinToolInvoke against a live counting
+// upstream with generated tool/org/URL/args and asserts the authorization
+// and SSRF invariants independently of the response prose: policy-denied
+// and SSRF-rejected invokes must never dial, an allowed invoke dials the
+// pinned server exactly once. The event media-hygiene funnel is pinned
+// separately in TestMediaHygienicEventContract (this driver wires no
+// publisher, so auditBuiltin's hygiene call is unreachable here and the
+// contract is input-independent anyway).
 func btGenerated(t *testing.T, data []byte) {
 	t.Helper()
 	p := data
@@ -135,47 +138,58 @@ func btGenerated(t *testing.T, data []byte) {
 	if w.Body.Len() > 0 && !json.Valid(w.Body.Bytes()) {
 		t.Fatalf("bt gen: non-JSON envelope: %q", w.Body.String())
 	}
-	// Critical-go contract pins for the event media-hygiene funnel (this
-	// driver wires no publisher, so auditBuiltin's hygiene call is
-	// unreachable here; the contract is pinned directly instead).
+}
+
+// TestMediaHygienicEventContract pins the event media-hygiene funnel (the
+// auditBuiltin call btGenerated's fuzz driver never reaches, since it wires
+// no publisher): a nil event stays nil, a media-bearing event sanitizes
+// into a NEW event with the inline base64 run stripped, and a media-free
+// event returns the caller's pointer unchanged.
+func TestMediaHygienicEventContract(t *testing.T) {
 	if mediaHygienicEvent(nil) != nil {
-		t.Fatal("bt gen: nil event must stay nil")
+		t.Fatal("nil event must stay nil")
 	}
 	media := &eventpub.Event{Payload: `{"img":"data:image/png;base64,` + strings.Repeat("QUJD", 64) + `"}`}
 	sanitized := mediaHygienicEvent(media)
-	if sanitized == nil || sanitized == media || sanitized.Payload == media.Payload ||
-		strings.Contains(sanitized.Payload, "QUJDQUJDQUJD") {
-		t.Fatalf("bt gen: inline media not stripped: %q", sanitized.Payload)
+	if sanitized == nil {
+		t.Fatal("media-bearing event must sanitize into a new event, got nil")
+	}
+	if sanitized == media {
+		t.Fatal("media-bearing event must not return the caller's pointer")
+	}
+	if sanitized.Payload == media.Payload || strings.Contains(sanitized.Payload, "QUJDQUJDQUJD") {
+		t.Fatalf("inline media not stripped: %q", sanitized.Payload)
 	}
 	plain := &eventpub.Event{Payload: `{"ok":true}`}
 	if got := mediaHygienicEvent(plain); got != plain {
-		t.Fatal("bt gen: media-free event must return the same pointer")
+		t.Fatal("media-free event must return the same pointer")
 	}
 }
 
 // btGenAssert checks the generated invoke against the authorization and
-// dial invariants: policy/args denials must answer 403, and an allowed
+// dial invariants: policy/args denials must answer 403 without any
+// upstream dial (denials are decided before dispatch), and an allowed
 // invoke dials the pinned upstream exactly once while a non-allowlisted
 // URL never dials at all.
 func btGenAssert(t *testing.T, c btGenCase, w *httptest.ResponseRecorder, before, after int32) {
 	t.Helper()
-	switch {
-	case c.wantPolicyDeny || c.wantForbiddenArgs:
-		if w.Code != http.StatusForbidden {
-			t.Fatalf("bt gen: policy denial expected: org=%s tool=%s params=%s -> %d %s",
-				c.org, c.tool, c.params, w.Code, w.Body.String())
+	if c.wantPolicyDeny || c.wantForbiddenArgs {
+		if w.Code != http.StatusForbidden || after != before {
+			t.Fatalf("bt gen: policy denial must answer 403 without an upstream dial (denials are decided before dispatch): org=%s tool=%s params=%s -> %d %s (hits %d->%d)",
+				c.org, c.tool, c.params, w.Code, w.Body.String(), before, after)
 		}
-	case c.tool != "web_fetch":
-		// non-fetch tools resolve without the pinned HTTP dial
-	default:
-		if !c.dialPinned && after != before {
-			t.Fatalf("bt gen: unexpected upstream hit without an allowlisted URL: params=%s hits %d->%d",
-				c.params, before, after)
-		}
-		if c.dialPinned && after != before+1 {
-			t.Fatalf("bt gen: allowed invoke must dial exactly once: params=%s hits %d->%d (%d %s)",
-				c.params, before, after, w.Code, w.Body.String())
-		}
+		return
+	}
+	if c.tool != "web_fetch" {
+		return // non-fetch tools resolve without the pinned HTTP dial
+	}
+	if !c.dialPinned && after != before {
+		t.Fatalf("bt gen: unexpected upstream hit without an allowlisted URL: params=%s hits %d->%d",
+			c.params, before, after)
+	}
+	if c.dialPinned && after != before+1 {
+		t.Fatalf("bt gen: allowed invoke must dial exactly once: params=%s hits %d->%d (%d %s)",
+			c.params, before, after, w.Code, w.Body.String())
 	}
 }
 
