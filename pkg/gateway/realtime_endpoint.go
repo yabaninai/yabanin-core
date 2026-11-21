@@ -700,6 +700,10 @@ func (h *realtimeTerminalHold) release() {
 	h.done = true
 	defer h.cleanup()
 	if h.spill != nil {
+		if _, err := h.spill.Seek(0, io.SeekStart); err != nil {
+			h.replayErr = err
+			return
+		}
 		buf := make([]byte, 32*1024)
 		for {
 			n, err := h.spill.Read(buf)
