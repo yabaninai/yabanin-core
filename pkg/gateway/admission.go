@@ -231,7 +231,7 @@ func (gw *gateway) resolveAdmissionModel(w http.ResponseWriter, r *http.Request,
 	if info.Fallback && gw.unknownModelPolicy == "reject" {
 		msg := fmt.Sprintf("model %q is not available on this gateway", in.Model)
 		apierrors.WriteWithCode(w, http.StatusNotFound, apierrors.ErrorCodeNotFound, msg, "model_not_found")
-		publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+		publishEventWithContext(r.Context(), gw.publisher, l, eventBase{
 			EventType:      "request.invalid",
 			RequestID:      out.RequestID,
 			SessionID:      out.SessionID,
@@ -360,7 +360,7 @@ func (gw *gateway) checkTeamBudget(w http.ResponseWriter, r *http.Request, l *sl
 		case errors.Is(err, budget.ErrBudgetExceeded):
 			apierrors.Write(w, http.StatusTooManyRequests, "budget_exceeded",
 				fmt.Sprintf("team budget limit reached: %v", err))
-			publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+			publishEventWithContext(r.Context(), gw.publisher, l, eventBase{
 				EventType:      "request.budget_exceeded",
 				RequestID:      out.RequestID,
 				SessionID:      out.SessionID,

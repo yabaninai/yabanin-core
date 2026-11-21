@@ -153,12 +153,12 @@ func (gw *gateway) buildShadowJob(ctx context.Context, body []byte, model, orgID
 		ComputeCost: func(u provider.Usage, _, modelName string) float64 {
 			return provider.ComputeCost(u, providerName, modelName).EstimatedCostUSD
 		},
-		Publish: func(ev *eventpub.Event) { //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+		Publish: func(ev *eventpub.Event) {
 			ev.APIKeyID, ev.SessionKeyID = apiKeyID, sessionKeyID
 			if err := gw.stampAndCommitInvocationTerminal(accountingCtx, ev, l); err != nil {
 				return
 			}
-			publishEvent(gw.publisher, l, ev)
+			publishEventWithContext(accountingCtx, gw.publisher, l, ev)
 		},
 	}
 }

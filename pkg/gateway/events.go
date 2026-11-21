@@ -113,6 +113,10 @@ func mediaHygienicEvent(event *eventpub.Event) *eventpub.Event {
 }
 
 func publishEvent(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Event) {
+	publishEventWithContext(context.Background(), p, l, event)
+}
+
+func publishEventWithContext(ctx context.Context, p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Event) {
 	eventObserverMu.Lock()
 	obs := eventObserver
 	eventObserverMu.Unlock()
@@ -128,7 +132,7 @@ func publishEvent(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Ev
 	case eventPublishSem <- struct{}{}:
 		go func() {
 			defer func() { <-eventPublishSem }()
-			publishAttempt(p, l, event)
+			publishAttempt(context.WithoutCancel(ctx), p, l, event)
 		}()
 	default:
 		l.Warn("event publish skipped, backlog full",
@@ -149,7 +153,7 @@ func publishEvent(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Ev
 // against its own 2s timeout, then the fail-visible terminal accounting
 // (Warn + counter + request-row stamp). It detaches from the caller
 // context on purpose — see publishEvent.
-func publishAttempt(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Event) {
+func publishAttempt(ctx context.Context, p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Event) {
 	const (
 		maxRetries = 3
 		baseDelay  = 50 * time.Millisecond
@@ -164,8 +168,8 @@ func publishAttempt(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.
 			}
 			time.Sleep(delay)
 		}
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		err = p.Publish(ctx, event)
+		attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
+		err = p.Publish(attemptCtx, event)
 		cancel()
 		if err == nil {
 			traceStampObservePublished(event.RequestID)

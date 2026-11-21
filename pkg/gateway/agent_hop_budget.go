@@ -598,7 +598,7 @@ func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatReque
 			}
 		}
 	}
-	publishEvent(c.publisher, c.log, ev) //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+	publishEventWithContext(ctx, c.publisher, c.log, ev)
 	return nil
 }
 
