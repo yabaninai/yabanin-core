@@ -72,8 +72,8 @@ func (s *retentionCompatStore) GetRequestDetail(ctx context.Context, orgID, requ
 	return s.mockStore.GetRequestDetail(ctx, orgID, requestID)
 }
 
-func (s *retentionCompatStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+func (s *retentionCompatStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func retentionMatrixConfigs() map[string]*bool {

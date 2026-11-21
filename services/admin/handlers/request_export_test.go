@@ -69,11 +69,11 @@ func (s *exportRetentionStore) GetRequestDetail(ctx context.Context, orgID, requ
 	return s.mockStore.GetRequestDetail(ctx, orgID, requestID)
 }
 
-func (s *exportRetentionStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+func (s *exportRetentionStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	if s.consumeErr != nil {
-		return s.consumeErr
+		return adminstore.RequestPayloadGrant{}, s.consumeErr
 	}
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func TestRequestExportAppliesPayloadMatrix(t *testing.T) {

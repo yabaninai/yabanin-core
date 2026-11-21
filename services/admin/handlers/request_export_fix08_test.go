@@ -79,11 +79,11 @@ func (s *fix08SeamStore) preflightFiltersSeen() *adminstore.RequestListFilters {
 	return s.preflightFilters
 }
 
-func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func (s *fix08SeamStore) StreamRequestExport(ctx context.Context, filters adminstore.RequestListFilters, access adminstore.RequestPayloadAccess, maxRows int, emit func(*adminstore.RequestDetail) error) (int, error) {
@@ -155,8 +155,8 @@ func (s *fix08NoExportStore) ConsumeRequestPayloadGrant(token, orgID, requestID,
 	return s.base.ConsumeRequestPayloadGrant(token, orgID, requestID, rootID, now)
 }
 
-func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
-	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
+	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func (s *fix08NoExportStore) RevokeRequestPayloadGrant(token, rootID string) error {

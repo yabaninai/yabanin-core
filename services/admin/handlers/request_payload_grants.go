@@ -13,8 +13,11 @@ import (
 type requestPayloadGrantStore interface {
 	CreateRequestPayloadGrant(orgID, requestID, rootID string, ttl time.Duration, now time.Time) (adminstore.RequestPayloadGrant, error)
 	CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope string, ttl time.Duration, now time.Time) (adminstore.RequestPayloadGrant, error)
+	// PeekRequestPayloadGrantTarget resolves the bound physical row a
+	// redeemable grant addresses without consuming it (FIX-08 precheck).
+	PeekRequestPayloadGrantTarget(ctx context.Context, token, orgID, requestID, rootID string, now time.Time) (int64, error)
 	ConsumeRequestPayloadGrant(token, orgID, requestID, rootID string, now time.Time) bool
-	ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error
+	ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error)
 	RevokeRequestPayloadGrant(token, rootID string) error
 	ListRequestPayloadGrants(ctx context.Context, rootID string) ([]adminstore.RequestPayloadGrant, error)
 }
@@ -93,11 +96,16 @@ func (h *AdminHandlers) apiRootRequestPayloadGrant() http.HandlerFunc {
 		}
 		grant, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope, time.Duration(body.TTLSeconds)*time.Second, now)
 		if err != nil {
-			status := http.StatusServiceUnavailable
-			if errors.Is(err, adminstore.ErrInvalidRequestPayloadGrant) {
+			status, message := http.StatusServiceUnavailable, "request payload grant could not be issued"
+			switch {
+			case errors.Is(err, adminstore.ErrInvalidRequestPayloadGrant):
 				status = http.StatusBadRequest
+			case errors.Is(err, adminstore.ErrRequestPayloadGrantTargetMissing):
+				status, message = http.StatusNotFound, "request payload grant target not found"
+			case errors.Is(err, adminstore.ErrRequestPayloadGrantTargetAmbiguous):
+				status, message = http.StatusConflict, "request payload grant target is ambiguous; bind one physical row"
 			}
-			writeJSON(w, status, apiError{Error: "request payload grant could not be issued"})
+			writeJSON(w, status, apiError{Error: message})
 			return
 		}
 		writeJSON(w, http.StatusCreated, struct {

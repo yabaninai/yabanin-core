@@ -193,6 +193,18 @@ func (s *Store) GetRequestDetail(ctx context.Context, orgID, requestID string) (
 	return getRequestDetailOn(ctx, s.db, orgID, requestID)
 }
 
+// GetRequestDetailRow returns the full request_logs row addressed by the
+// immutable row key (org-scoped): the exact-row identity the request list
+// and the payload-grant binding use, so a redemption discloses the very row
+// the grant was bound to even when several rows share the client
+// correlation. Unknown, purged, or cross-org keys return ErrNotFound.
+func (s *Store) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*RequestDetail, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	return getRequestDetailOnKey(ctx, s.db, orgID, rowKey)
+}
+
 // requestDetailRowSelect is the shared authorized detail projection. The
 // WHERE clause is caller-supplied: $1 = org_id, $2 = the row identity (the
 // client correlation for the legacy path, the immutable request_logs.id for

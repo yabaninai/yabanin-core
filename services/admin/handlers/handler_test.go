@@ -648,7 +648,12 @@ type mockStore struct {
 	enqueueOutboxErr   error
 	err                error
 	lastRequestFilters adminstore.RequestListFilters
-	experiments        map[string]*cache.Experiment
+	// requestRows is an opt-in richer request fixture for row-key (0031)
+	// grant tests: physical rows carry their own key, owner and agent
+	// attribution. When nil, ListRequests keeps its historical single-row
+	// behavior so established non-grant tests are untouched.
+	requestRows []mockRequestRow
+	experiments map[string]*cache.Experiment
 	analytics          *adminstore.AnalyticsResult
 	pricingImport      func(catalog pricing.PriceFile, mappings []adminstore.CatalogPriceMap, onlyMapped, apply bool, updatedBy string) (adminstore.CatalogImportResult, error)
 }
@@ -1688,6 +1693,21 @@ func (m *mockStore) GetGlobalCostStats(_ context.Context, _ time.Time, _ time.Ti
 		AvgCostPerRequest:  0.01,
 	}, nil
 }
+// mockRequestRow models one physical request_logs row for the row-key
+// fixture: RowKey is the immutable physical identity (0031), OwnerUserID and
+// AgentID carry the attribution the list predicate scopes on.
+type mockRequestRow struct {
+	RowKey      int64
+	RequestID   string
+	OrgID       string
+	OwnerUserID string
+	AgentID     string
+	ModelUsed   string
+	TokensIn    int64
+	TokensOut   int64
+	CreatedAt   time.Time
+}
+
 func (m *mockStore) ListRequests(_ context.Context, f adminstore.RequestListFilters) ([]adminstore.RequestListRow, int, error) {
 	m.lastRequestFilters = f
 	if m.err != nil {
@@ -1696,10 +1716,70 @@ func (m *mockStore) ListRequests(_ context.Context, f adminstore.RequestListFilt
 	if f.ContentSearch != "" && f.PayloadAuthorizationSet && !f.PayloadSearchAllowed {
 		return []adminstore.RequestListRow{}, 0, nil
 	}
+	if m.requestRows != nil {
+		return m.listFixtureRows(f)
+	}
 	return []adminstore.RequestListRow{
 		{RequestID: "req-1", OrgID: f.OrgID, ModelUsed: "gpt-4o-mini", StatusCode: 200, CostUSD: 0.002, TokensIn: 100, TokensOut: 50, CreatedAt: time.Now(), PayloadOwned: f.PayloadUserID == "subject-a"},
 	}, 1, nil
 }
+
+// listFixtureRows applies the durable list predicate over the richer row
+// fixture: organization, request correlation, model, the row-key pin and the
+// owner scoping request_list.go applies without org-wide metadata. The total
+// is the matched row count, matching the count(*) the real preflight reads.
+func (m *mockStore) listFixtureRows(f adminstore.RequestListFilters) ([]adminstore.RequestListRow, int, error) {
+	rows := []adminstore.RequestListRow{}
+	for _, r := range m.requestRows {
+		if f.OrgID != "" && r.OrgID != f.OrgID {
+			continue
+		}
+		if f.RequestID != "" && r.RequestID != f.RequestID {
+			continue
+		}
+		if f.Model != "" && r.ModelUsed != f.Model {
+			continue
+		}
+		if f.RowKey > 0 && r.RowKey != f.RowKey {
+			continue
+		}
+		if f.OwnerUserID != "" && !f.OrgWideMetadata && r.OwnerUserID != f.OwnerUserID && r.AgentID != f.OwnerUserID {
+			continue
+		}
+		rows = append(rows, adminstore.RequestListRow{
+			RequestID: r.RequestID, OrgID: r.OrgID, ModelUsed: r.ModelUsed, StatusCode: 200,
+			CostUSD: 0.002, TokensIn: r.TokensIn, TokensOut: r.TokensOut, CreatedAt: r.CreatedAt,
+			PayloadOwned: !f.PayloadDenied && f.PayloadUserID == r.OwnerUserID,
+		})
+	}
+	return rows, len(rows), nil
+}
+// GetRequestDetailRow serves the row-key pinned detail read (0031): the
+// fixture's bound row is (org-1, key 1); every other key does not exist. The
+// access-context contract of GetRequestDetail still applies via delegation.
+func (m *mockStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	if orgID != "org-1" || rowKey != 1 {
+		return nil, adminstore.ErrNotFound
+	}
+	detail, err := m.GetRequestDetail(ctx, orgID, "req-1")
+	if err != nil || detail == nil || m.requestRows == nil {
+		return detail, err
+	}
+	// Overlay the fixture's physical-row facts so distinct rows under one
+	// correlation are distinguishable in emitted payloads.
+	for _, r := range m.requestRows {
+		if r.RowKey == rowKey && r.OrgID == orgID {
+			detail.TokensIn = r.TokensIn
+			detail.TokensOut = r.TokensOut
+			break
+		}
+	}
+	return detail, nil
+}
+
 func (m *mockStore) GetToolCallsReport(_ context.Context, orgID string, days int) (*adminstore.ToolCallsReport, error) {
 	if m.err != nil {
 		return nil, m.err

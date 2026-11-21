@@ -69,11 +69,34 @@ func (s *detailSeamStore) GetRequestDetail(ctx context.Context, orgID, requestID
 	return d, err
 }
 
-func (s *detailSeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+// GetRequestDetailRow is the grant path's pre-consume read (0031): the row-key
+// pinned lookup that decides 404 vs 500 before the consume. The seam flags
+// and stage recording mirror the GetRequestDetail override.
+func (s *detailSeamStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	s.record("read")
+	s.mu.Lock()
+	rowGone, failRead, badBody := s.rowGone, s.failRead, s.badBody
+	s.mu.Unlock()
+	switch {
+	case rowGone:
+		return nil, adminstore.ErrNotFound
+	case failRead:
+		return nil, context.DeadlineExceeded
+	}
+	d, err := s.mockStore.GetRequestDetailRow(ctx, orgID, rowKey)
+	if badBody && err == nil {
+		// Invalid raw JSON forces the writeJSON encode to fail AFTER the 200
+		// header is committed (the post-disclosure failure shape).
+		d.Response = json.RawMessage(`{"truncated`)
+	}
+	return d, err
+}
+
+func (s *detailSeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 // runRootDetail invokes the detail handler as root with a concrete target.

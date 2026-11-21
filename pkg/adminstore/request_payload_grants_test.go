@@ -15,17 +15,39 @@ import (
 )
 
 type payloadGrantFakeDB struct {
-	mu         sync.Mutex
-	grants     map[[32]byte]RequestPayloadGrant
-	audited    []string
+	mu      sync.Mutex
+	grants  map[[32]byte]RequestPayloadGrant
+	audited []string
+	// consumeErr fails the consume UPDATE itself.
 	consumeErr error
 	// auditErr fails the durable audit INSERT (the T08 interruption seam:
 	// the grant row has already committed when the audit write runs).
 	auditErr error
+	// requestLogs models the issuance target resolution (0031): how many
+	// physical request_logs rows carry the correlation and the lowest row
+	// key among them.
+	requestLogCarriers int
+	requestLogMinKey   int64
+	// snapshots stack per open transaction so Rollback restores state (the
+	// consume couples UPDATE + audit in one commit).
+	snapshots []map[[32]byte]RequestPayloadGrant
+}
+
+// newPayloadGrantFakeDB returns the fake with its default physical target:
+// exactly one carrier row under key 4242.
+func newPayloadGrantFakeDB() *payloadGrantFakeDB {
+	return &payloadGrantFakeDB{grants: make(map[[32]byte]RequestPayloadGrant), requestLogCarriers: 1, requestLogMinKey: 4242}
 }
 
 func (db *payloadGrantFakeDB) BeginAuditTx(context.Context) (auditTx, error) {
-	return payloadGrantFakeTx{db: db}, nil
+	db.mu.Lock()
+	defer db.mu.Unlock()
+	snapshot := make(map[[32]byte]RequestPayloadGrant, len(db.grants))
+	for k, v := range db.grants {
+		snapshot[k] = v
+	}
+	db.snapshots = append(db.snapshots, snapshot)
+	return &payloadGrantFakeTx{db: db}, nil
 }
 
 func (db *payloadGrantFakeDB) Exec(_ context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
@@ -46,7 +68,7 @@ func (db *payloadGrantFakeDB) Query(_ context.Context, query string, args ...int
 	rows := &mockPGXRows{}
 	for _, grant := range db.grants {
 		if grant.RootID == rootID {
-			rows.data = append(rows.data, []interface{}{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.ExpiresAt, grant.Scope})
+			rows.data = append(rows.data, []interface{}{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.RowKey, grant.ExpiresAt, grant.Scope})
 		}
 	}
 	return rows, nil
@@ -67,6 +89,23 @@ func (db *payloadGrantFakeDB) queryRow(query string, args ...interface{}) pgx.Ro
 			}
 		}
 		return &mockPGXRow{data: [][]interface{}{{count}}}
+	case strings.Contains(query, "FROM request_logs"):
+		// Issuance target resolution (0031): carrier count + MIN(id).
+		return &mockPGXRow{data: [][]interface{}{{db.requestLogCarriers, db.requestLogMinKey}}}
+	case strings.Contains(query, "SELECT request_row_key"):
+		// Peek target resolution: the issuance-time bound row key, NULL for
+		// a legacy pre-binding grant.
+		hash := hashArg(args[0])
+		grant, ok := db.grants[hash]
+		orgID, requestID, rootID := args[1].(string), args[2].(string), args[3].(string)
+		now := args[4].(time.Time)
+		if !ok || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || !now.Before(grant.ExpiresAt) || grantConsumed(grant) || grantRevoked(grant) {
+			return &mockPGXRow{err: pgx.ErrNoRows}
+		}
+		if grant.RowKey <= 0 {
+			return &mockPGXRow{data: [][]interface{}{{nil}}}
+		}
+		return &mockPGXRow{data: [][]interface{}{{grant.RowKey}}}
 	case strings.Contains(query, "SELECT row_hash FROM admin_audit_logs"):
 		return &mockPGXRow{err: pgx.ErrNoRows}
 	case strings.Contains(query, "UPDATE request_payload_grants SET consumed_at"):
@@ -76,13 +115,16 @@ func (db *payloadGrantFakeDB) queryRow(query string, args ...interface{}) pgx.Ro
 		hash := hashArg(args[0])
 		grant, ok := db.grants[hash]
 		orgID, requestID, rootID := args[1].(string), args[2].(string), args[3].(string)
-		now, scope := args[4].(time.Time), args[5].(string)
+		now, scope, rowKey := args[4].(time.Time), args[5].(string), args[6].(int64)
+		if rowKey <= 0 || grant.RowKey != rowKey {
+			return &mockPGXRow{err: pgx.ErrNoRows}
+		}
 		if !ok || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || grant.Scope != scope || !now.Before(grant.ExpiresAt) || grant.Scope == "" || grantConsumed(grant) {
 			return &mockPGXRow{err: pgx.ErrNoRows}
 		}
 		grant.Scope = "consumed:" + grant.Scope
 		db.grants[hash] = grant
-		return &mockPGXRow{data: [][]interface{}{{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.ExpiresAt, strings.TrimPrefix(grant.Scope, "consumed:")}}}
+		return &mockPGXRow{data: [][]interface{}{{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.RowKey, grant.ExpiresAt, strings.TrimPrefix(grant.Scope, "consumed:")}}}
 	case strings.Contains(query, "UPDATE request_payload_grants SET revoked_at"):
 		hash := hashArg(args[0])
 		grant, ok := db.grants[hash]
@@ -92,7 +134,7 @@ func (db *payloadGrantFakeDB) queryRow(query string, args ...interface{}) pgx.Ro
 		}
 		grant.Scope = "revoked:" + grant.Scope
 		db.grants[hash] = grant
-		return &mockPGXRow{data: [][]interface{}{{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.ExpiresAt, strings.TrimPrefix(grant.Scope, "revoked:")}}}
+		return &mockPGXRow{data: [][]interface{}{{grant.ID, grant.OrgID, grant.RequestID, grant.RootID, grant.RowKey, grant.ExpiresAt, strings.TrimPrefix(grant.Scope, "revoked:")}}}
 	default:
 		return &mockPGXRow{err: errors.New("unexpected query row")}
 	}
@@ -104,9 +146,9 @@ func (db *payloadGrantFakeDB) exec(query string, args ...interface{}) (pgconn.Co
 	switch {
 	case strings.Contains(query, "INSERT INTO request_payload_grants"):
 		id, hash, rootID := args[0].(string), hashArg(args[1]), args[2].(string)
-		orgID, requestID, scope := args[3].(string), args[4].(string), args[5].(string)
-		expiresAt := args[6].(time.Time)
-		db.grants[hash] = RequestPayloadGrant{ID: id, OrgID: orgID, RequestID: requestID, RootID: rootID, Scope: scope, ExpiresAt: expiresAt}
+		orgID, requestID, rowKey := args[3].(string), args[4].(string), args[5].(int64)
+		scope, expiresAt := args[6].(string), args[7].(time.Time)
+		db.grants[hash] = RequestPayloadGrant{ID: id, OrgID: orgID, RequestID: requestID, RootID: rootID, RowKey: rowKey, Scope: scope, ExpiresAt: expiresAt}
 	case strings.Contains(query, "INSERT INTO admin_audit_logs"):
 		if db.auditErr != nil {
 			return pgconn.CommandTag{}, db.auditErr
@@ -124,19 +166,44 @@ func (db *payloadGrantFakeDB) exec(query string, args ...interface{}) (pgconn.Co
 	return pgconn.NewCommandTag("OK"), nil
 }
 
-type payloadGrantFakeTx struct{ db *payloadGrantFakeDB }
+// payloadGrantFakeTx models transactional commit/rollback over the fake map:
+// mutations land immediately but Rollback restores the BEGIN snapshot.
+type payloadGrantFakeTx struct {
+	db   *payloadGrantFakeDB
+	done bool
+}
 
-func (tx payloadGrantFakeTx) QueryRow(_ context.Context, query string, args ...interface{}) pgx.Row {
+func (tx *payloadGrantFakeTx) QueryRow(_ context.Context, query string, args ...interface{}) pgx.Row {
 	return tx.db.queryRow(query, args...)
 }
-func (tx payloadGrantFakeTx) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
+func (tx *payloadGrantFakeTx) Query(ctx context.Context, query string, args ...interface{}) (pgx.Rows, error) {
 	return tx.db.Query(ctx, query, args...)
 }
-func (tx payloadGrantFakeTx) Exec(_ context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
+func (tx *payloadGrantFakeTx) Exec(_ context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
 	return tx.db.exec(query, args...)
 }
-func (payloadGrantFakeTx) Commit(context.Context) error   { return nil }
-func (payloadGrantFakeTx) Rollback(context.Context) error { return nil }
+func (tx *payloadGrantFakeTx) Commit(context.Context) error {
+	tx.db.mu.Lock()
+	defer tx.db.mu.Unlock()
+	tx.done = true
+	if n := len(tx.db.snapshots); n > 0 {
+		tx.db.snapshots = tx.db.snapshots[:n-1]
+	}
+	return nil
+}
+func (tx *payloadGrantFakeTx) Rollback(context.Context) error {
+	tx.db.mu.Lock()
+	defer tx.db.mu.Unlock()
+	if tx.done {
+		return nil
+	}
+	tx.done = true
+	if n := len(tx.db.snapshots); n > 0 {
+		tx.db.grants = tx.db.snapshots[n-1]
+		tx.db.snapshots = tx.db.snapshots[:n-1]
+	}
+	return nil
+}
 
 func hashArg(value interface{}) [32]byte {
 	return sha256.Sum256(value.([]byte))
@@ -182,22 +249,28 @@ func TestRequestPayloadGrant_RejectsUnboundedTTL(t *testing.T) {
 
 func TestRequestPayloadGrant_DurableIssueConsumeRevokeAndList(t *testing.T) {
 	now := time.Date(2026, 10, 20, 12, 0, 0, 0, time.UTC)
-	db := &payloadGrantFakeDB{grants: make(map[[32]byte]RequestPayloadGrant)}
+	db := newPayloadGrantFakeDB()
 	store := newForTest(db, newTestLogger(), nil)
 	grant, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if grant.RowKey != 4242 {
+		t.Fatalf("issuance must bind the physical row key; got %d want 4242", grant.RowKey)
+	}
 	if len(db.audited) != 1 || db.audited[0] != "request_payload.grant_issued" {
 		t.Fatalf("issue must be audited before returning token; actions=%v", db.audited)
 	}
-	if err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-b", "request-a", "root-a", RequestPayloadScopeRead, now); err == nil {
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-b", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
 		t.Fatal("cross-organization grant redemption succeeded")
 	}
-	if err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", "root-a", RequestPayloadScopeRead, now); err != nil {
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4243, "root-a", RequestPayloadScopeRead, now); err == nil {
+		t.Fatal("redemption addressed a row the grant is not bound to")
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err != nil {
 		t.Fatalf("valid grant consumption failed: %v", err)
 	}
-	if err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", "root-a", RequestPayloadScopeRead, now); err == nil {
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
 		t.Fatal("consumed grant was reusable")
 	}
 	listed, err := store.ListRequestPayloadGrants(context.Background(), "root-a")
@@ -230,13 +303,120 @@ func TestRequestPayloadGrant_DurableIssueConsumeRevokeAndList(t *testing.T) {
 }
 
 func TestRequestPayloadGrant_DatabaseConsumeFailureFailsClosed(t *testing.T) {
-	db := &payloadGrantFakeDB{
-		grants:     make(map[[32]byte]RequestPayloadGrant),
-		consumeErr: errors.New("database connection lost"),
-	}
+	db := newPayloadGrantFakeDB()
+	db.consumeErr = errors.New("database connection lost")
 	store := newForTest(db, newTestLogger(), nil)
 	if store.ConsumeRequestPayloadGrant("unavailable-token", "org-a", "request-a", "root-a", time.Now().UTC()) {
 		t.Fatal("payload grant accepted while durable database operation failed")
+	}
+}
+
+// TestRequestPayloadGrant_IssuanceBindsExactlyOnePhysicalRow pins the 0031
+// issuance contract: a grant is minted only when exactly one physical
+// request_logs row carries the correlation in the org — no carrier is a 404
+// (missing target), several carriers are a 409 (ambiguous target) — and the
+// minted grant carries that row's key, which the consume then requires.
+func TestRequestPayloadGrant_IssuanceBindsExactlyOnePhysicalRow(t *testing.T) {
+	now := time.Date(2026, 11, 21, 10, 0, 0, 0, time.UTC)
+
+	db := newPayloadGrantFakeDB()
+	db.requestLogCarriers = 0
+	store := newForTest(db, newTestLogger(), nil)
+	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); err != ErrRequestPayloadGrantTargetMissing {
+		t.Fatalf("issuance without a carrier row = %v, want %v", err, ErrRequestPayloadGrantTargetMissing)
+	}
+
+	db.requestLogCarriers = 2
+	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); err != ErrRequestPayloadGrantTargetAmbiguous {
+		t.Fatalf("issuance over an ambiguous correlation = %v, want %v", err, ErrRequestPayloadGrantTargetAmbiguous)
+	}
+
+	db.requestLogCarriers, db.requestLogMinKey = 1, 777
+	grant, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if grant.RowKey != 777 {
+		t.Fatalf("grant bound to row %d, want the sole carrier 777", grant.RowKey)
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 778, "root-a", RequestPayloadScopeRead, now); err == nil {
+		t.Fatal("consume addressed a row the grant is not bound to")
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 777, "root-a", RequestPayloadScopeRead, now); err != nil {
+		t.Fatalf("consume of the bound row failed: %v", err)
+	}
+}
+
+// TestRequestPayloadGrant_ConsumeAuditFailureRollsBackAndRetrySucceeds pins
+// the single-commit coupling: the consume UPDATE and its mandatory use-audit
+// row commit together, so a journal outage denies the redemption WITHOUT
+// destroying the token — retrying the same token once the journal recovers
+// succeeds, and exactly one use-audit row exists afterwards.
+func TestRequestPayloadGrant_ConsumeAuditFailureRollsBackAndRetrySucceeds(t *testing.T) {
+	now := time.Date(2026, 11, 21, 11, 0, 0, 0, time.UTC)
+	db := newPayloadGrantFakeDB()
+	store := newForTest(db, newTestLogger(), nil)
+	grant, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	db.auditErr = errors.New("audit journal unavailable")
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now.Add(time.Second)); err == nil || !strings.Contains(err.Error(), "audit payload grant use") {
+		t.Fatalf("consume with a failed mandatory audit = %v, want audit failure", err)
+	}
+	if store.ConsumeRequestPayloadGrant(grant.Token, "org-a", "request-a", "root-a", now.Add(time.Second)) {
+		t.Fatal("token must stay redeemable-or-denied, never silently consumed, while its audit fails")
+	}
+
+	db.auditErr = nil
+	consumed, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now.Add(2*time.Second))
+	if err != nil {
+		t.Fatalf("retry on the same token after audit recovery failed: %v", err)
+	}
+	if consumed.RowKey != 4242 {
+		t.Fatalf("consumed grant reports row %d, want 4242", consumed.RowKey)
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now.Add(3*time.Second)); err == nil {
+		t.Fatal("token redeemed twice after retry")
+	}
+	used := 0
+	for _, action := range db.audited {
+		if action == "request_payload.grant_used" {
+			used++
+		}
+	}
+	if used != 1 {
+		t.Fatalf("grant_used audit rows = %d, want exactly 1 (the rolled-back attempt must leave none)", used)
+	}
+}
+
+// TestRequestPayloadGrant_LegacyUnboundGrantIsPermanentlyUnusable pins the
+// conservative legacy treatment: a grant issued before the 0031 binding has
+// NULL request_row_key, its original row is not provable, and it can never be
+// redeemed against whatever row the correlation currently names — not via
+// peek resolution and not via a direct keyed consume.
+func TestRequestPayloadGrant_LegacyUnboundGrantIsPermanentlyUnusable(t *testing.T) {
+	now := time.Date(2026, 11, 21, 12, 0, 0, 0, time.UTC)
+	db := newPayloadGrantFakeDB()
+	store := newForTest(db, newTestLogger(), nil)
+	hash := sha256.Sum256([]byte("legacy-token"))
+	db.grants[hash] = RequestPayloadGrant{ID: "legacy-grant", OrgID: "org-a", RequestID: "request-a", RootID: "root-a", Scope: RequestPayloadScopeRead, ExpiresAt: now.Add(time.Minute)}
+
+	if _, err := store.PeekRequestPayloadGrantTarget(context.Background(), "legacy-token", "org-a", "request-a", "root-a", now); err != ErrInvalidRequestPayloadGrant {
+		t.Fatalf("legacy unbound grant peek = %v, want the generic invalid error", err)
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope("legacy-token", "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
+		t.Fatal("legacy unbound grant was redeemed by key")
+	}
+	if store.ConsumeRequestPayloadGrant("legacy-token", "org-a", "request-a", "root-a", now) {
+		t.Fatal("legacy unbound grant was redeemed")
+	}
+	db.mu.Lock()
+	grant := db.grants[hash]
+	db.mu.Unlock()
+	if grantConsumed(grant) {
+		t.Fatal("denied legacy grant must not be burned")
 	}
 }
 
@@ -259,7 +439,7 @@ func TestRequestPayloadDenyOwnHistoryPolicy(t *testing.T) {
 // usable grant — no double grant, no cap consumed by the compensated row.
 func TestRequestPayloadGrantAuditInterruptionCompensatesAndRetryConverges(t *testing.T) {
 	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
-	db := &payloadGrantFakeDB{grants: make(map[[32]byte]RequestPayloadGrant)}
+	db := newPayloadGrantFakeDB()
 	store := newForTest(db, newTestLogger(), nil)
 
 	// Attempt 1: the audit write fails after the grant row committed.
