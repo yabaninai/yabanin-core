@@ -1003,6 +1003,9 @@ func fam01GeneratedHop(t *testing.T, ref string) {
 		budget.NewAdmission(nil, budget.ScopedRateSource{}, nil, "fam01-gen", budget.ModeOff, nil, budget.AdmissionConfig{}),
 		budget.NewLoopBudget(2, time.Minute),
 		nil, nil, judgeHopLogger(t),
+		// Preview2 durable accounting (additive option — the positional
+		// signature stays source-compatible).
+		WithJudgeInvocationStore(&fakeInvocationStore{}),
 	)
 	req := judgeHopRequest(ref)
 

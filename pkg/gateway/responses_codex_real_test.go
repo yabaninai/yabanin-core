@@ -93,6 +93,9 @@ func TestResponses_CodexCLI_RealE2E(t *testing.T) {
 	defer upstream.Close()
 
 	gw := responsesTestGateway(t, upstream.URL)
+	// Preview2: the real CLI cannot carry test identity headers; resolve
+	// its bearer key to a test org like the consumer-compat legacy mode.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("codex-e2e", nil))
 	gw.res = stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "m", DisplayName: "m", Provider: "openai", CreatedAt: time.Now().UTC(),
@@ -507,6 +510,9 @@ func TestResponses_CodexCLI_RealE2E_ToolsLoop(t *testing.T) {
 	defer upstream.Close()
 
 	gw := responsesTestGateway(t, upstream.URL)
+	// Preview2: the real CLI cannot carry test identity headers; resolve
+	// its bearer key to a test org like the consumer-compat legacy mode.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("codex-e2e", nil))
 	gw.res = stubModelResolver{"gpt-5-codex": {ModelName: "gpt-5-codex", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "gpt-5-codex", DisplayName: "gpt-5-codex", Provider: "openai", CreatedAt: time.Now().UTC(),
@@ -702,6 +708,9 @@ func TestResponses_CodexCLI_RealE2E_UnsupportedToolCall(t *testing.T) {
 	defer upstream.Close()
 
 	gw := responsesTestGateway(t, upstream.URL)
+	// Preview2: the real CLI cannot carry test identity headers; resolve
+	// its bearer key to a test org like the consumer-compat legacy mode.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("codex-e2e", nil))
 	gw.res = stubModelResolver{"gpt-5-codex": {ModelName: "gpt-5-codex", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "gpt-5-codex", DisplayName: "gpt-5-codex", Provider: "openai", CreatedAt: time.Now().UTC(),
@@ -801,6 +810,9 @@ func TestResponses_CodexCLI_RealE2E_ClientCancel(t *testing.T) {
 	defer closeRelease()
 
 	gw := responsesTestGateway(t, upstream.URL)
+	// Preview2: the real CLI cannot carry test identity headers; resolve
+	// its bearer key to a test org like the consumer-compat legacy mode.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("codex-e2e", nil))
 	gw.res = stubModelResolver{"gpt-5-codex": {ModelName: "gpt-5-codex", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "gpt-5-codex", DisplayName: "gpt-5-codex", Provider: "openai", CreatedAt: time.Now().UTC(),

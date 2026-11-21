@@ -96,6 +96,10 @@ func evalgateTestGateway(t *testing.T, primaryURL, judgeURL string, store verdic
 		log:         slog.Default(),
 		judge:       evalgate.NewJudge(judgeURL, nil),
 		evalStore:   store,
+		// Preview2 durable accounting: the production constructor wires
+		// NewPGInvocationStore(w.pool); isolated chat fixtures wire the
+		// fake so the fail-closed confirmed start admits.
+		invocations: &fakeInvocationStore{},
 	}
 	reg := classifier.NewRegistry(classifier.NewRuleTier())
 	gw.classifier = classifier.NewRegistryWithDBCacheSilent(

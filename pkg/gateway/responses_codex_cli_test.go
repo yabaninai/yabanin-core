@@ -12,7 +12,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/reireirei/yabanin/pkg/apiformat"
 )
 
@@ -52,6 +51,9 @@ func (c *mockCodexCLI) do(method, path, contentType string, body io.Reader) (cli
 		return cliResult{}, err
 	}
 	req.Header.Set("Authorization", "Bearer "+c.apiKey)
+	// Post-4a1aaaa convention: stand in for the resolved principal the
+	// production auth middleware injects (these servers skip auth).
+	goldenIdentity(req)
 	if contentType != "" {
 		req.Header.Set("Content-Type", contentType)
 	}
@@ -166,10 +168,9 @@ func TestResponses_CodexCLI_MockE2E(t *testing.T) {
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "gpt-5-codex", DisplayName: "gpt-5-codex", Provider: "openai", CreatedAt: time.Now().UTC(),
 	}}
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	// Minimal mount: /v1/responses without auth (mock CLI carries the
+	// golden identity itself).
+	gwServer := responsesBillingServer(t, gw)
 
 	cli := &mockCodexCLI{baseURL: gwServer.URL, apiKey: "test-key", model: "gpt-5-codex"}
 
@@ -298,10 +299,9 @@ func TestResponses_CodexCLI_MockE2E_ReasoningResendAndUsage(t *testing.T) {
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "gpt-5-codex", DisplayName: "gpt-5-codex", Provider: "openai", CreatedAt: time.Now().UTC(),
 	}}
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	// Minimal mount: /v1/responses without auth (mock CLI carries the
+	// golden identity itself).
+	gwServer := responsesBillingServer(t, gw)
 
 	cli := &mockCodexCLI{baseURL: gwServer.URL, apiKey: "test-key", model: "gpt-5-codex"}
 	cli.checkModels(t)

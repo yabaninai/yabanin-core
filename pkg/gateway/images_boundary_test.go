@@ -260,6 +260,7 @@ func TestImagesGenerations_ClientCancelMidResponse(t *testing.T) {
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"m","prompt":"x"}`))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -307,6 +308,7 @@ func TestImagesGenerations_BodyTooLargeThroughMaxBody(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/images/generations", strings.NewReader(big))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

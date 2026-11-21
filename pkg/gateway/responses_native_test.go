@@ -9,7 +9,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/toolpolicy"
 )
@@ -111,10 +110,11 @@ func TestResponsesNative_DenyPolicyUsesTranslation(t *testing.T) {
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("X-Org-Id", "org-1")
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	// Handler-direct: the auth middleware strips client identity headers
+	// while durable terminal facts require a tenant.
+	gw.responses(rec, req)
 	if path != "/v1/chat/completions" {
 		t.Fatalf("path %s body %s", path, rec.Body.String())
 	}

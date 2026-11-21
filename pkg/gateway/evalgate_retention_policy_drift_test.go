@@ -216,6 +216,9 @@ func runObs02ChatRequest(t *testing.T, gw *gateway, orgID, prompt string) *httpt
 	t.Helper()
 	body := nonStreamBody("gpt-4o-mini", prompt)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
+	// Handler-direct: golden identity stands in for the resolved principal;
+	// the caller's org stays authoritative.
+	goldenIdentity(r)
 	r.Header.Set("X-Org-Id", orgID)
 	w := httptest.NewRecorder()
 	gw.chatCompletions(w, r)

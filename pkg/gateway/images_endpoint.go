@@ -84,6 +84,7 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	// per-pixel variants) keep the token estimate path and are refused in
 	// enforce mode as unpriced (fail-closed, I3).
 	rctx := r.Context()
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "images.generation",
 		withUnitDemand(
 			gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
@@ -121,6 +122,19 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap), so a local failure never
+	// strands a durable admission for a request that never dispatched.
+	// Fail closed: an unwritten start (write error, timeout or lost ACK —
+	// outcome unknown) refuses the request with ZERO provider arrivals
+	// under the history_unavailable envelope, and the escrow is released.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 	resp, err := client.Do(ctx, "/v1/images/generations", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		if resp != nil && resp.Body != nil {
@@ -154,13 +168,6 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, status, errType, "upstream request failed")
 		return
 	}
-	if rctx.Err() != nil {
-		// N3: the client walked away while the response was in flight —
-		// settle the escrow with no spend event and publish no
-		// request.completed success event (audio pipeline parity).
-		gate.finalizeNoEvent(budget.TerminationClientCancel)
-		return
-	}
 
 	usage, source := imagesUsage(limited)
 	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
@@ -185,7 +192,7 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	_, _ = gw.finishRequest(rctx, requestFinish{
+	_, ferr := gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,
@@ -222,9 +229,29 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 		// NEXT-18c: settle the reservation and stamp tuples + termination
 		// (§5.3 Finalize). No resale on this pipeline; the wallet actual
 		// falls back to the base quote — the consumer's own rule.
+		// N3 + owner review 0574aa1: the provider fully served and was paid
+		// for its 200 (an interrupted read returned above with no fabricated
+		// usage). Whether the client transport is still alive only picks the
+		// termination outcome (completionTermination → client_cancel) and
+		// whether success bytes are written below — the KNOWN usage settles
+		// durably either way (terminal facts ride the WithoutCancel funnel).
 		termination: completionTermination(rctx),
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
+	if rctx.Err() != nil {
+		// N3: the client walked away after the provider was paid — no
+		// success bytes to the dead transport; the settlement above already
+		// carries the known usage with the cancellation recorded.
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

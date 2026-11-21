@@ -16,7 +16,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 )
 
@@ -193,10 +192,7 @@ func TestResponsesNative_StreamBreak_UpstreamFailure(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	post := func() *http.Response {
 		t.Helper()
@@ -207,6 +203,7 @@ func TestResponsesNative_StreamBreak_UpstreamFailure(t *testing.T) {
 		}
 		req.Header.Set("Authorization", "Bearer test-key")
 		req.Header.Set("Content-Type", "application/json")
+		goldenIdentity(req)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -260,10 +257,7 @@ func TestResponsesAdapted_StreamBreak_Parity(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	post := func() *http.Response {
 		t.Helper()
@@ -274,6 +268,7 @@ func TestResponsesAdapted_StreamBreak_Parity(t *testing.T) {
 		}
 		req.Header.Set("Authorization", "Bearer test-key")
 		req.Header.Set("Content-Type", "application/json")
+		goldenIdentity(req)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -330,10 +325,7 @@ func TestResponsesNative_StreamIdleTimeout(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	post := func() *http.Response {
 		t.Helper()
@@ -344,6 +336,7 @@ func TestResponsesNative_StreamIdleTimeout(t *testing.T) {
 		}
 		req.Header.Set("Authorization", "Bearer test-key")
 		req.Header.Set("Content-Type", "application/json")
+		goldenIdentity(req)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)
@@ -392,10 +385,7 @@ func TestResponsesNative_StreamCleanEOF_IsSuccess(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	post := func() *http.Response {
 		t.Helper()
@@ -406,6 +396,7 @@ func TestResponsesNative_StreamCleanEOF_IsSuccess(t *testing.T) {
 		}
 		req.Header.Set("Authorization", "Bearer test-key")
 		req.Header.Set("Content-Type", "application/json")
+		goldenIdentity(req)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)

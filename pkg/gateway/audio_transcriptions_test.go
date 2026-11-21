@@ -63,10 +63,13 @@ func postAudioTranscriptions(t *testing.T, gw *gateway, body []byte, contentType
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", contentType)
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	// Handler-direct (the post-4a1aaaa convention): the auth middleware
+	// strips client-supplied identity headers, and durable terminal facts
+	// require a tenant — the golden identity stands in for the resolved
+	// principal the production resolver injects.
+	gw.audioTranscriptions(rec, req)
 	return rec
 }
 
@@ -421,6 +424,7 @@ func TestAudioTranscriptions_FileTooLarge(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", contentType)
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 
@@ -665,14 +669,17 @@ func TestAudioTranscriptions_BodyLimitExactBoundary(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			calls.Store(0)
 			gw := newAudioGateway(t, audioTranscriptionModel(server.URL))
+			// MaxBody chain without the auth middleware (which strips the
+			// client identity headers the durable terminal facts need).
 			r := chi.NewRouter()
 			r.Use(httpmw.MaxBody(10 * 1024 * 1024))
-			gw.routes(r)
+			r.Post("/v1/audio/transcriptions", gw.audioTranscriptions)
 
 			body, contentType := buildAudioMultipartExact(t, tc.size, wav)
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
 			req.Header.Set("Authorization", "Bearer test-key")
 			req.Header.Set("Content-Type", contentType)
+			goldenIdentity(req)
 			rec := httptest.NewRecorder()
 			r.ServeHTTP(rec, req)
 

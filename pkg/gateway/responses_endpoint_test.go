@@ -38,7 +38,25 @@ func responsesTestGateway(t *testing.T, upstreamURL string) *gateway {
 		fallback:             router.NewFallbackExecutor(res, 3, slog.Default()),
 		retryPolicy:          retry.DefaultPolicy(),
 		streamUsageProviders: map[string]bool{"openai": true},
+		// Preview2 durable accounting: isolated tests wire an explicit
+		// fake store so the fail-closed confirmed start admits; tests
+		// scripting admission/facts faults replace this after construction.
+		invocations: &fakeInvocationStore{},
 	}
+}
+
+// responsesBillingServer mounts /v1/responses WITHOUT the auth
+// middleware, which strips the client identity headers the durable
+// terminal facts require (post-4a1aaaa convention: goldenIdentity stands
+// in for the resolved principal).
+func responsesBillingServer(t *testing.T, gw *gateway) *httptest.Server {
+	t.Helper()
+	router := chi.NewRouter()
+	router.Post("/v1/responses", gw.responses)
+	router.Get("/v1/models", gw.listModels)
+	server := httptest.NewServer(router)
+	t.Cleanup(server.Close)
+	return server
 }
 
 func postResponses(t *testing.T, gw *gateway, body string) *httptest.ResponseRecorder {
@@ -46,10 +64,13 @@ func postResponses(t *testing.T, gw *gateway, body string) *httptest.ResponseRec
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	// Handler-direct (the post-4a1aaaa convention): the auth middleware
+	// strips client-supplied identity headers, and durable terminal facts
+	// require a tenant — the golden identity stands in for the resolved
+	// principal the production resolver injects.
+	gw.responses(rec, req)
 	return rec
 }
 
