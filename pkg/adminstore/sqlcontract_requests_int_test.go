@@ -68,12 +68,22 @@ func seedRequestsExtension(t *testing.T, pool *pgxpool.Pool, fx *contractFixture
 		`{"env":"prod","issue":"PAY-9"}`)
 	require.NoError(t, err, "seed extension request_logs row")
 
+	// r2 is the unique legacy carrier for the positive attachment case: one
+	// orgA row, NULL invocation identity, its own web_search fact — the
+	// legacy-attach behavior the r1 pair can no longer provide (adding a
+	// fresh request row would shift the list-count contracts).
 	_, err = pool.Exec(ctx, `
 		INSERT INTO tool_calls (request_id, org_id, task_id, model_used, tool_name) VALUES
 			($1, $2::uuid, 'code-gen', $3, 'web_search'),
 			($1, $2::uuid, 'code-gen', $3, 'code_interpreter'),
-			($4, $2::uuid, NULL, $3, 'web_search')`,
-		fx.Token+"-rx", fx.OrgA, fx.Token+"-m-smart", fx.Token+"-r1")
+			($4, $2::uuid, NULL, $3, 'web_search'),
+			($5, $2::uuid, NULL, $3, 'web_search')`,
+		fx.Token+"-rx", fx.OrgA, fx.Token+"-m-smart", fx.Token+"-r1", fx.Token+"-r2")
+	// The r1 fact is the ambiguous control: the base fixture seeds r1 twice
+	// in orgA (smart + shadow mirror share org and request_id), so under the
+	// unique-carrier association rule its NULL-invocation fact attributes to
+	// neither row — detail stays empty and the report counts no request for
+	// it, while fact-domain totals still include it.
 	require.NoError(t, err, "seed tool_calls")
 
 	_, err = pool.Exec(ctx, `
@@ -909,6 +919,79 @@ func TestSQLContractRequests_YQLInjection(t *testing.T) {
 // TestSQLContractRequests_Labels covers the label attribution surface:
 // request labels (0004) through the list and detail reads, ListLabelKeys,
 // the api-key label write (0014) and its CAS variant.
+// runToolFactDetailContracts holds the tool-fact association detail
+// controls over the shared fixture: r2 is the unique legacy carrier whose
+// pre-0014 fact still attaches, and r1 — seeded twice in orgA (smart +
+// shadow mirror) with one NULL-invocation fact — must attribute that fact
+// to neither row (unique-carrier rule: linkage is never guessed).
+func runToolFactDetailContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetRequestDetail/r2", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r2")
+		if err != nil {
+			return err
+		}
+		if len(d.ToolCalls) != 1 || d.ToolCalls[0].ToolName != "web_search" {
+			t.Errorf("GetRequestDetail/r2: expected the seeded web_search call, got %v", d.ToolCalls)
+		}
+		if len(d.ToolCallInvocations) != 0 {
+			t.Errorf("GetRequestDetail/r2: expected no invocations, got %d", len(d.ToolCallInvocations))
+		}
+		return nil
+	})
+	contract(t, "GetRequestDetail/r1-ambiguous", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r1")
+		if err != nil {
+			return err
+		}
+		if len(d.ToolCalls) != 0 {
+			t.Errorf("GetRequestDetail/r1-ambiguous: ambiguous correlation must attach no facts, got %v", d.ToolCalls)
+		}
+		if len(d.ToolCallInvocations) != 0 {
+			t.Errorf("GetRequestDetail/r1-ambiguous: expected no invocations, got %d", len(d.ToolCallInvocations))
+		}
+		return nil
+	})
+}
+
+// runToolReportContract holds the GetToolCallsReport aggregate control:
+// four facts (rx web_search + code_interpreter, r1 web_search, r2
+// web_search), two tools, but only two request identities — rx's unique
+// carrier and r2's. The r1 fact stays in the fact-domain totals yet counts
+// no request: its correlation is carried by the smart + shadow mirror pair.
+func runToolReportContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetToolCallsReport/orgA", func(ctx context.Context) error {
+		rep, err := store.GetToolCallsReport(ctx, fx.OrgA, 7)
+		if err != nil {
+			return err
+		}
+		if rep.TotalCalls != 4 || rep.DistinctTools != 2 || rep.RequestsUsing != 2 {
+			t.Errorf("GetToolCallsReport/orgA: expected 4 calls / 2 tools / 2 requests, got %+v", rep)
+		}
+		checkToolReportShape(t, rep)
+		return nil
+	})
+}
+
+// checkToolReportShape pins the leaderboard and by-model grouping of the
+// orgA report: web_search leads with 3 of 4 calls (75%), one model group.
+func checkToolReportShape(t *testing.T, rep *ToolCallsReport) {
+	t.Helper()
+	if len(rep.Top) != 2 || rep.Top[0].Tool != "web_search" || rep.Top[0].Calls != 3 {
+		t.Errorf("GetToolCallsReport/orgA: top must lead with web_search×3, got %+v", rep.Top)
+		return
+	}
+	if rep.Top[0].Share < 74.0 || rep.Top[0].Share > 76.0 {
+		t.Errorf("GetToolCallsReport/orgA: share must be 3/4 of calls, got %f", rep.Top[0].Share)
+	}
+	if len(rep.ByModel) != 1 || rep.ByModel[0].Calls != 4 {
+		t.Errorf("GetToolCallsReport/orgA: by-model must group all 4 calls, got %+v", rep.ByModel)
+	}
+}
+
 func TestSQLContractRequests_Labels(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
@@ -942,21 +1025,9 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		return nil
 	})
 
-	// Detail for a request with a tool_call but no invocations (legacy rows).
-	contract(t, "GetRequestDetail/r1", func(ctx context.Context) error {
-		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
-		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r1")
-		if err != nil {
-			return err
-		}
-		if len(d.ToolCalls) != 1 || d.ToolCalls[0].ToolName != "web_search" {
-			t.Errorf("GetRequestDetail/r1: expected the seeded web_search call, got %v", d.ToolCalls)
-		}
-		if len(d.ToolCallInvocations) != 0 {
-			t.Errorf("GetRequestDetail/r1: expected no invocations, got %d", len(d.ToolCallInvocations))
-		}
-		return nil
-	})
+	// Detail for the ambiguous r1 pair and the unique legacy carrier r2 —
+	// the tool-fact association controls live in their own helper.
+	runToolFactDetailContracts(t, store, fx)
 
 	// Cross-org and missing lookups answer ErrNotFound without leaking
 	// existence.
@@ -1263,26 +1334,7 @@ func TestSQLContractRequests_ToolCalls(t *testing.T) {
 	fx := seedContractFixture(t, pool)
 	seedRequestsExtension(t, pool, fx)
 
-	contract(t, "GetToolCallsReport/orgA", func(ctx context.Context) error {
-		rep, err := store.GetToolCallsReport(ctx, fx.OrgA, 7)
-		if err != nil {
-			return err
-		}
-		if rep.TotalCalls != 3 || rep.DistinctTools != 2 || rep.RequestsUsing != 2 {
-			t.Errorf("GetToolCallsReport/orgA: expected 3 calls / 2 tools / 2 requests, got %+v", rep)
-		}
-		if len(rep.Top) != 2 || rep.Top[0].Tool != "web_search" || rep.Top[0].Calls != 2 {
-			t.Errorf("GetToolCallsReport/orgA: top must lead with web_search×2, got %+v", rep.Top)
-			return nil
-		}
-		if rep.Top[0].Share < 66.0 || rep.Top[0].Share > 67.0 {
-			t.Errorf("GetToolCallsReport/orgA: share must be 2/3 of calls, got %f", rep.Top[0].Share)
-		}
-		if len(rep.ByModel) != 1 || rep.ByModel[0].Calls != 3 {
-			t.Errorf("GetToolCallsReport/orgA: by-model must group all 3 calls, got %+v", rep.ByModel)
-		}
-		return nil
-	})
+	runToolReportContract(t, store, fx)
 	contract(t, "GetToolCallsReport/unknown-org", func(ctx context.Context) error {
 		rep, err := store.GetToolCallsReport(ctx, "00000000-0000-0000-0000-000000000000", 7)
 		if err != nil {

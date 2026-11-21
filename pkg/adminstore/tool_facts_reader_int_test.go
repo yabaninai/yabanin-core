@@ -29,6 +29,7 @@ package adminstore
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"log/slog"
 	"testing"
@@ -78,13 +79,25 @@ func insertReaderFact(t *testing.T, pool *pgxpool.Pool, orgID, requestID string,
 	require.NoError(t, err)
 }
 
-// insertReaderOccurrence seeds one tool_call_invocations row.
-func insertReaderOccurrence(t *testing.T, pool *pgxpool.Pool, orgID, requestID string, invocationID *string, seq int, callID, toolName string) {
+// insertReaderOccurrence seeds one tool_call_invocations row. arguments is
+// authored JSON text; each caller seeds a distinct payload so argument
+// attribution is independently catchable from name attribution.
+func insertReaderOccurrence(t *testing.T, pool *pgxpool.Pool, orgID, requestID string, invocationID *string, seq int, callID, toolName, arguments string) {
 	t.Helper()
 	_, err := pool.Exec(context.Background(),
-		"INSERT INTO tool_call_invocations (org_id, request_id, invocation_id, seq, call_id, tool_name, arguments) VALUES ($1, $2, $3, $4, $5, $6, '{}')",
-		orgID, requestID, invocationID, seq, callID, toolName)
+		"INSERT INTO tool_call_invocations (org_id, request_id, invocation_id, seq, call_id, tool_name, arguments) VALUES ($1, $2, $3, $4, $5, $6, $7)",
+		orgID, requestID, invocationID, seq, callID, toolName, arguments)
 	require.NoError(t, err)
+}
+
+// decodeReaderArgs parses an occurrence's arguments JSON for comparison,
+// robust to text-form differences in how the column round-trips.
+func decodeReaderArgs(t *testing.T, s *string) map[string]any {
+	t.Helper()
+	require.NotNil(t, s)
+	var m map[string]any
+	require.NoError(t, json.Unmarshal([]byte(*s), &m))
+	return m
 }
 
 // mustParseYQL compiles a YQL expression or fails the test.
@@ -122,8 +135,8 @@ func TestToolFacts_DetailBindsByInvocation(t *testing.T) {
 	insertReaderFact(t, pool, orgID, shared, &invA, "alpha")
 	insertReaderFact(t, pool, orgID, shared, &invB, "beta")
 	insertReaderFact(t, pool, orgID, shared, nil, "stale-legacy")
-	insertReaderOccurrence(t, pool, orgID, shared, &invA, 1, "ca-1", "alpha")
-	insertReaderOccurrence(t, pool, orgID, shared, &invB, 1, "cb-1", "beta")
+	insertReaderOccurrence(t, pool, orgID, shared, &invA, 1, "ca-1", "alpha", `{"limit":7}`)
+	insertReaderOccurrence(t, pool, orgID, shared, &invB, 1, "cb-1", "beta", `{"limit":19}`)
 
 	store := New(pool, slog.Default(), nil)
 	details, total, err := exportOrgDetails(t, store, orgID, RequestPayloadAccess{Grant: true, OrgWideMetadata: true}, 10)
@@ -143,10 +156,16 @@ func TestToolFacts_DetailBindsByInvocation(t *testing.T) {
 	assert.Equal(t, []string{"beta"}, toolNames(b.ToolCalls), "B sees exactly its own tool")
 	require.Len(t, a.ToolCallInvocations, 1)
 	assert.Equal(t, "alpha", a.ToolCallInvocations[0].ToolName)
-	assert.Equal(t, "ca-1", a.ToolCallInvocations[0].CallID)
+	require.NotNil(t, a.ToolCallInvocations[0].CallID)
+	assert.Equal(t, "ca-1", *a.ToolCallInvocations[0].CallID)
+	assert.Equal(t, map[string]any{"limit": float64(7)}, decodeReaderArgs(t, a.ToolCallInvocations[0].Arguments),
+		"A's decoded argument belongs to A's invocation")
 	require.Len(t, b.ToolCallInvocations, 1)
 	assert.Equal(t, "beta", b.ToolCallInvocations[0].ToolName)
-	assert.Equal(t, "cb-1", b.ToolCallInvocations[0].CallID)
+	require.NotNil(t, b.ToolCallInvocations[0].CallID)
+	assert.Equal(t, "cb-1", *b.ToolCallInvocations[0].CallID)
+	assert.Equal(t, map[string]any{"limit": float64(19)}, decodeReaderArgs(t, b.ToolCallInvocations[0].Arguments),
+		"B's decoded argument belongs to B's invocation")
 }
 
 // TestToolFacts_LegacyCorrelationStillAttaches pins the legacy-safe
@@ -161,7 +180,7 @@ func TestToolFacts_LegacyCorrelationStillAttaches(t *testing.T) {
 	uniq := "legacy-unique"
 	insertReaderRow(t, pool, orgID, &uniq, nil, 5, stamp)
 	insertReaderFact(t, pool, orgID, uniq, nil, "gamma")
-	insertReaderOccurrence(t, pool, orgID, uniq, nil, 1, "cg-1", "gamma")
+	insertReaderOccurrence(t, pool, orgID, uniq, nil, 1, "cg-1", "gamma", `{"file":"legacy.txt"}`)
 
 	amb := "legacy-ambiguous"
 	insertReaderRow(t, pool, orgID, &amb, nil, 6, stamp)
@@ -178,6 +197,9 @@ func TestToolFacts_LegacyCorrelationStillAttaches(t *testing.T) {
 	}
 	assert.Equal(t, []string{"gamma"}, toolNames(byToken[5].ToolCalls), "unique legacy correlation keeps its facts")
 	require.Len(t, byToken[5].ToolCallInvocations, 1)
+	require.NotNil(t, byToken[5].ToolCallInvocations[0].CallID)
+	assert.Equal(t, "cg-1", *byToken[5].ToolCallInvocations[0].CallID)
+	assert.Equal(t, map[string]any{"file": "legacy.txt"}, decodeReaderArgs(t, byToken[5].ToolCallInvocations[0].Arguments))
 	for _, tok := range []int64{6, 8} {
 		assert.Empty(t, toolNames(byToken[tok].ToolCalls),
 			"ambiguous legacy correlation attributes its facts to neither carrier (tokens %d)", tok)
@@ -328,8 +350,8 @@ func TestToolFacts_MintedSoleCarrierKeepsPre0030Facts(t *testing.T) {
 	insertReaderRow(t, pool, orgID, &corr, &inv, 11, stamp)
 	insertReaderFact(t, pool, orgID, corr, &inv, "minted-tool") // post-0030 fact
 	insertReaderFact(t, pool, orgID, corr, nil, "pre0030-tool") // NULL fact, minted parent
-	insertReaderOccurrence(t, pool, orgID, corr, &inv, 1, "cm-1", "minted-tool")
-	insertReaderOccurrence(t, pool, orgID, corr, nil, 1, "cp-1", "pre0030-tool")
+	insertReaderOccurrence(t, pool, orgID, corr, &inv, 1, "cm-1", "minted-tool", `{"mode":"post"}`)
+	insertReaderOccurrence(t, pool, orgID, corr, nil, 1, "cp-1", "pre0030-tool", `{"mode":"pre"}`)
 
 	store := New(pool, slog.Default(), nil)
 
@@ -340,12 +362,15 @@ func TestToolFacts_MintedSoleCarrierKeepsPre0030Facts(t *testing.T) {
 	assert.ElementsMatch(t, []string{"minted-tool", "pre0030-tool"}, toolNames(details[0].ToolCalls),
 		"the sole carrier keeps both its invocation-bound and its pre-0030 NULL facts")
 	require.Len(t, details[0].ToolCallInvocations, 2)
-	gotCalls := []string{}
-	for _, inv := range details[0].ToolCallInvocations {
-		require.NotNil(t, inv.CallID)
-		gotCalls = append(gotCalls, *inv.CallID)
+	gotArgs := map[string]map[string]any{}
+	for _, occ := range details[0].ToolCallInvocations {
+		require.NotNil(t, occ.CallID)
+		gotArgs[*occ.CallID] = decodeReaderArgs(t, occ.Arguments)
 	}
-	assert.ElementsMatch(t, []string{"cm-1", "cp-1"}, gotCalls)
+	assert.Equal(t, map[string]any{"mode": "post"}, gotArgs["cm-1"],
+		"the invocation-bound occurrence keeps its own decoded argument")
+	assert.Equal(t, map[string]any{"mode": "pre"}, gotArgs["cp-1"],
+		"the pre-0030 NULL occurrence keeps its own decoded argument")
 
 	rows, _, err := store.ListRequests(context.Background(), RequestListFilters{OrgID: orgID, PageSize: 10})
 	require.NoError(t, err)
