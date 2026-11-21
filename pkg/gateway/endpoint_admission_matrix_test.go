@@ -57,6 +57,18 @@ func newAdmissionMatrixGateway(t *testing.T) (*gateway, *atomic.Int64, *atomic.I
 	return gw, &hits, &events
 }
 
+// newAdmissionMatrixGatewayMissingOrg is the explicit missing-org variant of
+// newAdmissionMatrixGateway for the negatives that pin the org-less tenant:
+// strict api-key auth WITHOUT a resolver, so the identity carries no org
+// through admissionCore. Only the workload negative controls may use it —
+// every other matrix case keeps the resolved matrix-org tenant.
+func newAdmissionMatrixGatewayMissingOrg(t *testing.T) (*gateway, *atomic.Int64, *atomic.Int64) {
+	t.Helper()
+	gw, hits, events := newAdmissionMatrixGateway(t)
+	gw.auth = NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil)
+	return gw, hits, events
+}
+
 func postMatrixRequest(t *testing.T, gw *gateway, path, contentType, body string, extra map[string]string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, path, strings.NewReader(body))

@@ -32,7 +32,7 @@ import (
 // (Paid dispatch under a missing org is separately refused by durable
 // accounting — the per-key discriminator below relies on that boundary.)
 func TestAdmissionRoutes_WorkloadMissingOrgNamespaceEnforced(t *testing.T) {
-	gw, hits, events := newAdmissionMatrixGateway(t)
+	gw, hits, events := newAdmissionMatrixGatewayMissingOrg(t)
 	ledger := presetWorkloadLedger(t, 100)
 	ledger.Charge("", "ci", money.MicroUSD(100)) // the missing-org "ci" window is saturated
 
@@ -62,7 +62,7 @@ func TestAdmissionRoutes_WorkloadMissingOrgNamespaceEnforced(t *testing.T) {
 // resolver leaves the request in the missing-org namespace). The control
 // charge proves the request truly lives in "" — the spoof lands nowhere.
 func TestAdmissionRoutes_WorkloadOrgHeaderCannotHijackNamespace(t *testing.T) {
-	gw, hits, _ := newAdmissionMatrixGateway(t)
+	gw, hits, _ := newAdmissionMatrixGatewayMissingOrg(t)
 	ledger := presetWorkloadLedger(t, 100)
 	ledger.Charge("org-victim", "ci", money.MicroUSD(100)) // the victim's window is saturated
 
