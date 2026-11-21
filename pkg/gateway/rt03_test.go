@@ -571,3 +571,25 @@ func TestRT03_Shadow_AllowedCandidate_StillMirrored(t *testing.T) {
 	assert.Equal(t, "Bearer shadow-key", shadowed.callAt(0).Auth,
 		"the shadow call keeps its own documented credential contract")
 }
+
+func TestRT03_EvalgateDispatchesSelectedRegionalModel(t *testing.T) {
+	var judgeHits int32
+	judge, _, _ := judgeHitServer(t, &judgeHits)
+	verdicts := newFakeVerdictStore()
+	original := newRT03Upstream(t, nil)
+	regional := newRT03Upstream(t, nil)
+	gw := evalgateTestGateway(t, original.srv.URL, judge.URL, verdicts)
+	gw.res = stubModelResolver{
+		"premium":  {ModelName: "premium", Provider: "openai", UpstreamURL: original.srv.URL, Enabled: true},
+		"regional": {ModelName: "regional", Provider: "openai", UpstreamURL: regional.srv.URL, Enabled: true},
+	}
+	gw.residencyEnforcer = fakeResidency{dec: policy.Decision{Allowed: true, Region: "SG", RemappedModel: "regional"}}
+	cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "regional-comparison", body: nonStreamBody("cheap", mediumPrompt)}
+	cc.req.Model = "cheap"
+	gw.evalgateJudge(cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+	require.Equal(t, 0, original.totalCalls())
+	require.Equal(t, 1, regional.totalCalls())
+	require.Equal(t, "regional", regional.callAt(0).Model)
+	require.Equal(t, int32(1), judgeHits)
+	require.Equal(t, 1, verdicts.count())
+}

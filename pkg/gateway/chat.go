@@ -1693,12 +1693,13 @@ func (gw *gateway) evalgateJudge(cc *chatContext, gateID candidateIdentity, prom
 		l.Debug("evalgate: premium model resolution failed", "error", perr2)
 		return
 	}
-	if _, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo); pol != nil {
+	premiumInfo, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo)
+	if pol != nil {
 		return
 	}
 
 	// Call premium model for comparison
-	premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumModelName, cc.body)
+	premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumInfo, cc.body)
 	if perr != nil {
 		l.Debug("evalgate: premium response failed", "error", perr)
 		return
@@ -1721,7 +1722,7 @@ func (gw *gateway) evalgateJudge(cc *chatContext, gateID candidateIdentity, prom
 	if !gw.originalRetentionEnabled(judgeCtx, orgID) {
 		storedPrompt = ""
 	}
-	err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumModelName, v, conf)
+	err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumInfo.ModelName, v, conf)
 	if err != nil {
 		l.Debug("evalgate store failed", "error", err)
 	}

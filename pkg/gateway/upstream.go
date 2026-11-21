@@ -483,18 +483,10 @@ func ResolveModel(cfg config.Gateway, model string) string {
 	return model
 }
 
-// callUpstreamSingle makes a single non-retry, non-fallback upstream request.
-// Used by evalgate for premium model comparison sampling. This function has no
-// request identity, so gating happens at the call site (RT-03): the evalgate
-// caller runs gateAttemptCandidate on the resolved premium candidate before
-// invoking this — a denied/unavailable premium target never reaches here.
-func (gw *gateway) callUpstreamSingle(ctx context.Context, modelName string, body []byte) ([]byte, error) {
-	info, err := gw.resolveModelInfo(ctx, modelName)
-	if err != nil {
-		return nil, fmt.Errorf("resolve model %q: %w", modelName, err)
-	}
+// callUpstreamSingle dispatches the already authorized candidate without retry or fallback.
+func (gw *gateway) callUpstreamSingle(ctx context.Context, info resolver.ModelInfo, body []byte) ([]byte, error) {
 	if info.ModelName == "" {
-		return nil, fmt.Errorf("unknown model: %s", modelName)
+		return nil, fmt.Errorf("empty premium model")
 	}
 
 	upstreamURL, apiKey, err := gw.lookupUpstream(info)
@@ -504,14 +496,14 @@ func (gw *gateway) callUpstreamSingle(ctx context.Context, modelName string, bod
 
 	client, err := gw.pool.Get(upstreamURL, info.Provider)
 	if err != nil {
-		return nil, fmt.Errorf("resolve upstream client for model %s: %w", modelName, err)
+		return nil, fmt.Errorf("resolve upstream client for model %s: %w", info.ModelName, err)
 	}
 	reqBody, _ := json.Marshal(map[string]interface{}{
-		"model":    modelName,
+		"model":    info.ModelName,
 		"messages": extractChatMessages(body),
 	})
 
-	resp, err := client.ForwardJSON(ctx, reqBody, modelName, apiKey)
+	resp, err := client.ForwardJSON(ctx, reqBody, info.ModelName, apiKey)
 	if err != nil {
 		return nil, fmt.Errorf("upstream call failed: %w", err)
 	}
