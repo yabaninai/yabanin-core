@@ -30,19 +30,19 @@ const testInvocationID = "0f0e0d0c-0b0a-4901-8203-040506070809"
 // instead of silently narrowing the comparison.
 func chargedProducerEvent() eventpublisher.Event {
 	return eventpublisher.Event{
-		OrgID:             "org-abc",
-		RequestID:         "req-inv-1",
-		InvocationID:      testInvocationID,
-		EventType:         "request.completed",
-		TS:                1732212000000,
-		ModelRequested:    "gpt-4",
-		ModelUsed:         "gpt-4",
-		StatusCode:        200,
-		TokensIn:          12,
-		TokensOut:         34,
-		EstimatedCostUSD:  0.0123,
-		ResaleCostUSD:     0.05,
-		CostStatus:        "billed",
+		OrgID:            "org-abc",
+		RequestID:        "req-inv-1",
+		InvocationID:     testInvocationID,
+		EventType:        "request.completed",
+		TS:               1732212000000,
+		ModelRequested:   "gpt-4",
+		ModelUsed:        "gpt-4",
+		StatusCode:       200,
+		TokensIn:         12,
+		TokensOut:        34,
+		EstimatedCostUSD: 0.0123,
+		ResaleCostUSD:    0.05,
+		CostStatus:       "billed",
 	}
 }
 

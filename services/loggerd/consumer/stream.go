@@ -749,6 +749,44 @@ func (c *StreamConsumer) deliverEvent(ctx context.Context, msg redis.XMessage, e
 // request_logs row with status 429, so blocked demand is visible in analytics.
 // The row never reaches the Deductor (that path only runs for
 // request.completed), so no credit is charged for a blocked request.
+// resolveRefusalAdmission binds the admission of an invocation-bearing
+// budget refusal before any write: a bound admission of another tenant can
+// never be claimed (that identity is paid elsewhere) and a voided one
+// parks; a genuinely unadmitted refusal is a pre-dispatch event — the row
+// records in the legacy domain without claiming the minted uuid.
+// Refusals carry no charge, so no facts comparison applies.
+func (c *StreamConsumer) resolveRefusalAdmission(ctx context.Context, tx InboxTx, ev *requestEvent) error {
+	b, err := c.resolveAdmission(ctx, tx, *ev)
+	if err != nil {
+		return err
+	}
+	switch {
+	case !b.found:
+		c.logger.Info("unadmitted budget refusal — recording legacy-domain history without claiming the invocation",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		ev.invocationIDValue = nil
+		ev.invocationID = ""
+	case b.orgID != ev.orgID:
+		c.logger.Error("budget refusal admission belongs to another org — parking, never claiming a paid identity",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("admission_org_id", b.orgID),
+			slog.String("event_org_id", ev.orgID),
+		)
+		return errAdmissionOrgConflict
+	case b.state == "voided":
+		c.logger.Error("budget refusal for a voided invocation admission — parking",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+		)
+		return errAdmissionVoided
+	}
+	return nil
+}
+
 func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context, msg redis.XMessage, policy deliveryPolicy) error {
 	fields := msg.Values
 
@@ -771,40 +809,9 @@ func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context,
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
-	// An invocation-bearing budget refusal must respect the admission the
-	// gateway minted: a bound admission of another tenant can never be
-	// claimed (that identity is paid elsewhere), and a genuinely
-	// unadmitted refusal is a pre-dispatch event — it records in the
-	// legacy domain without claiming the minted uuid. Refusals carry no
-	// charge, so no facts comparison applies.
 	if ev.invocationIDValue != nil {
-		b, err := c.resolveAdmission(ctx, tx, ev)
-		if err != nil {
+		if err := c.resolveRefusalAdmission(ctx, tx, &ev); err != nil {
 			return err
-		}
-		switch {
-		case !b.found:
-			c.logger.Info("unadmitted budget refusal — recording legacy-domain history without claiming the invocation",
-				slog.String("invocation_id", ev.invocationID),
-				slog.String("request_id", ev.requestID),
-				slog.String("org_id", ev.orgID),
-			)
-			ev.invocationIDValue = nil
-			ev.invocationID = ""
-		case b.orgID != ev.orgID:
-			c.logger.Error("budget refusal admission belongs to another org — parking, never claiming a paid identity",
-				slog.String("invocation_id", ev.invocationID),
-				slog.String("request_id", ev.requestID),
-				slog.String("admission_org_id", b.orgID),
-				slog.String("event_org_id", ev.orgID),
-			)
-			return errAdmissionOrgConflict
-		case b.state == "voided":
-			c.logger.Error("budget refusal for a voided invocation admission — parking",
-				slog.String("invocation_id", ev.invocationID),
-				slog.String("request_id", ev.requestID),
-			)
-			return errAdmissionVoided
 		}
 	}
 
@@ -942,6 +949,66 @@ func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEven
 	return nil, nil
 }
 
+// insertTerminalRequestLog writes the terminal request_logs row of a
+// failed or completed delivery and returns the insert result for duplicate
+// detection. The failed shape keeps the raw error text and the raw status
+// code; the completed shape binds the defaulted status and an optional
+// error.
+func (c *StreamConsumer) insertTerminalRequestLog(ctx context.Context, tx InboxTx, msg redis.XMessage, ev requestEvent, errorValue any, statusCode int64) (pgconn.CommandTag, error) {
+	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	row := fullRequestLogRow(ev, sessionIDStr, errorValue, statusCode)
+	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
+	row.setInvocation(ev.invocationIDValue)
+	return tx.Exec(ctx, row.insertSQL(), row.args()...)
+}
+
+// finishDuplicateInvocation closes a redelivered terminal whose request log
+// row and every charge intent are already durable (a prior live delivery or
+// the recovery materialization committed them): enrich optional history
+// only, transition the admission, commit, ACK — never re-emit intents,
+// never recharge.
+func (c *StreamConsumer) finishDuplicateInvocation(ctx context.Context, tx InboxTx, ev requestEvent, policy deliveryPolicy) error {
+	if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
+		return err
+	}
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delivery transaction: %w", err)
+	}
+	c.logger.Info("duplicate invocation delivery — optional history enriched, no recharge",
+		slog.String("invocation_id", ev.invocationID),
+		slog.String("request_id", ev.requestID),
+		slog.String("org_id", ev.orgID),
+	)
+	return nil
+}
+
+// writeFirstDeliverySideEffects writes the mandatory side effects of a
+// FIRST terminal delivery and commits the claimed transaction: the policy
+// decision verdict (OP-9), one settlement intent per charged scope
+// (AF-04/NEXT-18d), the pending_price record, and the admission
+// resolution. Post-commit signals stay with the caller — they differ per
+// event class.
+func (c *StreamConsumer) writeFirstDeliverySideEffects(ctx context.Context, tx InboxTx, ev requestEvent, plan []scopeCharge, chargeState money.QuoteState, policy deliveryPolicy) error {
+	if err := c.insertPolicyDecision(ctx, tx, ev); err != nil {
+		return err
+	}
+	for _, sc := range plan {
+		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, ev.invocationIDValue, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
+			return err
+		}
+	}
+	if err := c.insertPendingPriceIntent(ctx, tx, ev, chargeState); err != nil {
+		return err
+	}
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
+}
+
 // persistFailedDelivery writes one request.failed delivery inside the
 // claimed transaction and commits it: the request log row (raw error text
 // and raw status code — the failed-shape contract), the policy decision
@@ -959,76 +1026,29 @@ func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, 
 	// request.failed keeps the raw error text and the raw status code: a
 	// failed event with status 0 stores 0, and an absent error stores '' —
 	// the failed-shape contract, unchanged.
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
-	row := fullRequestLogRow(ev, sessionIDStr, ev.errorMsg, ev.statusCode)
-	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
-	row.setInvocation(ev.invocationIDValue)
-
-	result, err := tx.Exec(ctx, row.insertSQL(), row.args()...)
+	result, err := c.insertTerminalRequestLog(ctx, tx, msg, ev, ev.errorMsg, ev.statusCode)
 	if err != nil {
 		return fmt.Errorf("insert request_log for failed event: %w", err)
 	}
 
+	// Duplicate invocation: the row and every charge intent are already
+	// durable — optional history only, never a recharge.
 	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
-		// Duplicate invocation: the row and every charge intent are already
-		// durable — enrich optional history only, never recharge.
-		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
-			return err
-		}
-		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit delivery transaction: %w", err)
-		}
-		c.logger.Info("duplicate invocation delivery (failed event) — optional history enriched, no recharge",
-			slog.String("invocation_id", ev.invocationID),
-			slog.String("request_id", ev.requestID),
-			slog.String("org_id", ev.orgID),
-		)
-		return nil
+		return c.finishDuplicateInvocation(ctx, tx, ev, policy)
 	}
 
-	// OP-9: the policy decision (when the event carries one) commits with
-	// the log — a policy_denied failure keeps its verdict trail.
-	if err := c.insertPolicyDecision(ctx, tx, ev); err != nil {
+	if err := c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
 		return err
-	}
-
-	// Partial-usage intents (enforce only) commit with the log — a request
-	// whose provider cost was already incurred bills exactly once.
-	for _, sc := range plan {
-		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, ev.invocationIDValue, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
-			return err
-		}
-	}
-
-	// pending_price record in the same transaction — never billed, expires
-	// to terminal 'unknown' after the pending deadline.
-	if err := c.insertPendingPriceIntent(ctx, tx, ev, chargeState); err != nil {
-		return err
-	}
-
-	// The FIRST successful failed-delivery insert resolves the admission:
-	// waiting for a duplicate would leave a delivered terminal unresolved
-	// forever when no redelivery ever happens.
-	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
-		return err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit delivery transaction: %w", err)
 	}
 
 	// After the commit succeeded: exactly one uncharged-unknown increment
-	// per committed delivery (N06-P04-T08). Counting before the claim let
-	// a redelivery of the same entry id re-inflate the signal on every
-	// retry; counting after the claim but before the commit would survive
-	// a rollback the same way. The residual window — a crash between the
-	// commit and the increment — is at-most-once for the signal alone: no
-	// money is affected, and the bound stays durably visible through the
-	// pending_price record committed in the same transaction, so the
-	// reconciler's pending deadline still surfaces it as terminal unknown.
+	// per committed delivery (N06-P04-T08). The residual window — a crash
+	// between the commit and the increment — is at-most-once for the signal
+	// alone: no money is affected, and the bound stays durably visible
+	// through the pending_price record committed in the same transaction,
+	// so the reconciler's pending deadline still surfaces it as terminal
+	// unknown. A priced-and-absorbed upstream failure is not an unknown
+	// cost — its bound belongs to the absorbed metric, not here.
 	if !absorbedUpstream || chargeState != money.QuotePositive {
 		reportUnchargedUnknown(ev, plan, chargeState)
 	}
@@ -1295,6 +1315,25 @@ func (c *StreamConsumer) handleRequestComplete(ctx context.Context, msg redis.XM
 	return c.handleRequestCompleteProfile(ctx, msg, legacyDeliveryPolicy())
 }
 
+// terminalChargePlan resolves the per-scope charge plan of a completed
+// event and warns when the price stayed unknown (AF-05): unknown
+// price/usage is a distinct state — never billed, never reported as zero —
+// and the cost stays visible through the pending_price record. Reservation
+// tuples are the authoritative areas when present, legacy attributions
+// otherwise.
+func (c *StreamConsumer) terminalChargePlan(ev requestEvent) (money.MicroUSD, money.QuoteState, []scopeCharge) {
+	chargeMicro, chargeState := resaleDeductionMicro(ev.costQuote, ev.resaleQuote, ev.costQuoteState, ev.resaleQuoteState)
+	if chargeState == money.QuoteUnknown {
+		c.logger.Warn("request completed with unknown price — no charge intent; pending_price record keeps the cost visible",
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+			slog.String("resale_quote", ev.resaleQuoteState.String()),
+			slog.String("cost_quote", ev.costQuoteState.String()),
+		)
+	}
+	return chargeMicro, chargeState, scopeChargePlan(ev, chargeMicro, chargeState)
+}
+
 // handleRequestCompleteProfile persists one request.completed event under
 // the message's delivery policy: the content profile decides whether
 // content rides at all; the org original-retention resolution (N02-P06 T03)
@@ -1322,24 +1361,10 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 
 	// Mandatory monetary side effects are computed up front and persisted as
 	// durable settlement work items inside the SAME transaction as the
-	// request log (AF-04). Since AF-05 the amounts are exact micro-USD
-	// validated at the event boundary; unknown price/usage stays a distinct
-	// state (never billed, never reported as zero). The AF-06 settlement
-	// worker executes these intents (lease/retry/idempotency); nothing is
-	// charged directly on the delivery path anymore.
-	chargeMicro, chargeState := resaleDeductionMicro(ev.costQuote, ev.resaleQuote, ev.costQuoteState, ev.resaleQuoteState)
-	if chargeState == money.QuoteUnknown {
-		c.logger.Warn("request completed with unknown price — no charge intent; pending_price record keeps the cost visible",
-			slog.String("request_id", ev.requestID),
-			slog.String("org_id", ev.orgID),
-			slog.String("resale_quote", ev.resaleQuoteState.String()),
-			slog.String("cost_quote", ev.costQuoteState.String()),
-		)
-	}
-
-	// Per-scope charge plan (NEXT-18d): reservation tuples are the
-	// authoritative areas when present, legacy attributions otherwise.
-	plan := scopeChargePlan(ev, chargeMicro, chargeState)
+	// request log (AF-04). The AF-06 settlement worker executes these
+	// intents (lease/retry/idempotency); nothing is charged directly on the
+	// delivery path anymore.
+	_, chargeState, plan := c.terminalChargePlan(ev)
 	// Unknown usage with a reserve: the bound is never billed and never
 	// reported as zero; reconcile releases it (ADR-0001 §6). The
 	// uncharged-unknown signal itself counts only after the commit below.
@@ -1357,36 +1382,15 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 		return err
 	}
 
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
-	row := fullRequestLogRow(ev, sessionIDStr, ev.errorOptional(), statusCode)
-	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
-	row.setInvocation(ev.invocationIDValue)
-	result, err := tx.Exec(ctx, row.insertSQL(), row.args()...)
+	result, err := c.insertTerminalRequestLog(ctx, tx, msg, ev, ev.errorOptional(), statusCode)
 	if err != nil {
 		return fmt.Errorf("insert request_log: %w", err)
 	}
 
+	// Duplicate invocation (fresh Redis entry id, consumer restart, DLQ
+	// replay): the row and every charge intent are already durable.
 	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
-		// Duplicate invocation (fresh Redis entry id, consumer restart, DLQ
-		// replay): the row and every charge intent are already durable — a
-		// prior live delivery or the recovery materialization committed
-		// them. Enrich optional history only, transition the admission,
-		// ACK; never re-emit intents, never recharge.
-		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
-			return err
-		}
-		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit delivery transaction: %w", err)
-		}
-		c.logger.Info("duplicate invocation delivery — optional history enriched, no recharge",
-			slog.String("invocation_id", ev.invocationID),
-			slog.String("request_id", ev.requestID),
-			slog.String("org_id", ev.orgID),
-		)
-		return nil
+		return c.finishDuplicateInvocation(ctx, tx, ev, policy)
 	}
 
 	// Tool-call aggregate (fail-soft like the budget roll below): the calls
@@ -1394,44 +1398,14 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 	// so the analytics table stays queryable; a failure never breaks the log.
 	c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse)
 
-	// OP-9: the policy decision log row (when the event carries one)
-	// commits in this same delivery transaction.
-	if err := c.insertPolicyDecision(ctx, tx, ev); err != nil {
+	if err := c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
 		return err
-	}
-
-	// Durable intents for every scope the request touched (AF-04/NEXT-18d) —
-	// wallet, team_month, agent_day and session. Each intent commits with
-	// the log or the whole delivery fails and is retried.
-	for _, sc := range plan {
-		if err := c.insertScopeIntent(ctx, tx, ev.orgID, ev.requestID, ev.invocationIDValue, sc, ev.tokensIn, ev.tokensOut, ev.costInUSD, ev.resaleCostUSD, ev.modelUsed); err != nil {
-			return err
-		}
-	}
-
-	// pending_price record in the same transaction — never billed, expires
-	// to terminal 'unknown' after the pending deadline.
-	if err := c.insertPendingPriceIntent(ctx, tx, ev, chargeState); err != nil {
-		return err
-	}
-
-	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
-		return err
-	}
-
-	if err := tx.Commit(ctx); err != nil {
-		return fmt.Errorf("commit delivery transaction: %w", err)
 	}
 
 	// After the commit succeeded: exactly one uncharged-unknown increment
-	// per committed delivery (N06-P04-T08). Counting before the claim let
-	// a redelivery of the same entry id re-inflate the signal on every
-	// retry; counting after the claim but before the commit would survive
-	// a rollback the same way. The residual window — a crash between the
-	// commit and the increment — is at-most-once for the signal alone: no
-	// money is affected, and the bound stays durably visible through the
-	// pending_price record committed in the same transaction, so the
-	// reconciler's pending deadline still surfaces it as terminal unknown.
+	// per committed delivery (N06-P04-T08). The residual crash window is
+	// at-most-once for the signal alone — the bound stays durably visible
+	// through the pending_price record committed in the same transaction.
 	reportUnchargedUnknown(ev, plan, chargeState)
 
 	rowsAffected := result.RowsAffected()
@@ -1811,6 +1785,23 @@ var genuineCacheHitKinds = map[string]bool{
 	"semantic": true,
 }
 
+// planHasPayableScope reports whether any plan entry bills a real scope: a
+// budget-area entry always counts, a wallet entry counts when its amount is
+// positive. Genuine free cache evidence requires none of them.
+func planHasPayableScope(plan []scopeCharge) bool {
+	for _, sc := range plan {
+		switch sc.kind {
+		case ChargeKindAgentSpend, ChargeKindTeamSpend, ChargeKindSessionSpend:
+			return true
+		case ChargeKindResaleDeduction:
+			if sc.amount > 0 {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // genuineCacheHit reports whether an admission-less invocation event
 // carries explicit free cache semantics — the only legitimate
 // admission-less terminal. The evidence must be explicit on every axis: a
@@ -1833,17 +1824,7 @@ func genuineCacheHit(ev requestEvent, plan []scopeCharge) bool {
 	if len(ev.reservations) > 0 {
 		return false
 	}
-	for _, sc := range plan {
-		switch sc.kind {
-		case ChargeKindAgentSpend, ChargeKindTeamSpend, ChargeKindSessionSpend:
-			return false
-		case ChargeKindResaleDeduction:
-			if sc.amount > 0 {
-				return false
-			}
-		}
-	}
-	return true
+	return !planHasPayableScope(plan)
 }
 
 // verifyTerminalFacts selects the admission's terminal fact row FOR UPDATE
@@ -2112,37 +2093,39 @@ func resaleDeductionMicro(cost, resale money.MicroUSD, costState, resaleState mo
 // Conflicting re-delivery (same identity, different amount): the first
 // amount stays authoritative, the second is never charged — the conflict is
 // reported (warn log + metric) instead of silently ignored.
-func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgID, requestID string, invocation any, sc scopeCharge, tokensIn, tokensOut int64, costUSD, resaleUSD float64, modelUsed string) error {
+// scopeIntentEligible reports whether this scope's intent exists at all:
+// the wallet charge exists exactly when a deduction would be attempted
+// today (positive charge, identified request, credit store configured);
+// agent spend needs a configured spender and its key; every other scope
+// needs its key. An unknown kind warns and skips — never a silent drop.
+func (c *StreamConsumer) scopeIntentEligible(sc scopeCharge, orgID, requestID string) bool {
 	if orgID == "" {
-		return nil
+		return false
 	}
 	switch sc.kind {
 	case ChargeKindResaleDeduction:
-		// Legacy gate: the wallet charge exists exactly when a deduction
-		// would be attempted today (positive charge, identified request).
-		if c.creditStore == nil || sc.amount <= 0 || requestID == "" {
-			return nil
-		}
+		return c.creditStore != nil && sc.amount > 0 && requestID != ""
 	case ChargeKindTeamSpend:
-		if sc.key == "" {
-			return nil
-		}
+		return sc.key != ""
 	case ChargeKindAgentSpend:
-		if c.agentSpender == nil || sc.key == "" {
-			return nil
-		}
+		return c.agentSpender != nil && sc.key != ""
 	case ChargeKindSessionSpend:
-		if sc.key == "" {
-			return nil
-		}
+		return sc.key != ""
 	default:
 		c.logger.Warn("unknown scope charge kind — intent skipped",
 			slog.String("charge_kind", sc.kind),
 			slog.String("request_id", requestID),
 		)
-		return nil
+		return false
 	}
+}
 
+// scopeIntentPayload renders the settlement payload of one scope charge:
+// the wallet scope carries the full pricing facts, agent spend the token
+// counts, the period scopes their identity; a reserve link additionally
+// lands in the payload for the settle-time decrement. A marshal failure
+// degrades to an empty object — the intent row is still mandatory.
+func scopeIntentPayload(sc scopeCharge, tokensIn, tokensOut int64, costUSD, resaleUSD float64, modelUsed string) []byte {
 	payload := map[string]any{}
 	switch sc.kind {
 	case ChargeKindResaleDeduction:
@@ -2167,8 +2150,16 @@ func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgI
 	}
 	payloadBytes, err := json.Marshal(payload)
 	if err != nil {
-		payloadBytes = []byte("{}")
+		return []byte("{}")
 	}
+	return payloadBytes
+}
+
+func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgID, requestID string, invocation any, sc scopeCharge, tokensIn, tokensOut int64, costUSD, resaleUSD float64, modelUsed string) error {
+	if !c.scopeIntentEligible(sc, orgID, requestID) {
+		return nil
+	}
+	payloadBytes := scopeIntentPayload(sc, tokensIn, tokensOut, costUSD, resaleUSD, modelUsed)
 
 	// The invocation-domain statements carry invocation_id in their column
 	// list and are schema-self-evidencing (invalid before 0028 — a loud
@@ -2185,21 +2176,22 @@ func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgI
 	} else {
 		plainStmt, withAllowanceStmt = settlementIntentStatements(false, invocation)
 	}
-	var tag pgconn.CommandTag
-	switch {
-	case invocation != nil && sc.link.AllowanceID > 0:
-		tag, err = tx.Exec(ctx, withAllowanceStmt,
-			orgID, requestID, invocation, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes, sc.link.AllowanceID)
-	case invocation != nil:
-		tag, err = tx.Exec(ctx, plainStmt,
-			orgID, requestID, invocation, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes)
-	case sc.link.AllowanceID > 0:
-		tag, err = tx.Exec(ctx, withAllowanceStmt,
-			orgID, requestID, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes, sc.link.AllowanceID)
-	default:
-		tag, err = tx.Exec(ctx, plainStmt,
-			orgID, requestID, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes)
+
+	// Both statement families bind the same prefix (identity columns, then
+	// kind and the two amount renderings, then the payload); the allowance
+	// variant appends its link.
+	args := []any{orgID, requestID}
+	if invocation != nil {
+		args = append(args, invocation)
 	}
+	args = append(args, sc.kind, sc.amount.Cents(), int64(sc.amount), payloadBytes)
+	stmt := plainStmt
+	if sc.link.AllowanceID > 0 {
+		stmt = withAllowanceStmt
+		args = append(args, sc.link.AllowanceID)
+	}
+
+	tag, err := tx.Exec(ctx, stmt, args...)
 	if err != nil {
 		return fmt.Errorf("insert %s settlement intent: %w", sc.kind, err)
 	}
@@ -2209,21 +2201,10 @@ func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgI
 	return nil
 }
 
-// record inside the delivery transaction: one pending_price settlement row
-// per (org, request) when the event's cost stayed unknown while usage
-// existed and a reserve was held. The row carries no amount and no charge
-// semantics — the settlement worker never claims it (the claim query takes
-// only pending/retry); the worker's expiry pass terminates it as 'unknown'
-// after the pending deadline (24h default, owner decision 2026-10-18).
-// Skipping conditions mirror reportUnchargedUnknown: no usage (nothing
-// unknown) or no reserve (nothing at stake) means no record.
-func (c *StreamConsumer) insertPendingPriceIntent(ctx context.Context, tx InboxTx, ev requestEvent, chargeState money.QuoteState) error {
-	if chargeState != money.QuoteUnknown || ev.acct.usageSource == "none" || len(ev.reservations) == 0 {
-		return nil
-	}
-	if ev.orgID == "" || ev.requestID == "" {
-		return nil
-	}
+// pendingPricePayload snapshots the reservations whose bound cost stayed
+// unknown — the durable visibility the reconciler's pending deadline
+// expires to terminal 'unknown' (24h default, owner decision 2026-10-18).
+func pendingPricePayload(ev requestEvent) []byte {
 	reserved := make([]map[string]any, 0, len(ev.reservations))
 	for _, t := range ev.reservations {
 		reserved = append(reserved, map[string]any{
@@ -2236,24 +2217,41 @@ func (c *StreamConsumer) insertPendingPriceIntent(ctx context.Context, tx InboxT
 		"reservations": reserved,
 	})
 	if err != nil {
-		payload = []byte("{}")
+		return []byte("{}")
 	}
+	return payload
+}
+
+// insertPendingPriceIntent records one pending_price settlement row inside
+// the delivery transaction: one per (org, request) when the event's cost
+// stayed unknown while usage existed and a reserve was held. The row
+// carries no amount and no charge semantics — the settlement worker never
+// claims it (the claim query takes only pending/retry); the worker's
+// expiry pass terminates it as 'unknown' after the pending deadline.
+// Skipping conditions mirror reportUnchargedUnknown: no usage (nothing
+// unknown) or no reserve (nothing at stake) means no record.
+func (c *StreamConsumer) insertPendingPriceIntent(ctx context.Context, tx InboxTx, ev requestEvent, chargeState money.QuoteState) error {
+	if chargeState != money.QuoteUnknown || ev.acct.usageSource == "none" || len(ev.reservations) == 0 {
+		return nil
+	}
+	if ev.orgID == "" || ev.requestID == "" {
+		return nil
+	}
+	payload := pendingPricePayload(ev)
 	stmt := pendingPriceIntentStatement(true, ev.invocationIDValue)
+	args := []any{ev.orgID, ev.requestID}
 	if ev.invocationIDValue == nil {
 		hasColumn, perr := c.settlementInvocationSchemaTx(ctx, tx)
 		if perr != nil {
 			return fmt.Errorf("probe settlement schema for pending_price intent: %w", perr)
 		}
 		stmt = pendingPriceIntentStatement(hasColumn, nil)
-	}
-	var execErr error
-	if ev.invocationIDValue != nil {
-		_, execErr = tx.Exec(ctx, stmt, ev.orgID, ev.requestID, ev.invocationIDValue, ChargeKindPendingPrice, payload)
 	} else {
-		_, execErr = tx.Exec(ctx, stmt, ev.orgID, ev.requestID, ChargeKindPendingPrice, payload)
+		args = append(args, ev.invocationIDValue)
 	}
-	if execErr != nil {
-		return fmt.Errorf("insert pending_price settlement record: %w", execErr)
+	args = append(args, ChargeKindPendingPrice, payload)
+	if _, err := tx.Exec(ctx, stmt, args...); err != nil {
+		return fmt.Errorf("insert pending_price settlement record: %w", err)
 	}
 	return nil
 }
