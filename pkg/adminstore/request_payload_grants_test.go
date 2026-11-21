@@ -3,6 +3,7 @@ package adminstore
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -18,6 +19,9 @@ type payloadGrantFakeDB struct {
 	mu      sync.Mutex
 	grants  map[[32]byte]RequestPayloadGrant
 	audited []string
+	// auditDetails captures the details column of each audit INSERT (same
+	// order as audited; column 4 of the append statement).
+	auditDetails []string
 	// consumeErr fails the consume UPDATE itself.
 	consumeErr error
 	// auditErr fails the durable audit INSERT (the T08 interruption seam:
@@ -154,6 +158,9 @@ func (db *payloadGrantFakeDB) exec(query string, args ...interface{}) (pgconn.Co
 			return pgconn.CommandTag{}, db.auditErr
 		}
 		db.audited = append(db.audited, args[1].(string))
+		if len(args) > 3 {
+			db.auditDetails = append(db.auditDetails, args[3].(string))
+		}
 	case strings.Contains(query, "UPDATE request_payload_grants SET revoked_at"):
 		id, now := args[0].(string), args[1].(time.Time)
 		for hash, grant := range db.grants {
@@ -352,6 +359,67 @@ func TestRequestPayloadGrant_IssuanceBindsExactlyOnePhysicalRow(t *testing.T) {
 // row commit together, so a journal outage denies the redemption WITHOUT
 // destroying the token — retrying the same token once the journal recovers
 // succeeds, and exactly one use-audit row exists afterwards.
+// TestRequestPayloadGrant_LifecycleAuditDetailsDecode pins the store-side
+// journal contract for hostile request ids: every issue/consume lifecycle
+// details blob is valid JSON (encoding/json, never %q escaping, which emits
+// invalid-JSON \x.. escapes for control bytes), round-trips the bound row
+// key and the request id (invalid UTF-8 marshals as the U+FFFD replacement
+// rune), and never contains the bearer token. The handler decision journal
+// is a different record, covered by the hostile-ID detail handler test.
+func TestRequestPayloadGrant_LifecycleAuditDetailsDecode(t *testing.T) {
+	db := newPayloadGrantFakeDB()
+	store := &Store{db: db}
+
+	hostile := "req\x01\x1b\xff"
+	grant, err := store.CreateRequestPayloadGrantScope("org-1", hostile, "root-1", RequestPayloadScopeRead, time.Minute, time.Now().UTC())
+	if err != nil {
+		t.Fatalf("issue grant for hostile request id: %v", err)
+	}
+	if grant.RowKey != 4242 {
+		t.Fatalf("issuance binds the seeded carrier row: got %d", grant.RowKey)
+	}
+	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-1", hostile, grant.RowKey, "root-1", RequestPayloadScopeRead, time.Now().UTC()); err != nil {
+		t.Fatalf("consume the issued grant: %v", err)
+	}
+
+	if len(db.auditDetails) != len(db.audited) {
+		t.Fatalf("audit capture mismatch: actions=%v details=%d", db.audited, len(db.auditDetails))
+	}
+	if len(db.audited) < 2 {
+		t.Fatalf("issue and consume must both journal: %v", db.audited)
+	}
+	const wantRequestID = "req\x01\x1b\ufffd"
+	actions := map[string]bool{}
+	for i, raw := range db.auditDetails {
+		if !json.Valid([]byte(raw)) {
+			t.Fatalf("lifecycle details must be valid JSON for a hostile request id, got %q", raw)
+		}
+		var d requestPayloadGrantAuditDetail
+		if err := json.Unmarshal([]byte(raw), &d); err != nil {
+			t.Fatalf("decode lifecycle details: %v", err)
+		}
+		if d.RequestID != wantRequestID {
+			t.Fatalf("request id must round trip (invalid UTF-8 replaced by U+FFFD): got %q", d.RequestID)
+		}
+		if d.RowKey != 4242 {
+			t.Fatalf("bound row key must round trip: got %d", d.RowKey)
+		}
+		if d.GrantID == "" || d.OrgID != "org-1" || d.Scope != RequestPayloadScopeRead {
+			t.Fatalf("lifecycle details lost grant fields: %+v", d)
+		}
+		if _, err := time.Parse(time.RFC3339Nano, d.ExpiresAt); err != nil {
+			t.Fatalf("expires_at must stay RFC3339Nano: %q", d.ExpiresAt)
+		}
+		if strings.Contains(raw, grant.Token) {
+			t.Fatal("the bearer token must never reach the lifecycle journal")
+		}
+		actions[db.audited[i]] = true
+	}
+	if !actions["request_payload.grant_issued"] || !actions["request_payload.grant_used"] {
+		t.Fatalf("lifecycle actions must cover issue and use: %v", db.audited)
+	}
+}
+
 func TestRequestPayloadGrant_ConsumeAuditFailureRollsBackAndRetrySucceeds(t *testing.T) {
 	now := time.Date(2026, 11, 21, 11, 0, 0, 0, time.UTC)
 	db := newPayloadGrantFakeDB()

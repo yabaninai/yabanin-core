@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -316,12 +317,45 @@ func (s *Store) cacheConsumedRequestPayloadGrant(hash [32]byte, now time.Time) {
 	}
 }
 
+// requestPayloadGrantAuditDetail is the journal payload shared by every
+// grant lifecycle entry (issue, use, revoke).
+type requestPayloadGrantAuditDetail struct {
+	GrantID   string `json:"grant_id"`
+	OrgID     string `json:"org_id"`
+	RequestID string `json:"request_id"`
+	RowKey    int64  `json:"row_key"`
+	Scope     string `json:"scope"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// requestPayloadGrantAuditDetails renders the lifecycle journal details for
+// a grant. encoding/json is mandatory: fmt %q emits \x.. byte escapes —
+// invalid JSON — for request ids carrying control bytes or invalid UTF-8,
+// and the journal must never hold malformed JSON.
+func requestPayloadGrantAuditDetails(grant RequestPayloadGrant) (string, error) {
+	details, err := json.Marshal(requestPayloadGrantAuditDetail{
+		GrantID:   grant.ID,
+		OrgID:     grant.OrgID,
+		RequestID: grant.RequestID,
+		RowKey:    grant.RowKey,
+		Scope:     grant.Scope,
+		ExpiresAt: grant.ExpiresAt.UTC().Format(time.RFC3339Nano),
+	})
+	if err != nil {
+		return "", fmt.Errorf("marshal payload grant audit details: %w", err)
+	}
+	return string(details), nil
+}
+
 // auditRequestPayloadGrant journals a grant lifecycle entry through the
 // standalone synchronous append (own transaction). Issuance uses it after
 // commit with a compensating revoke on failure; consume instead appends via
 // appendRequestPayloadGrantAudit inside the consume transaction.
 func (s *Store) auditRequestPayloadGrant(ctx context.Context, action string, grant RequestPayloadGrant, now time.Time) error {
-	details := fmt.Sprintf(`{"grant_id":%q,"org_id":%q,"request_id":%q,"row_key":%d,"scope":%q,"expires_at":%q}`, grant.ID, grant.OrgID, grant.RequestID, grant.RowKey, grant.Scope, grant.ExpiresAt.UTC().Format(time.RFC3339Nano))
+	details, err := requestPayloadGrantAuditDetails(grant)
+	if err != nil {
+		return err
+	}
 	// One grant, one audit-ID prefix: issuance audits the compact hex id the
 	// issuer minted, while consume/revoke read the id back through the uuid
 	// column (dashed rendering). Canonicalize so every lifecycle entry of a
@@ -333,7 +367,10 @@ func (s *Store) auditRequestPayloadGrant(ctx context.Context, action string, gra
 // appendRequestPayloadGrantAudit appends the same lifecycle entry inside an
 // open transaction, coupling the journal row to the state change it records.
 func appendRequestPayloadGrantAudit(ctx context.Context, tx auditTx, action string, grant RequestPayloadGrant, now time.Time) error {
-	details := fmt.Sprintf(`{"grant_id":%q,"org_id":%q,"request_id":%q,"row_key":%d,"scope":%q,"expires_at":%q}`, grant.ID, grant.OrgID, grant.RequestID, grant.RowKey, grant.Scope, grant.ExpiresAt.UTC().Format(time.RFC3339Nano))
+	details, err := requestPayloadGrantAuditDetails(grant)
+	if err != nil {
+		return err
+	}
 	grantID := strings.ReplaceAll(grant.ID, "-", "")
 	return auditlog.AppendInTx(ctx, pgxAppendTx{tx}, auditlog.Entry{
 		ID: grantID + "-" + action, Action: action, Resource: "request:" + grant.RequestID,
