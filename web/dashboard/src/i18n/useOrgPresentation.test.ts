@@ -4,11 +4,12 @@ import { resetMeCache, requestMe, type Me } from '../hooks/usePermissions.ts'
 import {
   beginDirectory,
   beginOrgDetail,
-  directoryExtra,
+  directoryExtraFor,
   directorySnapshot,
   identityKey,
   mayResolveDetail,
   memberOrgs,
+  presentationPool,
   resetDirectory,
   resolveOrgPresentation,
   wantDirectory,
@@ -179,7 +180,7 @@ describe('useOrgPresentation org pool (tenant parity)', () => {
     calls[1]!.resolve({ id: 'org-page9', name: 'Page Nine', slug: 'nine', currency: 'CHF', timezone: 'Europe/Zurich' })
     const org = await detail
     assert.equal(org?.currency, 'CHF')
-    assert.equal(directoryExtra('org-page9')?.timezone, 'Europe/Zurich')
+    assert.equal(directoryExtraFor(root, 'org-page9')?.timezone, 'Europe/Zurich')
     assert.deepEqual(resolveOrgPresentation([...rows, org!], 'org-page9'), { currency: 'CHF', timezone: 'Europe/Zurich' })
     // Committed singles are deduplicated: resolving again does not refetch.
     await beginOrgDetail(root, 'org-page9')
@@ -195,8 +196,8 @@ describe('useOrgPresentation org pool (tenant parity)', () => {
     const failed = beginOrgDetail(root, 'org-x')
     calls[1]!.reject(new TypeError('boom'))
     assert.equal(await failed, null)
-    assert.equal(directoryExtra('org-x'), null)
-    // Pending marker cleared → a later attempt refires instead of no-opping.
+    assert.equal(directoryExtraFor(root, 'org-x'), null)
+    // In-flight entry cleared → a later attempt refires instead of no-opping.
     const retried = beginOrgDetail(root, 'org-x')
     assert.equal(calls.length, 3)
     calls[2]!.resolve({ id: 'org-x', name: 'X', slug: 'x', currency: 'SEK', timezone: 'Europe/Stockholm' })
@@ -208,6 +209,60 @@ describe('useOrgPresentation org pool (tenant parity)', () => {
     resetDirectory()
     calls[3]!.resolve({ id: 'org-y', name: 'Y', slug: 'y', currency: 'NOK', timezone: 'Europe/Oslo' })
     assert.equal(await stale, null)
-    assert.equal(directoryExtra('org-y'), null, 'retired detail commit leaked into the fresh state')
+    assert.equal(directoryExtraFor(root, 'org-y'), null, 'retired detail commit leaked into the fresh state')
+  })
+
+  it('concurrent consumers of the same page-2+ org share one flight and all see the result', async () => {
+    // Reproduction of concurrent-detail.mjs: two mounted consumers resolve
+    // the same confirmed-root org while the single GET is in flight.
+    const root: Me = { id: 'root-a', name: 'A', is_root: true }
+    beginDirectory(root) // calls[0]: listing pending
+    const a = beginOrgDetail(root, 'org-page9')
+    const b = beginOrgDetail(root, 'org-page9')
+    assert.equal(calls.length, 2, 'second consumer refired the detail GET')
+    calls[1]!.resolve({ id: 'org-page9', name: 'Page Nine', slug: 'nine', currency: 'CHF', timezone: 'Europe/Zurich' })
+    const [ra, rb] = await Promise.all([a, b])
+    assert.equal(ra?.currency, 'CHF')
+    assert.equal(rb?.currency, 'CHF', 'a concurrent consumer received null for a successful fetch')
+
+    // The committed single reaches every consumer's resolution path...
+    assert.deepEqual(
+      resolveOrgPresentation(presentationPool([{ id: 'org-page1', name: 'P1', slug: 'p1' }], root, 'org-page9'), 'org-page9'),
+      { currency: 'CHF', timezone: 'Europe/Zurich' },
+    )
+    // ...is deduplicated (no refetch)...
+    await beginOrgDetail(root, 'org-page9')
+    assert.equal(calls.length, 2)
+    // ...and a concurrent FAILURE is shared the same way: both callers get
+    // null, and the retry still refires after the entry is cleared.
+    const fa = beginOrgDetail(root, 'org-z')
+    const fb = beginOrgDetail(root, 'org-z')
+    assert.equal(calls.length, 3)
+    calls[2]!.reject(new TypeError('boom'))
+    assert.equal(await fa, null)
+    assert.equal(await fb, null)
+    const retry = beginOrgDetail(root, 'org-z')
+    assert.equal(calls.length, 4)
+    calls[3]!.resolve({ id: 'org-z', name: 'Z', slug: 'z', currency: 'DKK', timezone: 'Europe/Copenhagen' })
+    assert.equal((await retry)?.currency, 'DKK')
+  })
+
+  it('a member never reads a previous root session\'s cached page-2+ single', async () => {
+    // Root session commits a single for org-x...
+    const root: Me = { id: 'root-a', name: 'A', is_root: true }
+    beginDirectory(root)
+    const detail = beginOrgDetail(root, 'org-x')
+    calls[1]!.resolve({ id: 'org-x', name: 'X', slug: 'x', currency: 'SEK', timezone: 'Europe/Stockholm' })
+    await detail
+    assert.equal(directoryExtraFor(root, 'org-x')?.currency, 'SEK')
+
+    // ...a member resolving the same id (deep link to a foreign org) must
+    // not see it: the cache belongs to another identity, even without an
+    // explicit reset in between.
+    const memberPool = memberOrgs(memberMe)
+    assert.equal(directoryExtraFor(memberMe, 'org-x'), null)
+    assert.deepEqual(resolveOrgPresentation(presentationPool(memberPool, memberMe, 'org-x'), 'org-x'), { currency: 'USD', timezone: 'UTC' })
+    // The member's own org still resolves from /api/me data.
+    assert.equal(resolveOrgPresentation(presentationPool(memberPool, memberMe, 'org-a'), 'org-a').currency, 'EUR')
   })
 })

@@ -46,13 +46,16 @@ interface DirectoryState {
   rows: Organization[] | null
   promise: Promise<Organization[]> | null
   extra: Map<string, Organization>
-  extraPending: Set<string>
+  // Shared in-flight single-org lookups: every concurrent consumer awaits
+  // the SAME promise (a Set marker would hand later callers a resolved
+  // null and hide the successful completion from their re-render).
+  extraInflight: Map<string, Promise<Organization | null>>
 }
-let dirState: DirectoryState = { identity: null, rows: null, promise: null, extra: new Map(), extraPending: new Set() }
+let dirState: DirectoryState = { identity: null, rows: null, promise: null, extra: new Map(), extraInflight: new Map() }
 let dirGeneration = 0
 
 function freshDirectory(identity: string | null): DirectoryState {
-  return { identity, rows: null, promise: null, extra: new Map(), extraPending: new Set() }
+  return { identity, rows: null, promise: null, extra: new Map(), extraInflight: new Map() }
 }
 
 /** Test seam: the committed directory state. */
@@ -87,8 +90,10 @@ export function beginDirectory(me: Me | null): Promise<Organization[]> {
   return promise
 }
 
-/** Committed single-org lookup (root, page 2+), by id or slug. */
-export function directoryExtra(orgId: string): Organization | null {
+/** Committed single-org lookup for the identity owning the cache, by id or
+ *  slug. Another identity (a member, a different root) never reads it. */
+export function directoryExtraFor(me: Me, orgId: string): Organization | null {
+  if (dirState.identity !== identityKey(me)) return null
   for (const org of dirState.extra.values()) {
     if (org.id === orgId || org.slug === orgId) return org
   }
@@ -103,19 +108,20 @@ export function findPoolOrg(orgs: Organization[] | null, orgId?: string): Organi
 
 /**
  * Root-only authoritative fallback for an org the page-1 listing lacks: the
- * supported GET /api/organizations/{id}. Deduplicated per id; commits only
- * while identity/generation still match; failures clear the pending marker
- * so a later attempt may retry. Test seam.
+ * supported GET /api/organizations/{id}. Concurrent consumers share one
+ * in-flight promise; commits only while identity/generation still match;
+ * retired flights resolve null (no commit, no adoption); failures clear the
+ * entry so a later attempt may retry. Test seam.
  */
 export function beginOrgDetail(me: Me, orgId: string): Promise<Organization | null> {
   const identity = identityKey(me)
   const generation = dirGeneration
   if (dirState.identity !== identity) dirState = freshDirectory(identity)
-  const known = directoryExtra(orgId)
+  const known = directoryExtraFor(me, orgId)
   if (known) return Promise.resolve(known)
-  if (dirState.extraPending.has(orgId)) return Promise.resolve(null)
-  dirState.extraPending.add(orgId)
-  return getOrganization(orgId)
+  const shared = dirState.extraInflight.get(orgId)
+  if (shared) return shared
+  const promise: Promise<Organization | null> = getOrganization(orgId)
     .then((org) => {
       // Retired flight: no commit, no adoption — mirrors requestMe.
       if (dirState.identity !== identity || dirGeneration !== generation) return null
@@ -124,10 +130,14 @@ export function beginOrgDetail(me: Me, orgId: string): Promise<Organization | nu
     })
     .catch(() => null)
     .finally(() => {
+      // Delete only our own entry: after a reset the whole state was
+      // discarded, and after a retry a newer entry may already exist.
       if (dirState.identity === identity && dirGeneration === generation) {
-        dirState.extraPending.delete(orgId)
+        if (dirState.extraInflight.get(orgId) === promise) dirState.extraInflight.delete(orgId)
       }
     })
+  dirState.extraInflight.set(orgId, promise)
+  return promise
 }
 
 /** A member's own orgs mapped straight from the /api/me payload. */
@@ -150,6 +160,14 @@ export function resolveOrgPresentation(orgs: Organization[] | null, orgId?: stri
     currency: org.currency && org.currency.length === 3 ? org.currency.toUpperCase() : DEFAULT_CURRENCY,
     timezone: org.timezone && org.timezone.length > 0 ? org.timezone : DEFAULT_TIMEZONE,
   }
+}
+
+/** Pool the presentation memo resolves against: the loaded orgs plus (for
+ *  the confirmed root identity that owns the cache) committed singles. */
+export function presentationPool(orgs: Organization[] | null, me: Me | null, orgId?: string): Organization[] | null {
+  if (!orgId || me === null || !me.is_root) return orgs
+  const extra = directoryExtraFor(me, orgId)
+  return extra ? [...(orgs ?? []), extra] : orgs
 }
 
 /**
@@ -229,7 +247,7 @@ export function useOrgPresentation(orgId?: string): OrgPresentation {
   // defaulting. Members never fetch here (the detail route is root-only).
   useEffect(() => {
     if (!orgId || !mayResolveDetail(meLoading, me)) return
-    if (findPoolOrg(orgs, orgId) || directoryExtra(orgId)) return
+    if (findPoolOrg(orgs, orgId) || directoryExtraFor(me, orgId)) return
     let alive = true
     void beginOrgDetail(me, orgId).then((org) => {
       if (alive && org) setDetailsVersion((v) => v + 1)
@@ -240,11 +258,9 @@ export function useOrgPresentation(orgId?: string): OrgPresentation {
   }, [orgId, me, meLoading, orgs])
 
   return useMemo(() => {
-    const extra = orgId ? directoryExtra(orgId) : null
-    const pool = extra ? [...(orgs ?? []), extra] : orgs
-    return resolveOrgPresentation(pool, orgId)
-    // detailsVersion re-computes when a single-org lookup commits.
-  }, [orgs, orgId, detailsVersion])
+    // detailsVersion re-computes when a shared single-org lookup commits.
+    return resolveOrgPresentation(presentationPool(orgs, me, orgId), orgId)
+  }, [orgs, me, orgId, detailsVersion])
 }
 
 /**
