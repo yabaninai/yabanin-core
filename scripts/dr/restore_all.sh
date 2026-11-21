@@ -20,10 +20,10 @@ fi
 
 start="$(date +%s)"
 if command -v pg_restore >/dev/null 2>&1; then
-  pg_restore "$uri" --no-owner --exit-on-error "$dump"
+  pg_restore --dbname="$uri" --no-owner --exit-on-error "$dump"
 else
   docker run --rm -i --network host -v "$(cd "$(dirname "$dump")" && pwd)":/backup:ro \
-    pgvector/pgvector:pg16 pg_restore "$uri" --no-owner --exit-on-error "/backup/$(basename "$dump")"
+    pgvector/pgvector:pg16 pg_restore --dbname="$uri" --no-owner --exit-on-error "/backup/$(basename "$dump")"
 fi
 end="$(date +%s)"
 

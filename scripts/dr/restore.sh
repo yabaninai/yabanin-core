@@ -15,6 +15,6 @@ if [ "${existing:-0}" != "0" ]; then
 fi
 
 start="$(date +%s)"
-pg_restore "$uri" --no-owner --exit-on-error "$dump"
+pg_restore --dbname="$uri" --no-owner --exit-on-error "$dump"
 end="$(date +%s)"
 echo "restore completed in $((end - start))s"

@@ -42,7 +42,10 @@ TABLES1=$(docker exec "$PG" psql -U yabanin -d yabanin -Atc \
   "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
 echo "  source: $TABLES1 tables"
 
-docker exec "$PG" pg_dump -U yabanin -d yabanin -F c -f /tmp/dr.dump
+uri='postgresql:///yabanin?user=yabanin'
+docker cp scripts/dr/backup_all.sh "$PG:/tmp/backup_all.sh"
+docker exec "$PG" bash /tmp/backup_all.sh "$uri" /tmp/dr-backup
+docker exec "$PG" sh -ec 'sha256sum -c /tmp/dr-backup/*.sha256 && cp /tmp/dr-backup/*.dump /tmp/dr.dump'
 docker cp "$PG:/tmp/dr.dump" "/tmp/dr-$$-host.dump"
 docker cp "/tmp/dr-$$-host.dump" "$PG2:/tmp/dr.dump"
 # yabanin_app, but roles are cluster-level objects that a database dump does
@@ -52,7 +55,8 @@ docker exec "$PG2" psql -U yabanin -d yabanin -qc "DO \$\$ BEGIN
   IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'yabanin_app') THEN
     CREATE ROLE yabanin_app NOLOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOBYPASSRLS;
   END IF; END \$\$;"
-docker exec "$PG2" pg_restore -U yabanin -d yabanin --no-owner /tmp/dr.dump
+docker cp scripts/dr/restore_all.sh "$PG2:/tmp/restore_all.sh"
+docker exec "$PG2" bash /tmp/restore_all.sh "$uri" /tmp/dr.dump
 TABLES_R=$(docker exec "$PG2" psql -U yabanin -d yabanin -Atc \
   "SELECT count(*) FROM information_schema.tables WHERE table_schema='public'")
 V_R=$(docker exec "$PG2" psql -U yabanin -d yabanin -Atc \
