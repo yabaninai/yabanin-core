@@ -232,7 +232,7 @@ func TestArchiveProjectionRoundTripPreservesInvocation(t *testing.T) {
 	require.Len(t, srcRows, 2, "both seeded rows must project")
 	// The projection is manifest-ordered: invocation_id is the LAST field.
 	invocationIdx := len(current) - 1
-	require.Equal(t, current[invocationIdx].Name, "invocation_id")
+	require.Equal(t, "invocation_id", current[invocationIdx].Name)
 	require.Equal(t, invSeedUUID, srcRows[0][invocationIdx], "invocation row must carry its identity")
 	require.Nil(t, srcRows[1][invocationIdx], "legacy row must keep NULL invocation_id")
 

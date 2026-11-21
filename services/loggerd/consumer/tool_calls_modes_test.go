@@ -366,7 +366,7 @@ func TestToolFactProbeFailurePropagatesUncached(t *testing.T) {
 		deliveryPolicy{profile: config.LogContentProfileLegacy, retainOriginal: true})
 	require.Error(t, err, "a transient probe failure fails the delivery")
 	require.ErrorIs(t, err, context.Canceled)
-	assert.NotErrorIs(t, err, errUnadmittedTerminal, "a probe failure is never a park")
+	require.NotErrorIs(t, err, errUnadmittedTerminal, "a probe failure is never a park")
 
 	require.NoError(t, c.handleRequestCompleteProfile(context.Background(), msg,
 		deliveryPolicy{profile: config.LogContentProfileLegacy, retainOriginal: true}))

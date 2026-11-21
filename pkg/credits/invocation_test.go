@@ -26,7 +26,7 @@ func TestDeductMicroInvocation_CanonicalIDGate(t *testing.T) {
 	for name, id := range shapes {
 		err := store.DeductMicroInvocation(context.Background(), "org-gate", 1000, "req-gate", id, nil)
 		require.ErrorContains(t, err, "canonical", "%s must be rejected", name)
-		assert.NotErrorIs(t, err, ErrChargeIdentityConflict, "%s is malformed input, not an integrity conflict", name)
+		require.NotErrorIs(t, err, ErrChargeIdentityConflict, "%s is malformed input, not an integrity conflict", name)
 	}
 	// Sanity: the canonical spelling passes the gate (and then fails only
 	// on the nil-DB parameter check — never on the identity).
@@ -133,7 +133,7 @@ func TestDeductMicro_LegacyAfterInvokedIsNeverSilentlySuppressed(t *testing.T) {
 
 	err := store.DeductMicro(ctx, org, 15000, "req-domains", nil)
 	require.Error(t, err, "the legacy charge is not suppressed into silence")
-	assert.NotErrorIs(t, err, ErrChargeIdentityConflict, "this is a loud insert collision, not a lookup conflict")
+	require.NotErrorIs(t, err, ErrChargeIdentityConflict, "this is a loud insert collision, not a lookup conflict")
 	var pgErr *pgconn.PgError
 	require.ErrorAs(t, err, &pgErr, "the collision is a Postgres unique violation")
 	assert.Equal(t, "23505", pgErr.Code)

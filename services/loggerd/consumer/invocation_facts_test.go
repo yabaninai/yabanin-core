@@ -242,7 +242,7 @@ func TestProbeTimeoutThenSuccessIsNotCachedAsOldSchema(t *testing.T) {
 	err := c.processMessage(context.Background(), msg)
 	require.Error(t, err, "a transient probe failure must fail the delivery")
 	require.ErrorIs(t, err, context.Canceled, "the probe error propagates unwrapped-as-park")
-	assert.NotErrorIs(t, err, errUnadmittedTerminal, "a probe failure is never a park")
+	require.NotErrorIs(t, err, errUnadmittedTerminal, "a probe failure is never a park")
 
 	require.NoError(t, c.processMessage(context.Background(), msg), "the retried delivery probes again and succeeds")
 	mu.Lock()

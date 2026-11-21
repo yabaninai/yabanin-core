@@ -152,10 +152,10 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	assert.Equal(t, staleSnap, fencingSnapshots(ctx, t, pool, jobIDs),
 		"stale batch and fenced terminal marks change no job field at all")
 	bal, rem, rows, micro := fencingWallet(ctx, t, pool, org)
-	assert.EqualValues(t, staleBal, bal, "stale batch moves no money")
-	assert.EqualValues(t, staleRem, rem)
-	assert.EqualValues(t, staleRows, rows, "stale batch writes no ledger row")
-	assert.EqualValues(t, staleMicro, micro)
+	assert.Equal(t, staleBal, bal, "stale batch moves no money")
+	assert.Equal(t, staleRem, rem)
+	assert.Equal(t, staleRows, rows, "stale batch writes no ledger row")
+	assert.Equal(t, staleMicro, micro)
 	for _, s := range staleSnap {
 		assert.Equal(t, "processing", s.status, "rightful claim's state untouched")
 		assert.Equal(t, 2, s.attempts)
@@ -166,7 +166,7 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 	w2 := imp99r1Worker(pool, pool)
 	reclaimed, err := w2.claimBatch(ctx)
 	require.NoError(t, err)
-	require.Len(t, reclaimed, 0, "claims are still leased — nothing to re-claim yet")
+	require.Empty(t, reclaimed, "claims are still leased — nothing to re-claim yet")
 
 	// Hand the lease back the way expiry would, then re-claim for real.
 	_, err = pool.Exec(ctx, `UPDATE settlement_jobs SET lease_until = now() - interval '5s' WHERE org_id = $1`, org)
@@ -296,10 +296,10 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	assert.Equal(t, recoveredSnap, fencingSnapshots(ctx, t, pool, jobIDs),
 		"stale batch and fenced marks change no field of the requeued state")
 	bal, rem, rows, micro := fencingWallet(ctx, t, pool, org)
-	assert.EqualValues(t, recBal, bal)
-	assert.EqualValues(t, recRem, rem)
-	assert.EqualValues(t, recRows, rows)
-	assert.EqualValues(t, recMicro, micro)
+	assert.Equal(t, recBal, bal)
+	assert.Equal(t, recRem, rem)
+	assert.Equal(t, recRows, rows)
+	assert.Equal(t, recMicro, micro)
 
 	// The rightful worker re-claims (token 2) and settles exactly once.
 	w2 := imp99r1Worker(pool, pool)

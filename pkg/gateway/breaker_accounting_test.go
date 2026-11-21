@@ -46,7 +46,7 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 				}
 				require.Equal(t, 1, upstream.totalCalls(), "entry refusal contacted provider")
 				require.Len(t, store.facts, 1, "entry refusal added a terminal charge")
-				require.Equal(t, len(store.admitted)-1, len(store.voided), "proven non-dispatch left a durable start open")
+				require.Len(t, store.voided, len(store.admitted)-1, "proven non-dispatch left a durable start open")
 				if len(store.voided) > 0 {
 					require.Equal(t, store.admitted[1].InvocationID, store.voided[0])
 				}

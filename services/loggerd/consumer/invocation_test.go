@@ -5,7 +5,6 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/redis/go-redis/v9"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -204,22 +203,4 @@ func mustJSON(t *testing.T, v any) string {
 	body, err := json.Marshal(v)
 	require.NoError(t, err)
 	return string(body)
-}
-
-// tsMessage builds a terminal stream message with an invocation field for
-// handler-level tests.
-func tsMessage(values map[string]interface{}) redis.XMessage {
-	base := map[string]interface{}{
-		"event_type":      "request.completed",
-		"source":          "gateway",
-		"org_id":          "org-inv",
-		"session_id":      "sess-inv",
-		"model_requested": "gpt-4",
-		"status_code":     "200",
-		"duration_ms":     "10",
-	}
-	for k, v := range values {
-		base[k] = v
-	}
-	return redis.XMessage{ID: "12-1", Values: base}
 }
