@@ -3,9 +3,12 @@ package evalgate
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -165,5 +168,32 @@ func TestTP03_JudgeVerdictValidation(t *testing.T) {
 				t.Fatalf("verdict mismatch: got %+v, want %+v", *v, *tc.wantVerdict)
 			}
 		})
+	}
+}
+
+func TestMeasuredJudgePreservesUsageForInvalidVerdict(t *testing.T) {
+	const model = "configured-evaluator"
+	var arrived atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived.Add(1)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"invalid verdict"}}],"usage":{"prompt_tokens":11,"completion_tokens":3}}`)
+	}))
+	defer server.Close()
+	j := NewJudge(server.URL, nil)
+	j.SetModel(model)
+	refused := errors.New("start unavailable")
+	admit := func(ctx context.Context, m string) error {
+		if m != model {
+			t.Fatalf("admission model = %q", m)
+		}
+		return refused
+	}
+	_, _, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", admit)
+	if !errors.Is(err, refused) || arrived.Load() != 0 {
+		t.Fatalf("failed admission contacted evaluator: arrivals=%d err=%v", arrived.Load(), err)
+	}
+	v, call, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+	if v != nil || err == nil || arrived.Load() != 1 || call.Model != model || call.Status != 200 || call.Usage.PromptTokens != 11 || call.Usage.CompletionTokens != 3 {
+		t.Fatalf("invalid verdict lost provider facts: call=%+v verdict=%v arrivals=%d err=%v", call, v, arrived.Load(), err)
 	}
 }

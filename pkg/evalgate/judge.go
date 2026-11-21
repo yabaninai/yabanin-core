@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/reireirei/yabanin/pkg/provider"
 )
 
 // Judge evaluates whether a cheap-model response is sufficient or if a premium model
@@ -57,6 +59,22 @@ func NewJudge(evaluatorURL string, log *slog.Logger) *Judge {
 // Evaluate compares a cheap and premium model response to the same prompt.
 // Returns a verdict indicating whether the cheap model was sufficient.
 func (j *Judge) Evaluate(ctx context.Context, prompt, cheapResponse, premiumResponse string) (*Verdict, error) {
+	verdict, _, err := j.EvaluateMeasured(ctx, prompt, cheapResponse, premiumResponse, nil)
+	return verdict, err
+}
+
+// JudgeCall records what the evaluator endpoint returned, including usage for
+// responses whose verdict could not be interpreted.
+type JudgeCall struct {
+	Model  string
+	Status int
+	Usage  provider.Usage
+}
+
+// EvaluateMeasured invokes beforeDispatch after building the request and before
+// sending it. A failed admission stops the evaluation before the HTTP call.
+func (j *Judge) EvaluateMeasured(ctx context.Context, prompt, cheapResponse, premiumResponse string, beforeDispatch func(context.Context, string) error) (*Verdict, JudgeCall, error) {
+	call := JudgeCall{Model: j.model}
 	start := time.Now()
 
 	judgePrompt := fmt.Sprintf(`You are evaluating two AI responses to the same user prompt.
@@ -80,23 +98,43 @@ Return ONLY valid JSON with these exact fields:
 
 	req, err := http.NewRequestWithContext(ctx, "POST", j.evaluatorURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create judge request: %w", err)
+		return nil, call, fmt.Errorf("create judge request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if j.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+j.apiKey)
 	}
 
+	if beforeDispatch != nil {
+		if err := beforeDispatch(ctx, j.model); err != nil {
+			return nil, call, err
+		}
+	}
 	resp, err := j.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("judge request failed: %w", err)
+		return nil, call, fmt.Errorf("judge request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	call.Status = resp.StatusCode
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("judge returned status %d", resp.StatusCode)
+		return nil, call, fmt.Errorf("judge returned status %d", resp.StatusCode)
 	}
 
+	var raw json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, call, fmt.Errorf("parse judge response: %w", err)
+	}
+	call.Usage = provider.OpenAI{}.ParseUsage(raw)
+	verdict, err := parseVerdict(raw)
+	if err == nil {
+		j.log.Debug("judge verdict", "cheap_quality", verdict.CheapQuality, "premium_quality", verdict.PremiumQuality,
+			"should_upgrade", verdict.ShouldUpgrade, "latency_ms", time.Since(start).Milliseconds())
+	}
+	return verdict, call, err
+}
+
+func parseVerdict(raw json.RawMessage) (*Verdict, error) {
 	var judgeOut struct {
 		Choices []struct {
 			Message struct {
@@ -104,7 +142,7 @@ Return ONLY valid JSON with these exact fields:
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&judgeOut); err != nil {
+	if err := json.Unmarshal(raw, &judgeOut); err != nil {
 		return nil, fmt.Errorf("parse judge response: %w", err)
 	}
 	if len(judgeOut.Choices) == 0 {
@@ -143,12 +181,6 @@ Return ONLY valid JSON with these exact fields:
 			return nil, fmt.Errorf("judge verdict %s=%v out of range [0,1]", score.name, score.value)
 		}
 	}
-
-	j.log.Debug("judge verdict",
-		"cheap_quality", verdict.CheapQuality,
-		"premium_quality", verdict.PremiumQuality,
-		"should_upgrade", verdict.ShouldUpgrade,
-		"latency_ms", time.Since(start).Milliseconds())
 
 	return &verdict, nil
 }
