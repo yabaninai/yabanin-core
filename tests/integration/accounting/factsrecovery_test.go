@@ -98,9 +98,18 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 	// (there is none), and must say so.
 	s.restartLoggerd()
 
+	// The wallet debit lands on the settlement worker's tick (AF-06: the
+	// sweep only writes settlement_jobs intents; the worker debits
+	// credit_transactions asynchronously), so the poll must cover both
+	// boundaries before the immediate exactly-once assertions below —
+	// the same shape as the settlement-fault, client-retry and
+	// event-redelivery cases.
 	pollUntil(t, 6*time.Minute, "recovery materializes from facts", func() error {
 		if s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 0 {
 			return fmt.Errorf("no request_logs row yet")
+		}
+		if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows == 0 {
+			return fmt.Errorf("no wallet usage row yet")
 		}
 		return nil
 	})
