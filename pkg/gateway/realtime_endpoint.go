@@ -3,6 +3,7 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -158,14 +159,17 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Connection", "keep-alive")
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Proxy-Cache", "bypass")
-	flusher, ok := w.(http.Flusher)
-	if !ok {
+	if _, ok := w.(http.Flusher); !ok {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
 		return
 	}
 
-	usage, tee, term, drainErr := gw.realtimeRelay(rctx, w, flusher, resp.Body, cancelStream)
+	// The raw-chunk relay writes through the tail tracker so a torn last
+	// event is closed before the terminal error frame composes (chat F2
+	// canon); the tee is fed from the read side and is unaffected.
+	tail := &ssePassthroughTail{w: w}
+	usage, tee, term, drainErr := gw.realtimeRelay(rctx, tail, tail, resp.Body, cancelStream)
 
 	ttftMs, hasTTFT := tee.firstTokenMs(started)
 	if hasTTFT {
@@ -177,7 +181,9 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	if drainErr != nil {
 		// Best-effort terminal error frame (contained when the client is
 		// already gone — stream.go writeSSEError parity); partial usage was
-		// consumed upstream, so it still bills (G3).
+		// consumed upstream, so it still bills (G3). The torn tail closes
+		// first so the error frame starts at an event boundary.
+		tail.complete()
 		switch term {
 		case budget.TerminationIdleTimeout:
 			writeSSEError(w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
@@ -288,11 +294,27 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 }
 
 // realtimeRelay pipes the upstream SSE session to the client byte-honestly:
-// raw chunks are forwarded and flushed as they arrive (no per-event
-// re-serialization), while a side parser extracts the last usage-bearing
-// event for actual billing (D3) and a bounded tee captures the stream for
-// the analytics event. Returns the parsed usage, the tee, the drain error
-// (nil on clean EOF) and its Finalize termination class (§5.3).
+// raw chunks feed the side parser (last usage-bearing event for actual
+// billing, D3 — usage is read-based and stays truthful even after the
+// client disconnects) and the bounded analytics tee unchanged, while
+// client writes are frame-batched — a consumer decodes an event only
+// once its blank separator has arrived, so lines of an unterminated
+// frame are held back with bounded memory. On an upstream break — and
+// at clean EOF, which is not a drain failure — the held frame is
+// dispatched only when the end aligned to a line boundary (no
+// unterminated partial followed it) and it is a decodable event missing
+// just its separator; the salvaged frame is closed with a CRLF blank
+// separator — valid after an LF, CRLF or lone-CR last line alike — and
+// followed by the usage parser's Flush, so the client stream and the
+// settlement see the same terminal event. When the frame is dropped the
+// parser is not flushed: a torn event is never billed. The
+// unterminated trailing line is dropped either way, as it can never
+// become an event. After a failed client write no further bytes are
+// written and no further provider bytes are pulled — a streaming upstream
+// on the live connection would keep doing paid work for a client that is
+// gone; the usage already covers every byte read. Returns the parsed
+// usage, the tee, the drain error (nil on clean EOF; a write failure
+// settles as a client cancel) and its Finalize termination class (§5.3).
 func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, flusher http.Flusher, body io.Reader, cancelStream context.CancelFunc) (usage provider.Usage, tee *boundedBuffer, term budget.Termination, drainErr error) {
 	var capture boundedBuffer
 	tee = &capture
@@ -306,7 +328,80 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 	}
 	term = budget.TerminationUpstreamErr
 	var relayed int64
+	var lines apiformat.SSELineSplitter
+	var frames apiformat.SSEFrameBuffer
+	var werr error // first client-write failure; writes stop and no further provider bytes are pulled
 	buf := make([]byte, 32*1024)
+	writeBlob := func(blob []byte) {
+		if len(blob) == 0 || werr != nil {
+			return
+		}
+		if _, e := w.Write(blob); e != nil {
+			werr = e
+			return
+		}
+		flusher.Flush()
+	}
+	// processLine routes one complete upstream line: keepalive comments
+	// ride no event and pass through immediately (downstream idle
+	// timeouts stay reset; the frame buffer never grows on them), field
+	// lines batch into the frame buffer, and a blank separator flushes
+	// the whole frame to the client.
+	processLine := func(line []byte) error {
+		if apiformat.SSECommentLine(line) {
+			writeBlob(line)
+			return nil
+		}
+		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
+		if overflow {
+			// An unterminated frame grew past the buffering limit: the
+			// relay aborts as an upstream error (bounded memory).
+			return errRealtimeLineTooLarge{}
+		}
+		if blank {
+			writeBlob(append(frames.Take(), line...))
+		}
+		return nil
+	}
+	// lineAbort ends the drain for a line-processing error: an oversized
+	// line/frame is an upstream abort; any other error is a failed client
+	// write — the client walked away mid-session, and the consumed
+	// prefix is billed by the caller (G3 cancel-settle parity).
+	lineAbort := func(lerr error) (provider.Usage, *boundedBuffer, budget.Termination, error) {
+		var tooLarge errRealtimeLineTooLarge
+		if errors.As(lerr, &tooLarge) {
+			return usage, tee, budget.TerminationUpstreamErr, lerr
+		}
+		return usage, tee, budget.TerminationClientCancel, lerr
+	}
+	// settleTail ends the framing at a stream break or clean EOF: the
+	// splitter's trailing lone CR resolves into a complete line (the CR
+	// was received — it terminates its line under the grammar whether or
+	// not a further LF ever arrives); the held frame is salvaged only
+	// when no unterminated partial followed it and it is a decodable
+	// event missing just its separator. The salvaged frame is closed
+	// with a CRLF blank separator — valid after an LF, CRLF or lone-CR
+	// last line alike — and followed by the usage parser's Flush, so the
+	// settlement bills what the upstream actually sent; a dropped frame
+	// leaves the parser unflushed — a torn event is never billed.
+	settleTail := func() error {
+		flushLines, partial := lines.Flush()
+		for _, line := range flushLines {
+			if lerr := processLine(line); lerr != nil {
+				return lerr
+			}
+		}
+		if len(partial) > 0 || !frames.Salvageable() {
+			return nil
+		}
+		writeBlob(append(frames.Take(), '\r', '\n'))
+		for _, ev := range parser.Flush() {
+			if u, ok := realtimeUsageFromEvent([]byte(ev.Data)); ok {
+				usage = u
+			}
+		}
+		return nil
+	}
 	for {
 		n, rerr := reader.Read(buf)
 		if n > 0 {
@@ -323,22 +418,52 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 					usage = u // last usage-bearing event wins (carryStreamUsage parity)
 				}
 			}
-			if _, werr := w.Write(chunk); werr != nil {
-				// Client walked away mid-session — the consumed prefix is
-				// billed by the caller (G3 cancel-settle parity).
-				return usage, tee, budget.TerminationClientCancel, werr
+			// Frame-batch the client writes: only whole frames (through
+			// their blank separator) leave the relay while the upstream is
+			// still running.
+			for _, line := range lines.Feed(chunk) {
+				if lerr := processLine(line); lerr != nil {
+					return lineAbort(lerr)
+				}
 			}
-			flusher.Flush()
+			if lines.Pending() > apiformat.SSEStreamLineLimit {
+				// An unterminated line grew past the buffering limit: the
+				// relay aborts as an upstream error (bounded memory).
+				return usage, tee, budget.TerminationUpstreamErr, errRealtimeLineTooLarge{}
+			}
+		}
+		if werr != nil {
+			// The client write failed: stop pulling provider bytes — a
+			// streaming upstream on the live connection would keep doing
+			// paid work for a client that is gone. The usage parser was
+			// fed above from every byte this chunk carried, so the usage
+			// already covers what was paid for.
+			return usage, tee, budget.TerminationClientCancel, werr
 		}
 		if rerr == io.EOF {
-			for _, ev := range parser.Flush() {
-				if u, ok := realtimeUsageFromEvent([]byte(ev.Data)); ok {
-					usage = u
-				}
+			// Clean end: EOF is not a drain failure; the tail settles with
+			// the same boundary-aligned salvage rule. A recorded client
+			// write failure still settles as a cancel — the client never
+			// saw the stream through.
+			if lerr := settleTail(); lerr != nil {
+				return lineAbort(lerr)
+			}
+			if werr != nil {
+				return usage, tee, budget.TerminationClientCancel, werr
 			}
 			return usage, tee, budget.TerminationCompleted, nil
 		}
 		if rerr != nil {
+			// Broken upstream: same boundary-aligned salvage as EOF — the
+			// closed frame keeps the client stream and the settlement on
+			// the same event — then the termination class and the read
+			// error return.
+			if lerr := settleTail(); lerr != nil {
+				return lineAbort(lerr)
+			}
+			if werr != nil {
+				return usage, tee, budget.TerminationClientCancel, werr
+			}
 			switch {
 			case idle != nil && idle.Fired():
 				term = budget.TerminationIdleTimeout
@@ -355,6 +480,14 @@ type errRealtimeStreamTooLarge struct{}
 
 func (errRealtimeStreamTooLarge) Error() string {
 	return "upstream stream exceeds the realtime size limit"
+}
+
+// errRealtimeLineTooLarge marks a relay aborted because a single
+// unterminated SSE line or frame grew past apiformat.SSEStreamLineLimit.
+type errRealtimeLineTooLarge struct{}
+
+func (errRealtimeLineTooLarge) Error() string {
+	return "upstream realtime SSE line or frame exceeds the buffering limit"
 }
 
 // realtimeUsageFromEvent extracts usage from one SSE event data payload: a

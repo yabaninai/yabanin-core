@@ -190,9 +190,17 @@ type streamRun struct {
 	// clientSawDone records whether the terminal "data: [DONE]" frame was
 	// already delivered to the client during the drain (N03-P01): a late
 	// drain failure after the terminator must not emit a second terminal
-	// event. Set by the terminal watch installed in drain and read by the
-	// finishers on the same goroutine.
+	// event. Fed by doneWatch (innermost, installed in wrapWriters) and
+	// read by the finishers on the same goroutine.
 	clientSawDone bool
+	// clientTerminalDelivered reads the watch live: the streaming-policy
+	// seam releases its held prefix after drain returns (finishStream),
+	// so a drain-time snapshot can miss a terminator delivered moments
+	// later. Same-goroutine discipline as the field above.
+	// doneWatch observes the client-bound bytes below every wrapper
+	// (cache record, history capture, policy seam, tool gate): nil in
+	// hand-assembled test chains that skip wrapWriters.
+	doneWatch *sseTerminalWatch
 
 	// connection-phase results (connect).
 	finalInfo        resolver.ModelInfo
@@ -742,6 +750,14 @@ func (r *streamRun) finishConnectFailure() {
 // storing never lands in the shared cache.
 func (r *streamRun) wrapWriters() http.Flusher {
 	var flusher http.Flusher
+	// The terminal watch rides INNERMOST, over the raw response writer:
+	// every wrapper above may rewrite client-bound bytes (the policy seam
+	// reframes fused terminators into a standalone [DONE], the tool gate
+	// drops denied fragments, the passthrough tail appends separator
+	// bytes), so only a watch below all of them records exactly the
+	// terminals the client actually received (N03-P01).
+	r.doneWatch = newSSETerminalWatch(r.w)
+	r.w = r.doneWatch
 	recordCache := r.gw.cache != nil && r.orgID != "" && !r.cacheDisabled && r.gw.cfg.CacheStreamEnabled
 	if recordCache {
 		// STREAM-01: the capture is bounded — an arbitrarily long upstream
@@ -801,18 +817,30 @@ func (r *streamRun) wrapWriters() http.Flusher {
 	return flusher
 }
 
-// ssePassthroughTail observes the client-facing tail of the passthrough
-// relay: whether the bytes written so far end inside an SSE event (a data
-// line was written but its blank frame separator has not). Writes pass
-// through unchanged — the passthrough relay stays bit-for-bit; only
-// completePassthroughTail ever appends, exactly one LF, at drain-failure
-// composition time. Single-goroutine by construction: drain and the
-// end-of-stream composition run on the serveStream goroutine.
+// ssePassthroughTail observes the client-facing tail of a passthrough
+// relay: whether the bytes actually written so far end inside an SSE
+// event (a data line was written but its blank frame separator has not).
+// Writes pass through unchanged — the passthrough relays stay
+// bit-for-bit; only complete ever appends, and only at terminal-frame
+// composition time (drain failure or stream-interruption synthesis).
+// Terminator state is derived from a small trailing-byte window of the
+// cumulative stream, so it survives arbitrary write fragmentation —
+// including a CRLF or a lone-CR terminator split across writes — and a
+// partially failed write (the tracker only records the bytes the client
+// actually received). Single-goroutine by construction: drain and the
+// end-of-stream composition run on the serve goroutine of the owning
+// endpoint.
 type ssePassthroughTail struct {
 	w     http.ResponseWriter
-	total int64 // bytes passed through (0 = nothing streamed: nothing torn)
-	lfRun int   // trailing consecutive LF count of the cumulative stream, capped at 2
+	total int64  // bytes the client actually received (0 = nothing streamed: nothing torn)
+	tail  []byte // trailing window of the cumulative stream, ≤ tailWindow bytes
+	run   int    // trailing line-terminator run of the cumulative stream, capped at 2
+	hang  bool   // the stream's last byte is a CR whose LF successor is still unknown
 }
+
+// tailWindow covers the state the terminator scan needs: two full CRLF
+// terminators plus the carried lone CR.
+const tailWindow = 8
 
 func (t *ssePassthroughTail) Header() http.Header  { return t.w.Header() }
 func (t *ssePassthroughTail) WriteHeader(code int) { t.w.WriteHeader(code) }
@@ -823,46 +851,92 @@ func (t *ssePassthroughTail) Flush() {
 }
 
 func (t *ssePassthroughTail) Write(p []byte) (int, error) {
-	t.total += int64(len(p))
-	if n := len(p); n > 0 {
-		// Trailing LF run of the cumulative stream. A write that is
-		// entirely LFs extends the previous run — the passthrough handler
-		// writes a line and its terminator as separate calls, so the
-		// "\n\n" separator can split across writes.
-		run := 0
-		for i := n - 1; i >= 0 && p[i] == '\n'; i-- {
-			run++
+	n, err := t.w.Write(p)
+	if n > 0 {
+		// Record only what the client received: a short or failed write
+		// must not leave the tracker asserting bytes (e.g. a frame
+		// separator) that never reached the wire.
+		t.total += int64(n)
+		t.tail = append(t.tail, p[:n]...)
+		if len(t.tail) > tailWindow {
+			t.tail = t.tail[len(t.tail)-tailWindow:]
 		}
-		if run == n {
-			t.lfRun = min(t.lfRun+run, 2)
-		} else {
-			t.lfRun = min(run, 2)
+		t.run, t.hang = analyzeTailTerminators(t.tail)
+	}
+	return n, err
+}
+
+// analyzeTailTerminators scans the cumulative tail window once, forward,
+// under the SSE line-terminator grammar: '\n' is a terminator, '\r' is
+// one half of CRLF or a terminator in its own right. A CR counts as a
+// terminator immediately and hangs pending — a following LF pairs with
+// it (one terminator, no second count), any other byte leaves it a
+// resolved lone CR. Content resets the run. The run caps at two: that is
+// all complete() needs to know about a frame separator.
+func analyzeTailTerminators(p []byte) (run int, hang bool) {
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '\n':
+			if hang {
+				hang = false // the pending CR pairs with this LF
+				continue
+			}
+			if run < 2 {
+				run++
+			}
+		case '\r':
+			if run < 2 {
+				run++
+			}
+			hang = true
+		default:
+			run, hang = 0, false
 		}
 	}
-	return t.w.Write(p)
+	return run, hang
 }
 
 // torn reports a streamed tail that ends mid-event: at least one byte was
-// written and the trailing LF run is shorter than the "\n\n" frame
-// separator.
+// written and the trailing line-terminator run is shorter than the two
+// terminators of a frame separator.
 func (t *ssePassthroughTail) torn() bool {
-	return t.total > 0 && t.lfRun < 2
+	return t.total > 0 && t.run < 2
+}
+
+// complete closes a torn SSE event by appending exactly the missing bytes
+// of the frame separator. A cut mid-line (run 0) takes two LFs — the
+// partial line ends and the separator follows; a dangling line with its
+// terminator already counted (run 1, no hanging CR) takes one LF. A tail
+// ending in a hanging CR (run 1, hang) takes two: the first LF pairs
+// into the line's CRLF, the second is the separator — appending a single
+// LF there would close the line but leave the event pending, which an
+// SSE client discards at stream end. Nil and untorn tails are no-ops, so
+// terminal-frame composers can call it unconditionally. Writing through
+// the tracker marks the tail complete, making repeated calls no-ops too.
+func (t *ssePassthroughTail) complete() {
+	if t == nil || !t.torn() {
+		return
+	}
+	if t.hang || t.run == 0 {
+		_, _ = io.WriteString(t, "\n\n")
+		return
+	}
+	_, _ = io.WriteString(t, "\n")
 }
 
 // completePassthroughTail closes a torn SSE event on the passthrough relay
-// right before the drain-failure notification composes its error frame: one
-// LF turns a dangling "data: …\n" tail into its whole event, byte-exact
-// against the upstream stream, so the error frame starts at an event
-// boundary instead of gluing into a half-written event (the line-buffered
-// relay contract). Never reached on the policy-seam path: there the
-// assembly buffer drops the never-processed partial instead
-// (sseStreamPolicyWriter.finishStream) — completing it would emit raw,
-// unmutated upstream content that passed no policy stage.
+// right before the drain-failure notification composes its error frame, so
+// the error frame starts at an event boundary instead of gluing into a
+// half-written event (the line-buffered relay contract). Never reached on
+// the policy-seam path: there the assembly buffer drops the
+// never-processed partial instead (sseStreamPolicyWriter.finishStream) —
+// completing it would emit raw, unmutated upstream content that passed no
+// policy stage.
 func (r *streamRun) completePassthroughTail() {
-	if r.streamPolicy != nil || r.sseTail == nil || !r.sseTail.torn() {
+	if r.streamPolicy != nil {
 		return
 	}
-	_, _ = io.WriteString(r.sseTail, "\n")
+	r.sseTail.complete()
 }
 
 // streamIdentityRequest carries the stream stage's trusted identity headers
@@ -1036,14 +1110,31 @@ func (r *streamRun) drain(flusher http.Flusher) (usage provider.Usage, drainErr 
 	// RM-03: when the gateway injected include_usage on the client's behalf
 	// (clientWantsUsage == false), suppress the trailing usage-only chunk
 	// from the client bytes; usage is still parsed for tokens/cost/budgets.
-	// The terminal watch rides the outermost writer so every producer's
-	// [DONE] (passthrough, translation, policy flush) marks the delivery.
-	watch := newSSETerminalWatch(r.w)
+	// The terminal watch (doneWatch, innermost in wrapWriters) records
+	// every producer's [DONE] — passthrough, translation, policy flush.
+	// Paths that assemble streamRun directly (split-drain units, legacy
+	// endpoints) skip wrapWriters; drain guarantees the watch exists the
+	// same way, wrapping the writer it was handed.
+	if r.doneWatch == nil {
+		r.doneWatch = newSSETerminalWatch(r.w)
+		r.w = r.doneWatch
+	}
 	handler := provider.NewStreamHandlerWithOptions(r.finalInfo.Provider, r.finalInfo.ModelName,
 		provider.StreamOptions{SuppressUsageOnlyChunk: !r.clientWantsUsage, RequestBytes: len(r.body)})
-	usage, drainErr = handler.HandleStream(r.streamCtx, watch, flusher, r.streamResp)
-	r.clientSawDone = watch.sawDone()
+	usage, drainErr = handler.HandleStream(r.streamCtx, r.w, flusher, r.streamResp)
+	r.clientSawDone = r.doneWatch.sawDone()
 	return usage, drainErr
+}
+
+// clientTerminalDelivered reports whether the client's stream ended at a
+// [DONE] terminator — live from the innermost watch, not the drain-time
+// snapshot: the streaming-policy seam may release its held prefix (and
+// its reframed terminator) after drain returns.
+func (r *streamRun) clientTerminalDelivered() bool {
+	if r.doneWatch != nil && r.doneWatch.sawDone() {
+		return true
+	}
+	return r.clientSawDone
 }
 
 // streamCacheChunk mirrors the chat.completion.chunk fields the stream cache
@@ -1416,7 +1507,7 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 	// terminal event (an error frame + duplicate [DONE] after [DONE] is an
 	// invalid stream per pkg/apiformat.ValidateChatStream). The failure is
 	// still logged here and reported as request.failed below.
-	if !r.clientSawDone {
+	if !r.clientTerminalDelivered() {
 		if idleAbort {
 			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
 		} else {
@@ -1606,7 +1697,7 @@ func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsa
 	// upgraded to partial + capture_limit inside finishEnvelope.
 	if r.history != nil {
 		status, reason := responseHistoryStatusComplete, ""
-		if !r.clientSawDone {
+		if !r.clientTerminalDelivered() {
 			status, reason = responseHistoryStatusPartial, responseHistoryReasonMissingDoneFram
 		}
 		successBase.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
@@ -1794,15 +1885,30 @@ var sseDoneFrames = [][]byte{
 	[]byte("data:[DONE]"),  // no-space terminator (same payload per ValidateChatStream)
 }
 
-// isSSEDoneFrame reports whether p — a single Write on the client writer —
-// is exactly a [DONE] terminator line, optionally wrapped in the frame's
-// newlines. A JSON chunk line never trims to a terminator shape, so a
-// content delta merely mentioning "data: [DONE]" cannot trip the detection.
+// isSSEDoneFrame reports whether p — a single Write on the client writer
+// — carries the [DONE] terminator line: a standalone terminator frame
+// (optionally wrapped in the frame's newlines), a frame whose final line
+// is the terminator (a malformed upstream gluing [DONE] to an unfinished
+// event), or a batched blob with the terminator anywhere inside it (a
+// streaming-policy hold release, or a contract-violating upstream sending
+// frames after its own terminator — the relay stays byte-faithful and the
+// client's stream still ended at the terminator). The match is
+// line-exact — the validator's own rule — so a JSON chunk line merely
+// mentioning "data: [DONE]" inside its payload can never trip it.
 func isSSEDoneFrame(p []byte) bool {
-	trimmed := bytes.TrimSpace(p)
-	for _, frame := range sseDoneFrames {
-		if bytes.Equal(trimmed, frame) {
-			return true
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		var line []byte
+		if i < 0 {
+			line, p = p, nil
+		} else {
+			line, p = p[:i], p[i+1:]
+		}
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		for _, frame := range sseDoneFrames {
+			if bytes.Equal(line, frame) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1811,13 +1917,17 @@ func isSSEDoneFrame(p []byte) bool {
 // sseTerminalWatch wraps the client writer for the duration of a stream
 // drain and records whether the terminal "data: [DONE]" frame reached the
 // client (N03-P01: a late failure after the terminator must not emit a
-// second terminal event). Producers emit the terminator either as the bare
-// line (the OpenAI passthrough writes line and newline separately) or as
-// the whole frame ("data: [DONE]\n\n"); both trim to the same payload, in
-// the spaced and the no-space form (the shapes ValidateChatStream accepts
-// as the terminator). A JSON chunk line never trims to a terminator shape,
-// so a content delta merely mentioning "data: [DONE]" cannot trip the
-// detection.
+// second terminal event). It wraps the RAW response writer innermost, so
+// every producer's terminator — the passthrough handler, a translation
+// relay, the streaming-policy seam's reframed standalone [DONE], the tail
+// completion — marks the delivery exactly when the bytes actually reach
+// the client (a rewriter above it may split, drop or reframe the handler's
+// own writes, so a watch placed above the rewriters would miss terminals
+// the client did receive and count ones it did not). A glued terminator
+// (an unfinished event whose final data field is [DONE]) ends the client's
+// stream too and counts; a JSON chunk line never ends with a bare
+// terminator line, so a content delta merely mentioning "data: [DONE]"
+// cannot trip the detection.
 type sseTerminalWatch struct {
 	http.ResponseWriter
 	flusher http.Flusher
