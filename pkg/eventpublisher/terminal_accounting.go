@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/reireirei/yabanin/pkg/money"
 )
 
 // UnmarshalJSON keeps legacy events without an invocation ID readable while
@@ -95,7 +96,7 @@ func (event *Event) TerminalAccountingFields() (map[string]string, error) {
 	if !isTerminalEventType(event.EventType) {
 		return nil, errors.New("invalid terminal accounting event type")
 	}
-	if !validTerminalCosts(event.EstimatedCostUSD, event.ResaleCostUSD, event.CounterfactualCostUSD) {
+	if !event.validTerminalCosts() {
 		return nil, errors.New("invalid terminal accounting cost")
 	}
 	reservations, err := event.terminalReservations()
@@ -136,13 +137,21 @@ func (event *Event) validTerminalQuantities() bool {
 	return true
 }
 
-func validTerminalCosts(amounts ...float64) bool {
-	for _, amount := range amounts {
-		if amount < 0 || math.IsNaN(amount) || math.IsInf(amount, 0) {
-			return false
-		}
-	}
-	return true
+func (event *Event) validTerminalCosts() bool {
+	return validSettlementQuote(event.EstimatedCostUSD) &&
+		validSettlementQuote(event.ResaleCostUSD) &&
+		validCounterfactualCost(event.CounterfactualCostUSD)
+}
+
+// Loggerd treats out-of-range settlement quotes as unknown. Catch these
+// before acknowledging that recoverable terminal facts have been saved.
+func validSettlementQuote(usd float64) bool {
+	_, err := money.FromUSD(usd)
+	return err == nil
+}
+
+func validCounterfactualCost(usd float64) bool {
+	return usd >= 0 && usd <= math.MaxFloat64
 }
 
 // Reservations are the one nested wire field permitted in durable facts.
