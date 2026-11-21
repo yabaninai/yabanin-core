@@ -64,17 +64,10 @@ func TestMessages_ClaudeCodeTurn_Stream(t *testing.T) {
 	req.Header.Set("x-claude-code-session-id", "cc-session-1")
 	req.Header.Set("x-claude-code-agent-id", "agent-1")
 	req.Header.Set("x-claude-code-parent-agent-id", "parent-1")
-	goldenIdentity(req)
-	// Claude Code requests carry no resolved session or agent; let the
-	// endpoint fall back to the claude-code headers.
-	req.Header.Del("X-Session-Id")
-	req.Header.Del("X-Agent-Id")
 	rec := httptest.NewRecorder()
-	// Handler-direct (the post-4a1aaaa convention): the auth middleware
-	// strips client-supplied identity headers, and durable terminal facts
-	// require a tenant — the golden identity stands in for the resolved
-	// principal the production resolver injects.
-	gw.messages(rec, req)
+	r := chi.NewRouter()
+	gw.routes(r)
+	r.ServeHTTP(rec, req)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
 	}
@@ -133,20 +126,6 @@ func TestMessages_NonStream_Text(t *testing.T) {
 	}
 }
 
-// messagesBillingServer mounts /v1/messages behind the production error
-// envelope WITHOUT the auth middleware, which strips the client identity
-// headers the durable terminal facts require (post-4a1aaaa convention:
-// goldenIdentity stands in for the resolved principal).
-func messagesBillingServer(t *testing.T, gw *gateway) *httptest.Server {
-	t.Helper()
-	router := chi.NewRouter()
-	router.Use(anthropicErrorEnvelope)
-	router.Post("/v1/messages", gw.messages)
-	server := httptest.NewServer(router)
-	t.Cleanup(server.Close)
-	return server
-}
-
 func TestMessages_Unauthorized_AnthropicEnvelope(t *testing.T) {
 	gw := responsesTestGateway(t, "http://127.0.0.1:1")
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages", strings.NewReader(`{"model":"m","max_tokens":1,"messages":[{"role":"user","content":"Hi"}]}`))
@@ -195,17 +174,9 @@ func postMessages(t *testing.T, gw *gateway, body string) *httptest.ResponseReco
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	// Handler-direct (the post-4a1aaaa convention): the auth middleware
-	// strips client-supplied identity headers, and durable terminal facts
-	// require a tenant — the golden identity stands in for the resolved
-	// principal the production resolver injects. The anthropic error
-	// envelope stays in the chain: every production /v1/messages response
-	// rides it, so direct calls must too.
 	r := chi.NewRouter()
-	r.Use(anthropicErrorEnvelope)
-	r.Post("/v1/messages", gw.messages)
+	gw.routes(r)
 	r.ServeHTTP(rec, req)
 	return rec
 }
@@ -300,14 +271,16 @@ func TestMessages_AdaptedStream_PromptCacheTrailer_RealRoundtrip(t *testing.T) {
 		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":9,\"completion_tokens\":2,\"total_tokens\":11,\"prompt_tokens_details\":{\"cached_tokens\":5}}}\n\n")
 	gw := responsesTestGateway(t, server.URL)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	t.Cleanup(gwServer.Close)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, gwServer.URL+"/v1/messages",
 		strings.NewReader(`{"model":"m","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = resp.Body.Close() })
@@ -339,14 +312,16 @@ func TestMessages_AdaptedStream_PromptCacheTrailer_DrainFailure(t *testing.T) {
 	gw := responsesTestGateway(t, upstream.URL)
 	cap := captureAll(t)
 
-	gwServer := messagesBillingServer(t, gw)
+	router := chi.NewRouter()
+	gw.routes(router)
+	gwServer := httptest.NewServer(router)
+	t.Cleanup(gwServer.Close)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, gwServer.URL+"/v1/messages",
 		strings.NewReader(`{"model":"m","max_tokens":16,"stream":true,"messages":[{"role":"user","content":"hi"}]}`))
 	require.NoError(t, err)
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	resp, err := http.DefaultClient.Do(req)
 	require.NoError(t, err)
 	t.Cleanup(func() { _ = resp.Body.Close() })

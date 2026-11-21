@@ -32,10 +32,10 @@ func responsesTestGateway(t *testing.T, upstreamURL string) *gateway {
 	return &gateway{
 		cfg: cfg,
 		log: slog.Default(),
-		// Strict auth resolves the tenant from the API key exactly like the
-		// production edge (client identity headers are stripped); durable
-		// accounting binds org_id NOT NULL and refuses unattributed
-		// dispatches.
+		// Preview2: durable terminal facts require a tenant; resolve the
+		// bearer key to a test org exactly like production org-key auth
+		// so route-riding fixtures admit with a real principal (tests
+		// scripting auth faults replace this after construction).
 		auth:                 NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
 		res:                  res,
 		pool:                 upstream.NewPool(upstream.Options{}),
@@ -49,32 +49,15 @@ func responsesTestGateway(t *testing.T, upstreamURL string) *gateway {
 	}
 }
 
-// responsesBillingServer mounts /v1/responses WITHOUT the auth
-// middleware, which strips the client identity headers the durable
-// terminal facts require (post-4a1aaaa convention: goldenIdentity stands
-// in for the resolved principal).
-func responsesBillingServer(t *testing.T, gw *gateway) *httptest.Server {
-	t.Helper()
-	router := chi.NewRouter()
-	router.Post("/v1/responses", gw.responses)
-	router.Get("/v1/models", gw.listModels)
-	server := httptest.NewServer(router)
-	t.Cleanup(server.Close)
-	return server
-}
-
 func postResponses(t *testing.T, gw *gateway, body string) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/responses", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	// Handler-direct (the post-4a1aaaa convention): the auth middleware
-	// strips client-supplied identity headers, and durable terminal facts
-	// require a tenant — the golden identity stands in for the resolved
-	// principal the production resolver injects.
-	gw.responses(rec, req)
+	r := chi.NewRouter()
+	gw.routes(r)
+	r.ServeHTTP(rec, req)
 	return rec
 }
 

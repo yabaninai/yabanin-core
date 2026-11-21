@@ -89,18 +89,10 @@ func TestChatCompletions_OpenCodeCLI_RealE2E(t *testing.T) {
 	defer upstream.Close()
 
 	gw := responsesTestGateway(t, upstream.URL)
-	// The real CLI cannot send identity headers; resolve its bearer key to
-	// a test org exactly like production org-key auth so Preview2 durable
-	// accounting admits the turn.
-	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("opencode-e2e", nil))
 	gw.res = stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "m", DisplayName: "m", Provider: "openai", CreatedAt: time.Now().UTC(),
 	}}
-	// Strict auth strips client identity headers, so the tenant must come
-	// from key resolution — exactly like the production edge. Durable
-	// accounting binds org_id NOT NULL and refuses unattributed dispatches.
-	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-opencode-e2e", nil))
 
 	var sawChat atomic.Bool
 	restore := observeEvent(func(e *eventpub.Event) {
