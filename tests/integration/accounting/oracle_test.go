@@ -540,6 +540,52 @@ func (s *stand) requireWalletChargedExactlyOnce(t *testing.T, rid, orgID, phase 
 	}
 }
 
+// requireUUIDKeyedCharge asserts that a completed request's charges are
+// keyed to its ONE minted invocation UUID — exactly one signed wallet
+// debit of the independently computed fixture cost and at least one
+// settlement job under that invocation_id — and that NO duplicate charge
+// or job exists under the legacy correlation-key identity (rows keyed by
+// client request id that do not belong to this invocation). Returns the
+// invocation UUID for caller-side admission assertions.
+func (s *stand) requireUUIDKeyedCharge(t *testing.T, rid, orgID, phase string) string {
+	t.Helper()
+	rows := s.oracleAdmissions(t, rid, orgID)
+	if len(rows) != 1 {
+		t.Fatalf("%s: uuid-keyed charge: admissions for %s = %d (%s), want exactly 1 minted invocation", phase, rid, len(rows), fmtAdmissions(rows))
+	}
+	invocationID := rows[0].InvocationID
+
+	c := s.oracleUsageByInvocation(t, invocationID, orgID)
+	const wantMicro = int64(-fixtureMicroUSDCost)
+	if c.UsageRows != 1 || c.SumMicroUSD != wantMicro {
+		t.Fatalf("%s: uuid-keyed charge: invocation %s has %d usage rows summing to %d micro-USD, want exactly 1 signed debit of %d",
+			phase, invocationID, c.UsageRows, c.SumMicroUSD, wantMicro)
+	}
+	if legacy := s.oracleCount(t,
+		`SELECT count(*) FROM credit_transactions
+		 WHERE org_id = $1 AND request_id = $2 AND type = 'usage'
+		   AND invocation_id IS DISTINCT FROM $3::uuid`,
+		orgID, rid, invocationID); legacy != 0 {
+		t.Fatalf("%s: uuid-keyed charge: %d legacy correlation-keyed usage rows for %s beside invocation %s — duplicate charge identity",
+			phase, legacy, rid, invocationID)
+	}
+	if jobs := s.oracleCount(t,
+		`SELECT count(*) FROM settlement_jobs WHERE invocation_id = $1::uuid AND org_id = $2`,
+		invocationID, orgID); jobs < 1 {
+		t.Fatalf("%s: uuid-keyed charge: no settlement jobs under invocation %s for completed %s", phase, invocationID, rid)
+	}
+	if legacy := s.oracleCount(t,
+		`SELECT count(*) FROM settlement_jobs
+		 WHERE org_id = $1 AND request_id = $2
+		   AND invocation_id IS DISTINCT FROM $3::uuid`,
+		orgID, rid, invocationID); legacy != 0 {
+		t.Fatalf("%s: uuid-keyed charge: %d legacy correlation-keyed settlement jobs for %s beside invocation %s — duplicate settlement identity",
+			phase, legacy, rid, invocationID)
+	}
+	t.Logf("%s: %s charged exactly once under invocation %s, no legacy-keyed duplicates", phase, rid, invocationID)
+	return invocationID
+}
+
 // oracleUsageByInvocation counts usage transactions carrying one
 // server-minted invocation id — the invocation-scoped exact-once surface
 // that survives shared client correlation ids and event redelivery.

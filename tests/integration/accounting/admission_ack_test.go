@@ -333,6 +333,43 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
   (SELECT count(*) FROM settlement_jobs WHERE org_id=$1 AND request_id=$2) +
   (SELECT count(*) FROM credit_transactions WHERE org_id=$1 AND request_id=$2 AND type='usage')`, s.oracleDB.orgID, dropRID).Scan(&count))
 	require.Zero(t, count, "correlation-keyed jobs or charges")
+
+	// Post-control accounting recheck inside an EXPLICIT observation
+	// horizon. First wait for the consumer group to drain: every event
+	// published in this case (forwarded success, both controls — the
+	// dropped start never published) must be fully processed and
+	// acknowledged before charge conclusions are drawn; a pending entry
+	// can still redeliver. The horizon is stated, not implied by check
+	// ordering.
+	rdb := s.redisClient(t)
+	s.requireGroupDrainedWithin(t, rdb, 2*time.Minute)
+
+	// Whole provider counts across the ENTIRE case window (pre-control,
+	// forwarded success, dropped start — zero provider traffic — and
+	// post-control): no hidden re-dispatch under ANY request id, including
+	// ids the case never asserted individually.
+	require.Equal(t, fixtureTotals{3, 3, 3}, s.fixture.Snapshot(), "whole-ledger provider totals for the case")
+
+	// The forwarded request's accounting was not individually awaited
+	// above; with the group drained its billing is committed (charging
+	// precedes the ack), still bounded by an explicit horizon.
+	pollUntil(t, 3*time.Minute, "forwarded request becomes durable", func() error {
+		if s.oracleRequestLogCount(t, forwardRID, s.oracleDB.orgID) == 0 {
+			return fmt.Errorf("no request_logs row for %s yet", forwardRID)
+		}
+		return nil
+	})
+	// Charges for every completed request of this case — the forwarded
+	// target and both healthy controls — must be keyed exactly once to
+	// their minted invocation UUID, with no duplicate under the legacy
+	// correlation-key identity.
+	for _, charged := range []struct{ rid, phase string }{
+		{forwardRID, "ack forward"},
+		{s.reqPrefix + "ctl-ack-pre", "ack pre-control"},
+		{s.reqPrefix + "ctl-ack-post", "ack post-control"},
+	} {
+		s.requireUUIDKeyedCharge(t, charged.rid, s.oracleDB.orgID, charged.phase)
+	}
 }
 
 func TestAccountingAckRelayControl(t *testing.T) {

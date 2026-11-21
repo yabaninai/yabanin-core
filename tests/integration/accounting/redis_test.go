@@ -216,6 +216,33 @@ func (s *stand) requireInboxClaimsCommitted(t *testing.T, rdb *redis.Client, ids
 	t.Logf("redis: all %d replayed entries claimed in event_inbox (source=%s, consumer=%s)", len(ids), s.eventStream, group)
 }
 
+// requireGroupDrainedWithin waits, inside an EXPLICIT observation horizon,
+// until the consumer group's pending list is empty, then point-asserts the
+// drain via requireGroupDrained. Delivered-but-unfinished entries hold PEL
+// slots and can still redeliver, so charge-completeness or idempotence
+// conclusions drawn while entries are pending would be premature; the
+// horizon makes the waiting budget a stated contract instead of an
+// accident of check ordering.
+func (s *stand) requireGroupDrainedWithin(t *testing.T, rdb *redis.Client, horizon time.Duration) {
+	t.Helper()
+	pollUntil(t, horizon, fmt.Sprintf("consumer group on %s drains its pending list", s.eventStream), func() error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		groups, err := rdb.XInfoGroups(ctx, s.eventStream).Result()
+		if err != nil {
+			return fmt.Errorf("XINFO GROUPS: %w", err)
+		}
+		if len(groups) == 0 {
+			return abortf("no consumer group on %s although the consumer is running", s.eventStream)
+		}
+		if groups[0].Pending != 0 {
+			return fmt.Errorf("%d delivered-but-unacknowledged entries", groups[0].Pending)
+		}
+		return nil
+	})
+	s.requireGroupDrained(t, rdb)
+}
+
 // requireGroupDrained asserts the consumer group exists on the stand's
 // stream and has zero pending (delivered-but-unacknowledged) entries. A
 // non-zero PEL means an entry was delivered but never finished processing
