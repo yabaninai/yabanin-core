@@ -28,7 +28,7 @@ func seedRowKeyCorrelation(t *testing.T, db *pgxpool.Pool, orgID, req, model str
 	err := db.QueryRow(context.Background(),
 		`INSERT INTO request_logs (id, org_id, home_region, model_requested, model_used, status_code,
 		   duration_ms, tokens_in, tokens_out, request_id, cost_in_usd, created_at)
-		 VALUES ($1, $2, 'sg', $3, $3, 200, 10, $4, $5, $6, 0.001, $7) RETURNING id::text`,
+		 VALUES (COALESCE(NULLIF($1::bigint, 0), nextval(pg_get_serial_sequence('request_logs', 'id'))), $2, 'sg', $3, $3, 200, 10, $4, $5, $6, 0.001, $7) RETURNING id::text`,
 		explicitID, orgID, model, tokensIn, tokensOut, req, time.Now().UTC()).Scan(&idText)
 	require.NoError(t, err)
 	require.NotEmpty(t, idText)
