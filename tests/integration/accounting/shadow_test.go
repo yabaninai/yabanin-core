@@ -27,7 +27,7 @@ func TestAccountingShadowAdmission(t *testing.T) {
 	before := s.fixture.Snapshot()
 	chat := func(phase string) string {
 		rid := s.reqPrefix + "shadow-" + phase
-		status, body, err := s.chat(t, rid, 45*time.Second)
+		status, body, err := s.chatFull(t, rid, 45*time.Second, chatOptions{content: rid})
 		require.NoError(t, err)
 		require.Equal(t, http.StatusOK, status, body)
 		require.Contains(t, body, fixtureAssistantContent)
@@ -48,12 +48,18 @@ func TestAccountingShadowAdmission(t *testing.T) {
 	requireEventually(t, time.Minute, 100*time.Millisecond, func() bool {
 		return s.oracleCount(t, "SELECT CASE WHEN is_called THEN 1 ELSE 0 END FROM acc_shadow_refusals") == 1
 	}, "the detached mirror must reach its own admission barrier")
+	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1, receipts: 1}, mirror.Snapshot())
 	s.oracleExec(t, "restore mirror admission", "DROP TRIGGER acc_shadow_refuse ON request_admissions")
 	post := chat("post")
 	s.requireSettledShadowPair(t, post, model)
 	s.requireGroupDrainedWithin(t, s.redisClient(t), 2*time.Minute)
 	s.requireSettledShadowPair(t, pre, model)
+	requireEventually(t, time.Minute, 200*time.Millisecond, func() bool {
+		return s.oracleCreditTotals(t, target, s.oracleDB.orgID).UsageRows == 1
+	}, "the primary must settle despite the mirror refusal")
 	s.requireUUIDKeyedCharge(t, target, s.oracleDB.orgID, "primary while mirror refused")
+	require.Equal(t, 1, s.oracleRequestLogCount(t, target, s.oracleDB.orgID))
+	require.Equal(t, 1, s.oracleTerminalFactsCount(t, target, s.oracleDB.orgID))
 	require.Equal(t, fixtureTotals{arrivals: 3, dispatches: 3, receipts: 3}, s.fixture.Since(before))
 	require.Equal(t, fixtureTotals{arrivals: 2, dispatches: 2, receipts: 2}, mirror.Snapshot())
 	mirror.VerifyEvidence()
