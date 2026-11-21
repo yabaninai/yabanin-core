@@ -471,6 +471,26 @@ func (s *stand) ageAdmissionPastGrace(t *testing.T, rid, orgID string) {
 	t.Logf("harness: target admission for %s aged past the 15m grace window", rid)
 }
 
+// ageAdmissionByInvocationPastGrace is the invocation-precise form of
+// ageAdmissionPastGrace for cases where several admissions share one
+// client correlation id (e.g. crash + client retry): it expires exactly
+// the captured server-minted invocation, never its same-rid sibling.
+func (s *stand) ageAdmissionByInvocationPastGrace(t *testing.T, invocationID, orgID string) {
+	t.Helper()
+	res, err := s.oracleDB.db.Exec(`
+		UPDATE request_admissions SET admitted_at = now() - interval '16 minutes'
+		WHERE invocation_id = $1 AND org_id = $2 AND state = 'admitted'`,
+		invocationID, orgID)
+	if err != nil {
+		t.Fatalf("harness: age admission by invocation: %v", err)
+	}
+	n, _ := res.RowsAffected()
+	if n != 1 {
+		t.Fatalf("harness: age admission by invocation: aged %d rows for %s, want exactly 1 (the captured crashed invocation, still admitted)", n, invocationID)
+	}
+	t.Logf("harness: admission %s aged past the 15m grace window", invocationID)
+}
+
 // oracleTerminalFactsCount counts the terminal-facts projection rows for a
 // client correlation id in the given organization. The facts row is the
 // durable completion evidence the reconciler recovers from when no live

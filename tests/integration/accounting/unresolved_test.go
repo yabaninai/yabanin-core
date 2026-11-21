@@ -12,11 +12,14 @@ import (
 // but before the response is finalized must leave an EXPLICIT,
 // tenant-scoped unresolved identification — 0028 state 'unresolved' with
 // resolve_reason 'grace_elapsed_no_terminal_facts' after the grace window
-// (deterministic path: age ONLY the target's admission past grace, only
-// after the crash; never age still-live controls) — with no invented
-// usage, no wallet debit and no fabricated request_logs success. Discovery
-// through the admission row is sufficient; a request_logs row is NOT
-// forced (and if one exists it must not claim success/usage/cost).
+// (deterministic path: age ONLY the target's admission — captured by its
+// server-minted UUID at the pre-kill barrier — past grace, only after the
+// crash; never age still-live controls) — with no invented usage, no
+// wallet debit and no fabricated request_logs success. Exactly that one
+// UUID — never a duplicate mint, never a replacement — must surface as
+// the unresolved row through the restart. Discovery through the admission
+// row is sufficient; a request_logs row is NOT forced (and if one exists
+// it must not claim success/usage/cost).
 //
 // Baseline (4e9895d) truth: request_admissions does not exist — the case
 // must fail there with an explicit defect message, not pass vacuously.
@@ -52,16 +55,23 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 	// Durable start at the crash barrier: on the candidate an 'admitted'
 	// row exists BEFORE the first paid call returned; the dispatch observed
 	// above proves the paid call happened, so the admission must exist now.
+	// Exactly one admission may exist for this single HTTP invocation, and
+	// its server-minted UUID is captured here: every later assertion —
+	// grace expiry and the post-restart terminal state — is bound to this
+	// exact UUID, so a duplicate mint under the same call cannot hide
+	// behind a first-row read.
 	hasAdmissions := s.oracleTableExists(t, "request_admissions")
 	admAtBarrier := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-	if hasAdmissions && len(admAtBarrier) == 0 {
-		t.Fatalf("durable start: dispatch observed for %s but no admission row under this org", rid)
+	if hasAdmissions && len(admAtBarrier) != 1 {
+		t.Fatalf("durable start: dispatch observed for %s but admissions at barrier = %d (%s), want exactly 1", rid, len(admAtBarrier), fmtAdmissions(admAtBarrier))
 	}
+	targetUUID := ""
 	for _, a := range admAtBarrier {
 		requireAdmissionVocabulary(t, a)
 		if a.State != "admitted" {
 			t.Fatalf("durable start: admission state at barrier = %q, want 'admitted' (pre-terminal)", a.State)
 		}
+		targetUUID = a.InvocationID
 	}
 
 	// Crash: gateway only (SIGKILL), release the held response into a dead
@@ -95,37 +105,45 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 			"the start is silently lost instead of explicitly visible", rid)
 	}
 
-	// Strict unresolved: poll for state 'unresolved' with the exact contract
-	// reason. 'admitted' (stuck), 'voided' (claims proven-never-dispatched —
+	// Strict unresolved for the EXACT captured UUID: poll until precisely
+	// one admission exists under this correlation id, it is the barrier
+	// UUID, and it is 'unresolved' with the exact contract reason.
+	// 'admitted' (stuck), 'voided' (claims proven-never-dispatched —
 	// false, the fixture observed the dispatch) and 'reconciled' (claims
-	// terminal evidence that does not exist) are all explicit defects.
+	// terminal evidence that does not exist) are all explicit defects, as
+	// is any duplicate mint under the single HTTP invocation.
 	pollUntil(t, 6*time.Minute, "target admission reaches 'unresolved'", func() error {
 		rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-		if len(rows) == 0 {
+		switch {
+		case len(rows) == 0:
 			return errTransient("no admission rows after restart")
+		case len(rows) > 1:
+			return abortf("duplicate admissions minted under one HTTP invocation: %s (captured UUID %s)", fmtAdmissions(rows), targetUUID)
 		}
-		for _, a := range rows {
-			requireAdmissionVocabulary(t, a)
-			switch a.State {
-			case "unresolved":
-				if !a.ResolveReason.Valid || a.ResolveReason.String != reasonGraceElapsed {
-					return abortf("unresolved with wrong resolve_reason: %s", fmtAdmissions(rows))
-				}
-				if !a.ResolvedAt.Valid {
-					return abortf("unresolved without resolved_at: %s", fmtAdmissions(rows))
-				}
-				return nil
-			case "admitted":
-				return errTransient("still admitted (reconciler sweep has not run or grace not honored): " + fmtAdmissions(rows))
-			case "voided":
-				return abortf("voided claims proven-never-dispatched, but the fixture observed the dispatch: %s", fmtAdmissions(rows))
-			case "reconciled":
-				return abortf("reconciled claims terminal evidence that does not exist: %s", fmtAdmissions(rows))
+		a := rows[0]
+		if a.InvocationID != targetUUID {
+			return abortf("admission UUID changed across the restart: barrier %s, now %s", targetUUID, a.InvocationID)
+		}
+		requireAdmissionVocabulary(t, a)
+		switch a.State {
+		case "unresolved":
+			if !a.ResolveReason.Valid || a.ResolveReason.String != reasonGraceElapsed {
+				return abortf("unresolved with wrong resolve_reason: %s", fmtAdmissions(rows))
 			}
+			if !a.ResolvedAt.Valid {
+				return abortf("unresolved without resolved_at: %s", fmtAdmissions(rows))
+			}
+			return nil
+		case "admitted":
+			return errTransient("still admitted (reconciler sweep has not run or grace not honored): " + fmtAdmissions(rows))
+		case "voided":
+			return abortf("voided claims proven-never-dispatched, but the fixture observed the dispatch: %s", fmtAdmissions(rows))
+		case "reconciled":
+			return abortf("reconciled claims terminal evidence that does not exist: %s", fmtAdmissions(rows))
 		}
-		return errTransient("no admission reached a grace-terminal state: " + fmtAdmissions(rows))
+		return errTransient("no terminal state recognized: " + fmtAdmissions(rows))
 	})
-	t.Logf("target: admission reached 'unresolved' with reason %s", reasonGraceElapsed)
+	t.Logf("target: admission %s reached 'unresolved' with reason %s", targetUUID, reasonGraceElapsed)
 
 	// No invented usage, no wallet debit, no fabricated request_logs claim.
 	s.requireNoWalletDebit(t, rid, s.oracleDB.orgID, "unresolved")
