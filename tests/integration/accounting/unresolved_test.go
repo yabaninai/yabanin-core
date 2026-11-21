@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestAccountingUnresolvedAfterGraceNoFacts: crash after the paid dispatch
@@ -45,64 +47,8 @@ func TestAccountingUnresolvedAfterGraceNoFacts(t *testing.T) {
 
 	rid := s.reqPrefix + "tgt-unresolved"
 	before := s.fixture.Snapshot()
-	s.fixture.Hold(rid)
-
-	type chatResult struct {
-		status int
-		body   string
-		err    error
-	}
-	clientDone := make(chan chatResult, 1)
-	go func() {
-		status, body, err := s.chat(t, rid, 60*time.Second)
-		clientDone <- chatResult{status: status, body: body, err: err}
-	}()
-
-	if !s.fixture.WaitForDispatch(rid, 20*time.Second) {
-		t.Fatalf("target: provider dispatch never happened (fixture hold gates AFTER arrival recording but BEFORE dispatch; hold released at kill)")
-	}
-	if arr, disp, _ := s.fixture.Counts(rid); arr != 1 || disp != 1 {
-		t.Fatalf("target: fixture arr/disp = %d/%d, want 1/1 before crash", arr, disp)
-	}
-
-	// Durable start at the crash barrier: on the candidate an 'admitted'
-	// row exists BEFORE the first paid call returned; the dispatch observed
-	// above proves the paid call happened, so the admission must exist now.
-	// Exactly one admission may exist for this single HTTP invocation, and
-	// its server-minted UUID is captured here: every later assertion —
-	// grace expiry and the post-restart terminal state — is bound to this
-	// exact UUID, so a duplicate mint under the same call cannot hide
-	// behind a first-row read.
-	admAtBarrier := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-	if hasAdmissions && len(admAtBarrier) != 1 {
-		t.Fatalf("durable start: dispatch observed for %s but admissions at barrier = %d (%s), want exactly 1", rid, len(admAtBarrier), fmtAdmissions(admAtBarrier))
-	}
-	targetUUID := ""
-	for _, a := range admAtBarrier {
-		requireAdmissionVocabulary(t, a)
-		if a.State != "admitted" {
-			t.Fatalf("durable start: admission state at barrier = %q, want 'admitted' (pre-terminal)", a.State)
-		}
-		targetUUID = a.InvocationID
-	}
-
-	// Crash: gateway only (SIGKILL), release the held response into a dead
-	// client path. The dispatch stands; the receipt never lands (the dead
-	// gateway cannot receive the provider's bytes).
-	s.killGatewaySIGKILL()
-	s.fixture.ReleaseAll()
-	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 0 {
-		t.Fatalf("target: ledger after crash arr/disp/recv = %d/%d/%d, want 1/1/0 (dispatch stands, client gone)", delta.arrivals, delta.dispatches, delta.receipts)
-	}
-	select {
-	case r := <-clientDone:
-		if r.err == nil && r.status == httpOK {
-			t.Fatalf("target: client received a successful completion (%d) although the gateway died mid-flight", r.status)
-		}
-		t.Logf("target: client observed the crash (status=%d err=%v)", r.status, r.err)
-	case <-time.After(10 * time.Second):
-		t.Fatalf("target: client request did not terminate after the gateway was killed")
-	}
+	targetUUID := s.crashHeldChat(t, rid, chatOptions{}, 60*time.Second)
+	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1}, s.fixture.Since(before))
 
 	// Deterministic grace expiry (after the crash, target-only).
 	if hasAdmissions {
@@ -222,3 +168,36 @@ func (s *stand) requireUnresolvedEvidence(t *testing.T, rid string, balanceBefor
 
 // errTransient wraps a not-yet state for pollUntil (opposite of abortf).
 func errTransient(msg string) error { return fmt.Errorf("poll: %s", msg) }
+
+// crashHeldChat kills the gateway after one provider dispatch and before the
+// provider returns. Any candidate admission must already exist at this barrier.
+func (s *stand) crashHeldChat(t *testing.T, rid string, opts chatOptions, timeout time.Duration) string {
+	t.Helper()
+	s.fixture.Hold(rid)
+	type outcome struct {
+		status int
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() { status, _, err := s.chatFull(t, rid, timeout, opts); done <- outcome{status, err} }()
+	require.True(t, s.fixture.WaitForDispatch(rid, 20*time.Second), "missing provider dispatch")
+	a, d, r := s.fixture.Counts(rid)
+	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1}, fixtureTotals{arrivals: a, dispatches: d, receipts: r})
+	id := ""
+	if s.oracleTableExists(t, "request_admissions") {
+		rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
+		require.Len(t, rows, 1)
+		require.Equal(t, "admitted", rows[0].State)
+		id = rows[0].InvocationID
+		require.NotEmpty(t, id)
+	}
+	s.killGatewaySIGKILL()
+	s.fixture.ReleaseAll()
+	select {
+	case o := <-done:
+		require.False(t, o.err == nil && o.status == httpOK, "client received a successful response after the crash")
+	case <-time.After(10 * time.Second):
+		t.Fatal("client request did not terminate after gateway crash")
+	}
+	return id
+}
