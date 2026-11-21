@@ -55,6 +55,8 @@ func shadowTestGateway(t *testing.T, primaryURL, shadowURL string) *gateway {
 		t.Fatalf("shadow config: %v", err)
 	}
 	gw := &gateway{
+		// Explicit invocation store, the scripted shadow double (embeds
+		// fakeInvocationStore; see streamTestGateway for the plain one).
 		invocations: &shadowAccountingFixture{},
 		cfg:         cfg,
 		pool:        upstream.NewPool(upstream.Options{BaseURL: primaryURL}),
@@ -62,8 +64,6 @@ func shadowTestGateway(t *testing.T, primaryURL, shadowURL string) *gateway {
 		retryPolicy: retry.Policy{MaxAttempts: 1},
 		log:         slog.Default(),
 		shadow:      shadow.NewDispatcher(vcfg, slog.Default()),
-		// Explicit in-memory invocation store (see streamTestGateway).
-		invocations: &fakeInvocationStore{},
 	}
 	// No DB in tests: pin check via closure.
 	gw.shadow.SetPinnedOrgFunc(func(ctx context.Context, orgID string) bool {
