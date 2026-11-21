@@ -82,7 +82,7 @@ func TestRun_FailureBoundariesOnFreshDB(t *testing.T) {
 	up, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "fresh-DB baseline apply must succeed")
 	require.Equal(t, 1, up.Applied)
-	require.Equal(t, int64(27), up.Version)
+	require.Equal(t, int64(29), up.Version)
 
 	// --- 3) Role bootstrap (deploy layer, mirrors
 	// deploy/quickstart/bootstrap-app-role.sql) + seed insert as the
@@ -114,30 +114,30 @@ func TestRun_FailureBoundariesOnFreshDB(t *testing.T) {
 	// --- 4) Repeat operation: a second migrate is a no-op success.
 	repeat, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "re-running migrate must be a no-op success")
-	require.Equal(t, int64(27), repeat.Version)
+	require.Equal(t, int64(29), repeat.Version)
 
 	// --- 5) Interruption: dirty schema_migrations (crashed mid-migration).
 	_, err = ownerPool.Exec(ctx, `UPDATE schema_migrations SET dirty = true`)
 	require.NoError(t, err)
 	_, err = Run(ctx, connStr, "sg")
 	require.Error(t, err, "migrate must fail loudly on a dirty database")
-	require.Contains(t, err.Error(), "Dirty database version 27")
+	require.Contains(t, err.Error(), "Dirty database version 29")
 	var dirty bool
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT dirty FROM schema_migrations`).Scan(&dirty))
 	require.True(t, dirty, "a failed attempt must not auto-heal the dirty flag")
 	_, err = Run(ctx, connStr, "sg")
 	require.Error(t, err, "a second attempt must fail identically (no partial success)")
-	require.Contains(t, err.Error(), "Dirty database version 27")
+	require.Contains(t, err.Error(), "Dirty database version 29")
 	// Recovery is explicit: the operator resolves the state, not the tool.
 	_, err = ownerPool.Exec(ctx, `UPDATE schema_migrations SET dirty = false`)
 	require.NoError(t, err)
 	recovered, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "after explicit resolution migrate succeeds again")
-	require.Equal(t, int64(27), recovered.Version)
+	require.Equal(t, int64(29), recovered.Version)
 
 	// --- 6) Pre-squash stand: recorded version 23 is absent from the
-	// embedded set (head is 27; 0023 is the permanently-unused released
+	// embedded set (head is 29; 0023 is the permanently-unused released
 	// slot; 0023 alone is a reserved gap; 0022 is present via e02p01a,
 	// 0024 via e03p01b and 0025 via e04p01a).
 	// Up and Down
@@ -161,11 +161,11 @@ func TestRun_FailureBoundariesOnFreshDB(t *testing.T) {
 	// Explicit operator resolution: stamp the head version the stand's
 	// schema actually converged to (the forged-23 record was the only lie;
 	// the schema is at the head) — a no-op success, never auto-healed.
-	_, err = ownerPool.Exec(ctx, `UPDATE schema_migrations SET version = 27`)
+	_, err = ownerPool.Exec(ctx, `UPDATE schema_migrations SET version = 29`)
 	require.NoError(t, err)
 	stamped, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "after the explicit stamp the stand is a no-op success")
-	require.Equal(t, int64(27), stamped.Version)
+	require.Equal(t, int64(29), stamped.Version)
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT v FROM canary_r059_boundary`).Scan(&canary))
 	require.Equal(t, 42, canary, "stamping + no-op migrate must leave data untouched")
