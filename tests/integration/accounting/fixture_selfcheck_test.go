@@ -8,6 +8,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -100,10 +101,33 @@ func TestFixtureSelfCheck(t *testing.T) {
 		t.Fatalf("fixture self-check: completed request counts arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1", a, d, r)
 	}
 
+	// The streamed delivery mode must produce the same fixed completion
+	// shape and the same ledger semantics (receipt only after the final
+	// frame reaches the client), so both modes back comparable verdicts.
+	srid := "unit-streamed"
+	beforeStream := f.Snapshot()
+	status, body, err = httpPostJSON(5*time.Second, f.baseURL()+"/v1/chat/completions",
+		"unit-token", srid, `{"model":"m","stream":true,"messages":[{"role":"user","content":"x"}]}`)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("fixture self-check: streamed request status=%d err=%v body=%q, want 200", status, err, body)
+	}
+	for _, want := range []string{
+		"delta", fixtureAssistantContent, `"finish_reason":"stop"`,
+		`"prompt_tokens":` + strconv.Itoa(fixturePromptTokens), `data: [DONE]`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Fatalf("fixture self-check: streamed body missing %q: %s", want, body)
+		}
+	}
+	if delta := f.Since(beforeStream); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
+		t.Fatalf("fixture self-check: streamed delta arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1",
+			delta.arrivals, delta.dispatches, delta.receipts)
+	}
+
 	// Snapshot/delta math must be exact across the whole history.
 	total := f.Snapshot()
-	if total.arrivals != 2 || total.dispatches != 1 || total.receipts != 1 {
-		t.Fatalf("fixture self-check: total ledger %d/%d/%d, want 2/1/1", total.arrivals, total.dispatches, total.receipts)
+	if total.arrivals != 3 || total.dispatches != 2 || total.receipts != 2 {
+		t.Fatalf("fixture self-check: total ledger %d/%d/%d, want 3/2/2", total.arrivals, total.dispatches, total.receipts)
 	}
 	if delta := f.Since(total); delta.arrivals != 0 || delta.dispatches != 0 || delta.receipts != 0 {
 		t.Fatalf("fixture self-check: delta against the current snapshot must be zero, got %d/%d/%d",
@@ -113,7 +137,7 @@ func TestFixtureSelfCheck(t *testing.T) {
 	// Evidence files must mirror the oracle state line for line and be
 	// valid records.
 	f.VerifyEvidence()
-	wantLines := map[string]int{"arrivals": 2, "dispatches": 1, "receipts": 1}
+	wantLines := map[string]int{"arrivals": 3, "dispatches": 2, "receipts": 2}
 	for name, want := range wantLines {
 		data, err := os.ReadFile(filepath.Join(dir, "fixture-ledgers", name+".jsonl"))
 		if err != nil {

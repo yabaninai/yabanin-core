@@ -5,6 +5,7 @@ package accounting
 import (
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"fmt"
@@ -81,6 +82,25 @@ type stand struct {
 	orgName    string
 	model      string
 
+	// Per-run Redis stream name, for the event-redelivery and
+	// facts-recovery cases that must inspect or manipulate the stand's
+	// event traffic.
+	eventStream string
+
+	// orgB is the second, independently seeded tenant for cross-tenant
+	// scoping cases. Zero until seedSecondOrg provisions it.
+	orgB standOrg
+
+	// Owner-login seed environment (redis + shared encryption key),
+	// retained so seedSecondOrg can run the same controlled-elevation
+	// seed path after startStand.
+	ownerSeedEnv []string
+	// upstreamKeyFile is the fixture bearer token file passed to seed.
+	upstreamKeyFile string
+
+	// procSeq disambiguates process log files across restarts.
+	procSeq int
+
 	// Operator-installed per-million rates for the seeded model. Billed
 	// rows are validated against these known inputs and the fixture's
 	// fixed usage, never against gateway-reported values.
@@ -95,6 +115,13 @@ type stand struct {
 
 	gatewayEnv []string
 	loggerdEnv []string
+}
+
+// standOrg is one seeded tenant identity used by the stand.
+type standOrg struct {
+	name   string
+	orgID  string
+	apiKey string
 }
 
 // newRunID mints a collision-free run identifier.
@@ -236,6 +263,12 @@ func startStand(t *testing.T) *stand {
 		t.Fatalf("harness: build product binary: %v\n%s", err, out)
 	}
 
+	// Artifact evidence: the built binary is a genuine CLI that starts on
+	// its own — the license surface deliberately runs before any service
+	// config exists, so this check needs no database, Redis or config
+	// file — and its hash is retained as run evidence.
+	s.verifyCLIArtifact(t)
+
 	// Controllable provider fixture and its bearer token.
 	tokRaw := make([]byte, 18)
 	if _, err := rand.Read(tokRaw[:]); err != nil {
@@ -306,14 +339,7 @@ func startStand(t *testing.T) *stand {
 	if err != nil {
 		t.Fatalf("harness: seed: %v\n%s", err, seedOut)
 	}
-	for _, line := range strings.Split(string(seedOut), "\n") {
-		if strings.HasPrefix(line, "API key (shown once, store it now): ") {
-			s.apiKey = strings.TrimPrefix(line, "API key (shown once, store it now): ")
-		}
-	}
-	if s.apiKey == "" {
-		t.Fatalf("harness: seed output did not contain the API key:\n%s", seedOut)
-	}
+	s.apiKey = parseSeedAPIKey(t, seedOut)
 
 	// Bind the oracle to this stand's organization (after seed) and
 	// install the operator-known rates for the seeded model.
@@ -323,8 +349,24 @@ func startStand(t *testing.T) *stand {
 		 VALUES ('openai-compat', $1, $2, $3, 'manual')`,
 		s.model, s.pricingInputPerM, s.pricingOutputPerM)
 
+	// Zero-markup resale provisioning. reseller_pricing defaults to a 15%
+	// markup, which would make the wallet debit model-dependent
+	// (32 micro-USD * 1.15). An explicit zero-markup row for this org+model
+	// makes resale == base cost, so the independently expected debit stays
+	// exactly 32 micro-USD. Installed before the gateway starts so the
+	// pricer's override cache can never hold a stale pre-provisioning
+	// value.
+	s.oracleExec(t, "install zero-markup resale pricing",
+		`INSERT INTO reseller_pricing (org_id, model_name, markup_pct, active)
+		 VALUES ($1, $2, 0, true)`, s.oracleDB.orgID, s.model)
+
+	// Retain the controlled-elevation seed inputs so seedSecondOrg can run
+	// the identical path for the neighbor tenant.
+	s.ownerSeedEnv = ownerEnv
+	s.upstreamKeyFile = keyFile
+
 	// Run-unique Redis stream so this stand's event traffic is isolated.
-	stream := "events:" + s.runID
+	s.eventStream = "events:" + s.runID
 	gwPort := freePort(t)
 	ldPort := freePort(t)
 	s.gatewayURL = fmt.Sprintf("http://127.0.0.1:%d", gwPort)
@@ -332,14 +374,14 @@ func startStand(t *testing.T) *stand {
 		"YABANIN_GATEWAY_LISTEN=127.0.0.1:" + fmt.Sprint(gwPort),
 		"YABANIN_AUTH_MODE=header",
 		"YABANIN_PROVIDER_ADDR=" + s.fixture.baseURL(),
-		"YABANIN_EVENT_STREAM=" + stream,
+		"YABANIN_EVENT_STREAM=" + s.eventStream,
 		"YABANIN_CACHE_HMAC_SECRET=" + hex.EncodeToString(keyRaw),
 		"YABANIN_LOG_LEVEL=info",
 		"YABANIN_LOG_FORMAT=text",
 	}, appEnv...)
 	s.loggerdEnv = append([]string{
 		"YABANIN_LOGGERD_LISTEN=127.0.0.1:" + fmt.Sprint(ldPort),
-		"YABANIN_LOGGERD_STREAM=" + stream,
+		"YABANIN_LOGGERD_STREAM=" + s.eventStream,
 		"YABANIN_LOGGERD_LOG_LEVEL=info",
 	}, appEnv...)
 
@@ -450,10 +492,34 @@ func (s *stand) startLoggerd() {
 	if s.loggerdCmd != nil {
 		s.t.Fatal("harness: loggerd already running")
 	}
-	logFile := filepath.Join(s.tempDir, "loggerd.log")
+	s.procSeq++
+	logFile := filepath.Join(s.tempDir, fmt.Sprintf("loggerd-%d.log", s.procSeq))
 	s.loggerdCmd = s.spawn("loggerd", s.loggerdEnv, logFile)
 	t := s.t
 	t.Cleanup(func() { s.stopProc("loggerd", s.loggerdCmd) })
+}
+
+// stopLoggerd terminates the consumer process, leaving PostgreSQL, Redis,
+// the gateway and the provider running. Used by the consumer-outage and
+// facts-recovery cases.
+func (s *stand) stopLoggerd() {
+	s.t.Helper()
+	if s.loggerdCmd == nil {
+		return
+	}
+	s.stopProc("loggerd", s.loggerdCmd)
+	s.loggerdCmd = nil
+	s.t.Logf("harness: loggerd stopped; gateway, storage and provider untouched")
+}
+
+// restartLoggerd starts a fresh consumer process against the same storage
+// and stream.
+func (s *stand) restartLoggerd() {
+	s.t.Helper()
+	if s.loggerdCmd != nil {
+		s.t.Fatal("harness: loggerd still running")
+	}
+	s.startLoggerd()
 }
 
 // startGateway launches the gateway process, registers its cleanup, and
@@ -463,7 +529,8 @@ func (s *stand) startGateway() {
 	if s.gatewayCmd != nil {
 		s.t.Fatal("harness: gateway already running")
 	}
-	logFile := filepath.Join(s.tempDir, "gateway.log")
+	s.procSeq++
+	logFile := filepath.Join(s.tempDir, fmt.Sprintf("gateway-%d.log", s.procSeq))
 	s.gatewayCmd = s.spawn("gateway", s.gatewayEnv, logFile)
 	t := s.t
 	t.Cleanup(func() { s.stopProc("gateway", s.gatewayCmd) })
@@ -572,13 +639,112 @@ func (s *stand) restartGateway() {
 	s.startGateway()
 }
 
+// verifyCLIArtifact proves the built artifact is a genuine, startable CLI
+// without any container, database or config file (the license subcommand
+// tree deliberately executes before service configuration is loaded), and
+// retains the binary's source hash as run evidence.
+func (s *stand) verifyCLIArtifact(t *testing.T) {
+	t.Helper()
+	out, err := exec.Command(s.binary, "license", "--help").CombinedOutput()
+	if err != nil {
+		t.Fatalf("harness: artifact smoke (license --help, no containers/config needed): %v\n%s", err, out)
+	}
+	if !strings.Contains(strings.ToLower(string(out)), "license") {
+		t.Fatalf("harness: artifact help output does not mention the license surface:\n%s", out)
+	}
+	data, err := os.ReadFile(s.binary)
+	if err != nil {
+		t.Fatalf("harness: read artifact for hashing: %v", err)
+	}
+	sum := fmt.Sprintf("%x", sha256.Sum256(data))
+	evPath := filepath.Join(s.tempDir, "artifact-sha256.txt")
+	if err := os.WriteFile(evPath, []byte(sum+"\n"), 0o640); err != nil {
+		t.Fatalf("harness: write artifact hash evidence: %v", err)
+	}
+	t.Logf("harness: artifact verified (license --help ok), yabanin sha256 %s (%s)", sum, evPath)
+}
+
+// parseSeedAPIKey extracts the once-shown API key plaintext from seed
+// output.
+func parseSeedAPIKey(t *testing.T, out []byte) string {
+	t.Helper()
+	for _, line := range strings.Split(string(out), "\n") {
+		if strings.HasPrefix(line, "API key (shown once, store it now): ") {
+			return strings.TrimPrefix(line, "API key (shown once, store it now): ")
+		}
+	}
+	t.Fatalf("harness: seed output did not contain the API key:\n%s", out)
+	return ""
+}
+
+// seedSecondOrg provisions the neighbor tenant for cross-tenant scoping
+// cases through the same controlled-elevation seed path as the primary
+// org: a fresh slug (new organization, team, wallet and API key), a
+// distinct admin, the same globally registered model, and its own
+// zero-markup resale row.
+func (s *stand) seedSecondOrg(t *testing.T) {
+	t.Helper()
+	if s.orgB.apiKey != "" {
+		return
+	}
+	name := "acc-org-b-" + s.runID
+	stdin := strings.NewReader("acc-admin-password-b-" + s.runID + "\n")
+	out, err := s.runCmd(120*time.Second, s.ownerSeedEnv, stdin,
+		"seed", "--profile", "provider",
+		"--admin-email", "admin-b@"+s.runID+".test",
+		"--admin-password-stdin",
+		"--upstream-url", s.fixture.baseURL(),
+		"--upstream-key-file", s.upstreamKeyFile,
+		"--model", s.model,
+		"--org-name", name,
+	)
+	if err != nil {
+		t.Fatalf("harness: seed second org: %v\n%s", err, out)
+	}
+	s.orgB.name = name
+	s.orgB.apiKey = parseSeedAPIKey(t, out)
+	if s.orgB.apiKey == s.apiKey {
+		t.Fatalf("harness: second seed returned the primary org's API key")
+	}
+	if err := s.oracleDB.db.QueryRow(`SELECT id::text FROM organizations WHERE name = $1`, name).Scan(&s.orgB.orgID); err != nil {
+		t.Fatalf("harness: second org lookup: %v", err)
+	}
+	s.oracleExec(t, "install zero-markup resale pricing for second org",
+		`INSERT INTO reseller_pricing (org_id, model_name, markup_pct, active)
+		 VALUES ($1, $2, 0, true)`, s.orgB.orgID, s.model)
+	t.Logf("harness: second org seeded (org %s)", s.orgB.orgID)
+}
+
+// chatOptions varies one client invocation. The zero value is the same
+// buffered probe the original cases used.
+type chatOptions struct {
+	stream  bool   // request SSE streaming delivery
+	content string // distinct request bodies prevent any content dedup
+	apiKey  string // tenant whose credentials send the request
+}
+
+// chatFull sends one authenticated chat completion with explicit options.
+func (s *stand) chatFull(t *testing.T, rid string, timeout time.Duration, opts chatOptions) (status int, body string, err error) {
+	t.Helper()
+	content := opts.content
+	if content == "" {
+		content = "accounting acceptance probe"
+	}
+	apiKey := opts.apiKey
+	if apiKey == "" {
+		apiKey = s.apiKey
+	}
+	payload := fmt.Sprintf(`{"model":%q,"stream":%t,"messages":[{"role":"user","content":%q}]}`,
+		s.model, opts.stream, content)
+	return httpPostJSON(timeout, s.gatewayURL+"/v1/chat/completions", apiKey, rid, payload)
+}
+
 // chat sends one authenticated chat completion through the gateway. The
 // request id is run-namespaced for ledger/database filtering; window-level
 // provider-contact detection uses whole-ledger totals, not this id.
 func (s *stand) chat(t *testing.T, rid string, timeout time.Duration) (status int, body string, err error) {
 	t.Helper()
-	payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":"accounting acceptance probe"}]}`, s.model)
-	return httpPostJSON(timeout, s.gatewayURL+"/v1/chat/completions", s.apiKey, rid, payload)
+	return s.chatFull(t, rid, timeout, chatOptions{})
 }
 
 // controlRequest issues a healthy control request through the same
@@ -608,9 +774,9 @@ func (s *stand) controlRequest(t *testing.T, label string) {
 			label, delta.arrivals, delta.dispatches, delta.receipts, a, d, r)
 	}
 	requireEventually(t, 60*time.Second, 500*time.Millisecond, func() bool {
-		return s.oracleRequestLogCount(t, rid) == 1
+		return s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 1
 	}, "harness: control request %s never became durable in request_logs", label)
-	s.requireBilledRow(t, rid, "harness: control "+label)
+	s.requireBilledRow(t, rid, s.oracleDB.orgID, "harness: control "+label)
 	t.Logf("harness: control %s ok (request id %s)", label, rid)
 }
 

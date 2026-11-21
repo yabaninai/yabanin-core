@@ -22,6 +22,13 @@ const (
 	fixturePromptTokens     = 7
 	fixtureCompletionTokens = 3
 	fixtureAssistantContent = "fixture reply"
+
+	// fixtureMicroUSDCost is the independently computed micro-USD cost of
+	// one fixture completion under the harness's operator-installed rates
+	// (2.0/6.0 per M): 7*2 + 3*6 = 32. With the harness's explicit
+	// zero-markup resale provisioning, the wallet debit equals this value
+	// (signed negative), not a marked-up retail price.
+	fixtureMicroUSDCost = 7*2 + 3*6
 )
 
 // fixtureRecord is one ledger entry. Arrival entries are written for every
@@ -138,6 +145,7 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 
 	var body struct {
 		Model    string `json:"model"`
+		Stream   bool   `json:"stream"`
 		Messages []struct {
 			Role    string `json:"role"`
 			Content string `json:"content"`
@@ -154,6 +162,11 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	// response withheld until release.
 	if ch := f.holdChan(rid); ch != nil {
 		<-ch
+	}
+
+	if body.Stream {
+		f.serveStream(w, rid, body.Model, r.URL.Path)
+		return
 	}
 
 	resp := map[string]any{
@@ -181,6 +194,49 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.append("receipts", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: true})
+}
+
+// serveStream delivers the same fixed completion as server-sent-events
+// chunks, mirroring an openai-compat streaming response: a role frame, the
+// content frame, a terminal chunk carrying the usage object, then the
+// [DONE] sentinel. The receipt ledger entry is appended only after every
+// frame has been written successfully, exactly like the buffered path —
+// the ledgers remain comparable across delivery modes.
+func (f *fixture) serveStream(w http.ResponseWriter, rid, model, path string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		streamFrame(map[string]any{"id": "chatcmpl-fixture-" + rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}, "finish_reason": nil}}}),
+		streamFrame(map[string]any{"id": "chatcmpl-fixture-" + rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": fixtureAssistantContent}, "finish_reason": nil}}}),
+		streamFrame(map[string]any{"id": "chatcmpl-fixture-" + rid, "object": "chat.completion.chunk", "created": time.Now().Unix(), "model": model,
+			"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+			"usage": map[string]any{
+				"prompt_tokens":     fixturePromptTokens,
+				"completion_tokens": fixtureCompletionTokens,
+				"total_tokens":      fixturePromptTokens + fixtureCompletionTokens,
+			}}),
+		"data: [DONE]\n\n",
+	}
+	for _, frame := range frames {
+		if _, err := w.Write([]byte(frame)); err != nil {
+			f.t.Logf("fixture: stream write failed for %s (client gone): %v", rid, err)
+			return
+		}
+		flusher.Flush()
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// streamFrame encodes one SSE data frame from a JSON payload.
+func streamFrame(payload any) string {
+	data, _ := json.Marshal(payload)
+	return "data: " + string(data) + "\n\n"
 }
 
 // holdChan returns the release channel when the request is held.

@@ -93,13 +93,13 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	// Storage oracle: the attempt must be discoverable after recovery —
 	// exactly one durable row for the request, bound to this stand's org.
 	requireEventually(t, 90*time.Second, 500*time.Millisecond, func() bool {
-		return s.oracleRequestLogCount(t, rid) == 1
+		return s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 1
 	}, "product: recovery case: the crashed request %s is not discoverable in request_logs after gateway restart (rows=%d, admission rows=%d)",
-		rid, s.oracleRequestLogCount(t, rid), s.oracleAdmissionRowCount(t, rid))
-	if n := s.oracleRequestLogCount(t, rid); n != 1 {
+		rid, s.oracleRequestLogCount(t, rid, s.oracleDB.orgID), s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID))
+	if n := s.oracleRequestLogCount(t, rid, s.oracleDB.orgID); n != 1 {
 		t.Fatalf("product: recovery case: request_logs rows for %s = %d, want exactly 1 (duplicate accounting)", rid, n)
 	}
-	if n := s.oracleAdmissionRowCount(t, rid); n > 1 {
+	if n := s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID); n > 1 {
 		t.Fatalf("product: recovery case: %d admission rows for %s, want at most 1 (duplicate accounting)", n, rid)
 	}
 
@@ -111,20 +111,23 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	s.requireUnresolvedDurableState(t, rid, "after restart")
 
 	// No duplicate charge: at most one usage transaction and one
-	// settlement job, and a present usage amount must match the
-	// independently known fixture billing.
-	credits := s.oracleCreditTotals(t, rid)
+	// settlement job; a present usage transaction must be the signed
+	// wallet debit of the independently known fixture billing — the crash
+	// response was never delivered, so under the candidate contract the
+	// charge may legitimately never have been taken (0 rows) or have been
+	// taken exactly once as a signed -32 micro-USD debit.
+	credits := s.oracleCreditTotals(t, rid, s.oracleDB.orgID)
 	switch {
 	case credits.UsageRows > 1:
 		t.Fatalf("product: recovery case: %d usage transactions for %s, want at most 1 (duplicate charge)", credits.UsageRows, rid)
 	case credits.UsageRows == 1:
-		const expectedMicroUSD = int64(32) // 7 tokens @ $2/M + 3 @ $6/M
+		const expectedMicroUSD = int64(-fixtureMicroUSDCost) // signed wallet debit: 7 @ $2/M + 3 @ $6/M under zero markup
 		if credits.SumMicroUSD != expectedMicroUSD {
-			t.Errorf("product: recovery case: usage transaction for %s bills %d micro-USD, independently computed %d",
+			t.Errorf("product: recovery case: usage transaction for %s bills %d micro-USD, independently computed the signed debit %d",
 				rid, credits.SumMicroUSD, expectedMicroUSD)
 		}
 	}
-	if jobs := s.oracleSettlementJobs(t, rid); jobs > 1 {
+	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs > 1 {
 		t.Fatalf("product: recovery case: %d settlement jobs for %s, want at most 1", jobs, rid)
 	}
 
@@ -142,11 +145,11 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 // start.
 func (s *stand) requireDurableStartAtBarrier(t *testing.T, rid string) {
 	t.Helper()
-	if state, ok := s.oracleAdmissionState(t, rid); ok {
+	if state, ok := s.oracleAdmissionState(t, rid, s.oracleDB.orgID); ok {
 		t.Logf("product: recovery case: durable start at barrier via request_admissions (state=%q)", state)
 		return
 	}
-	if row, ok := s.oracleRequestRow(t, rid); ok {
+	if row, ok := s.oracleRequestRow(t, rid, s.oracleDB.orgID); ok {
 		if row.OrgID != s.oracleDB.orgID {
 			t.Fatalf("product: recovery case: barrier row for %s is bound to org %s, not this stand's org", rid, row.OrgID)
 		}
@@ -167,7 +170,7 @@ func (s *stand) requireDurableStartAtBarrier(t *testing.T, rid string) {
 // through; the actual observed values are logged as evidence.
 func (s *stand) requireUnresolvedDurableState(t *testing.T, rid, phase string) {
 	t.Helper()
-	row, ok := s.oracleRequestRow(t, rid)
+	row, ok := s.oracleRequestRow(t, rid, s.oracleDB.orgID)
 	if !ok {
 		t.Fatalf("%s: recovery case: no request_logs row for %s to examine", phase, rid)
 	}
@@ -178,7 +181,7 @@ func (s *stand) requireUnresolvedDurableState(t *testing.T, rid, phase string) {
 		t.Fatalf("%s: recovery case: request_logs row for %s claims a 200 completion although the provider response was never delivered back — unresolved usage was fabricated as success (receipts for this request: 0)", phase, rid)
 	}
 	t.Logf("product: recovery case: %s: unresolved usage positively persisted (status=%d, error=%q)", phase, row.Status, row.Err.String)
-	if state, ok := s.oracleAdmissionState(t, rid); ok {
+	if state, ok := s.oracleAdmissionState(t, rid, s.oracleDB.orgID); ok {
 		if isSuccessState(state) {
 			t.Fatalf("%s: recovery case: admission state for %s is %q — claims completion although the provider response was never delivered back", phase, rid, state)
 		}

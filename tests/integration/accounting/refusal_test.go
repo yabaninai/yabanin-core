@@ -74,16 +74,16 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	// Independent storage oracle: nothing was recorded or charged for the
 	// refused request (org-bound queries; cross-org rows cannot satisfy
 	// them).
-	if n := s.oracleRequestLogCount(t, rid); n != 0 {
+	if n := s.oracleRequestLogCount(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d request_logs row(s) exist for the refused request", n)
 	}
-	if c := s.oracleCreditTotals(t, rid); c.UsageRows+c.TopupRows != 0 {
+	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows+c.TopupRows != 0 {
 		t.Fatalf("product: refusal case: credit transactions exist for the refused request (%+v)", c)
 	}
-	if n := s.oracleSettlementJobs(t, rid); n != 0 {
+	if n := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d settlement job(s) exist for the refused request", n)
 	}
-	if n := s.oracleAdmissionRowCount(t, rid); n != 0 {
+	if n := s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d admission row(s) exist for the refused request", n)
 	}
 
@@ -94,10 +94,10 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	s.controlRequest(t, "post-fault")
 
 	// The refused request must never retroactively bill.
-	if n := s.oracleRequestLogCount(t, rid); n != 0 {
+	if n := s.oracleRequestLogCount(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d request_logs row(s) appeared for the refused request after restoration", n)
 	}
-	if c := s.oracleCreditTotals(t, rid); c.UsageRows != 0 {
+	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows != 0 {
 		t.Fatalf("product: refusal case: %d usage transaction(s) appeared for the refused request after restoration", c.UsageRows)
 	}
 	t.Logf("product: refusal case passed (request id %s)", rid)
