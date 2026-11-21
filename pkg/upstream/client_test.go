@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -792,4 +793,25 @@ func TestStream_TranslateRequestErrorIsTypedNotSent(t *testing.T) {
 	var ns *retry.RequestNotSentError
 	require.ErrorAs(t, serr, &ns)
 	assert.Contains(t, serr.Error(), "translate stream request")
+}
+
+func TestForwardJSONAdmitsOnlyPreparedRequests(t *testing.T) {
+	var arrivals atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { arrivals.Add(1) }))
+	defer server.Close()
+	client, err := newTestClientWithAdapter(Options{BaseURL: server.URL, ProviderName: "anthropic"})
+	require.NoError(t, err)
+	refused := errors.New("accounting unavailable")
+	attempts := 0
+	admit := func(context.Context) error { attempts++; return refused }
+	_, err = client.ForwardJSONWithAdmission(t.Context(), []byte("not-json"), "m", "key", admit)
+	require.ErrorAs(t, err, new(*retry.RequestNotSentError))
+	require.Zero(t, attempts)
+	valid := []byte(`{"model":"m","messages":[{"role":"user","content":"text"}]}`)
+	_, err = client.ForwardJSONWithAdmission(t.Context(), valid, "m", "key", admit)
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, attempts)
+	_, err = client.ForwardJSONWithAdmission(t.Context(), valid, "m", "key", nil)
+	require.Error(t, err)
+	require.Zero(t, arrivals.Load())
 }

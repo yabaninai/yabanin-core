@@ -207,7 +207,7 @@ func (c *Client) Adapter() provider.Provider { return c.adapter }
 // header_observed / provider_attested evidence tiers; Clone detaches the
 // headers from resp's lifetime (the body is closed before return).
 func (c *Client) ForwardJSONWithHeaders(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration) (http.Header, []byte, error) {
-	hdr, respBody, _, err := c.forward(ctx, body, model, apiKey, timeout, false)
+	hdr, respBody, _, err := c.forward(ctx, body, model, apiKey, timeout, false, nil)
 	return hdr, respBody, err
 }
 
@@ -216,10 +216,20 @@ func (c *Client) ForwardJSONWithHeaders(ctx context.Context, body []byte, model 
 // went to the model" evidence the request explorer shows next to the
 // client's original payload (tier routing / effort injection visible).
 func (c *Client) ForwardJSONCapturing(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration) (http.Header, []byte, []byte, error) {
-	return c.forward(ctx, body, model, apiKey, timeout, true)
+	return c.forward(ctx, body, model, apiKey, timeout, true, nil)
 }
 
-func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration, capture bool) (http.Header, []byte, []byte, error) {
+// ForwardJSONWithAdmission admits a paid request after local preparation
+// succeeds and immediately before its HTTP round trip.
+func (c *Client) ForwardJSONWithAdmission(ctx context.Context, body []byte, model, apiKey string, admit func(context.Context) error) ([]byte, error) {
+	if admit == nil {
+		return nil, errors.New("paid upstream request requires admission")
+	}
+	_, response, _, err := c.forward(ctx, body, model, apiKey, 0, false, admit)
+	return response, err
+}
+
+func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration, capture bool, admit func(context.Context) error) (http.Header, []byte, []byte, error) {
 	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
 		return nil, nil, nil, err
 	}
@@ -273,6 +283,15 @@ func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey 
 		req.Header.Set(requestid.RequestIDHeader, string(id))
 	}
 
+	if admit != nil {
+		if err := admit(ctx); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return c.sendForward(req, sent)
+}
+
+func (c *Client) sendForward(req *http.Request, sent []byte) (http.Header, []byte, []byte, error) {
 	resp, err := c.client.Do(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
