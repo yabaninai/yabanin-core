@@ -2,13 +2,14 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -1625,6 +1626,22 @@ func (gw *gateway) buildEvalgateHook(ctx context.Context, cc *chatContext, final
 	}
 }
 
+// evalgateSample uses 53 random bits so every draw is exactly representable
+// as a float64 in [0, 1).
+func evalgateSample(rate float64) bool {
+	if !(rate > 0) {
+		return false
+	}
+	if rate >= 1 {
+		return true
+	}
+	var bits [8]byte
+	_, _ = rand.Read(bits[:])
+	const fractionBits = 53
+	draw := binary.BigEndian.Uint64(bits[:]) >> (64 - fractionBits)
+	return float64(draw)/(1<<fractionBits) < rate
+}
+
 // maybeEvalgateSample applies the P5.9 sampling criteria — Medium class,
 // low confidence, configured rate — and spawns the detached judge
 // evaluation. EvalgateSampled is stamped synchronously here, before
@@ -1636,7 +1653,7 @@ func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, fin
 
 	// Check if this request matches sampling criteria: Medium class, low confidence
 	isMediumLowConf := classLabel == "medium" && conf < 0.7
-	if isMediumLowConf && gw.cfg.EvalgateSampleRate > 0 && rand.Float64() < gw.cfg.EvalgateSampleRate { //nolint:gosec // evalgate sampling, not cryptography
+	if isMediumLowConf && evalgateSample(gw.cfg.EvalgateSampleRate) {
 		// TP-04: a judge pair needs the cheap answer as full comparable
 		// text. Tool-only, empty or unparseable bodies must not produce a
 		// fabricated verdict — skip judging and record why.
