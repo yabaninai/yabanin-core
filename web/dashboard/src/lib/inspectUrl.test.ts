@@ -2,7 +2,7 @@
 // (same contract as tableUrl.test.ts — the encode/decode a reload uses).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readInspectParam, readInspectRowKeys, relatedListHref, writeInspectParam } from './inspectUrl.ts'
+import { readInspectParam, readInspectRowKeys, relatedListHref, selectedRequestRowId, writeInspectParam } from './inspectUrl.ts'
 
 test('readInspectParam: present, absent, blank and unparsable values', () => {
   assert.equal(readInspectParam('inspect=org-9'), 'org-9')
@@ -77,4 +77,14 @@ test('relatedListHref: strips inspect, keeps scope params, applies extras', () =
     relatedListHref('requests-explorer', 'org=acme&inspect=request%3Areq-1&row_key=7'),
     '#requests-explorer?org=acme',
   )
+})
+
+test('a malformed or mismatched selector highlights no sibling', () => {
+  const rows = [{ request_id: 'shared', row_key: '12' }, { request_id: 'shared', row_key: '9007199254740993' }, { request_id: 'other', row_key: '13' }]
+  for (const keys of [['12', '99'], [''], ['bad'], ['0'], ['13']]) {
+    assert.equal(selectedRequestRowId('shared', keys, rows), undefined)
+  }
+  assert.equal(selectedRequestRowId('shared', ['9007199254740993'], rows), '9007199254740993')
+  assert.equal(selectedRequestRowId('shared', ['+0012'], rows), '12')
+  assert.equal(selectedRequestRowId('shared', [], rows), '12')
 })

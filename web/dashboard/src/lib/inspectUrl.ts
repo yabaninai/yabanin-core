@@ -71,3 +71,12 @@ export function relatedListHref(
   const qs = params.toString()
   return `#${target}${qs ? `?${qs}` : ''}`
 }
+
+/** Match the inspector target to a visible row. Only a selector-less link uses correlation alone. */
+export function selectedRequestRowId(requestId: string, keys: string[], rows: ReadonlyArray<{ request_id?: string, row_key?: string }>): string | undefined {
+  if (!requestId) return undefined
+  if (keys.length === 0) return rows.find(row => row.request_id === requestId)?.row_key || requestId
+  if (keys.length !== 1 || !/^\+?\d+$/.test(keys[0])) return undefined
+  const key = keys[0].replace(/^\+?0*/, '')
+  return rows.find(row => row.request_id === requestId && row.row_key === key)?.row_key
+}

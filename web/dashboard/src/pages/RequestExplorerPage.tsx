@@ -7,7 +7,7 @@ import {
   getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
-import { currentHashQuery, INSPECT_ROW_PARAM, relatedListHref } from '../lib/inspectUrl'
+import { currentHashQuery, INSPECT_ROW_PARAM, relatedListHref, selectedRequestRowId } from '../lib/inspectUrl'
 import {
   appendClause, parseYQL, serializeYQL, YQL_FIELDS, type YqlFieldMeta,
 } from '../lib/queryLang'
@@ -1042,7 +1042,6 @@ export function RequestExplorerPage() {
   // drawer's honest unknown/failed notice) — the client never collapses
   // duplicates to the first sibling and never silently falls back to the
   // ambiguous correlation read.
-  const rowKeysJSON = JSON.stringify(inspectRowKeys)
   useEffect(() => {
     if (!inspectId) return
     let cancelled = false
@@ -1065,10 +1064,7 @@ export function RequestExplorerPage() {
       setInspectorLoading(false)
     })
     return () => { cancelled = true }
-    // rowKeysJSON (JSON.stringify of the complete ordered selector) is the
-    // effect identity: a stable string that differs for EVERY selector
-    // mutation, including ones a scalar .get() cannot see.
-  }, [inspectId, org, rowKeysJSON])
+  }, [inspectId, org, inspectRowKeys])
 
   // Fetch the decision-log rows for this request. First page
   // only — the drawer shows the freshest evaluations plus a link into the
@@ -1114,19 +1110,7 @@ export function RequestExplorerPage() {
     setInspectDecisionsState('idle')
   }
 
-  // The highlighted row: the URL's target resolved into the table's
-  // identity space. A usable selector (exactly one non-blank row_key)
-  // highlights that row; a malformed one (blank/duplicated) highlights at
-  // correlation level like a legacy link — the drawer itself fails loudly
-  // on the forwarded selector, so the highlight never pretends the first
-  // sibling was chosen. Legacy links keep the open product decision
-  // (which sibling a selector-less correlation opens) untouched.
-  const rowSelectorUsable = inspectRowKeys.length === 1 && inspectRowKeys[0].trim() !== ''
-  const selectedRowId = inspectId === ''
-    ? undefined
-    : rowSelectorUsable
-      ? inspectRowKeys[0]
-      : rows.find(r => r.request_id === inspectId)?.row_key || inspectId
+  const selectedRowId = selectedRequestRowId(inspectId, inspectRowKeys, rows)
 
   // Chips, the add-filter builder, the YQL input with the error
   // highlight and the cheatsheet live in the shared FilterBar. The page

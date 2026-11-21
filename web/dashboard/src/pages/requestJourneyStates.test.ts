@@ -71,10 +71,10 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
     // synchronously — a stale org's request can never linger in the drawer.
     assert.match(
       page,
-      /\}, \[inspectId, org\]\)/,
+      /\}, \[inspectId, org, inspectRowKeys\]\)/,
       'drawer data effect depends on both the request id and the org',
     )
-    const effect = page.slice(page.indexOf('setInspectRecord(null)'), page.indexOf('}, [inspectId, org, rowKeysJSON])'))
+    const effect = page.slice(page.indexOf('setInspectRecord(null)'), page.indexOf('}, [inspectId, org, inspectRowKeys])'))
     assert.ok(effect.includes('setInspectDetail(null)'), 'detail state is cleared on scope change')
     assert.ok(effect.includes('setInspectorLoading(true)'), 'loading state is reset on scope change')
   })
@@ -106,7 +106,7 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
     )
     assert.match(
       page,
-      /JSON\.stringify\(inspectRowKeys\)/,
+      /\[inspectId, org, inspectRowKeys\]/,
       'the detail effect identity is the full selector snapshot, so every selector mutation re-runs it',
     )
     assert.match(
@@ -115,7 +115,7 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
       'an absent selector keeps the legacy correlation read; present values forward verbatim',
     )
     // The row highlight must not pretend a malformed selector chose a row.
-    assert.match(page, /rowSelectorUsable/, 'the highlight gates on a usable single non-blank selector')
+    assert.match(page, /selectedRequestRowId\(inspectId, inspectRowKeys, rows\)/, 'the highlight gates on a usable single non-blank selector')
   })
 
   it('evidence links carry actual ids only', () => {

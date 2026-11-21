@@ -238,7 +238,7 @@ function useOrgPoolCore(): { orgs: Organization[] | null; reload: () => void; me
 export function useOrgPresentation(orgId?: string): OrgPresentation {
   const { i18n } = useTranslation()
   const { orgs, me, meLoading } = useOrgPoolCore()
-  const [detailsVersion, setDetailsVersion] = useState(0)
+  const [, setDetailsVersion] = useState(0)
 
   void i18n
 
@@ -258,10 +258,8 @@ export function useOrgPresentation(orgId?: string): OrgPresentation {
     }
   }, [orgId, me, meLoading, orgs])
 
-  return useMemo(() => {
-    // detailsVersion re-computes when a shared single-org lookup commits.
-    return resolveOrgPresentation(presentationPool(orgs, me, orgId), orgId)
-  }, [orgs, me, orgId, detailsVersion])
+  const { currency, timezone } = resolveOrgPresentation(presentationPool(orgs, me, orgId), orgId)
+  return useMemo(() => ({ currency, timezone }), [currency, timezone])
 }
 
 /**

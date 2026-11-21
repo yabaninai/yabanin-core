@@ -141,7 +141,9 @@ function LabelHost() {
 
 function RowKeysHost() {
   const [keys, setKey] = useHashParamValues('row_key')
-  g.__rowKeysFetches = (g.__rowKeysFetches as string[] ?? []).concat(JSON.stringify(keys))
+  useEffect(() => {
+    g.__rowKeysFetches = (g.__rowKeysFetches as string[] ?? []).concat(JSON.stringify(keys))
+  }, [keys])
   return createElement('div', null,
     createElement('output', { id: 'out' }, JSON.stringify(keys)),
     createElement('button', { id: 'rk-set', onClick: () => setKey('7') }, 'Set row 7'),
