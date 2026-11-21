@@ -205,6 +205,34 @@ func (s *Store) GetRequestDetailRow(ctx context.Context, orgID string, rowKey in
 	return getRequestDetailOnKey(ctx, s.db, orgID, rowKey)
 }
 
+// GetRequestDetailRowInCorrelation returns the full request_logs row
+// addressed by the immutable row key, scoped to the org AND the correlation
+// the caller named (0028): the exact-row identity for API callers that
+// selected a physical row out of a correlation-keyed list or link. A key
+// that belongs to a different org, a different correlation of the same org,
+// or that is unknown, purged or NULL-correlated returns ErrNotFound — the
+// same no-existence-oracle 404 as every other detail miss.
+func (s *Store) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*RequestDetail, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	if requestID == "" {
+		return nil, ErrNotFound
+	}
+	d, err := getRequestDetailOnKey(ctx, s.db, orgID, rowKey)
+	if err != nil {
+		return nil, err
+	}
+	// id is the primary key, so the load already resolved at most one row;
+	// a correlation mismatch (stale link, hand-edited key) is simply not
+	// this path's row. Equivalent to a compound predicate, without forking
+	// the shared projection's parameter layout.
+	if d.RequestID != requestID {
+		return nil, ErrNotFound
+	}
+	return d, nil
+}
+
 // requestDetailRowSelect is the shared authorized detail projection. The
 // WHERE clause is caller-supplied: $1 = org_id, $2 = the row identity (the
 // client correlation for the legacy path, the immutable request_logs.id for

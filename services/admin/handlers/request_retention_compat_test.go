@@ -80,6 +80,13 @@ func (s *retentionCompatStore) GetRequestDetailRow(ctx context.Context, orgID st
 	return s.mockStore.GetRequestDetailRow(ctx, orgID, rowKey)
 }
 
+// GetRequestDetailRowInCorrelation mirrors GetRequestDetail for the
+// inspector's correlation-scoped row-key read.
+func (s *retentionCompatStore) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	s.access, _ = adminstore.RequestPayloadAccessFromContext(ctx)
+	return s.mockStore.GetRequestDetailRowInCorrelation(ctx, orgID, requestID, rowKey)
+}
+
 func (s *retentionCompatStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }

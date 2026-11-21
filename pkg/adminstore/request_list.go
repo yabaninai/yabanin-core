@@ -98,12 +98,15 @@ type RequestListFilters struct {
 type RequestListRow struct {
 	RequestID string `json:"request_id"`
 	OrgID     string `json:"org_id"`
-	// RowKey is the immutable request_logs.id of this physical row. The
-	// client-supplied RequestID is a correlation field only (0028): two
-	// legitimate invocations sharing it bill and log as independent rows,
-	// so exact-row consumers (the export walk) address rows by RowKey.
-	// Internal — never serialized.
-	RowKey         int64   `json:"-"`
+	// RowKey is the immutable request_logs.id of this physical row, exposed
+	// as `row_key` — an exact decimal STRING, never a JSON number: the
+	// bigint routinely exceeds 2^53, where JS number rounding would point a
+	// client at the wrong physical row. The client-supplied RequestID is a
+	// correlation field only (0028): two legitimate invocations sharing it
+	// bill and log as independent rows, so exact-row consumers (the export
+	// walk, the inspector deep link) address rows by RowKey. Omitted only
+	// for synthetic rows with no physical key (omitempty's zero check).
+	RowKey         int64   `json:"row_key,string,omitempty"`
 	ModelRequested string  `json:"model_requested,omitempty"`
 	ModelUsed      string  `json:"model_used"`
 	StatusCode     int     `json:"status_code"`

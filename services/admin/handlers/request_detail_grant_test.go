@@ -92,6 +92,12 @@ func (s *detailSeamStore) GetRequestDetailRow(ctx context.Context, orgID string,
 	return d, err
 }
 
+// GetRequestDetailRowInCorrelation is the inspector's correlation-scoped
+// row-key read; the grant-path seam flags do not apply, so it delegates.
+func (s *detailSeamStore) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	return s.mockStore.GetRequestDetailRowInCorrelation(ctx, orgID, requestID, rowKey)
+}
+
 func (s *detailSeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()

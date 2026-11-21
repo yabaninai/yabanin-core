@@ -1748,7 +1748,7 @@ func (m *mockStore) listFixtureRows(f adminstore.RequestListFilters) ([]adminsto
 			continue
 		}
 		rows = append(rows, adminstore.RequestListRow{
-			RequestID: r.RequestID, OrgID: r.OrgID, ModelUsed: r.ModelUsed, StatusCode: 200,
+			RequestID: r.RequestID, OrgID: r.OrgID, RowKey: r.RowKey, ModelUsed: r.ModelUsed, StatusCode: 200,
 			CostUSD: 0.002, TokensIn: r.TokensIn, TokensOut: r.TokensOut, CreatedAt: r.CreatedAt,
 			PayloadOwned: !f.PayloadDenied && f.PayloadUserID == r.OwnerUserID,
 		})
@@ -1780,6 +1780,32 @@ func (m *mockStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKe
 		}
 	}
 	return detail, nil
+}
+
+// GetRequestDetailRowInCorrelation serves the inspector's correlation-scoped
+// row-key read: the key must name a fixture row of exactly (org, requestID)
+// — a key from another org or another correlation is not-found, the real
+// store's no-oracle 404. The access-context contract of GetRequestDetail
+// still applies via delegation.
+func (m *mockStore) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	if m.err != nil {
+		return nil, m.err
+	}
+	for _, r := range m.requestRows {
+		if r.OrgID == orgID && r.RowKey == rowKey {
+			if r.RequestID != requestID {
+				return nil, adminstore.ErrNotFound
+			}
+			detail, err := m.GetRequestDetail(ctx, orgID, requestID)
+			if err != nil || detail == nil {
+				return detail, err
+			}
+			detail.TokensIn = r.TokensIn
+			detail.TokensOut = r.TokensOut
+			return detail, nil
+		}
+	}
+	return nil, adminstore.ErrNotFound
 }
 
 func (m *mockStore) GetToolCallsReport(_ context.Context, orgID string, days int) (*adminstore.ToolCallsReport, error) {

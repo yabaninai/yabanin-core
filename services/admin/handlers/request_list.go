@@ -13,6 +13,24 @@ import (
 	"github.com/reireirei/yabanin/pkg/adminstore"
 )
 
+// selectedRequestRowKey reads the optional decimal row identity sent by the list.
+func selectedRequestRowKey(w http.ResponseWriter, r *http.Request) (int64, bool) {
+	values, present := r.URL.Query()["row_key"]
+	if !present {
+		return 0, true
+	}
+	if len(values) != 1 || values[0] == "" {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid row_key: exactly one non-empty value required"})
+		return 0, false
+	}
+	key, err := strconv.ParseInt(values[0], 10, 64)
+	if err != nil || key <= 0 {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid row_key: must be a positive decimal request_logs row key"})
+		return 0, false
+	}
+	return key, true
+}
+
 // apiOrgRequestDetail handles GET /api/organizations/{id}/requests/{request_id}
 // — the full request_logs row (PO-04): the stored (redacted/truncated) response
 // snapshot as raw JSON, prompt_hash, classifier/cache/tier/routing fields, and
@@ -34,6 +52,10 @@ import (
 func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !h.requireStore(w, r) {
+			return
+		}
+		selectedKey, ok := selectedRequestRowKey(w, r)
+		if !ok {
 			return
 		}
 		orgID := chi.URLParam(r, "id")
@@ -82,7 +104,7 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 		}
 		// ---- Phase: pre-consume target resolution and row read (the discarded read) ----
 		ctx := adminstore.WithRequestPayloadAccess(r.Context(), access)
-		d, rowKey, ok := h.readRequestDetailRow(ctx, w, r, orgID, requestID, userID, token, grantScope)
+		d, rowKey, ok := h.readRequestDetailRow(ctx, w, r, orgID, requestID, userID, token, grantScope, selectedKey)
 		if !ok {
 			return
 		}
@@ -178,9 +200,15 @@ func (h *AdminHandlers) allowRequestDetailOriginals(w http.ResponseWriter, r *ht
 // its result is discarded unless the verified atomic consume succeeds — no
 // byte of it is written before that, so the hypothetical widening can never
 // turn into disclosure.
-func (h *AdminHandlers) readRequestDetailRow(ctx context.Context, w http.ResponseWriter, r *http.Request, orgID, requestID, userID, token, grantScope string) (*adminstore.RequestDetail, int64, bool) {
+func (h *AdminHandlers) readRequestDetailRow(ctx context.Context, w http.ResponseWriter, r *http.Request, orgID, requestID, userID, token, grantScope string, selectedKey int64) (*adminstore.RequestDetail, int64, bool) {
 	if token == "" {
-		d, err := h.store.GetRequestDetail(ctx, orgID, requestID)
+		var d *adminstore.RequestDetail
+		var err error
+		if selectedKey != 0 {
+			d, err = h.store.GetRequestDetailRowInCorrelation(ctx, orgID, requestID, selectedKey)
+		} else {
+			d, err = h.store.GetRequestDetail(ctx, orgID, requestID)
+		}
 		if err != nil {
 			h.respondRequestDetailReadError(w, r, err, orgID, requestID, token, grantScope)
 			return nil, 0, false
@@ -200,6 +228,11 @@ func (h *AdminHandlers) readRequestDetailRow(ctx context.Context, w http.Respons
 		// generic 403, token untouched.
 		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_invalid_or_unavailable")
 		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
+		return nil, 0, false
+	}
+	if selectedKey != 0 && selectedKey != rowKey {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "row_key_mismatch")
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "row_key does not match the row the payload grant is bound to"})
 		return nil, 0, false
 	}
 	d, err := h.store.GetRequestDetailRow(ctx, orgID, rowKey)

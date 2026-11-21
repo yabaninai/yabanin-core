@@ -7,6 +7,11 @@ import { fetchJSON, type Paginated, type RequestOptions } from './http.ts'
 export interface RequestRow {
   request_id: string
   org_id: string
+  // Physical request_logs row identity (0028): a correlation can legitimately
+  // span several rows, so request_id alone is ambiguous in the list. Decimal
+  // STRING on the wire (the bigint exceeds 2^53, where a JS number would
+  // round and point the inspector at the wrong row). Absent = legacy row.
+  row_key?: string
   model_requested?: string
   model_used: string
   status_code: number
@@ -184,8 +189,24 @@ export interface RequestDetail {
   }
 }
 
-export async function getRequestDetail(orgId: string, requestId: string, opts?: RequestOptions): Promise<RequestDetail> {
-  return fetchJSON(`/organizations/${encodeURIComponent(orgId)}/requests/${encodeURIComponent(requestId)}`, opts)
+export async function getRequestDetail(
+  orgId: string,
+  requestId: string,
+  opts?: RequestOptions,
+  rowKeys?: string[],
+): Promise<RequestDetail> {
+  const qs = new URLSearchParams()
+  // Forward the URL's selector values VERBATIM — one value selects a row;
+  // a blank or duplicated row_key is appended as-is so the server's strict
+  // 400 answers it. The client never collapses duplicates (URLSearchParams
+  // .get would silently pick the first sibling) and never falls back to the
+  // ambiguous correlation read on its own.
+  if (rowKeys) for (const v of rowKeys) qs.append('row_key', v)
+  const query = qs.toString()
+  return fetchJSON(
+    `/organizations/${encodeURIComponent(orgId)}/requests/${encodeURIComponent(requestId)}${query ? `?${query}` : ''}`,
+    opts,
+  )
 }
 
 export async function listRequests(params: RequestListParams, opts?: RequestOptions): Promise<Paginated<RequestRow>> {

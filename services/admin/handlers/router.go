@@ -126,6 +126,9 @@ type StoreInterface interface {
 	GetRequestDetail(ctx context.Context, orgID, requestID string) (*adminstore.RequestDetail, error)
 	// Exact-row request detail by immutable request_logs.id (grant binding).
 	GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error)
+	// Exact-row request detail scoped to the named correlation (inspector
+	// row selection; 0028 shared-correlation rows stay distinct).
+	GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error)
 	GetSavingsReport(ctx context.Context, orgID string, days int, provider string) (*adminstore.SavingsReport, error)
 	GetShadowComparison(ctx context.Context, orgID string, days int) (*adminstore.ShadowComparison, error)
 	// ADL-04: quality closed-loop (evalgate verdicts → per-model / per-task-class

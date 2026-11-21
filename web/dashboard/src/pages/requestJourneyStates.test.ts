@@ -88,9 +88,27 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
     assert.match(page, /detailRequestUnknownTitle/, 'the unknown-request diagnosis is titled')
     assert.match(
       page,
-      /getRequestDetail\(org, inspectId\)/,
-      'the detail is fetched within the current org scope only',
+      /getRequestDetail\(org, inspectId, undefined, rowKeys \?\? undefined\)/,
+      'the detail is fetched within the current org scope only, forwarding the URL selector values when present',
     )
+  })
+
+  it('a malformed row selector is forwarded, never collapsed or silently retried', () => {
+    // 0028: the selector is read with ALL its values (getAll), so a
+    // duplicated row_key reaches the server's strict 400 instead of being
+    // collapsed to the first sibling by URLSearchParams.get.
+    assert.match(
+      page,
+      /readInspectRowKeys\(currentHashQuery\(\)\)/,
+      'the selector is read with all its values, not collapsed to the first sibling',
+    )
+    assert.match(
+      page,
+      /rowKeys \?\? undefined/,
+      'an absent selector keeps the legacy correlation read; present values forward verbatim',
+    )
+    // The row highlight must not pretend a malformed selector chose a row.
+    assert.match(page, /rowSelectorUsable/, 'the highlight gates on a usable single non-blank selector')
   })
 
   it('evidence links carry actual ids only', () => {

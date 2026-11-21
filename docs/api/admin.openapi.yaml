@@ -1220,7 +1220,13 @@ paths:
         row's `routing_decision` field — see docs/api/CONTRACT.md §10 for
         the reserved envelope vocabulary). The dashboard deep-links here via
         `#requests-explorer?org=…&inspect=request:<id>` (hash params, again
-        §10).
+        §10). Each row carries `row_key`: the immutable request_logs row id
+        as an EXACT DECIMAL STRING (type string, never a JSON number — the
+        bigint exceeds 2^53, where JS number rounding would point a client
+        at the wrong physical row). A repeated client request id (shared
+        correlation) is one list entry per physical row, each with its own
+        row_key and its own usage facts; pass that row_key to the detail
+        endpoint to inspect exactly that invocation.
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: rule_id, in: query, description: Routing-rule identity filter (routing_rules.id); STRICT uuid — a malformed value is a 400 naming the field, never a silently ignored filter, schema: { type: string, format: uuid } }
@@ -1330,7 +1336,19 @@ paths:
         fields require the same owner/grant/role matrix as the export;
         original payload scope additionally requires effective original
         retention. A request without a payload grant token is the everyday
-        metadata-only read and never consumes anything.
+        metadata-only read and never consumes anything. The optional
+        `row_key` selector (the decimal string the list endpoint exposes)
+        addresses ONE physical row of the path correlation: several rows may
+        legitimately share a request_id (per-invocation billing), and with
+        row_key the response is the selected row's own facts; the selected
+        row must belong to the path organization AND correlation, else the
+        same 404 as any miss. Presence is intent — a blank value, a repeated
+        selector, or a non-positive non-decimal value is an explicit 400,
+        never a silent fallback to the arbitrary-row correlation read.
+        Without row_key the legacy correlation behavior is unchanged. Under
+        a payload grant, row_key must exactly name the peeked row the grant
+        is bound to: a mismatch is a pre-consume 400 (grant untouched), an
+        exact match the normal one-time redemption.
         Grant refusal/replay contract (
         identical to the export endpoint): every non-disclosing precheck runs
         before the one-time consume — grant scope validation (400), grant
@@ -1360,6 +1378,7 @@ paths:
       parameters:
         - { name: id, in: path, required: true, schema: { type: string } }
         - { name: request_id, in: path, required: true, schema: { type: string } }
+        - { name: row_key, in: query, description: Physical row selector — the list row's row_key as a decimal string; must name a row of the path org AND correlation (else 404). Blank, repeated or non-positive values are a 400; under a payload grant it must exactly match the grant's bound row (else a pre-consume 400), schema: { type: string } }
         - { name: payload_grant, in: query, description: Single-use request-bound bearer grant; alternatively send X-Request-Payload-Grant, schema: { type: string } }
         - { name: scope, in: query, description: Grant scope; payload.read_originals requires effective original retention, schema: { type: string, enum: [payload.read, payload.read_originals] } }
       responses:
@@ -1368,7 +1387,7 @@ paths:
             Request detail. For a redeemed grant the 200 commit is final: an
             encode/write failure after the consume can only truncate the body
             and the grant stays consumed (no refund, no re-serve).
-        "400": { description: Invalid grant scope; a payload grant is not consumed }
+        "400": { description: Invalid grant scope; a malformed row_key selector (blank, repeated, non-positive/non-decimal); or a row_key that does not exactly name a payload grant's bound row. None of these consume the grant }
         "403":
           description: >
             Fail-closed denial, one of: the payload grant cannot be used

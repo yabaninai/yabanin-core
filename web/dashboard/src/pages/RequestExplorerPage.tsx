@@ -7,7 +7,7 @@ import {
   getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
-import { currentHashQuery, relatedListHref } from '../lib/inspectUrl'
+import { currentHashQuery, INSPECT_ROW_PARAM, readInspectRowKeys, relatedListHref } from '../lib/inspectUrl'
 import {
   appendClause, parseYQL, serializeYQL, YQL_FIELDS, type YqlFieldMeta,
 } from '../lib/queryLang'
@@ -841,6 +841,11 @@ export function RequestExplorerPage() {
   const { labelKeys, refreshLabels } = useRequestLabelKeys(org)
   const [inspectParam, setInspectParam] = useInspectParam()
   const inspectId = inspectParam.startsWith('request:') ? inspectParam.slice('request:'.length) : inspectParam
+  // 0028: which physical row of the (possibly shared) correlation the
+  // inspector targets — the list's row_key, kept next to the inspect id so
+  // a deep link reproduces the exact row the link author clicked. Absent
+  // param = '' like the inspect id; back/forward changes it and refetches.
+  const [inspectRowParam, setInspectRowParam] = useHashParam(INSPECT_ROW_PARAM)
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
   const [inspectDetail, setInspectDetail] = useState<RequestDetail | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
@@ -1024,18 +1029,25 @@ export function RequestExplorerPage() {
   // The drawer's data: lineage (signature/region evidence) and the
   // request-log detail (stored response snapshot + prompt_hash) are
   // independent; fetch both and let either resolve. The effect (not a click
-  // handler) is what makes the ?inspect=request:<id> deep link work.
+  // handler) is what makes the ?inspect=request:<id> deep link work. The
+  // detail read forwards the URL's row_key values VERBATIM: one value
+  // selects the physical row of a possibly-shared correlation, while a
+  // blank or duplicated selector reaches the server's strict 400 (the
+  // drawer's honest unknown/failed notice) — the client never collapses
+  // duplicates to the first sibling and never silently falls back to the
+  // ambiguous correlation read.
   useEffect(() => {
     if (!inspectId) return
     let cancelled = false
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectorLoading(true)
+    const rowKeys = readInspectRowKeys(currentHashQuery())
     const lineage = getLineage(inspectId)
       .then(rec => ({ ok: true as const, rec }))
       .catch(() => ({ ok: false as const, rec: null }))
     const detail = org
-      ? getRequestDetail(org, inspectId)
+      ? getRequestDetail(org, inspectId, undefined, rowKeys ?? undefined)
         .then(rec => ({ ok: true as const, rec }))
         .catch(() => ({ ok: false as const, rec: null }))
       : Promise.resolve({ ok: false as const, rec: null })
@@ -1046,7 +1058,7 @@ export function RequestExplorerPage() {
       setInspectorLoading(false)
     })
     return () => { cancelled = true }
-  }, [inspectId, org])
+  }, [inspectId, org, inspectRowParam])
 
   // Fetch the decision-log rows for this request. First page
   // only — the drawer shows the freshest evaluations plus a link into the
@@ -1073,17 +1085,41 @@ export function RequestExplorerPage() {
 
   useEffect(() => loadInspectDecisions(), [loadInspectDecisions])
 
-  const openInspector = (requestId: string) => {
+  // Opens the inspector on one physical row: the correlation id plus, when
+  // the row exposes one, its row_key — a click on a shared correlation must
+  // not be retargeted to whichever sibling the server happens to pick. The
+  // selector is cleared for legacy rows so it can never leak stale into the
+  // next inspector.
+  const openInspector = (requestId: string, rowKey?: string) => {
     if (!requestId) return
+    setInspectRowParam(rowKey ?? '')
     setInspectParam(`request:${requestId}`)
   }
   const closeInspector = () => {
     setInspectParam(null)
+    setInspectRowParam('')
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectDecisions(null)
     setInspectDecisionsState('idle')
   }
+
+  // The highlighted row: the URL's target resolved into the table's
+  // identity space. A usable selector (exactly one non-blank row_key)
+  // highlights that row; a malformed one (blank/duplicated) highlights at
+  // correlation level like a legacy link — the drawer itself fails loudly
+  // on the forwarded selector, so the highlight never pretends the first
+  // sibling was chosen. Legacy links keep the open product decision
+  // (which sibling a selector-less correlation opens) untouched.
+  const rowSelectorUsable = (() => {
+    const keys = readInspectRowKeys(currentHashQuery())
+    return keys !== null && keys.length === 1 && keys[0].trim() !== ''
+  })()
+  const selectedRowId = inspectId === ''
+    ? undefined
+    : rowSelectorUsable
+      ? inspectRowParam
+      : rows.find(r => r.request_id === inspectId)?.row_key || inspectId
 
   // Chips, the add-filter builder, the YQL input with the error
   // highlight and the cheatsheet live in the shared FilterBar. The page
@@ -1131,7 +1167,7 @@ export function RequestExplorerPage() {
       <RowActions
         label={`${t('common.actions')}: ${r.request_id}`}
         items={[
-          { id: 'inspect', label: t('common.inspector'), onSelect: () => openInspector(r.request_id) },
+          { id: 'inspect', label: t('common.inspector'), onSelect: () => openInspector(r.request_id, r.row_key) },
           { id: 'lineage', label: t('explorer.viewLineage'), onSelect: () => { window.location.hash = `#lineage?req=${encodeURIComponent(r.request_id)}` } },
           { id: 'copy', label: t('common.copy'), onSelect: () => { void copyText(r.request_id) } },
           ...sortedLabelEntries(r.labels).slice(0, 3).map(([key, value]) => ({
@@ -1377,7 +1413,7 @@ export function RequestExplorerPage() {
         <section aria-label={t('explorer.requestsHeading')} className="flex flex-col gap-2">
           <BulkActions
             rows={rows}
-            getRowId={r => r.request_id || `${r.created_at}-${r.status_code}`}
+            getRowId={r => r.row_key || r.request_id || `${r.created_at}-${r.status_code}`}
             getRowLabel={r => r.request_id || r.created_at}
             selectedIds={selectedRequestIds}
             onSelectionChange={setSelectedRequestIds}
@@ -1390,7 +1426,7 @@ export function RequestExplorerPage() {
           <DataTable
             columns={columns}
             rows={rows}
-            getRowId={r => r.request_id || `${r.created_at}-${r.status_code}`}
+            getRowId={r => r.row_key || r.request_id || `${r.created_at}-${r.status_code}`}
             selection={{
               selectedRowIds: selectedRequestIds,
               onSelectionChange: setSelectedRequestIds,
@@ -1411,8 +1447,8 @@ export function RequestExplorerPage() {
             emptyAction={{ label: t('explorer.clearModelFilter'), onClick: () => applyQuery('') }}
             density={tablePrefs.density}
             hiddenColumnIds={tablePrefs.hiddenColumnIds}
-            onRowClick={r => openInspector(r.request_id)}
-            selectedId={inspectId || undefined}
+            onRowClick={r => openInspector(r.request_id, r.row_key)}
+            selectedId={selectedRowId}
             renderActions={rowActions}
           />
           <Pagination page={page} pageSize={PAGE_SIZE} total={total} totalPages={totalPages} loading={loading} onChange={setRequestedPage} />

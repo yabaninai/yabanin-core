@@ -276,6 +276,9 @@ func (s *stubStore) GetRequestDetail(ctx context.Context, orgID, requestID strin
 func (s *stubStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
 	return nil, errStub
 }
+func (s *stubStore) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	return nil, errStub
+}
 func (s *stubStore) GetTaskAnalytics(ctx context.Context, orgID string, from, to time.Time, groupBy string, limit int) (*adminstore.TaskAnalyticsReport, error) {
 	return nil, errStub
 }
