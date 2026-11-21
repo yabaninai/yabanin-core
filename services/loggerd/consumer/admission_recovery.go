@@ -14,6 +14,7 @@ import (
 const (
 	recoveryBatchSize    = 128
 	recoveryInterval     = 15 * time.Second
+	recoveryRowTimeout   = 5 * time.Second
 	recoveryGraceSeconds = 15 * 60
 )
 
@@ -145,7 +146,7 @@ func (c *StreamConsumer) recoverIndividualFacts(ctx context.Context, db Settleme
 		if err := ctx.Err(); err != nil {
 			return cursor, false, err
 		}
-		fact, err := readRecoveryFact(db.QueryRow(ctx, pendingFactSQL, id))
+		fact, err := readRecoveryFactByID(ctx, db, id)
 		if err == nil {
 			err = c.recoverAdmission(ctx, fact)
 		}
@@ -158,6 +159,12 @@ func (c *StreamConsumer) recoverIndividualFacts(ctx context.Context, db Settleme
 		return cursor, true, nil
 	}
 	return initialRecoveryCursor, false, nil
+}
+
+func readRecoveryFactByID(ctx context.Context, db SettlementDB, id string) (recoveryFact, error) {
+	ctx, cancel := context.WithTimeout(ctx, recoveryRowTimeout)
+	defer cancel()
+	return readRecoveryFact(db.QueryRow(ctx, pendingFactSQL, id))
 }
 
 func (c *StreamConsumer) recoverAdmission(ctx context.Context, fact recoveryFact) error {
@@ -175,5 +182,9 @@ func (c *StreamConsumer) recoverAdmission(ctx context.Context, fact recoveryFact
 	policy.recoveredFromFacts = true
 	// No stream delivery occurred. An empty ID deliberately bypasses the
 	// Redis inbox claim; the locked admission and invocation uniqueness govern replay.
+	// An uncommitted live delivery may hold this admission's row lock.
+	// Leave the fact retryable and give the next invocation its own deadline.
+	ctx, cancel := context.WithTimeout(ctx, recoveryRowTimeout)
+	defer cancel()
 	return c.deliverEventPolicy(ctx, redis.XMessage{Values: fields}, fields["event_type"].(string), policy)
 }

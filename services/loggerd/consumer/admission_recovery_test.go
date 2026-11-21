@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
@@ -153,4 +154,55 @@ func TestAdmissionRecoveryBrokenPagePreservesCursor(t *testing.T) {
 	require.False(t, more)
 	require.Equal(t, initialRecoveryCursor, end)
 	require.Equal(t, scan.ids, scan.checked)
+}
+
+func TestAdmissionRecoveryLockedRowCannotConsumeWorkerContext(t *testing.T) {
+	ev := chargedProducerEvent()
+	fields, err := ev.TerminalAccountingFields()
+	require.NoError(t, err)
+	data, err := json.Marshal(fields)
+	require.NoError(t, err)
+	fact := recoveryFact{id: ev.InvocationID, orgID: ev.OrgID, admittedKind: "chat", terminalKind: "chat", correlation: ev.RequestID, terminalCorrelation: ev.RequestID, data: data}
+	workerCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	workerDeadline, _ := workerCtx.Deadline()
+	holdingLock := true
+	route := admissionRow(1, &fakeRow{vals: []any{ev.OrgID, "admitted"}}, chargedTerminalFacts())
+	db := &mockDB{QueryRowFn: func(ctx context.Context, q string, args ...any) pgx.Row {
+		if holdingLock && strings.Contains(q, "FROM request_admissions") {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok && deadline.Before(workerDeadline), "row lock uses the worker lifetime")
+			<-ctx.Done()
+			return errRow{err: ctx.Err()}
+		}
+		return route(ctx, q, args...)
+	}}
+	c := NewWithCreditStore(nil, db, "events", silentLogger(), credits.NewStore(nil, silentLogger()))
+	require.ErrorIs(t, c.recoverAdmission(workerCtx, fact), context.DeadlineExceeded)
+	require.NoError(t, workerCtx.Err())
+	holdingLock = false
+	require.NoError(t, c.recoverAdmission(workerCtx, fact))
+}
+
+type recoveryLookupContext struct {
+	fakeSettlementDB
+	lookup context.Context
+}
+
+func (db *recoveryLookupContext) QueryRow(ctx context.Context, _ string, _ ...any) pgx.Row {
+	db.lookup = ctx
+	return errRow{err: pgx.ErrNoRows}
+}
+
+func TestAdmissionRecoveryFallbackReadHasOwnDeadline(t *testing.T) {
+	db := new(recoveryLookupContext)
+	workerCtx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	_, err := readRecoveryFactByID(workerCtx, db, testInvocationID)
+	require.ErrorIs(t, err, pgx.ErrNoRows)
+	workerDeadline, _ := workerCtx.Deadline()
+	lookupDeadline, ok := db.lookup.Deadline()
+	require.True(t, ok && lookupDeadline.Before(workerDeadline))
+	require.ErrorIs(t, db.lookup.Err(), context.Canceled)
+	require.NoError(t, workerCtx.Err())
 }
