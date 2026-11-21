@@ -92,7 +92,7 @@ func TestRunURIBoundaryCorpus(t *testing.T) {
 	t.Run("encoded credentials upgrade end to end", func(t *testing.T) {
 		up, err := Run(ctx, encodedDSN, "")
 		require.NoError(t, err, "the full embedded set must apply through a percent-encoded DSN with special characters in the password")
-		require.Equal(t, int64(29), up.Version,
+		require.Equal(t, int64(jointScenario.headVersion), up.Version,
 			"embedded head moved: re-pin the corpus probes in the same change")
 
 		// The same encoded DSN must also open a plain pool: the credentials
@@ -102,7 +102,7 @@ func TestRunURIBoundaryCorpus(t *testing.T) {
 		defer pool.Close()
 		var version int64
 		require.NoError(t, pool.QueryRow(ctx, "SELECT MAX(version) FROM schema_migrations").Scan(&version))
-		require.Equal(t, int64(29), version, "the encoded-DSN session must see the applied head")
+		require.Equal(t, int64(jointScenario.headVersion), version, "the encoded-DSN session must see the applied head")
 	})
 }
 
@@ -130,19 +130,19 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 		dsn, pool, _ := spinBaselineStand(t, ctx)
 		up, err := Run(ctx, dsn, "sg")
 		require.NoError(t, err, "initial upgrade must reach the embedded head")
-		require.Equal(t, int64(29), up.Version,
+		require.Equal(t, int64(jointScenario.headVersion), up.Version,
 			"embedded head moved: re-pin the corpus targets in the same change")
 
 		t.Run("target above head is a no-op", func(t *testing.T) {
-			res, err := Down(ctx, dsn, "sg", 30)
+			res, err := Down(ctx, dsn, "sg", jointScenario.headVersion+1)
 			require.NoError(t, err)
-			require.Equal(t, int64(29), res.Version)
+			require.Equal(t, int64(jointScenario.headVersion), res.Version)
 			require.Equal(t, 1, res.Applied)
 		})
 		t.Run("target at current is a no-op", func(t *testing.T) {
-			res, err := Down(ctx, dsn, "sg", 29)
+			res, err := Down(ctx, dsn, "sg", jointScenario.headVersion)
 			require.NoError(t, err)
-			require.Equal(t, int64(29), res.Version)
+			require.Equal(t, int64(jointScenario.headVersion), res.Version)
 			require.Equal(t, 1, res.Applied)
 		})
 		t.Run("target 14 reverts the 0015..0018 alterations", func(t *testing.T) {
@@ -157,7 +157,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 		})
 		reup, err := Run(ctx, dsn, "sg")
 		require.NoError(t, err, "re-upgrade between targets must succeed")
-		require.Equal(t, int64(29), reup.Version)
+		require.Equal(t, int64(jointScenario.headVersion), reup.Version)
 		t.Run("target 11 reverts the 0012..0029 span (reserved gaps skipped)", func(t *testing.T) {
 			res, err := Down(ctx, dsn, "sg", 11)
 			require.NoError(t, err)
@@ -191,7 +191,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 				"incremental structures must be gone at version 1")
 			reup, err := Run(ctx, dsn, "sg")
 			require.NoError(t, err)
-			require.Equal(t, int64(29), reup.Version)
+			require.Equal(t, int64(jointScenario.headVersion), reup.Version)
 			requireRowCount(t, ctx, pool, "guard_pack_state", 0,
 				"re-created structures start empty: deleted probe data is not restored")
 		})
@@ -208,7 +208,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 				"the 0001 down must drop the baseline tables on a full revert")
 			reup, err := Run(ctx, dsn, "sg")
 			require.NoError(t, err)
-			require.Equal(t, int64(29), reup.Version)
+			require.Equal(t, int64(jointScenario.headVersion), reup.Version)
 		})
 
 		t.Run("negative target full-reverts and zero is a no-op at zero", func(t *testing.T) {
@@ -225,7 +225,7 @@ func TestDownTargetBoundaryCorpus(t *testing.T) {
 				"downgrading from zero must stay a no-op success")
 			reup, err := Run(ctx, dsn, "sg")
 			require.NoError(t, err)
-			require.Equal(t, int64(29), reup.Version)
+			require.Equal(t, int64(jointScenario.headVersion), reup.Version)
 			requireRowCount(t, ctx, pool, "organizations", 0,
 				"the full-revert probe row must not come back: no migration restores data")
 		})

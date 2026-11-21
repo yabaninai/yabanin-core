@@ -134,7 +134,7 @@ func TestCheckMetricsViews_ReadyAfterMigrateRun_Integration(t *testing.T) {
 	_, dsn := dedicatedDB(t)
 
 	res := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 29, res.Version)
+	assert.EqualValues(t, 30, res.Version)
 
 	missing, unreadable, err := feedback.CheckMetricsViews(ctx, appPoolOn(t, dsn))
 	require.NoError(t, err)
@@ -147,14 +147,14 @@ func TestMigrateRunFirstUpProvisionsViews_Integration(t *testing.T) {
 	owner, dsn := dedicatedDB(t)
 
 	// Genuine first up-migration (empty database): one consolidated baseline
-	// step to schema head 29 (reference harness: Applied=1, Version=29 on the
+	// step to schema head 30 (reference harness: Applied=1, Version=30 on the
 	// original checkout), then a second generation over the same database —
 	// the retained-volume restart shape.
 	first := runLogged(t, ctx, dsn)
 	assert.GreaterOrEqual(t, first.Applied, 1, "fresh first-up must apply the consolidated baseline")
-	assert.EqualValues(t, 29, first.Version)
+	assert.EqualValues(t, 30, first.Version)
 	second := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 29, second.Version)
+	assert.EqualValues(t, 30, second.Version)
 
 	var n int
 	require.NoError(t, owner.QueryRow(ctx,
