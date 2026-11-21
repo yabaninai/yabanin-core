@@ -593,3 +593,45 @@ func TestRT03_EvalgateDispatchesSelectedRegionalModel(t *testing.T) {
 	require.Equal(t, int32(1), judgeHits)
 	require.Equal(t, 1, verdicts.count())
 }
+
+type evalgateRefusingStore struct {
+	fakeInvocationStore
+	attempts int
+	refuseAt int
+}
+
+func (s *evalgateRefusingStore) AdmitInvocation(ctx context.Context, rec admissionRecord) error {
+	s.attempts++
+	if s.attempts == s.refuseAt {
+		return ErrInvocationStoreUnavailable
+	}
+	return s.fakeInvocationStore.AdmitInvocation(ctx, rec)
+}
+
+func TestRT03_EvalgateStartFailurePreventsPaidCall(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		refuseAt, premiumCalls int
+	}{
+		{"premium admission", 1, 0},
+		{"evaluator admission", 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var judgeHits int32
+			judge, _, _ := judgeHitServer(t, &judgeHits)
+			verdicts := newFakeVerdictStore()
+			premium := newRT03Upstream(t, nil)
+			gw := evalgateTestGateway(t, premium.srv.URL, judge.URL, verdicts)
+			gw.res = stubModelResolver{"premium": {ModelName: "premium", Provider: "openai", UpstreamURL: premium.srv.URL, Enabled: true}}
+			accounting := &evalgateRefusingStore{refuseAt: tc.refuseAt}
+			gw.invocations = accounting
+			cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "fault-comparison", body: nonStreamBody("cheap", mediumPrompt)}
+			cc.req.Model = "cheap"
+			gw.evalgateJudge(cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+			assert.Equal(t, tc.refuseAt, accounting.attempts)
+			assert.Equal(t, tc.premiumCalls, premium.totalCalls())
+			assert.Equal(t, int32(0), judgeHits)
+			assert.Zero(t, verdicts.count())
+		})
+	}
+}
