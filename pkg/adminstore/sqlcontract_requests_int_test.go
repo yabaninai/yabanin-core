@@ -998,7 +998,25 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 	fx := seedContractFixture(t, pool)
 	seedRequestsExtension(t, pool, fx)
 
-	// Detail: labels + tool calls + per-occurrence invocations (0014 reads).
+	// Contract order is load-bearing: the label-key, api-key write and CAS
+	// groups chain state (write -> verify -> clear; unconditional -> match
+	// -> mismatch reads the post-match state).
+	runRxDetailContract(t, store, fx)
+	runRxInvocationContract(t, store, fx)
+	runToolFactDetailContracts(t, store, fx)
+	runDetailBoundaryContracts(t, store, fx)
+	runLabelKeyContracts(t, store, fx)
+	runAPIKeyLabelWriteContract(t, store, pool, fx)
+	runAPIKeyLabelClearContract(t, store, pool, fx)
+	runAPIKeyLabelCASUnconditionalContract(t, store, fx)
+	runAPIKeyLabelCASMatchContract(t, store, fx)
+	runAPIKeyLabelCASErrorContracts(t, store, fx)
+}
+
+// runRxDetailContract covers the rx detail read: labels round-trip and
+// tool calls listed in id order (0014 reads).
+func runRxDetailContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "GetRequestDetail/rx", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-rx")
@@ -1010,6 +1028,20 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		if len(d.ToolCalls) != 2 || d.ToolCalls[0].ToolName != "web_search" || d.ToolCalls[1].ToolName != "code_interpreter" {
 			t.Errorf("GetRequestDetail/rx: tool calls must list both names in id order, got %v", d.ToolCalls)
+		}
+		return nil
+	})
+}
+
+// runRxInvocationContract covers the rx per-occurrence invocations (0014):
+// the first carries id and arguments, the second tolerates NULLs.
+func runRxInvocationContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetRequestDetail/rx-invocations", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-rx")
+		if err != nil {
+			return err
 		}
 		if len(d.ToolCallInvocations) != 2 {
 			t.Errorf("GetRequestDetail/rx: expected 2 invocations, got %d", len(d.ToolCallInvocations))
@@ -1024,13 +1056,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// Detail for the ambiguous r1 pair and the unique legacy carrier r2 —
-	// the tool-fact association controls live in their own helper.
-	runToolFactDetailContracts(t, store, fx)
-
-	// Cross-org and missing lookups answer ErrNotFound without leaking
-	// existence.
+// runDetailBoundaryContracts covers the detail ErrNotFound boundary:
+// cross-org and missing lookups never leak existence.
+func runDetailBoundaryContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "GetRequestDetail/cross-org", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		_, err := store.GetRequestDetail(contentCtx, fx.OrgB, fx.Token+"-rx")
@@ -1047,8 +1078,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// Label keys over the window (0004 data) and the honest empty answer.
+// runLabelKeyContracts covers ListLabelKeys over the window (0004 data)
+// and the honest empty answer for an unknown org.
+func runLabelKeyContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "ListLabelKeys/orgA", func(ctx context.Context) error {
 		keys, err := store.ListLabelKeys(ctx, fx.OrgA, fx.From, fx.To)
 		if err != nil {
@@ -1077,8 +1112,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// API-key labels (0014): plain write, verify, clear, missing id.
+// runAPIKeyLabelWriteContract covers the plain api-key label write (0014)
+// with flags, verified directly against the row.
+func runAPIKeyLabelWriteContract(t *testing.T, store *Store, pool *pgxpool.Pool, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabels/write", func(ctx context.Context) error {
 		err := store.UpdateAPIKeyLabels(ctx, fx.APIKeyA, map[string]string{"team": "alpha", "issue": "IMP-03E"}, true, true, false)
 		if err != nil {
@@ -1100,6 +1139,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelClearContract covers the clear-to-{} write and the
+// missing-id error.
+func runAPIKeyLabelClearContract(t *testing.T, store *Store, pool *pgxpool.Pool, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabels/clear", func(ctx context.Context) error {
 		if err := store.UpdateAPIKeyLabels(ctx, fx.APIKeyA, nil, false, false, false); err != nil {
 			return err
@@ -1120,9 +1165,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// CAS (0014): unconditional, expected-state success, mismatch and a
-	// vanished row.
+// runAPIKeyLabelCASUnconditionalContract covers the CAS unconditional
+// write (0014).
+func runAPIKeyLabelCASUnconditionalContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned", func(ctx context.Context) error {
 		st, err := store.UpdateAPIKeyLabelsPreconditioned(ctx, fx.APIKeyA,
 			map[string]string{"team": "alpha"}, true, false, true, nil)
@@ -1134,6 +1182,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelCASMatchContract covers the CAS expected-state success
+// path (0014).
+func runAPIKeyLabelCASMatchContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned/match", func(ctx context.Context) error {
 		expect := &APIKeyLabelsState{
 			Labels: map[string]string{"team": "alpha"}, LabelsLocked: true, CanMintSessions: false, CanReadUsage: true,
@@ -1148,6 +1202,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelCASErrorContracts covers the CAS failure modes (0014):
+// mismatch (returning the current state) and a vanished row.
+func runAPIKeyLabelCASErrorContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned/mismatch", func(ctx context.Context) error {
 		stale := &APIKeyLabelsState{
 			Labels: map[string]string{"team": "alpha"}, LabelsLocked: true, CanMintSessions: false, CanReadUsage: true,
