@@ -31,6 +31,33 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 	s.controlRequestOpts(t, "xt-pre-b", orgB, chatOptions{stream: true, apiKey: s.orgB.apiKey})
 
 	rid := s.reqPrefix + "tgt-xt-shared"
+	s.runSharedCorrelationPair(t, rid)
+
+	// Exactly one billed row per org, bound to that org only.
+	s.requireSharedCorrelationBilled(t, rid, orgA, orgB)
+
+	// Each wallet debited exactly once, signed, in its own org ledger.
+	s.requireWalletChargedExactlyOnce(t, rid, orgA, "cross-tenant A")
+	s.requireWalletChargedExactlyOnce(t, rid, orgB, "cross-tenant B")
+
+	// Admissions are org-bound: one per org, never leaked, both reconciled.
+	s.requireAdmissionsReconciledPerOrg(t, rid, orgA, orgB)
+
+	// Settlement intents stay org-scoped too.
+	if jobsA, jobsB := s.oracleSettlementJobs(t, rid, orgA), s.oracleSettlementJobs(t, rid, orgB); jobsA > 1 || jobsB > 1 {
+		t.Fatalf("cross-tenant: settlement jobs A/B = %d/%d, want <= 1 each", jobsA, jobsB)
+	}
+
+	s.controlRequest(t, "xt-post-a")
+	s.controlRequestOpts(t, "xt-post-b", orgB, chatOptions{stream: true, apiKey: s.orgB.apiKey})
+}
+
+// runSharedCorrelationPair drives the buffered org-A request and the
+// streamed org-B request under the SAME client correlation id, then
+// asserts the provider saw exactly two independent dispatches: the
+// shared id must not dedupe or cross-wire either tenant's invocation.
+func (s *stand) runSharedCorrelationPair(t *testing.T, rid string) {
+	t.Helper()
 
 	// Org A completes a buffered request under the shared correlation id.
 	statusA, _, errA := s.chatFull(t, rid, 30*time.Second, chatOptions{
@@ -55,8 +82,12 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 	if arr, disp, recv := s.fixture.Counts(rid); arr != 2 || disp != 2 || recv != 2 {
 		t.Fatalf("cross-tenant: ledger arr/disp/recv = %d/%d/%d, want 2/2/2 (independent invocations)", arr, disp, recv)
 	}
+}
 
-	// Exactly one billed row per org, bound to that org only.
+// requireSharedCorrelationBilled asserts each org's request log holds
+// exactly one httpOK billed row for the shared correlation id.
+func (s *stand) requireSharedCorrelationBilled(t *testing.T, rid, orgA, orgB string) {
+	t.Helper()
 	rowsA := s.oracleRequestLogRows(t, rid, orgA)
 	rowsB := s.oracleRequestLogRows(t, rid, orgB)
 	if len(rowsA) != 1 || rowsA[0].Status != httpOK {
@@ -67,11 +98,14 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 	}
 	s.requireBilledRow(t, rid, orgA, "cross-tenant A")
 	s.requireBilledRow(t, rid, orgB, "cross-tenant B")
+}
 
-	// Each wallet debited exactly once, signed, in its own org ledger.
-	s.requireWalletChargedExactlyOnce(t, rid, orgA, "cross-tenant A")
-	s.requireWalletChargedExactlyOnce(t, rid, orgB, "cross-tenant B")
-
+// requireAdmissionsReconciledPerOrg waits until every org holds exactly
+// one vocabulary-valid admission for the shared correlation id in state
+// reconciled with the live-event reason: completed requests must never
+// void and must never appear under the neighbor org.
+func (s *stand) requireAdmissionsReconciledPerOrg(t *testing.T, rid, orgA, orgB string) {
+	t.Helper()
 	// Admissions are org-bound (text column): one admission per org, never
 	// leaked, vocabulary-valid; both eventually reconciled (both completed).
 	if !s.oracleTableExists(t, "request_admissions") {
@@ -99,12 +133,4 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 		}
 		return nil
 	})
-
-	// Settlement intents stay org-scoped too.
-	if jobsA, jobsB := s.oracleSettlementJobs(t, rid, orgA), s.oracleSettlementJobs(t, rid, orgB); jobsA > 1 || jobsB > 1 {
-		t.Fatalf("cross-tenant: settlement jobs A/B = %d/%d, want <= 1 each", jobsA, jobsB)
-	}
-
-	s.controlRequest(t, "xt-post-a")
-	s.controlRequestOpts(t, "xt-post-b", orgB, chatOptions{stream: true, apiKey: s.orgB.apiKey})
 }
