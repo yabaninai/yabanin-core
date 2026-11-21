@@ -1770,7 +1770,13 @@ func (gw *gateway) writeChatCacheAsync(ctx context.Context, cc *chatContext, fin
 		GenParams: gw.effortForCandidate(finalInfo, classifier.Class(cc.classifierClass)),
 		Upstream:  gw.cacheUpstreamFP(finalInfo), // H1: bind the entry to the endpoint that generated it
 	}
-	gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)) //nolint:errcheck,gosec // async cache write: a miss is non-fatal, the next request repopulates
+	if usage.PromptTokens < 0 || usage.PromptTokens > math.MaxInt || usage.CompletionTokens < 0 || usage.CompletionTokens > math.MaxInt {
+		cc.l.Debug("cache write skipped for invalid provider token counts", "request_id", cc.reqID)
+		return
+	}
+	if err := gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)); err != nil {
+		cc.l.Debug("chat cache write failed", "request_id", cc.reqID, "error", err)
+	}
 }
 
 // writeChatJSONClient answers the JSON client after the terminal event has

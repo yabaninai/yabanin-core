@@ -473,7 +473,7 @@ func (s pgInvocationStore) RecordTerminalFacts(ctx context.Context, rec terminal
 	if err != nil {
 		return fmt.Errorf("%w: begin terminal tx for %s: %w", ErrInvocationStoreUnavailable, rec.InvocationID, err)
 	}
-	defer tx.Rollback(ctx) //nolint:errcheck // rollback of a finished tx is a no-op
+	defer func() { _ = tx.Rollback(ctx) }()
 
 	if err := insertInvocationFacts(ctx, tx, rec, event); err != nil {
 		return err
