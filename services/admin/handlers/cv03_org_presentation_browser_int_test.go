@@ -92,6 +92,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/adminstore"
 	"github.com/reireirei/yabanin/pkg/credits"
 	"github.com/reireirei/yabanin/pkg/testdb"
+	"github.com/reireirei/yabanin/services/loggerd/consumer"
 	"github.com/stretchr/testify/require"
 )
 
@@ -688,6 +689,14 @@ func TestCV03OrgPresentationBrowserAcceptance(t *testing.T) {
 	// Same origin for the artifact and the API (cookie scope + same-origin
 	// fetches are part of the contract under test); the barrier wraps the
 	// whole mux as the outermost handler.
+	// The dashboard groups by day and reads hourly rollups. Materialize the
+	// seeded log rows through the production refresher before opening Chromium.
+	hour := time.Now().UTC().Truncate(time.Hour)
+	refresh := consumer.RollupRefresher{DB: consumer.NewRollupDB(pool), Region: "e2e"}
+	skipped, err := refresh.RefreshWindow(ctx, hour.Add(-4*time.Hour), hour.Add(time.Hour))
+	require.NoError(t, err)
+	require.False(t, skipped, "reader fixture rollup must be committed")
+
 	barrier := cv03NewBarrier(target.ID)
 	mux := http.NewServeMux()
 	mux.Handle("/api/", router)

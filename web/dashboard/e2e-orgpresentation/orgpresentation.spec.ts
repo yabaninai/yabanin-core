@@ -146,7 +146,9 @@ test('AC-OP-SHARE remount shares the parked org GET and then renders CHF/Zurich'
   // page-1 filler (the target is beyond page 1), then re-enter the target.
   const walletsBeforeRecommit = targetWalletGETs
   await page.goto('/#overview')
+  await expect(page.getByRole('heading', { name: 'Overview', exact: true })).toBeVisible()
   await page.goto('/#credits')
+  await expect(page.getByRole('heading', { name: 'Credits & Billing', exact: true })).toBeVisible()
   await page.getByLabel('Org ID').selectOption({ label: 'Enter ID manually…' })
   await page.getByLabel('org uuid').fill(fx.target.id)
 
