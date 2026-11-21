@@ -43,3 +43,10 @@ func TestDecodeTerminalAccounting(t *testing.T) {
 		})
 	}
 }
+
+func TestTerminalFactsCannotCommitNegativeUsage(t *testing.T) {
+	event := accountingFixture()
+	event.TokensOut = -1
+	_, err := event.TerminalAccountingFields()
+	require.Error(t, err)
+}

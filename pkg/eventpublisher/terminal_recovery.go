@@ -49,11 +49,7 @@ func validAccountingScalar(key, value string) bool {
 		n, err := strconv.ParseInt(value, 10, 64)
 		return err == nil && n >= 0
 	case "event_type":
-		switch value {
-		case "request.completed", "request.failed", "request.shadow_completed", "request.budget_exceeded":
-			return true
-		}
-		return false
+		return isTerminalEventType(value)
 	}
 	return true
 }

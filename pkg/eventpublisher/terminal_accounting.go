@@ -92,9 +92,7 @@ func (event *Event) TerminalAccountingFields() (map[string]string, error) {
 	if !validInvocationID(event.InvocationID) {
 		return nil, errors.New("invalid terminal invocation ID")
 	}
-	switch event.EventType {
-	case "request.completed", "request.failed", "request.shadow_completed", "request.budget_exceeded":
-	default:
+	if !isTerminalEventType(event.EventType) {
 		return nil, errors.New("invalid terminal accounting event type")
 	}
 	if !validTerminalCosts(event.EstimatedCostUSD, event.ResaleCostUSD, event.CounterfactualCostUSD) {
@@ -103,6 +101,9 @@ func (event *Event) TerminalAccountingFields() (map[string]string, error) {
 	reservations, err := event.terminalReservations()
 	if err != nil {
 		return nil, err
+	}
+	if !event.validTerminalQuantities() {
+		return nil, errors.New("negative terminal accounting quantity")
 	}
 	return event.terminalFields(reservations), nil
 }
@@ -116,6 +117,23 @@ func (event *Event) terminalFields(reservations string) map[string]string {
 	fields["user_id"] = event.UserID
 	fields["prompt_hash"] = ResolvePromptHash(event.PromptHash, event.Payload)
 	return fields
+}
+
+func isTerminalEventType(value string) bool {
+	switch value {
+	case "request.completed", "request.failed", "request.shadow_completed", "request.budget_exceeded":
+		return true
+	}
+	return false
+}
+
+func (event *Event) validTerminalQuantities() bool {
+	for _, n := range [...]int64{event.TokensIn, event.TokensOut, event.CacheReadTokens, event.CacheCreationTokens, event.DurationMs, event.FirstTokenMs, event.StatusCode, int64(event.AttemptCount), int64(event.RetryCount)} {
+		if n < 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func validTerminalCosts(amounts ...float64) bool {
