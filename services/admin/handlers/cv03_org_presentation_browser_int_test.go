@@ -129,9 +129,9 @@ var cv03RequiredCases = []string{
 // under UTC, Europe/Zurich and Asia/Tokyo. November sits in CET (UTC+1),
 // so Europe/Zurich shifts stamps by one hour and Asia/Tokyo by nine.
 const (
-	cv03TargetStamp = "2026-11-21 12:34:56+00" // Zurich 13:34, Tokyo 21:34
-	cv03MemberStamp = "2026-11-21 09:05:00+00" // Tokyo 18:05, Zurich 10:05
-	cv03ReaderStamp = "2026-11-20 08:15:00+00" // Berlin 09:15 (denied, never rendered)
+	cv03TargetStamp = "2026-11-21T12:34:56Z" // Zurich 13:34, Tokyo 21:34
+	cv03MemberStamp = "2026-11-21T09:05:00Z" // Tokyo 18:05, Zurich 10:05
+	cv03ReaderStamp = "2026-11-20T08:15:00Z" // Berlin 09:15 (denied, never rendered)
 
 	cv03TargetCents = int64(123)  // "1.23 USD" under CHF/JPY, "$1.23" only if defaulted
 	cv03MemberCents = int64(4567) // "45.67 USD" under JPY
@@ -785,8 +785,8 @@ func TestCV03OrgPresentationBrowserAcceptance(t *testing.T) {
 			"cv03 preflight: %s wallet must serve the DISTINCT seeded cents (wrong row?)", name)
 		want, err := time.Parse(time.RFC3339, stamp)
 		require.NoError(t, err, "cv03 preflight: %s stamp parse", name)
-		require.WithinDuration(t, want, bal.UpdatedAt, time.Second,
-			"cv03 preflight: %s wallet must serve the DISTINCT seeded stamp (wrong row?)", name)
+		require.True(t, want.Equal(bal.UpdatedAt),
+			"cv03 preflight: %s wallet stamp: got %s, want %s", name, bal.UpdatedAt, want)
 	}
 	walletPreflight("target", target.ID, cv03TargetCents, cv03TargetStamp, cookieRoot)
 	walletPreflight("member", memberOrg.ID, cv03MemberCents, cv03MemberStamp, cookieMember)
