@@ -467,6 +467,35 @@ func (s pgInvocationStore) RecordTerminalFacts(ctx context.Context, rec terminal
 	}
 	defer tx.Rollback(ctx) //nolint:errcheck // rollback of a finished tx is a no-op
 
+	if err := insertInvocationFacts(ctx, tx, rec, event); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return s.verifyFailedCommit(ctx, rec, event, err)
+	}
+	return nil
+}
+
+// A fresh read distinguishes an acknowledged-by-storage commit from a
+// transaction that can be retried under the same invocation.
+func (s pgInvocationStore) verifyFailedCommit(ctx context.Context, rec terminalFactsRecord, event []byte, cause error) error {
+	state, err := s.verifyTerminalFacts(ctx, rec, event)
+	if err != nil {
+		return fmt.Errorf("%w: commit terminal facts for %s: %w (verify: %v)",
+			ErrInvocationStoreUnavailable, rec.InvocationID, cause, err)
+	}
+	switch state {
+	case terminalVerifyIdentical:
+		return nil
+	case terminalVerifyDivergent:
+		return fmt.Errorf("%w: commit verification for %s", ErrTerminalFactsDivergent, rec.InvocationID)
+	default:
+		return fmt.Errorf("%w: commit terminal facts for %s: %w", ErrInvocationStoreUnavailable, rec.InvocationID, cause)
+	}
+}
+
+// Serialize the terminal write with a concurrent void of the same admission.
+func insertInvocationFacts(ctx context.Context, tx pgx.Tx, rec terminalFactsRecord, event []byte) error {
 	var state string
 	if err := tx.QueryRow(ctx, `
 		SELECT state FROM request_admissions
@@ -496,38 +525,7 @@ func (s pgInvocationStore) RecordTerminalFacts(ctx context.Context, rec terminal
 		return err
 	}
 	if tag.RowsAffected() == 0 {
-		var storedOrg, storedKind, storedEvent string
-		derr := tx.QueryRow(ctx,
-			`SELECT org_id, kind, event::text FROM request_terminal_facts WHERE invocation_id = $1`,
-			rec.InvocationID).Scan(&storedOrg, &storedKind, &storedEvent)
-		if derr != nil {
-			return fmt.Errorf("%w: divergence diagnosis for %s failed: %w",
-				ErrTerminalFactsDivergent, rec.InvocationID, derr)
-		}
-		return fmt.Errorf("%w: invocation=%s stored=(org=%s kind=%s event=%s) new=(org=%s kind=%s event=%s)",
-			ErrTerminalFactsDivergent, rec.InvocationID,
-			storedOrg, storedKind, storedEvent, rec.OrgID, rec.Kind, event)
-	}
-	if err := tx.Commit(ctx); err != nil {
-		// Ambiguous commit: the ACK can be lost AFTER a durable land.
-		// Bounded same-ID idempotent verification — a fresh read of the
-		// facts row inside the caller's bounded context — decides:
-		// identical row ⇒ the commit landed (nil; the funnel proceeds
-		// and the client may succeed); absent ⇒ the original cause
-		// flows on (the funnel retries serialization classes, fails
-		// closed otherwise); a different row is a divergence.
-		switch verified, verr := s.verifyTerminalFacts(ctx, rec, event); {
-		case verr != nil:
-			return fmt.Errorf("%w: commit terminal facts for %s: %w (verify: %v)",
-				ErrInvocationStoreUnavailable, rec.InvocationID, err, verr)
-		case verified == terminalVerifyIdentical:
-			return nil
-		case verified == terminalVerifyDivergent:
-			return fmt.Errorf("%w: commit verification for %s", ErrTerminalFactsDivergent, rec.InvocationID)
-		default:
-			return fmt.Errorf("%w: commit terminal facts for %s: %w",
-				ErrInvocationStoreUnavailable, rec.InvocationID, err)
-		}
+		return fmt.Errorf("%w: invocation=%s", ErrTerminalFactsDivergent, rec.InvocationID)
 	}
 	return nil
 }
