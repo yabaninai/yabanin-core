@@ -10,6 +10,8 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
 	"sync"
@@ -20,7 +22,7 @@ import (
 )
 
 type ackCut struct {
-	held      chan struct{}
+	held      chan string
 	forward   chan bool
 	discarded chan time.Time
 }
@@ -35,7 +37,7 @@ type ackRelay struct {
 func (r *ackRelay) arm(pid uint32) *ackCut {
 	r.Lock()
 	defer r.Unlock()
-	cut := &ackCut{make(chan struct{}), make(chan bool, 1), make(chan time.Time, 1)}
+	cut := &ackCut{make(chan string, 1), make(chan bool, 1), make(chan time.Time, 1)}
 	r.cuts[pid] = cut
 	return cut
 }
@@ -48,6 +50,7 @@ func (r *ackRelay) take(pid uint32) *ackCut {
 }
 func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.Reader) error {
 	var pid uint32
+	var command string
 	var header [5]byte
 	for {
 		if _, err := io.ReadFull(backend, header[:]); err != nil {
@@ -65,9 +68,12 @@ func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.
 		if header[0] == 'K' && size == 8 {
 			pid = binary.BigEndian.Uint32(frame[5:9])
 		}
+		if header[0] == 'C' {
+			command = strings.TrimSuffix(string(frame[5:]), "\x00")
+		}
 		if header[0] == 'Z' && size == 1 && frame[5] == 'I' {
 			if cut := r.take(pid); cut != nil {
-				if err := cut.deliver(ctx, client); err != nil {
+				if err := cut.deliver(ctx, client, command); err != nil {
 					return err
 				}
 			}
@@ -80,19 +86,18 @@ func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.
 		}
 	}
 }
-func (c *ackCut) deliver(ctx context.Context, client net.Conn) error {
-	close(c.held)
+func (c *ackCut) deliver(ctx context.Context, client net.Conn, command string) error {
+	c.held <- command
 	select {
 	case forward := <-c.forward:
 		if forward {
 			return nil
 		}
-		at := time.Now()
 		err := client.Close()
-		c.discarded <- at
 		if err != nil {
 			return err
 		}
+		c.discarded <- time.Now()
 		return net.ErrClosed
 	case <-ctx.Done():
 		return ctx.Err()
@@ -169,6 +174,29 @@ type ackResponse struct {
 	at     time.Time
 }
 
+func (s *stand) ackRequest(ctx context.Context, rid string) ackResponse {
+	var out ackResponse
+	trace := httptrace.ClientTrace{GotFirstResponseByte: func() { out.at = time.Now() }}
+	payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, s.model, rid)
+	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, &trace), http.MethodPost, s.gatewayURL+"/v1/chat/completions", strings.NewReader(payload))
+	if err != nil {
+		out.err = err
+		return out
+	}
+	req.Header.Set("Authorization", "Bearer "+s.apiKey)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Request-ID", rid)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		out.err = err
+		return out
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	out.status, out.body, out.err = resp.StatusCode, string(body), err
+	return out
+}
+
 func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn, rid string, forward bool) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
@@ -183,10 +211,9 @@ func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn,
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		status, body, err := s.chat(t, rid, 30*time.Second)
-		result <- ackResponse{status, body, err, time.Now()}
+		result <- s.ackRequest(ctx, rid)
 	}()
-	t.Cleanup(func() { <-done })
+	defer func() { cancel(); <-done }()
 	var pid uint32
 	require.Eventually(t, func() bool {
 		err := db.QueryRowContext(ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING(pid)
@@ -201,7 +228,9 @@ func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn,
 	cut := relay.arm(pid)
 	require.NoError(t, lock.Commit())
 	select {
-	case <-cut.held:
+	case command := <-cut.held:
+		require.Contains(t, []string{"INSERT 0 1", "COMMIT"}, command, "expected the completion exchange for this admission")
+		t.Logf("gateway backend %d completed %s and its transaction-ready reply is held", pid, command)
 	case r := <-result:
 		t.Fatalf("client returned before commit reply: %d %v", r.status, r.err)
 	case <-ctx.Done():
@@ -232,7 +261,8 @@ func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn,
 	}
 	select {
 	case at := <-cut.discarded:
-		require.False(t, resp.at.Before(at), "client refused before the selected reply was discarded")
+		require.False(t, resp.at.IsZero(), "missing HTTP first-byte observation")
+		require.False(t, resp.at.Before(at), "HTTP response began before the selected connection was closed")
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
