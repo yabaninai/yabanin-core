@@ -88,7 +88,7 @@ const (
 		 ON CONFLICT (org_id, request_id, charge_kind) WHERE invocation_id IS NULL DO NOTHING`
 	settlementIntentInvocationQuery = `INSERT INTO settlement_jobs
 		 (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload)
-		 VALUES ($1, $2, $3, $4, $5, 'pending', $6)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)
 		 ON CONFLICT (org_id, invocation_id, charge_kind) WHERE invocation_id IS NOT NULL DO NOTHING`
 	// The reservation-linked variant (NEXT-18d, ADR-0001 §13) additionally
 	// records the allocation whose reserve the settle decrements. Only
@@ -104,7 +104,7 @@ const (
 		 ON CONFLICT (org_id, request_id, charge_kind) WHERE invocation_id IS NULL DO NOTHING`
 	settlementIntentWithAllowanceInvocationQuery = `INSERT INTO settlement_jobs
 		 (org_id, request_id, invocation_id, charge_kind, amount_cents, amount_micro_usd, status, payload, allowance_id)
-		 VALUES ($1, $2, $3, $4, $5, 'pending', $6, $7, $8)
+		 VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7, $8)
 		 ON CONFLICT (org_id, invocation_id, charge_kind) WHERE invocation_id IS NOT NULL DO NOTHING`
 	// a settlement_jobs row in the non-claimable 'pending_price' state,
 	// written in the SAME delivery transaction as the request log. It is
