@@ -96,6 +96,9 @@ func newJudgeHopClient(t *testing.T, up *judgeHopUpstream, mut func(c *budgetedJ
 		log:       judgeHopLogger(t),
 		now:       time.Now,
 		admission: budget.NewAdmission(nil, budget.ScopedRateSource{}, nil, "test", budget.ModeOff, nil, budget.AdmissionConfig{}),
+		// Preview2 durable accounting: healthy store by default — a judge
+		// hop is a paid dispatch, so the client fails closed without one.
+		invocations: &fakeInvocationStore{},
 	}
 	if mut != nil {
 		mut(client)
@@ -282,9 +285,10 @@ func TestBudgetedJudge_WireShapeMatchesJudgeContract(t *testing.T) {
 		models: llmjudge.ModelResolverFunc(func(_ context.Context, ref string) (llmjudge.Target, error) {
 			return llmjudge.Target{Model: ref, Provider: "openai", UpstreamURL: srv.URL}, nil
 		}),
-		loop: budget.NewLoopBudget(0, 0),
-		log:  judgeHopLogger(t),
-		now:  time.Now,
+		loop:        budget.NewLoopBudget(0, 0),
+		log:         judgeHopLogger(t),
+		now:         time.Now,
+		invocations: &fakeInvocationStore{},
 	}
 	resp, err := client.JudgeChat(context.Background(), judgeHopRequest("judge-model"))
 	require.NoError(t, err)

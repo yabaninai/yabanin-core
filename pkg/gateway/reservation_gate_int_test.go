@@ -92,6 +92,10 @@ func newReservationGateway(t *testing.T, pool *pgxpool.Pool, up *httptest.Server
 		})
 		gw.admission = budget.NewAdmission(store, gatewayRates(pool), nil,
 			"gw-int-"+uuid.NewString()[:8], gate, reservationOrgLoader(pool), budget.DefaultAdmissionConfig())
+		// Preview2 durable accounting: live-Postgres fixtures wire the real
+		// invocation store so the fail-closed confirmed start (chat canon and
+		// every wired endpoint) admits against the shared database.
+		gw.invocations = NewPGInvocationStore(pool)
 	}
 	return gw
 }

@@ -11,7 +11,6 @@ import (
 	"testing"
 	"time"
 
-	"github.com/go-chi/chi/v5"
 	"github.com/reireirei/yabanin/pkg/budget"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 )
@@ -46,10 +45,7 @@ func TestResponsesNative_StreamClientCancel(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -60,6 +56,7 @@ func TestResponsesNative_StreamClientCancel(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -132,10 +129,7 @@ func TestResponsesAdapted_StreamClientCancel(t *testing.T) {
 	restore := observeEvent(func(e *eventpub.Event) { evCh <- e })
 	t.Cleanup(restore)
 
-	router := chi.NewRouter()
-	gw.routes(router)
-	gwServer := httptest.NewServer(router)
-	defer gwServer.Close()
+	gwServer := responsesBillingServer(t, gw)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -146,6 +140,7 @@ func TestResponsesAdapted_StreamClientCancel(t *testing.T) {
 	}
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	resp, err := gwServer.Client().Do(req)
 	if err != nil {
 		t.Fatal(err)

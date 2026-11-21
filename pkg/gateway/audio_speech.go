@@ -97,6 +97,7 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	// tokens) keeps the token-free estimate path and is refused in enforce
 	// mode as unpriced (fail-closed, I3).
 	rctx := r.Context()
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "audio.speech",
 		withUnitDemand(
 			gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
@@ -134,6 +135,19 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap), so a local failure never
+	// strands a durable admission for a request that never dispatched.
+	// Fail closed: an unwritten start (write error, timeout or lost ACK —
+	// outcome unknown) refuses the request with ZERO provider arrivals
+	// under the history_unavailable envelope, and the escrow is released.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 	resp, err := client.Do(ctx, "/v1/audio/speech", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -158,12 +172,6 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
 		apierrors.Write(w, status, errType, "upstream request failed")
-		return
-	}
-	if rctx.Err() != nil {
-		// N3: the client walked away mid-response — settle the escrow with
-		// zero spend and publish no request.completed success event.
-		gate.finalizeNoEvent(budget.TerminationClientCancel)
 		return
 	}
 
@@ -192,7 +200,7 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	_, _ = gw.finishRequest(rctx, requestFinish{
+	_, ferr := gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,
@@ -223,11 +231,31 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 			ProviderEntityJurisdiction: admitted.Info.Provider,
 			Labels:                     labelsFrom(rctx),
 		},
-		info:        admitted.Info,
-		resp:        resp,
+		info: admitted.Info,
+		resp: resp,
+		// N3 + owner review 0574aa1: the provider fully served and was paid
+		// for its 200 (an interrupted read returned above with no fabricated
+		// usage). Whether the client transport is still alive only picks the
+		// termination outcome (completionTermination → client_cancel) and
+		// whether success bytes are written below — the KNOWN usage settles
+		// durably either way (terminal facts ride the WithoutCancel funnel).
 		termination: completionTermination(rctx),
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
+	if rctx.Err() != nil {
+		// N3: the client walked away after the provider was paid — no
+		// success bytes to the dead transport; the settlement above already
+		// carries the known usage with the cancellation recorded.
+		return
+	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {

@@ -59,6 +59,9 @@ func streamTestGateway(upstreamURL string) *gateway {
 		fallback:    fallbackrouter.NewFallbackExecutor(nil, 3, nil),
 		retryPolicy: retry.Policy{MaxAttempts: 1}, // no retry by default in tests
 		log:         slog.Default(),
+		// Preview2 durable accounting: the production constructor wires
+		// NewPGInvocationStore(w.pool); isolated chat fixtures wire the
+		// fake so the fail-closed confirmed start admits.
 		invocations: &fakeInvocationStore{},
 	}
 }

@@ -55,7 +55,10 @@ func TestMessages_ConsumerAuthGenerations(t *testing.T) {
 	newCfg := func(mode string) *gateway {
 		gw := nativeMessagesGateway(t, upstream.URL)
 		gw.cfg.AuthMode = mode
-		gw.auth = NewAuthMiddleware(gw.cfg, nil)
+		// Preview2: durable terminal facts require a tenant, so the key
+		// resolves to a test org exactly like the legacy subtest below —
+		// auth acceptance semantics are unchanged.
+		gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("consumer-auth", nil))
 		return gw
 	}
 

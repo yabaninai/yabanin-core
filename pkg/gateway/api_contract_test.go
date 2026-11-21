@@ -41,6 +41,9 @@ func TestContract_ErrorEnvelopeShape(t *testing.T) {
 			r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
 			r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 			r.Header.Set("Content-Type", "application/json")
+			// Handler-direct: golden identity stands in for the resolved
+			// principal the production auth middleware injects.
+			goldenIdentity(r)
 			rec := httptest.NewRecorder()
 			gw.chatCompletions(rec, r)
 			require.Equal(t, tc.wantStatus, rec.Code, rec.Body.String())
@@ -70,6 +73,9 @@ func TestContract_SuccessBodyShape(t *testing.T) {
 		strings.NewReader(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`))
 	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
+	// Handler-direct: golden identity stands in for the resolved principal
+	// the production auth middleware injects.
+	goldenIdentity(r)
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())

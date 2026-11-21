@@ -41,12 +41,17 @@ func newAdmissionMatrixGateway(t *testing.T) (*gateway, *atomic.Int64, *atomic.I
 	t.Cleanup(server.Close)
 
 	gw := &gateway{
-		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
-		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key"},
-		log:         slog.Default(),
-		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:         stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-		pool:        upstream.NewPool(upstream.Options{}),
+		cfg: config.Gateway{AuthMode: "strict", APIKey: "test-key"},
+		log: slog.Default(),
+		// Preview2: durable terminal facts require a tenant; resolve the
+		// bearer key to a test org exactly like production org-key auth
+		// (the matrix rides the real routes).
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("matrix-org", nil)),
+		res:  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+		pool: upstream.NewPool(upstream.Options{}),
+		// Preview2 durable accounting: fake store so the fail-closed
+		// confirmed start admits.
+		invocations: &fakeInvocationStore{},
 	}
 	gw.eventNote = func(*eventpub.Event) { events.Add(1) }
 	return gw, &hits, &events

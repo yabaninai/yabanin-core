@@ -80,6 +80,12 @@ type admitted struct {
 	WorkloadID     string
 	SessionID      string
 	RequestID      string
+	// Invocation is the Preview2 durable-accounting holder minted by the
+	// shared admission core. Endpoints that dispatch paid provider quota
+	// bind it to their request context (withInvocationIdentity) so the
+	// confirmed-start and terminal-facts funnel attributes this request;
+	// families that opted out of minting-on-context keep it inert.
+	Invocation *invocationIdentity
 }
 
 // admissionCoreInput is the input of the shared pre-routing guard sequence.
@@ -530,6 +536,7 @@ func (gw *gateway) admit(w http.ResponseWriter, r *http.Request, in admitInput) 
 		WorkloadID:     core.WorkloadID,
 		SessionID:      core.SessionID,
 		RequestID:      core.RequestID,
+		Invocation:     core.Invocation,
 	}
 
 	if gw.residencyEnforcer != nil && out.OrgID != "" {

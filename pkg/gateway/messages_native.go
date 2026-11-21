@@ -60,6 +60,7 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 	// call (no cache branch on this pipeline). The gate rides the
 	// request-derived context for the finishers below.
 	rctx := withPolicyEvent(r.Context(), policyEvent)
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "messages.native",
 		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 			admitted.Info, admitted.Body, nil, false))
@@ -84,10 +85,26 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
 	extra := anthropicExtraHeaders(r)
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap, header prep), so a local
+	// failure never strands a durable admission for a request that never
+	// dispatched. One admission per request; the JSON and stream branches
+	// below share it and the kind binds to the transport actually
+	// dispatched. Fail closed: an unwritten start (write error, timeout or
+	// lost ACK — outcome unknown) refuses the request with ZERO provider
+	// arrivals under the history_unavailable envelope, and the escrow is
+	// released.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindForChat(probe.Stream)); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 	if probe.Stream {
 		// W-TIMEOUT: streams carry no whole-request deadline; the transport's
 		// ResponseHeaderTimeout plus the idle watchdog below bound them.
-		gw.messagesNativeStream(w, r, gate, admitted, client, upstreamBody, apiKey, upstreamURL, extra, started)
+		gw.messagesNativeStream(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, upstreamURL, extra, started)
 		return
 	}
 	timeout := admitted.Info.UpstreamTimeout
@@ -115,7 +132,7 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		gw.forwardAnthropicError(w, r, admitted, resp, limited, upstreamURL, started)
+		gw.forwardAnthropicError(w, rctx, admitted, resp, limited, upstreamURL, started)
 		return
 	}
 	usage := provider.Anthropic{}.ParseUsage(limited)
@@ -128,14 +145,22 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 			rctx = withPolicyEvent(rctx, appendPolicyEvents(policyEventFrom(rctx), postEvent))
 		}
 		if denied {
-			gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusBadRequest, started, resp, "request.failed", "response blocked by organization policy")
+			if ferr := gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusBadRequest, started, resp, "request.failed", "response blocked by organization policy"); ferr != nil {
+				l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+			}
 			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"response blocked by organization policy", policyDenyErrorCode)
 			return
 		}
 		limited = masked
 	}
-	gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "")
+	if ferr := gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", ""); ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		writeTerminalAccountingFailure(w)
+		return
+	}
 	// N03-P06-T02: same provider-derived transparency the OpenAI-compat
 	// JSON path reports (finalizeChatJSON); before WriteHeader below.
 	setPromptCacheHeader(w, usage)
@@ -145,7 +170,7 @@ func (gw *gateway) messagesNative(w http.ResponseWriter, r *http.Request, body [
 	_, _ = w.Write(limited)
 }
 
-func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, extra http.Header, started time.Time) {
+func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, extra http.Header, started time.Time) {
 	l := logctx.From(r.Context(), gw.log)
 	streamCtx, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
@@ -168,7 +193,7 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 			apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
 			return
 		}
-		gw.forwardAnthropicError(w, r, admitted, resp, limited, upstreamURL, started)
+		gw.forwardAnthropicError(w, rctx, admitted, resp, limited, upstreamURL, started)
 		return
 	}
 	copyAnthropicPassthrough(w.Header(), resp.Header)
@@ -192,7 +217,15 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 	// delivered-usage asymmetry is pinned by
 	// TestMessagesNative_EventAsymmetry_CutStream.
 	setPromptCacheTrailer(w, usage)
-	gw.finishNativeMessages(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "")
+	if ferr := gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", ""); ferr != nil {
+		// SSE 200 headers are already committed: the client keeps the
+		// stream, and the terminal accounting failure closes it with the
+		// protocol-shaped error event carrying accounting_commit_failed
+		// (the chat stream canon: NOT safe to retry — support reconciles
+		// the charge). The withheld event never reaches the consumer.
+		l.Error("terminal facts commit failed after streamed dispatch", "error", ferr)
+		writeAnthropicStreamAccountingFailure(w)
+	}
 }
 
 // relayAnthropicSSE forwards the upstream Anthropic SSE stream to the client
@@ -470,8 +503,12 @@ type anthRawUsage struct {
 	CacheCreate *int64 `json:"cache_creation_input_tokens"`
 }
 
-func (gw *gateway) forwardAnthropicError(w http.ResponseWriter, r *http.Request, admitted admitted, resp *http.Response, body []byte, upstreamURL string, started time.Time) {
-	gw.finishNativeMessages(w, r.Context(), admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed")
+func (gw *gateway) forwardAnthropicError(w http.ResponseWriter, ctx context.Context, admitted admitted, resp *http.Response, body []byte, upstreamURL string, started time.Time) {
+	if ferr := gw.finishNativeMessages(w, ctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed"); ferr != nil {
+		// The client envelope is already the upstream failure; the
+		// withheld event is logged loudly (finishRequestLogged canon).
+		logctx.From(ctx, gw.log).Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+	}
 	copyAnthropicPassthrough(w.Header(), resp.Header)
 	if ct := resp.Header.Get("Content-Type"); ct != "" {
 		w.Header().Set("Content-Type", ct)
@@ -482,7 +519,11 @@ func (gw *gateway) forwardAnthropicError(w http.ResponseWriter, r *http.Request,
 	_, _ = w.Write(body)
 }
 
-func (gw *gateway) finishNativeMessages(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, upstreamURL string, status int, started time.Time, resp *http.Response, eventType, errText string) {
+// finishNativeMessages closes the native /v1/messages request. It returns
+// the terminal-facts commit error so success call sites can convert the
+// client reply (writeTerminalAccountingFailure / the Anthropic SSE
+// accounting event); failure call sites log it (finishRequestLogged canon).
+func (gw *gateway) finishNativeMessages(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, upstreamURL string, status int, started time.Time, resp *http.Response, eventType, errText string) error {
 	ext := provider.ComputeCost(usage, "anthropic", admitted.Info.ModelName)
 	if eventType == "request.completed" {
 		gw.accountUsage(ctx, w, usageRecord{
@@ -498,7 +539,7 @@ func (gw *gateway) finishNativeMessages(w http.ResponseWriter, ctx context.Conte
 	if eventType == "request.completed" {
 		term = completionTermination(ctx)
 	}
-	_, _ = gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  eventType,
 			RequestID:                  admitted.RequestID,
@@ -540,6 +581,30 @@ func (gw *gateway) finishNativeMessages(w http.ResponseWriter, ctx context.Conte
 		termination: term,
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		return ferr
+	}
+	return nil
+}
+
+// writeAnthropicStreamAccountingFailure closes a native /v1/messages
+// stream whose terminal accounting could not be committed after the
+// provider already served it: the Anthropic error-event shape mirroring
+// closeOpenAnthropicBlocks, with the accounting_commit_failed code in the
+// message (the fixed anthropic error.type vocabulary has no code slot)
+// and the chat-stream canon's no-safe-retry language. Best-effort: the
+// client may already be gone.
+func writeAnthropicStreamAccountingFailure(w http.ResponseWriter) {
+	payload, _ := apierrs.Anthropic(http.StatusInternalServerError, &apierrs.E{
+		Type:    apierrs.TypeAPI,
+		Message: accountingCommitFailedCode + ": stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge",
+	})
+	if werr := apiformat.WriteSSEEvent(w, "error", payload); werr != nil {
+		return
+	}
+	if flusher, ok := w.(http.Flusher); ok {
+		flusher.Flush()
+	}
 }
 
 func anthropicExtraHeaders(r *http.Request) http.Header {

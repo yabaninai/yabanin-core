@@ -101,6 +101,12 @@ type budgetedJudgeClient struct {
 	// reservations off for this deploy (legacy behavior for the hop too).
 	admission *budget.Admission
 
+	// invocations is the Preview2 durable request-accounting store. nil =
+	// fail closed: a judge hop is a paid provider dispatch, so an
+	// unbindable durable start refuses the hop outright (the central
+	// gateway binding's posture — no ungated internal traffic).
+	invocations invocationStore
+
 	// agentEnforcer mirrors admissionCore's G2 per-agent check. nil-safe.
 	agentEnforcer agentBudgetChecker
 
@@ -114,11 +120,17 @@ type budgetedJudgeClient struct {
 // llmjudge.SetDefaultDeps. pool is required; models/keys may be nil for
 // plain openai-compatible key-less endpoints; admission/loop/agentEnforcer
 // and publisher are nil-safe and disable their respective accounting.
-func NewBudgetedJudgeClient(pool *upstream.Pool, models llmjudge.ModelResolver, keys llmjudge.KeyResolver, admission *budget.Admission, loop *budget.LoopBudget, agentEnforcer agentBudgetChecker, publisher *eventpub.RedisPublisher, log *slog.Logger) llmjudge.JudgeClient {
+//
+// Preview2 durable accounting: the store is NOT a positional parameter
+// (an internal interface must not sit in the required signature slot —
+// upstream callers compile unchanged). Without the additive option a nil
+// store fails every hop closed: a judge hop is a paid dispatch, so it
+// mirrors the central binding (no unrecorded paid starts).
+func NewBudgetedJudgeClient(pool *upstream.Pool, models llmjudge.ModelResolver, keys llmjudge.KeyResolver, admission *budget.Admission, loop *budget.LoopBudget, agentEnforcer agentBudgetChecker, publisher *eventpub.RedisPublisher, log *slog.Logger, opts ...BudgetedJudgeClientOption) llmjudge.JudgeClient {
 	if log == nil {
 		log = slog.Default()
 	}
-	return &budgetedJudgeClient{
+	c := &budgetedJudgeClient{
 		pool:          pool,
 		models:        models,
 		keys:          keys,
@@ -129,6 +141,20 @@ func NewBudgetedJudgeClient(pool *upstream.Pool, models llmjudge.ModelResolver, 
 		log:           log,
 		now:           time.Now,
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
+}
+
+// BudgetedJudgeClientOption is the additive wiring surface for the judge
+// client (kept out of the positional signature for source compatibility).
+type BudgetedJudgeClientOption func(*budgetedJudgeClient)
+
+// WithJudgeInvocationStore wires the durable invocation store the hop's
+// confirmed start and terminal facts commit through.
+func WithJudgeInvocationStore(store invocationStore) BudgetedJudgeClientOption {
+	return func(c *budgetedJudgeClient) { c.invocations = store }
 }
 
 // newBudgetedJudgeClient builds the client from the gateway's own
@@ -140,7 +166,8 @@ func NewBudgetedJudgeClient(pool *upstream.Pool, models llmjudge.ModelResolver, 
 // buildPolicyRuntime (gateway_policy.go) installs it as the process-wide
 // llmjudge.DefaultDeps client (N06-P07-T03 wiring landed).
 func (gw *gateway) newBudgetedJudgeClient(models llmjudge.ModelResolver, keys llmjudge.KeyResolver) llmjudge.JudgeClient {
-	return NewBudgetedJudgeClient(gw.pool, models, keys, gw.admission, sharedLoopBudget(), gw.agentEnforcer, gw.publisher, gw.log)
+	return NewBudgetedJudgeClient(gw.pool, models, keys, gw.admission, sharedLoopBudget(), gw.agentEnforcer, gw.publisher, gw.log,
+		WithJudgeInvocationStore(gw.invocations))
 }
 
 // JudgeChat implements llmjudge.JudgeClient: admit, call, settle.
@@ -196,15 +223,45 @@ func (c *budgetedJudgeClient) JudgeChat(ctx context.Context, req llmjudge.ChatRe
 		return llmjudge.ChatResponse{}, err
 	}
 
-	// 5. The wire round trip with usage capture.
-	respBody, usage, statusCode, callErr := c.call(ctx, req, target)
+	// 4b. Preview2 durable accounting: mint the hop's invocation identity
+	// here so settlement can close it, but commit the confirmed start only
+	// inside call — immediately before the actual upstream Do, after every
+	// fallible local step (key lookup, client setup, translation, method
+	// and header prep). A purely local failure must never strand a paid
+	// durable admission for a hop that never dispatched: those paths
+	// release the reservation at zero spend below and settle nothing.
+	holder := newInvocationIdentity(req.Meta.Org, logctx.RequestID(ctx), "", req.Meta.Key, agentHopSessionKey(ctx), req.ModelRef)
+	ctx = withInvocationIdentity(ctx, holder)
+
+	// 5. The wire round trip with usage capture. dispatched tells whether
+	// the confirmed start committed (the hop is durably admitted from that
+	// point on, whatever the wire does next).
+	dispatched, respBody, usage, statusCode, callErr := c.call(ctx, req, target, holder)
+	if !dispatched {
+		// Never-dispatched local failure: release the reserved escrow at
+		// zero spend and publish nothing — no terminal billed for a hop
+		// the provider never saw.
+		if rsv != nil {
+			walletActual, budgetActual := reservationActuals(0, 0)
+			c.admission.Finalize(rsv, walletActual, budgetActual)
+		}
+		if callErr != nil {
+			return llmjudge.ChatResponse{}, callErr
+		}
+		return llmjudge.ChatResponse{}, errors.New("judge hop never dispatched")
+	}
 
 	// 6. Settlement: exactly one request.completed per hop, on success AND
-	// failure, with the reservation tuples + Finalize actuals attached.
-	c.settle(ctx, req, target, start, usage, statusCode, callErr, rsv)
+	// failure, with the reservation tuples + Finalize actuals attached. A
+	// terminal-facts commit failure withholds the event (the funnel's
+	// contract); the provider error, when present, keeps precedence.
+	serr := c.settle(ctx, req, target, start, usage, statusCode, callErr, rsv)
 
 	if callErr != nil {
 		return llmjudge.ChatResponse{}, callErr
+	}
+	if serr != nil {
+		return llmjudge.ChatResponse{}, serr
 	}
 	content, err := judgeHopContent(respBody)
 	if err != nil {
@@ -355,29 +412,36 @@ func buildJudgeHopBody(req llmjudge.ChatRequest, model string) judgeHopBody {
 // and returning the raw response body plus its EXACT parsed usage (the
 // provider adapter's own extractor — the settlement contract never estimates
 // from sizes).
-func (c *budgetedJudgeClient) call(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target) (respBody []byte, usage provider.Usage, statusCode int, callErr error) {
+//
+// dispatched is false for every failure BEFORE the confirmed durable start
+// (local key lookup, client setup, translation, header prep — and the start
+// commit itself): those hops never reached the provider, so the caller
+// releases the reservation and settles nothing. Once the start commits,
+// dispatched stays true through any later wire failure — the hop is
+// durably admitted and settles exactly once.
+func (c *budgetedJudgeClient) call(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target, holder *invocationIdentity) (dispatched bool, respBody []byte, usage provider.Usage, statusCode int, callErr error) {
 	key := ""
 	if c.keys != nil {
 		var err error
 		key, err = c.keys.ResolveJudgeKey(ctx, req.Meta.Org, target)
 		if err != nil {
-			return nil, provider.Usage{}, 0, fmt.Errorf("judge key resolve: %w", err)
+			return false, nil, provider.Usage{}, 0, fmt.Errorf("judge key resolve: %w", err)
 		}
 	}
 
 	cl, err := c.pool.Get(target.UpstreamURL, target.Provider)
 	if err != nil {
-		return nil, provider.Usage{}, 0, fmt.Errorf("judge upstream client: %w", err)
+		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge upstream client: %w", err)
 	}
 	prov := cl.Adapter()
 
 	body, err := json.Marshal(buildJudgeHopBody(req, target.Model))
 	if err != nil {
-		return nil, provider.Usage{}, 0, fmt.Errorf("judge request encode: %w", err)
+		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge request encode: %w", err)
 	}
 	native, err := prov.TranslateRequest(body)
 	if err != nil {
-		return nil, provider.Usage{}, 0, fmt.Errorf("judge request translate: %w", err)
+		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge request translate: %w", err)
 	}
 
 	extra := http.Header{}
@@ -390,29 +454,42 @@ func (c *budgetedJudgeClient) call(ctx context.Context, req llmjudge.ChatRequest
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the actual paid dispatch — every fallible local step (key
+	// lookup, client setup, translation, method/header prep) has run above,
+	// so a local failure never strands a durable admission for a hop that
+	// never dispatched. Fail closed: an unwritten start (write error,
+	// timeout or lost ACK — outcome unknown) fails the hop with ZERO
+	// provider arrivals; the caller releases the reserved escrow at zero
+	// spend and the hop identity never dispatches later under this id.
+	if err := holder.beginPaidDispatch(ctx, c.invocations, invocationKindJudge); err != nil {
+		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge hop durable start: %w", err)
+	}
+	dispatched = true
+
 	resp, err := cl.Do(ctx, prov.Path(false), native, key, false, extra)
 	if err != nil {
-		return nil, provider.Usage{}, 0, fmt.Errorf("judge upstream call: %w", err)
+		return dispatched, nil, provider.Usage{}, 0, fmt.Errorf("judge upstream call: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
 		errBody, _ := io.ReadAll(io.LimitReader(resp.Body, agentHopMaxErrorBody))
 		upErr := upstream.Error{Status: resp.StatusCode, Body: string(errBody)}
-		return nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream status %d: %s", resp.StatusCode, upErr.Error())
+		return dispatched, nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream status %d: %s", resp.StatusCode, upErr.Error())
 	}
 
 	respBody, err = io.ReadAll(io.LimitReader(resp.Body, agentHopMaxRespBody))
 	if err != nil {
-		return nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream read: %w", err)
+		return dispatched, nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream read: %w", err)
 	}
 	// Translate (and discard) here exactly like the packaged client, so a
 	// provider the gateway cannot translate fails the hop before the
 	// verdict parser ever sees it.
 	if _, err := prov.TranslateResponse(respBody); err != nil {
-		return nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream translate response: %w", err)
+		return dispatched, nil, provider.Usage{}, resp.StatusCode, fmt.Errorf("judge upstream translate response: %w", err)
 	}
-	return respBody, prov.ParseUsage(respBody), resp.StatusCode, nil
+	return dispatched, respBody, prov.ParseUsage(respBody), resp.StatusCode, nil
 }
 
 // judgeHopContent extracts choices[0].message.content from an
@@ -440,8 +517,11 @@ func judgeHopContent(body []byte) (string, error) {
 // the computed cost, so the consumer charges the hop like any other usage;
 // a failed hop settles zero spend with the error on the event. Resale is
 // not computed on this pipeline — the wallet actual falls back to the base
-// quote (the consumer's own rule, as on the completions pipeline).
-func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target, start time.Time, usage provider.Usage, statusCode int, callErr error, rsv *budget.Reservation) {
+// quote (the consumer's own rule, as on the completions pipeline). It
+// returns the terminal-facts commit error: the event is withheld from the
+// consumer then (a published completion whose facts row is absent parks in
+// the consumer; the reconciler's grace sweep owns the admitted row).
+func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target, start time.Time, usage provider.Usage, statusCode int, callErr error, rsv *budget.Reservation) error {
 	providerName := target.Provider
 	if providerName == "" {
 		providerName = "openai"
@@ -507,7 +587,63 @@ func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatReque
 		slog.Int64("tokens_in", usage.PromptTokens),
 		slog.Int64("tokens_out", usage.CompletionTokens),
 	)
+
+	// Preview2 durable accounting: stamp the hop's identity and commit the
+	// terminal facts BEFORE the publish — the finishRequest funnel order.
+	// A commit failure withholds the event entirely (never a published
+	// completion without its facts row); the escrow above already settled,
+	// and the reconciler's grace sweep owns the admitted row.
+	if h := invocationIdentityFrom(ctx); h != nil {
+		ev.InvocationID = h.ID()
+		if h.Admitted() {
+			if err := c.commitHopTerminal(ctx, h, ev); err != nil {
+				return err
+			}
+		}
+	}
 	publishEvent(c.publisher, c.log, ev) //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+	return nil
+}
+
+// commitHopTerminal is the judge-hop seam of the finishRequest funnel
+// (gw.stampAndCommitInvocationTerminal), local to this client because the
+// hop does not ride finishRequest: stamps one TS so the facts row and the
+// published event agree, then commits the content-free terminal facts with
+// a BOUNDED INDEPENDENT context (client cancellation must not kill the
+// accounting write) and the shared transient-class retry ladder. Returns
+// the commit error so settle can withhold the event from the consumer.
+func (c *budgetedJudgeClient) commitHopTerminal(ctx context.Context, h *invocationIdentity, ev *eventpub.Event) error {
+	if err := nilInvocationStore(c.invocations); err != nil {
+		return fmt.Errorf("%w: admitted invocation %s: %v", ErrInvocationStoreUnavailable, h.ID(), err)
+	}
+	if ev.TS == 0 {
+		ev.TS = time.Now().UnixMilli()
+	}
+	fctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), terminalFactsTimeout)
+	defer cancel()
+	// Same retry posture as the funnel: the write is idempotent under
+	// exact equality, so ambiguous outcomes (serialization, transport)
+	// recommit the same invocation in the same bounded window;
+	// deterministic failures fail closed for the reconciler to own.
+	var err error
+	for attempt := 0; attempt < terminalFactsAttempts; attempt++ {
+		if attempt > 0 {
+			select {
+			case <-time.After(terminalFactsRetryBackoff << uint(attempt-1)):
+			case <-fctx.Done():
+			}
+		}
+		err = h.commitInvocationTerminal(fctx, c.invocations, ev)
+		if err == nil {
+			return nil
+		}
+		if !shouldRetryTerminalCommit(err) {
+			break
+		}
+	}
+	c.log.Error("terminal facts commit failed after judge hop; withholding event from consumer",
+		"invocation_id", h.ID(), "error", err)
+	return err
 }
 
 // agentHopAgent resolves the parent request's agent identity (G2 scope).

@@ -66,6 +66,7 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 	// call (no cache branch on this pipeline). The gate rides the
 	// request-derived context for the finishers below.
 	rctx := withPolicyEvent(r.Context(), policyEvent)
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "responses.native",
 		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 			admitted.Info, admitted.Body, nil, false))
@@ -89,10 +90,25 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap), so a local failure never
+	// strands a durable admission for a request that never dispatched. One
+	// admission per request; the JSON and stream branches below share it
+	// and the kind binds to the transport actually dispatched. Fail closed:
+	// an unwritten start (write error, timeout or lost ACK — outcome
+	// unknown) refuses the request with ZERO provider arrivals under the
+	// history_unavailable envelope, and the escrow is released.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindForChat(probe.Stream)); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 	if probe.Stream {
 		// W-TIMEOUT: streams carry no whole-request deadline; the transport's
 		// ResponseHeaderTimeout plus the idle watchdog below bound them.
-		gw.responsesNativeStream(w, r, gate, admitted, client, upstreamBody, apiKey, upstreamURL, started)
+		gw.responsesNativeStream(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, upstreamURL, started)
 		return
 	}
 	timeout := admitted.Info.UpstreamTimeout
@@ -120,7 +136,11 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		gw.finishResponsesNative(w, rctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", "")
+		if ferr := gw.finishResponsesNative(w, rctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); ferr != nil {
+			// The client envelope is already the upstream failure; the
+			// withheld event is logged loudly (finishRequestLogged canon).
+			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+		}
 		copyResponsesPassthrough(w.Header(), resp.Header)
 		if ct := resp.Header.Get("Content-Type"); ct != "" {
 			w.Header().Set("Content-Type", ct)
@@ -139,14 +159,22 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 			rctx = withPolicyEvent(rctx, appendPolicyEvents(policyEventFrom(rctx), postEvent))
 		}
 		if denied {
-			gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusBadRequest, started, resp, "request.failed", "response blocked by organization policy", "")
+			if ferr := gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusBadRequest, started, resp, "request.failed", "response blocked by organization policy", ""); ferr != nil {
+				l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+			}
 			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"response blocked by organization policy", policyDenyErrorCode)
 			return
 		}
 		limited = masked
 	}
-	gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "", "")
+	if ferr := gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "", ""); ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		writeTerminalAccountingFailure(w)
+		return
+	}
 	// N03-P06-T02: same provider-derived transparency the OpenAI-compat
 	// JSON path reports (finalizeChatJSON); before WriteHeader below.
 	setPromptCacheHeader(w, usage)
@@ -160,7 +188,7 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 	_, _ = w.Write(limited)
 }
 
-func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, started time.Time) {
+func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, started time.Time) {
 	l := logctx.From(r.Context(), gw.log)
 	streamCtx, cancelStream := context.WithCancel(r.Context())
 	defer cancelStream()
@@ -183,7 +211,9 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 			apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
 			return
 		}
-		gw.finishResponsesNative(w, r.Context(), admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", "")
+		if ferr := gw.finishResponsesNative(w, rctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); ferr != nil {
+			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+		}
 		copyResponsesPassthrough(w.Header(), resp.Header)
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(limited)
@@ -227,7 +257,7 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 			detail = "upstream stream idle timeout"
 			term = budget.TerminationIdleTimeout
 		}
-		gw.accountUsage(r.Context(), w, usageRecord{
+		gw.accountUsage(rctx, w, usageRecord{
 			orgID:     admitted.OrgID,
 			taskID:    admitted.TaskID,
 			sessionID: admitted.SessionID,
@@ -235,36 +265,63 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 		})
 		tail.complete()
 		writeResponsesStreamFailed(w, detail)
-		gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", detail, term)
+		if ferr := gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", detail, term); ferr != nil {
+			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+		}
 		return
 	}
 	if terminal == "response.failed" {
 		// The upstream itself failed the response and that terminal was
 		// delivered: settle as failed with the provider usage (recorded,
 		// no charge intent) and no second client terminal.
-		gw.accountUsage(r.Context(), w, usageRecord{
+		gw.accountUsage(rctx, w, usageRecord{
 			orgID:     admitted.OrgID,
 			taskID:    admitted.TaskID,
 			sessionID: admitted.SessionID,
 			usage:     usage,
 		})
-		gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", "upstream response.failed", "")
+		if ferr := gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", "upstream response.failed", ""); ferr != nil {
+			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+		}
 		return
 	}
-	gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "", "")
+	if ferr := gw.finishResponsesNative(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "", ""); ferr != nil {
+		// SSE 200 headers are already committed: the client keeps the
+		// stream, and the terminal accounting failure closes it with the
+		// protocol-shaped frame carrying accounting_commit_failed (the
+		// chat stream canon: NOT safe to retry — support reconciles the
+		// charge). The withheld event never reaches the consumer.
+		l.Error("terminal facts commit failed after streamed dispatch", "error", ferr)
+		writeResponsesStreamAccountingFailure(w)
+		return
+	}
 }
 
 // writeResponsesStreamFailed emits the protocol-shaped terminal failure
 // frame for a native /v1/responses stream that broke after the 200/SSE
 // commit (best-effort: the client may already be gone).
 func writeResponsesStreamFailed(w http.ResponseWriter, message string) {
+	writeResponsesStreamFailedCode(w, "server_error", message)
+}
+
+// writeResponsesStreamAccountingFailure closes a stream whose terminal
+// accounting could not be committed after the provider already served it:
+// the same external code and no-safe-retry language as the JSON refusal
+// (writeTerminalAccountingFailure), in the native /v1/responses frame
+// shape. Best-effort: the client may already be gone.
+func writeResponsesStreamAccountingFailure(w http.ResponseWriter) {
+	writeResponsesStreamFailedCode(w, accountingCommitFailedCode,
+		"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+}
+
+func writeResponsesStreamFailedCode(w http.ResponseWriter, code, message string) {
 	payload := map[string]any{
 		"type": "response.failed",
 		"response": map[string]any{
 			"id":     "",
 			"object": "response",
 			"status": "failed",
-			"error":  map[string]any{"code": "server_error", "message": message},
+			"error":  map[string]any{"code": code, "message": message},
 			"output": []any{},
 		},
 	}
@@ -470,8 +527,11 @@ func copyResponsesPassthrough(dst, src http.Header) {
 // finishResponsesNative closes the native responses request. termHint
 // overrides the non-completed termination class (the stream drain-failure
 // branch distinguishes idle-timeout from upstream error, mirroring the chat
-// finishDrainFailure canon); empty keeps the default classification.
-func (gw *gateway) finishResponsesNative(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, upstreamURL string, status int, started time.Time, resp *http.Response, eventType, errText string, termHint budget.Termination) {
+// finishDrainFailure canon); empty keeps the default classification. It
+// returns the terminal-facts commit error so success call sites can convert
+// the client reply (writeTerminalAccountingFailure / the SSE accounting
+// frame); failure call sites log it (finishRequestLogged canon).
+func (gw *gateway) finishResponsesNative(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, upstreamURL string, status int, started time.Time, resp *http.Response, eventType, errText string, termHint budget.Termination) error {
 	ext := provider.ComputeCost(usage, admitted.Info.Provider, admitted.Info.ModelName)
 	if eventType == "request.completed" {
 		gw.accountUsage(ctx, w, usageRecord{
@@ -490,7 +550,7 @@ func (gw *gateway) finishResponsesNative(w http.ResponseWriter, ctx context.Cont
 	case termHint != "":
 		term = termHint
 	}
-	_, _ = gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  eventType,
 			RequestID:                  admitted.RequestID,
@@ -532,4 +592,8 @@ func (gw *gateway) finishResponsesNative(w http.ResponseWriter, ctx context.Cont
 		termination: term,
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		return ferr
+	}
+	return nil
 }

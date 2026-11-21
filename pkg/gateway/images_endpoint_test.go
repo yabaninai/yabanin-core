@@ -28,10 +28,13 @@ func postImages(t *testing.T, gw *gateway, body string) *httptest.ResponseRecord
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/images/generations", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	// Handler-direct (the post-4a1aaaa convention): the auth middleware
+	// strips client-supplied identity headers, and durable terminal facts
+	// require a tenant — the golden identity stands in for the resolved
+	// principal the production resolver injects.
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	gw.imagesGenerations(rec, req)
 	return rec
 }
 
@@ -43,6 +46,10 @@ func imagesTestGateway(t *testing.T, info resolver.ModelInfo, upstreamURL string
 		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
 		res:  stubModelResolver{"m": info},
 		pool: upstream.NewPool(upstream.Options{}),
+		// Preview2 durable accounting: isolated tests wire an explicit
+		// fake store so the fail-closed confirmed start admits; tests
+		// scripting admission/facts faults replace this after construction.
+		invocations: &fakeInvocationStore{},
 	}
 }
 
@@ -218,6 +225,7 @@ func TestImagesGenerations_UnsupportedRoutesRefused(t *testing.T) {
 	get := httptest.NewRecorder()
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/images/generations", nil)
 	req.Header.Set("Authorization", "Bearer test-key")
+	goldenIdentity(req)
 	r.ServeHTTP(get, req)
 	if get.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("get status %d", get.Code)
