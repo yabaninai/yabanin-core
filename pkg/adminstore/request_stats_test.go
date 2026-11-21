@@ -144,10 +144,10 @@ func TestListRequests_ObservabilityColumnsScan(t *testing.T) {
 			now := time.Now()
 			return &mockPGXRows{data: [][]interface{}{
 				// measured row: session + ttft + attempts + retries present
-				{"req-1", "org-1", "gpt-4", "gpt-4", 200, 0.002, int64(100), int64(50),
+				{int64(101), "req-1", "org-1", "gpt-4", "gpt-4", 200, 0.002, int64(100), int64(50),
 					"", "sess-1", int64(1500), "exact", int64(412), int64(2), int64(1), "", now, nil, []byte(`{"issue":"PAY-1"}`)},
 				// legacy row: all three NULL, no session, no labels
-				{"req-2", "org-1", "", "gpt-3.5", 200, 0.0, int64(10), int64(5),
+				{int64(102), "req-2", "org-1", "", "gpt-3.5", 200, 0.0, int64(10), int64(5),
 					"", "", int64(300), "", nil, nil, nil, "", now, nil, []byte(`{}`)},
 			}}, nil
 		},
