@@ -516,8 +516,11 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 	}
 
 	// Product assertion: a durable start record must exist NOW, before
-	// the crash — the fact that makes recovery possible at all.
-	s.requireDurableStartAtBarrier(t, rid)
+	// the crash — the fact that makes recovery possible at all. Capture
+	// the exact server-minted admission UUID so every post-restart
+	// identity assertion binds to it (a duplicate mint under the same
+	// HTTP invocation cannot hide behind a first-row read).
+	ds := s.requireDurableStartAtBarrier(t, rid)
 
 	before := s.fixture.Snapshot()
 	s.killGatewaySIGKILL()
@@ -548,19 +551,12 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 			rid, a, d, r)
 	}
 
-	// Storage oracle: the attempt must be discoverable after recovery —
-	// exactly one durable row for the request, bound to this stand's org.
-	requireEventually(t, 90*time.Second, 500*time.Millisecond, func() bool {
-		return s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 1
-	}, "product: media recovery case: the crashed speech request %s is not discoverable in request_logs after gateway restart (rows=%d, admission rows=%d)",
-		rid, s.oracleRequestLogCount(t, rid, s.oracleDB.orgID), s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID))
-	if n := s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID); n > 1 {
-		t.Fatalf("product: media recovery case: %d admission rows for %s, want at most 1 (duplicate accounting)", n, rid)
-	}
-
-	// Positive unresolved-usage state: the durable record must
-	// explicitly carry that this request did not complete.
-	s.requireUnresolvedDurableState(t, rid, "after restart")
+	// Storage oracle (current b966c29 unresolved contract): discover the
+	// crashed media request through exactly one admission bound to the
+	// pre-crash captured UUID. The audit log is OPTIONAL — when rows are
+	// present they must not fabricate success (validated below); no
+	// mandatory request_logs row and no "at most one" admission slack.
+	s.requireMediaUnresolvedDurableState(t, ds, rid, "after restart")
 
 	// Speech-specific charge boundary: the codec's unpriced trusted 0/0
 	// outcome means a crashed speech request can never legitimately
@@ -577,4 +573,49 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 	// The stand must still be healthy after recovery.
 	s.controlRequest(t, "post-recovery")
 	t.Logf("product: media recovery case passed (request id %s)", rid)
+}
+
+// requireMediaUnresolvedDurableState asserts, at recovery time, the
+// b966c29 unresolved contract for a crashed media request: discovery via
+// exactly one tenant-bound admission matching the UUID captured at the
+// dispatch barrier (requireDurableStartAtBarrier) — no duplicate mint,
+// no success-shaped state; the audit log (request_logs) may be absent,
+// and any rows present must not fabricate success; zero fabricated
+// terminal facts; zero admissions under a foreign org. Wallet, credit-row
+// and settlement zeros are asserted by the caller's codec boundary below.
+// The eventual unresolved transition (grace window, exact resolve reason)
+// is owned by the sibling unresolved case, not this immediate check.
+func (s *stand) requireMediaUnresolvedDurableState(t *testing.T, ds durableStart, rid, phase string) {
+	t.Helper()
+	if ds.invocationUUID == "" {
+		t.Fatalf("%s: media recovery case: no admitted invocation UUID was captured for %s at the dispatch barrier — the admissions-backed start is required to bind post-restart identity", phase, rid)
+	}
+	adm := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
+	if len(adm) != 1 {
+		t.Fatalf("%s: media recovery case: %d admission row(s) for %s (%s), want exactly 1 bound to the captured UUID %s",
+			phase, len(adm), rid, fmtAdmissions(adm), ds.invocationUUID)
+	}
+	if adm[0].InvocationID != ds.invocationUUID {
+		t.Fatalf("%s: media recovery case: admission UUID changed across the restart: barrier %s, now %s", phase, ds.invocationUUID, adm[0].InvocationID)
+	}
+	requireAdmissionVocabulary(t, adm[0])
+	if adm[0].State == "reconciled" {
+		t.Fatalf("%s: media recovery case: admission state for %s is %q — claims completion although the provider response was never delivered back", phase, rid, adm[0].State)
+	}
+	t.Logf("product: media recovery case: %s: crashed request discoverable via admission %s in state %q", phase, ds.invocationUUID, adm[0].State)
+
+	// Tenant binding: the admission must surface only under this stand's org.
+	if foreign := s.oracleAdmissions(t, rid, "org-not-this-tenant"); len(foreign) != 0 {
+		t.Fatalf("%s: media recovery case: admission rows for %s leaked under a foreign org: %s", phase, rid, fmtAdmissions(foreign))
+	}
+
+	// No fabricated terminal evidence behind the not-completed state.
+	if n := s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID); n != 0 {
+		t.Fatalf("%s: media recovery case: %d terminal facts row(s) for %s although the provider response was never delivered back", phase, n, rid)
+	}
+
+	// Audit log is optional; present rows must not fabricate success.
+	logRows := s.oracleRequestLogRows(t, rid, s.oracleDB.orgID)
+	requireNoFabricatedRequestLogRows(t, rid, s.oracleDB.orgID, logRows, phase)
+	t.Logf("product: media recovery case: %s: audit log rows=%d (optional; none fabricate success)", phase, len(logRows))
 }
