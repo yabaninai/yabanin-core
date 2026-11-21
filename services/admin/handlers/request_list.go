@@ -1,6 +1,7 @@
 package handlers
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"strconv"
@@ -26,6 +27,10 @@ import (
 // so a missing row or a store failure denies with the grant still redeemable;
 // the atomic consume is the last step before the payload write; any failure
 // after the 200 write begins is final (token stays consumed, never refunded).
+// A grant redemption discloses exactly the one physical row the grant is
+// bound to (peek + read by immutable row key): a correlation several rows
+// may share (0028) can never widen or retarget the disclosure, and a legacy
+// pre-binding grant denies generically without burning.
 func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !h.requireStore(w, r) {
@@ -38,64 +43,13 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 		subject, hasSubject := adminstore.RequestPayloadSubjectFromContext(r.Context())
 		human := !hasSubject || subject.Type == "" || subject.Type == adminstore.RequestPayloadHuman
 		// ---- Phase: prechecks (read-only, no disclosure, grant untouched) ----
-		// FIX-08 detail symmetry: scope validation, grant usability and the
-		// retention gate are safe prechecks and must run BEFORE the one-time
-		// consume, so a 400/403/503 here denies with the grant still
-		// redeemable and is journalled as a denial. A request without a
-		// bearer token takes the metadata-only path and never consumes.
-		grant := false
-		originalsGrant := false
-		grantScope := ""
-		token := requestPayloadGrantToken(r)
-		if token != "" {
-			grantScope = r.URL.Query().Get("scope")
-			if grantScope == "" {
-				grantScope = adminstore.RequestPayloadScopeRead
-			}
-			if grantScope != adminstore.RequestPayloadScopeRead && grantScope != adminstore.RequestPayloadScopeOriginals {
-				writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid payload scope"})
-				return
-			}
-			// A bearer grant is a root self-grant: a caller without the grant
-			// capability or under an explicit policy deny must neither use
-			// nor burn it. Fail closed loudly (the export contract) instead
-			// of silently degrading to a metadata read.
-			_, hasGrantStore := h.store.(requestPayloadGrantStore)
-			if !hasGrantStore || !isRoot(r) || adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context()) {
-				auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_unusable")
-				writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
-				return
-			}
-			if grantScope == adminstore.RequestPayloadScopeOriginals {
-				// Retention gates originals fail-closed BEFORE the consume:
-				// a lookup error never opens originals and never burns the
-				// token.
-				retention, ok := h.store.(orgOriginalRetentionStore)
-				if !ok {
-					auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "retention_unavailable")
-					writeJSON(w, http.StatusServiceUnavailable, apiError{Error: "original retention setting is unavailable"})
-					return
-				}
-				setting, err := retention.GetOrgOriginalRetention(r.Context(), orgID)
-				if err != nil {
-					auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "retention_unavailable")
-					h.respondError(w, r, err, http.StatusServiceUnavailable)
-					return
-				}
-				if setting == nil || !setting.Effective {
-					auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "original_retention_disabled")
-					writeJSON(w, http.StatusForbidden, apiError{Error: "original payload retention is disabled"})
-					return
-				}
-				originalsGrant = true
-			}
-			// Grant-hypothetical from here (the export preflight pattern):
-			// the verdict and the row read below run under the widened access
-			// the verified consume would grant. Nothing from these reads is
-			// ever disclosed unless the atomic consume succeeds — on a failed
-			// consume the read result is discarded with a generic 403.
-			grant = true
+		// FIX-08 detail symmetry: a request without a bearer token takes
+		// the metadata-only path and never consumes.
+		grantScope, grant, originalsGrant, ok := h.authorizeRequestDetailGrant(w, r, orgID, requestID)
+		if !ok {
+			return
 		}
+		token := requestPayloadGrantToken(r)
 		delegRead, delegPayload := false, false
 		if !human {
 			// N04-P05 T03: a marked agent/CI subject acts under a live
@@ -126,44 +80,15 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 				SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID, OrgWideMetadata: orgWideMetadata,
 			}
 		}
-		// ---- Phase: pre-consume row read (the discarded read) ----
-		// Reading the row before the consume only decides 404/500: a missing
-		// (or not-visible) row and a store failure deny with the grant still
-		// redeemable instead of burning it on a response that carries no
-		// payload. The read runs under the grant-hypothetical access built
-		// above; its result is discarded unless the verified atomic consume
-		// below succeeds — no byte of it is written before that, so the
-		// hypothetical widening can never turn into disclosure.
+		// ---- Phase: pre-consume target resolution and row read (the discarded read) ----
 		ctx := adminstore.WithRequestPayloadAccess(r.Context(), access)
-		d, err := h.store.GetRequestDetail(ctx, orgID, requestID)
-		if err != nil {
-			if adminstore.IsNotFound(err) {
-				if token != "" {
-					auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "row_not_found")
-				}
-				h.respondError(w, r, err, http.StatusNotFound)
-				return
-			}
-			if token != "" {
-				auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "store_error")
-			}
-			h.respondError(w, r, err, http.StatusInternalServerError)
+		d, rowKey, ok := h.readRequestDetailRow(ctx, w, r, orgID, requestID, userID, token, grantScope)
+		if !ok {
 			return
 		}
 		// ---- Phase: atomic one-time consume (last step before disclosure) ----
-		if token != "" {
-			grantStore, ok := h.store.(requestPayloadGrantStore)
-			if !ok || grantStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, userID, grantScope, time.Now().UTC()) != nil {
-				// Invalid, expired, revoked, wrong-scope, bound to a different
-				// request or organization, already consumed (replay), or a
-				// grant-store failure: the same fail-closed generic 403 with
-				// zero row bytes. The pre-consume read is discarded here, so
-				// invalid and replayed grants stay indistinguishable
-				// (anti-oracle), and a failed consume never burns the token.
-				auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_invalid_or_unavailable")
-				writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
-				return
-			}
+		if token != "" && !h.consumeRequestDetailGrant(w, r, orgID, requestID, userID, token, rowKey, grantScope) {
+			return
 		}
 		// ---- Phase: disclosure (the 200 commits; later failures are final) ----
 		// writeJSON writes the status header before it encodes, so once this
@@ -175,6 +100,153 @@ func (h *AdminHandlers) apiOrgRequestDetail() http.HandlerFunc {
 			auditRequestDetailDecision(h, r, orgID, requestID, grantScope, true, 1, "completed")
 		}
 	}
+}
+
+// authorizeRequestDetailGrant runs the non-disclosing grant prechecks (scope
+// validation, grant usability, retention gate) so a 400/403/503 denies with
+// the grant still redeemable and journalled as a denial. It returns the
+// resolved scope and the grant/originals flags; ok=false once a denial is
+// written. A bearer grant is a root self-grant: a caller without the grant
+// capability or under an explicit policy deny must neither use nor burn it —
+// fail closed loudly (the export contract) instead of silently degrading to
+// a metadata read. Retention gates originals fail-closed BEFORE the consume:
+// a lookup error never opens originals and never burns the token.
+func (h *AdminHandlers) authorizeRequestDetailGrant(w http.ResponseWriter, r *http.Request, orgID, requestID string) (grantScope string, grant, originalsGrant, ok bool) {
+	if requestPayloadGrantToken(r) == "" {
+		return "", false, false, true
+	}
+	grantScope = r.URL.Query().Get("scope")
+	if grantScope == "" {
+		grantScope = adminstore.RequestPayloadScopeRead
+	}
+	if grantScope != adminstore.RequestPayloadScopeRead && grantScope != adminstore.RequestPayloadScopeOriginals {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid payload scope"})
+		return "", false, false, false
+	}
+	_, hasGrantStore := h.store.(requestPayloadGrantStore)
+	if !hasGrantStore || !isRoot(r) || adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context()) {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_unusable")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
+		return "", false, false, false
+	}
+	if grantScope == adminstore.RequestPayloadScopeOriginals {
+		originalsGrant, ok = h.allowRequestDetailOriginals(w, r, orgID, requestID, grantScope)
+		if !ok {
+			return "", false, false, false
+		}
+	}
+	// Grant-hypothetical from here (the export preflight pattern): the
+	// verdict and the row read run under the widened access the verified
+	// consume would grant. Nothing from those reads is ever disclosed
+	// unless the atomic consume succeeds — on a failed consume the read
+	// result is discarded with a generic 403.
+	return grantScope, true, originalsGrant, true
+}
+
+// allowRequestDetailOriginals enforces the originals retention gate for a
+// detail grant redemption. Returns false once the fail-closed denial is
+// written; a lookup error never opens originals and never burns the token.
+func (h *AdminHandlers) allowRequestDetailOriginals(w http.ResponseWriter, r *http.Request, orgID, requestID, grantScope string) (allowed, ok bool) {
+	retention, isRetention := h.store.(orgOriginalRetentionStore)
+	if !isRetention {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "retention_unavailable")
+		writeJSON(w, http.StatusServiceUnavailable, apiError{Error: "original retention setting is unavailable"})
+		return false, false
+	}
+	setting, err := retention.GetOrgOriginalRetention(r.Context(), orgID)
+	if err != nil {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "retention_unavailable")
+		h.respondError(w, r, err, http.StatusServiceUnavailable)
+		return false, false
+	}
+	if setting == nil || !setting.Effective {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "original_retention_disabled")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "original payload retention is disabled"})
+		return false, false
+	}
+	return true, true
+}
+
+// readRequestDetailRow performs the discarded pre-consume read that only
+// decides 404/500: a missing (or not-visible) row and a store failure deny
+// with the grant still redeemable instead of burning it on a response that
+// carries no payload. A grant redemption resolves its one bound physical row
+// first (peek, never a consume) and reads exactly that row by key — a
+// correlation several rows may share (0028) can never widen or retarget the
+// disclosure; a legacy pre-binding grant is unusable (generic denial, no
+// burn). The read runs under the grant-hypothetical access the caller built;
+// its result is discarded unless the verified atomic consume succeeds — no
+// byte of it is written before that, so the hypothetical widening can never
+// turn into disclosure.
+func (h *AdminHandlers) readRequestDetailRow(ctx context.Context, w http.ResponseWriter, r *http.Request, orgID, requestID, userID, token, grantScope string) (*adminstore.RequestDetail, int64, bool) {
+	if token == "" {
+		d, err := h.store.GetRequestDetail(ctx, orgID, requestID)
+		if err != nil {
+			h.respondRequestDetailReadError(w, r, err, orgID, requestID, token, grantScope)
+			return nil, 0, false
+		}
+		return d, 0, true
+	}
+	grantStore, ok := h.store.(requestPayloadGrantStore)
+	if !ok {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_unusable")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
+		return nil, 0, false
+	}
+	rowKey, err := grantStore.PeekRequestPayloadGrantTarget(r.Context(), token, orgID, requestID, userID, time.Now().UTC())
+	if err != nil {
+		// Invalid, expired, revoked, replayed, wrong org/grantee/request,
+		// unbound legacy, or a grant-store failure: the same fail-closed
+		// generic 403, token untouched.
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_invalid_or_unavailable")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
+		return nil, 0, false
+	}
+	d, err := h.store.GetRequestDetailRow(ctx, orgID, rowKey)
+	if err != nil {
+		h.respondRequestDetailReadError(w, r, err, orgID, requestID, token, grantScope)
+		return nil, 0, false
+	}
+	return d, rowKey, true
+}
+
+// respondRequestDetailReadError maps a failed pre-consume read to 404/500
+// and journals the denial for grant redemptions.
+func (h *AdminHandlers) respondRequestDetailReadError(w http.ResponseWriter, r *http.Request, err error, orgID, requestID, token, grantScope string) {
+	if token != "" {
+		reason := "store_error"
+		if adminstore.IsNotFound(err) {
+			reason = "row_not_found"
+		}
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, reason)
+	}
+	if adminstore.IsNotFound(err) {
+		h.respondError(w, r, err, http.StatusNotFound)
+		return
+	}
+	h.respondError(w, r, err, http.StatusInternalServerError)
+}
+
+// consumeRequestDetailGrant performs the atomic one-time consume — the last
+// step before disclosure. Invalid, expired, revoked, wrong-scope, bound to a
+// different row, request or organization, already consumed (replay), or a
+// grant-store failure: the same fail-closed generic 403 with zero row bytes.
+// The pre-consume read is discarded here, so invalid and replayed grants
+// stay indistinguishable (anti-oracle), and a failed consume never burns the
+// token.
+func (h *AdminHandlers) consumeRequestDetailGrant(w http.ResponseWriter, r *http.Request, orgID, requestID, userID, token string, rowKey int64, grantScope string) bool {
+	grantStore, ok := h.store.(requestPayloadGrantStore)
+	if !ok {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_unusable")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
+		return false
+	}
+	if _, err := grantStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, userID, grantScope, time.Now().UTC()); err != nil {
+		auditRequestDetailDecision(h, r, orgID, requestID, grantScope, false, 0, "grant_invalid_or_unavailable")
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant is invalid or unavailable"})
+		return false
+	}
+	return true
 }
 
 // requestDetailAuditDetail is the journal payload of one grant-relevant detail

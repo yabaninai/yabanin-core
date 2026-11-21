@@ -140,28 +140,10 @@ func (f *fixture) serveTranscriptionRequest(w http.ResponseWriter, r *http.Reque
 		http.Error(w, "expected multipart/form-data", http.StatusBadRequest)
 		return
 	}
-	var model string
-	var files int
-	var filename string
-	for {
-		part, err := mr.NextPart()
-		if err == io.EOF {
-			break
-		}
-		if err != nil {
-			http.Error(w, "invalid multipart body", http.StatusBadRequest)
-			return
-		}
-		if part.FileName() == "" {
-			if part.FormName() == "model" {
-				value, _ := io.ReadAll(io.LimitReader(part, 1<<20))
-				model = string(bytes.TrimSpace(value))
-			}
-			continue
-		}
-		files++
-		filename = part.FileName()
-		_, _ = io.Copy(io.Discard, io.LimitReader(part, 64<<20))
+	model, filename, files, err := scanTranscriptionParts(mr)
+	if err != nil {
+		http.Error(w, "invalid multipart body", http.StatusBadRequest)
+		return
 	}
 	switch {
 	case model == "":
@@ -187,6 +169,33 @@ func (f *fixture) serveTranscriptionRequest(w http.ResponseWriter, r *http.Reque
 	w.WriteHeader(http.StatusOK)
 	_, _ = w.Write([]byte(reply))
 	f.append("receipts", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: true})
+}
+
+// scanTranscriptionParts walks a multipart upload once, collecting the
+// model field value, the last file part's filename and the file-part
+// count. File bytes are discarded (bounded), mirroring the product's
+// pre-admission validation contract.
+func scanTranscriptionParts(mr *multipart.Reader) (model, filename string, files int, err error) {
+	for {
+		part, err := mr.NextPart()
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return "", "", 0, err
+		}
+		if part.FileName() == "" {
+			if part.FormName() == "model" {
+				value, _ := io.ReadAll(io.LimitReader(part, 1<<20))
+				model = string(bytes.TrimSpace(value))
+			}
+			continue
+		}
+		files++
+		filename = part.FileName()
+		_, _ = io.Copy(io.Discard, io.LimitReader(part, 64<<20))
+	}
+	return model, filename, files, nil
 }
 
 // mediaReply is one binary-safe client outcome: raw response bytes, the
@@ -245,6 +254,34 @@ type multipartFile struct {
 // hold more than one entry (multiple-files control). extraFields are
 // additional text form fields.
 func httpPostMultipart(timeout time.Duration, url, apiKey, requestID, model string, extraFields map[string]string, files ...multipartFile) (status int, body string, contentType string, err error) {
+	bodyBuf, contentType, err := buildTranscriptionBody(model, extraFields, files)
+	if err != nil {
+		return 0, "", "", err
+	}
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(bodyBuf.Bytes()))
+	if err != nil {
+		return 0, "", "", err
+	}
+	req.Header.Set("Content-Type", contentType)
+	req.Header.Set("Authorization", "Bearer "+apiKey)
+	req.Header.Set("X-Request-ID", requestID)
+	client := &http.Client{Timeout: timeout}
+	resp, err := client.Do(req)
+	if err != nil {
+		return 0, "", "", err
+	}
+	defer resp.Body.Close()
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	if err != nil {
+		return resp.StatusCode, "", "", err
+	}
+	return resp.StatusCode, string(raw), resp.Header.Get("Content-Type"), nil
+}
+
+// buildTranscriptionBody encodes the multipart/form-data upload: text
+// fields first, then each file part. It returns the finished buffer and
+// the body's Content-Type (the multipart boundary).
+func buildTranscriptionBody(model string, extraFields map[string]string, files []multipartFile) (*bytes.Buffer, string, error) {
 	var buf bytes.Buffer
 	mw := multipart.NewWriter(&buf)
 	for k, v := range extraFields {
@@ -262,31 +299,14 @@ func httpPostMultipart(timeout time.Duration, url, apiKey, requestID, model stri
 		}
 		part, err := mw.CreatePart(h)
 		if err != nil {
-			return 0, "", "", err
+			return nil, "", err
 		}
 		if _, err := part.Write(file.data); err != nil {
-			return 0, "", "", err
+			return nil, "", err
 		}
 	}
 	if err := mw.Close(); err != nil {
-		return 0, "", "", err
+		return nil, "", err
 	}
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(buf.Bytes()))
-	if err != nil {
-		return 0, "", "", err
-	}
-	req.Header.Set("Content-Type", mw.FormDataContentType())
-	req.Header.Set("Authorization", "Bearer "+apiKey)
-	req.Header.Set("X-Request-ID", requestID)
-	client := &http.Client{Timeout: timeout}
-	resp, err := client.Do(req)
-	if err != nil {
-		return 0, "", "", err
-	}
-	defer resp.Body.Close()
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
-	if err != nil {
-		return resp.StatusCode, "", "", err
-	}
-	return resp.StatusCode, string(raw), resp.Header.Get("Content-Type"), nil
+	return &buf, mw.FormDataContentType(), nil
 }

@@ -3,14 +3,15 @@ package cli
 import (
 	"context"
 	"fmt"
-	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/stretchr/testify/require"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/require"
 )
 
 type reviewTransportStore struct {

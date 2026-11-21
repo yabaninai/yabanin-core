@@ -99,16 +99,16 @@ func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 
 // TestCheckBalance_DBErrorIsNotAdmittedBalance: a real database failure must
 // surface as an error (503 upstream), never as an admissible zero balance and
-// never as insufficient credits.
+// never as insufficient credits. The missing-relation drop runs inside the
+// isolated fixture schema, so the genuine 42P01 negative is preserved while
+// the public migrated schema stays intact for the suites that measure it.
 func TestCheckBalance_DBErrorIsNotAdmittedBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
-
-	// Force a genuine DB error: the wallet table does not exist past this drop.
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS org_credits`); err != nil {
-		t.Fatalf("drop org_credits: %v", err)
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	if _, err := pool.Exec(ctx, `DROP TABLE org_credits`); err != nil {
+		t.Fatalf("drop org_credits in isolated fixture schema: %v", err)
 	}
-	defer teardownTestTables(ctx, t, pool)
 
 	s := NewStore(pool, nil)
 	bal, err := s.CheckBalance(ctx, "org-db-error")
@@ -127,7 +127,7 @@ func TestCheckBalance_DBErrorIsNotAdmittedBalance(t *testing.T) {
 // must fail closed — no balance, no admission.
 func TestCheckBalance_CancelledContextIsNotAdmittedBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 

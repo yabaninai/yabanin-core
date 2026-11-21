@@ -300,9 +300,11 @@ type StreamConsumer struct {
 	// matching predicate. Only a successful probe is cached — a transient
 	// probe failure propagates so the next delivery re-probes instead of
 	// sealing "old schema" forever and downgrading invoked events.
-	schemaMu              sync.Mutex
-	schemaResolved        bool
-	schemaHasInvocationID bool
+	schemaMu                      sync.Mutex
+	schemaResolved                bool
+	schemaHasInvocationID         bool
+	schemaToolFactResolved        bool
+	schemaToolFactHasInvocationID bool
 }
 
 // redisXAckWrapper bridges *redis.Client's variadic XAck to our interface.
@@ -1009,6 +1011,18 @@ func (c *StreamConsumer) writeFirstDeliverySideEffects(ctx context.Context, tx I
 	return tx.Commit(ctx)
 }
 
+// persistCompletedSideEffects writes the post-log persistence of a
+// first-delivery request.completed as one unit: the retained tool-call
+// aggregate, then the shared first-delivery side effects with their commit.
+// request.failed keeps its own envelope (persistFailedDelivery) and its
+// semantics are unchanged — failures carry no tool-call aggregate.
+func (c *StreamConsumer) persistCompletedSideEffects(ctx context.Context, tx InboxTx, ev requestEvent, plan []scopeCharge, chargeState money.QuoteState, policy deliveryPolicy) error {
+	if err := c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse, ev.invocationIDValue); err != nil {
+		return err
+	}
+	return c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy)
+}
+
 // persistFailedDelivery writes one request.failed delivery inside the
 // claimed transaction and commits it: the request log row (raw error text
 // and raw status code — the failed-shape contract), the policy decision
@@ -1393,12 +1407,17 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 		return c.finishDuplicateInvocation(ctx, tx, ev, policy)
 	}
 
-	// Tool-call aggregate (fail-soft like the budget roll below): the calls
-	// the model requested are extracted from the raw sample (pre-truncation)
-	// so the analytics table stays queryable; a failure never breaks the log.
-	c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse)
-
-	if err := c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
+	// Tool-call aggregate + first-delivery accounting as one atomic unit:
+	// the calls the model requested are extracted from the raw sample
+	// (pre-truncation) so the analytics table stays queryable, then the
+	// shared side effects (policy decision, charge intents, admission
+	// transition, commit) run in the same transaction. The tool facts carry
+	// this delivery's invocation identity when it has one (0030); a legacy
+	// delivery binds the NULL domain unchanged. Errors fail the delivery
+	// (rollback, no ack, redelivery) — see insertToolCalls for why nothing
+	// inside a PostgreSQL transaction is fail-soft, and how redelivery
+	// converges without duplicate children.
+	if err := c.persistCompletedSideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
 		return err
 	}
 
@@ -1967,7 +1986,9 @@ func (c *StreamConsumer) enrichDuplicateInvocation(ctx context.Context, tx Inbox
 	if err := c.enrichRequestLogContent(ctx, tx, ev); err != nil {
 		return err
 	}
-	c.enrichToolCallsIfAbsent(ctx, tx, ev)
+	if err := c.enrichToolCallsIfAbsent(ctx, tx, ev); err != nil {
+		return err
+	}
 	return c.enrichPolicyDecisionIfAbsent(ctx, tx, ev)
 }
 
@@ -2021,18 +2042,68 @@ func (c *StreamConsumer) enrichRequestLogContent(ctx context.Context, tx InboxTx
 	return nil
 }
 
-// enrichToolCallsIfAbsent replays the fail-soft tool-call extraction only
-// when no tool_calls row exists for the request yet (the first live
-// delivery or a recovery replay may have written them).
-func (c *StreamConsumer) enrichToolCallsIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) {
-	var one int
-	if err := tx.QueryRow(ctx,
-		`SELECT 1 FROM tool_calls WHERE request_id = $1 AND org_id = $2 LIMIT 1`,
-		ev.requestID, ev.orgID,
-	).Scan(&one); err == nil {
-		return
+// Tool-fact enrichment probes for the absent-children backfill path:
+//   - the coarse pre-0030 probe — the only valid form where the
+//     invocation_id column does not exist (a 42703 there fails the
+//     enrichment transaction);
+//   - the NULL-domain form, required once 0030 added the identity column:
+//     a minted sibling sharing the client request-id must never satisfy
+//     the legacy existence check and suppress genuine legacy facts.
+const (
+	toolCallsAbsentProbeCoarseQuery     = `SELECT 1 FROM tool_calls WHERE request_id = $1 AND org_id = $2 LIMIT 1`
+	toolCallsAbsentProbeNullDomainQuery = `SELECT 1 FROM tool_calls WHERE request_id = $1 AND org_id = $2 AND invocation_id IS NULL LIMIT 1`
+)
+
+// enrichToolCallsIfAbsent replays the tool-call extraction for a
+// duplicate-invocation delivery whose children may be absent or partial.
+//
+// Identity split (0030):
+//   - invocation-bearing deliveries skip the existence probe entirely:
+//     every entry inserts under its own ON CONFLICT arbiter, so a partially
+//     written prior attempt (an insert error rolls back its whole delivery
+//     transaction, but a replay must not trust that) can never suppress
+//     the missing names or occurrences — each replay re-inserts everything
+//     and the arbiter no-ops exactly the rows that already exist for THIS
+//     invocation. On a pre-0030 schema the original coarse probe and the
+//     legacy bytes are kept verbatim: that is the supported
+//     rolling-deployment mode, and its inserts are non-idempotent, so the
+//     probe stays their only dedupe.
+//   - legacy deliveries keep the coarse probe — their inserts have no
+//     arbiter in any schema — scoped to the NULL domain once 0030's column
+//     exists. Existing rows are never read to infer an invocation (no
+//     guessed linkage); enrichment only replays THIS delivery's own
+//     retained sample. Existence is established only by a clean row or by
+//     pgx.ErrNoRows: any other probe error fails the enrichment (delivery
+//     error, no ack, redelivery) rather than being mistaken for absence.
+func (c *StreamConsumer) enrichToolCallsIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) error {
+	hasToolFactInvocation, err := c.toolFactInvocationSchemaTx(ctx, tx)
+	if err != nil {
+		return fmt.Errorf("probe tool-fact invocation schema: %w", err)
 	}
-	c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse)
+	if ev.invocationIDValue != nil {
+		if !hasToolFactInvocation {
+			var one int
+			switch err := tx.QueryRow(ctx, toolCallsAbsentProbeCoarseQuery, ev.requestID, ev.orgID).Scan(&one); {
+			case err == nil:
+				return nil
+			case !errors.Is(err, pgx.ErrNoRows):
+				return fmt.Errorf("probe tool_calls enrichment: %w", err)
+			}
+		}
+		return c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse, ev.invocationIDValue)
+	}
+	probe := toolCallsAbsentProbeCoarseQuery
+	if hasToolFactInvocation {
+		probe = toolCallsAbsentProbeNullDomainQuery
+	}
+	var one int
+	switch err := tx.QueryRow(ctx, probe, ev.requestID, ev.orgID).Scan(&one); {
+	case err == nil:
+		return nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("probe tool_calls enrichment: %w", err)
+	}
+	return c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse, nil)
 }
 
 // enrichPolicyDecisionIfAbsent commits the policy decision with the

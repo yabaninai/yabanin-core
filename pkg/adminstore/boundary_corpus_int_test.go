@@ -6,11 +6,13 @@ package adminstore
 //
 //   T07a — root self-grant boundaries: exact expiry edges (consume must fail
 //          at and after expires_at), revoked-then-consume, cross-request
-//          reuse, scope exclusivity (payload.read never implies
-//          payload.read_originals), the issuing-root binding (a grant is a
-//          self-grant: grantee == grantor, no other root can redeem or
-//          revoke it), and the per-root active-grant cap (10 OK, 11th
-//          rejected, revoking one frees the slot).
+//          reuse, row binding (0031: a grant redeems exactly the one
+//          physical request_logs row it was issued against; any other row
+//          denies without burning), scope exclusivity (payload.read never
+//          implies payload.read_originals), the issuing-root binding (a
+//          grant is a self-grant: grantee == grantor, no other root can
+//          redeem or revoke it), and the per-root active-grant cap (10 OK,
+//          11th rejected, revoking one frees the slot).
 //   T07b — no-account-limits edges: provisioning under concurrent invites
 //          and developer creations (no seat/license gate anywhere), with
 //          the duplicate-active-invite uniqueness enforced per email.
@@ -63,6 +65,20 @@ func auditRowCount(t *testing.T, store *Store, ctx context.Context, id string) i
 	return n
 }
 
+// corpusRequestRow seeds one physical request_logs carrier row and returns
+// its numeric row key: 0031 binds every one-request grant to exactly one
+// physical row, so issuance needs a carrier before any grant can exist.
+func corpusRequestRow(t *testing.T, store *Store, ctx context.Context, orgID, requestID string) int64 {
+	t.Helper()
+	var rowKey int64
+	require.NoError(t, store.db.QueryRow(ctx,
+		`INSERT INTO request_logs (org_id, model_requested, model_used, status_code, duration_ms, tokens_in, tokens_out, method, home_region, request_id, created_at)
+		 VALUES ($1::uuid, 'corpus-model', 'corpus-model', 200, 10, 10, 10, 'POST', 'sg', $2, $3)
+		 RETURNING id`,
+		orgID, requestID, time.Now().UTC()).Scan(&rowKey))
+	return rowKey
+}
+
 func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
@@ -70,6 +86,11 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	orgID, rootA, rootB := corpusOrg(t, store, ctx, "boundary")
 
 	const requestID = "boundary-request"
+
+	// 0031: issuance binds a grant to exactly one physical request_logs
+	// row — seed that carrier before any grant can be issued.
+	rowKey := corpusRequestRow(t, store, ctx, orgID, requestID)
+	carriers := []string{requestID}
 
 	// --- expiry edges -----------------------------------------------------
 	now := time.Now().UTC()
@@ -112,18 +133,46 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	// The failed reuse left the grant live — retire it for the cap section.
 	require.NoError(t, store.RevokeRequestPayloadGrant(active.Token, rootA))
 
+	// --- 0031 row binding: exactly one physical row ----------------------
+	// Issuance resolved and stored the seeded carrier's row key; a redeem
+	// against any other physical row denies fail-closed and burns nothing.
+	pinned, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
+	require.NoError(t, err)
+	assert.Equal(t, rowKey, pinned.RowKey, "issuance binds the grant to the seeded carrier row")
+	_, err = store.ConsumeRequestPayloadGrantScope(pinned.Token, orgID, requestID, rowKey+1, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant,
+		"a grant pinned to one physical row cannot be redeemed against another")
+	redeemed, err := store.ConsumeRequestPayloadGrantScope(pinned.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	require.NoError(t, err,
+		"the denied wrong-row attempt burned nothing — the token still redeems its bound row")
+	assert.Equal(t, rowKey, redeemed.RowKey)
+
+	// Scoped expiry edges through the keyed consume: exactly at expires_at
+	// denies (strict predicate) and burns nothing; one millisecond earlier
+	// redeems.
+	edgeScope, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
+	require.NoError(t, err)
+	_, err = store.ConsumeRequestPayloadGrantScope(edgeScope.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, edgeScope.ExpiresAt)
+	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant,
+		"scoped consume exactly at expires_at must fail (durable predicate is strict)")
+	_, err = store.ConsumeRequestPayloadGrantScope(edgeScope.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, edgeScope.ExpiresAt.Add(-time.Millisecond))
+	require.NoError(t, err,
+		"the failed expiry probe burned nothing — the live grant still redeems")
+
 	// --- scope exclusivity -------------------------------------------------
 	readOnly, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
 	require.NoError(t, err)
-	assert.Error(t, store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Now().UTC()),
-		"payload.read must never imply payload.read_originals")
-	assert.NoError(t, store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rootA, RequestPayloadScopeRead, time.Now().UTC()))
+	_, err = store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeOriginals, time.Now().UTC())
+	assert.Error(t, err, "payload.read must never imply payload.read_originals")
+	_, err = store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.NoError(t, err)
 
 	originals, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Minute, now)
 	require.NoError(t, err)
-	assert.Error(t, store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rootA, RequestPayloadScopeRead, time.Now().UTC()),
-		"payload.read_originals must never imply payload.read")
-	assert.NoError(t, store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Now().UTC()))
+	_, err = store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.Error(t, err, "payload.read_originals must never imply payload.read")
+	_, err = store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeOriginals, time.Now().UTC())
+	assert.NoError(t, err)
 
 	// The used-audit entry shares the issuance prefix (canonical grant id).
 	assert.Equal(t, int64(1), auditRowCount(t, store, ctx, readOnly.ID+"-request_payload.grant_used"),
@@ -147,7 +196,16 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 
 	// --- per-root active cap (10 OK, 11th rejected, revoke frees a slot) --
 	// Every earlier grant is by now consumed, revoked or expired, so the
-	// quota starts empty for rootA.
+	// quota starts empty for rootA. Each cap request carries its own seeded
+	// row: 0031 issuance resolves one physical carrier per request id.
+	for i := 0; i <= MaxActiveRequestGrants; i++ {
+		capID := fmt.Sprintf("cap-request-%d", i)
+		if i == MaxActiveRequestGrants {
+			capID = "cap-request-over"
+		}
+		corpusRequestRow(t, store, ctx, orgID, capID)
+		carriers = append(carriers, capID)
+	}
 	var capTokens []string
 	for i := 0; i < MaxActiveRequestGrants; i++ {
 		g, err := store.CreateRequestPayloadGrant(orgID, fmt.Sprintf("cap-request-%d", i), rootA, time.Minute, time.Now().UTC())
@@ -162,6 +220,7 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, carriers)
 	})
 }
 
@@ -177,6 +236,7 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 	store := New(pool, slog.Default(), nil)
 	ctx := context.Background()
 	orgID, rootA, _ := corpusOrg(t, store, ctx, "interrupt")
+	corpusRequestRow(t, store, ctx, orgID, "interrupted-request")
 
 	// Hold the audit append lock from a foreign transaction: the issuance's
 	// audit write will block after the grant row has already committed.
@@ -218,6 +278,7 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, []string{"interrupted-request"})
 	})
 }
 
@@ -230,6 +291,18 @@ func TestIntegration_AuditFailureResumeState(t *testing.T) {
 	store := New(pool, slog.Default(), nil)
 	ctx := context.Background()
 	orgID, rootA, _ := corpusOrg(t, store, ctx, "resume")
+
+	// 0031 carriers: the compensated grant plus every cap probe below.
+	resumeCarriers := []string{"resume-request"}
+	corpusRequestRow(t, store, ctx, orgID, "resume-request")
+	for i := 0; i <= MaxActiveRequestGrants; i++ {
+		capID := fmt.Sprintf("resume-cap-%d", i)
+		if i == MaxActiveRequestGrants {
+			capID = "resume-cap-over"
+		}
+		corpusRequestRow(t, store, ctx, orgID, capID)
+		resumeCarriers = append(resumeCarriers, capID)
+	}
 
 	now := time.Now().UTC()
 	compensated, err := store.CreateRequestPayloadGrantScope(orgID, "resume-request", rootA, RequestPayloadScopeRead, time.Minute, now)
@@ -255,6 +328,7 @@ func TestIntegration_AuditFailureResumeState(t *testing.T) {
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, resumeCarriers)
 	})
 }
 

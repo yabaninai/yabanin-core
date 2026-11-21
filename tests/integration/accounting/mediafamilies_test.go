@@ -269,38 +269,8 @@ func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase,
 	if len(rows) != 1 {
 		t.Fatalf("product: %s control %s: %d admission row(s), want exactly 1", fam.name, phase, len(rows))
 	}
-	invocationID := rows[0].InvocationID
 	if fam.walletMicro != 0 {
-		c := s.oracleUsageByInvocation(t, invocationID, s.oracleDB.orgID)
-		if c.UsageRows != 1 || c.SumMicroUSD != fam.walletMicro {
-			t.Fatalf("product: %s control %s: invocation %s has %d usage rows summing to %d micro-USD, want exactly 1 signed debit of %d (zero-markup resale of the family-distinct usage at the seeded rates)",
-				fam.name, phase, invocationID, c.UsageRows, c.SumMicroUSD, fam.walletMicro)
-		}
-		if c.SumCents > 0 {
-			t.Errorf("product: %s control %s: usage transaction for %s carries positive cents %d — a debit must not be positive", phase, fam.name, rid, c.SumCents)
-		}
-		if legacy := s.oracleCount(t,
-			`SELECT count(*) FROM credit_transactions
-			 WHERE org_id = $1 AND request_id = $2 AND type = 'usage'
-			   AND invocation_id IS DISTINCT FROM $3::uuid`,
-			s.oracleDB.orgID, rid, invocationID); legacy != 0 {
-			t.Fatalf("product: %s control %s: %d legacy correlation-keyed usage rows for %s beside invocation %s — duplicate charge identity",
-				fam.name, phase, legacy, rid, invocationID)
-		}
-		if jobs := s.oracleCount(t,
-			`SELECT count(*) FROM settlement_jobs WHERE invocation_id = $1::uuid AND org_id = $2`,
-			invocationID, s.oracleDB.orgID); jobs < fam.settlementJobs {
-			t.Fatalf("product: %s control %s: %d settlement jobs under invocation %s, want at least %d",
-				fam.name, phase, jobs, invocationID, fam.settlementJobs)
-		}
-		if legacy := s.oracleCount(t,
-			`SELECT count(*) FROM settlement_jobs
-			 WHERE org_id = $1 AND request_id = $2
-			   AND invocation_id IS DISTINCT FROM $3::uuid`,
-			s.oracleDB.orgID, rid, invocationID); legacy != 0 {
-			t.Fatalf("product: %s control %s: %d legacy correlation-keyed settlement jobs for %s beside invocation %s — duplicate settlement identity",
-				fam.name, phase, legacy, rid, invocationID)
-		}
+		s.requirePricedMediaCharge(t, fam, phase, rid, rows[0].InvocationID)
 		return
 	}
 	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows+c.TopupRows != 0 {
@@ -309,6 +279,44 @@ func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase,
 	}
 	if n := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: %s control %s: %d settlement job(s) for an unpriced codec — no settlement may be scheduled for a request that never priced", fam.name, phase, n)
+	}
+}
+
+// requirePricedMediaCharge asserts the priced-family wallet oracle: one
+// signed debit of the family-distinct amount under the minted
+// invocation, at least the expected settlement jobs, and no
+// legacy correlation-keyed duplicates of either.
+func (s *stand) requirePricedMediaCharge(t *testing.T, fam mediaFamily, phase, rid, invocationID string) {
+	t.Helper()
+	c := s.oracleUsageByInvocation(t, invocationID, s.oracleDB.orgID)
+	if c.UsageRows != 1 || c.SumMicroUSD != fam.walletMicro {
+		t.Fatalf("product: %s control %s: invocation %s has %d usage rows summing to %d micro-USD, want exactly 1 signed debit of %d (zero-markup resale of the family-distinct usage at the seeded rates)",
+			fam.name, phase, invocationID, c.UsageRows, c.SumMicroUSD, fam.walletMicro)
+	}
+	if c.SumCents > 0 {
+		t.Errorf("product: %s control %s: usage transaction for %s carries positive cents %d — a debit must not be positive", phase, fam.name, rid, c.SumCents)
+	}
+	if legacy := s.oracleCount(t,
+		`SELECT count(*) FROM credit_transactions
+		 WHERE org_id = $1 AND request_id = $2 AND type = 'usage'
+		   AND invocation_id IS DISTINCT FROM $3::uuid`,
+		s.oracleDB.orgID, rid, invocationID); legacy != 0 {
+		t.Fatalf("product: %s control %s: %d legacy correlation-keyed usage rows for %s beside invocation %s — duplicate charge identity",
+			fam.name, phase, legacy, rid, invocationID)
+	}
+	if jobs := s.oracleCount(t,
+		`SELECT count(*) FROM settlement_jobs WHERE invocation_id = $1::uuid AND org_id = $2`,
+		invocationID, s.oracleDB.orgID); jobs < fam.settlementJobs {
+		t.Fatalf("product: %s control %s: %d settlement jobs under invocation %s, want at least %d",
+			fam.name, phase, jobs, invocationID, fam.settlementJobs)
+	}
+	if legacy := s.oracleCount(t,
+		`SELECT count(*) FROM settlement_jobs
+		 WHERE org_id = $1 AND request_id = $2
+		   AND invocation_id IS DISTINCT FROM $3::uuid`,
+		s.oracleDB.orgID, rid, invocationID); legacy != 0 {
+		t.Fatalf("product: %s control %s: %d legacy correlation-keyed settlement jobs for %s beside invocation %s — duplicate settlement identity",
+			fam.name, phase, legacy, rid, invocationID)
 	}
 }
 

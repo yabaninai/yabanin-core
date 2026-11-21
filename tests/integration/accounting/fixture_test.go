@@ -23,6 +23,10 @@ const (
 	fixturePromptTokens     = 7
 	fixtureCompletionTokens = 3
 	fixtureAssistantContent = "fixture reply"
+	// fixtureAnthropicVersion is the protocol version the native
+	// Anthropic Messages adapter must pin when the client omits one
+	// (anthropicExtraHeaders defaults to it).
+	fixtureAnthropicVersion = "2023-06-01"
 
 	// fixtureMicroUSDCost is the independently computed micro-USD cost of
 	// one fixture completion under the harness's operator-installed rates
@@ -88,6 +92,7 @@ type fixture struct {
 	dispatches []fixtureRecord
 	receipts   []fixtureRecord
 	hold       map[string]chan struct{}
+	postTerm   map[string]chan struct{}
 	writeErr   error
 
 	srv *http.Server
@@ -103,6 +108,7 @@ func startFixture(t *testing.T, runDir string, token string) *fixture {
 		token:     token,
 		ledgerDir: filepath.Join(runDir, "fixture-ledgers"),
 		hold:      map[string]chan struct{}{},
+		postTerm:  map[string]chan struct{}{},
 	}
 	if err := os.MkdirAll(f.ledgerDir, 0o750); err != nil {
 		t.Fatalf("harness: fixture ledger dir: %v", err)
@@ -146,15 +152,32 @@ func (f *fixture) stop() {
 //
 //   - arrivals: the instant the request reached the provider, before any
 //     authentication decision. Any provider contact lands here.
-//   - dispatches: after bearer authentication succeeded and the body was
-//     accepted — the request is irrevocably dispatched from this point.
+//   - dispatches: after protocol-specific authentication succeeded and
+//     the body was accepted — the request is irrevocably dispatched
+//     from this point.
 //   - receipts: after the response bytes were written back successfully.
 func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	rid := r.Header.Get("X-Request-ID")
 	if rid == "" {
 		rid = "(no-request-id)"
 	}
-	authOK := r.Header.Get("Authorization") == "Bearer "+f.token
+	// Credential shapes are enforced by upstream protocol path (an
+	// independent in-process wire probe showed an either-shape gate
+	// accepts Messages-with-Bearer and Responses-with-x-api-key): every
+	// openai-compat surface must present the fixture token as a Bearer
+	// credential, while the native Anthropic Messages surface must
+	// present it as x-api-key together with the pinned
+	// anthropic-version. A wrong shape is 401 with an arrival-only
+	// ledger (1/0/0) — a translated request must never be able to
+	// masquerade as a native dispatch, or the arrival-path oracle is
+	// meaningless.
+	authOK := false
+	if r.URL.Path == "/v1/messages" {
+		authOK = r.Header.Get("x-api-key") == f.token &&
+			r.Header.Get("anthropic-version") == fixtureAnthropicVersion
+	} else {
+		authOK = r.Header.Get("Authorization") == "Bearer "+f.token
+	}
 	f.append("arrivals", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: authOK})
 	if !authOK {
 		// Provider was contacted but refused: still an arrival, never a
@@ -193,6 +216,9 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 	f.serveAccepted(w, r.URL.Path, rid, body)
 }
 
+// serveAccepted routes an authenticated, dispatched request to its
+// protocol family. Streaming-capable families stay here; the simple JSON
+// families continue in serveAcceptedExtra.
 func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fixtureBody) {
 	switch path {
 	case "/v1/audio/speech":
@@ -200,11 +226,18 @@ func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fi
 	case "/v1/embeddings":
 		f.serveEmbeddings(w, rid, body.Model, path)
 	case "/v1/responses":
-		if body.Stream {
-			f.serveResponsesStream(w, rid, body.Model, path)
-			return
-		}
-		f.serveResponsesJSON(w, rid, body.Model, path)
+		f.serveResponses(w, rid, body.Model, path, body.Stream)
+	case "/v1/messages":
+		f.serveMessages(w, rid, body.Model, path, body.Stream)
+	default:
+		f.serveAcceptedExtra(w, path, rid, body)
+	}
+}
+
+// serveAcceptedExtra continues routing for the simple JSON families;
+// chat remains the default surface.
+func (f *fixture) serveAcceptedExtra(w http.ResponseWriter, path, rid string, body fixtureBody) {
+	switch path {
 	case "/v1/completions":
 		f.serveCompletionsJSON(w, rid, body.Model, path)
 	case "/v1/moderations":
@@ -218,6 +251,24 @@ func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fi
 	default:
 		f.serveChat(w, rid, path, body)
 	}
+}
+
+// serveResponses and serveMessages split the buffered and streaming
+// variants of each native surface, mirroring serveChat.
+func (f *fixture) serveResponses(w http.ResponseWriter, rid, model, path string, stream bool) {
+	if stream {
+		f.serveResponsesStream(w, rid, model, path)
+		return
+	}
+	f.serveResponsesJSON(w, rid, model, path)
+}
+
+func (f *fixture) serveMessages(w http.ResponseWriter, rid, model, path string, stream bool) {
+	if stream {
+		f.serveMessagesStream(w, rid, model, path)
+		return
+	}
+	f.serveMessagesJSON(w, rid, model, path)
 }
 
 func (f *fixture) serveChat(w http.ResponseWriter, rid, path string, body fixtureBody) {
@@ -364,12 +415,101 @@ func (f *fixture) serveResponsesStream(w http.ResponseWriter, rid, model, path s
 		flusher.Flush()
 	}
 	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+	f.awaitPostTerminalHold(rid)
 }
 
 // responsesFrame encodes one named SSE event from a JSON payload.
 func responsesFrame(event string, payload any) string {
 	data, _ := json.Marshal(payload)
 	return "event: " + event + "\ndata: " + string(data) + "\n\n"
+}
+
+// anthropicFrame encodes one named Anthropic Messages SSE event.
+func anthropicFrame(event string, payload any) string {
+	data, _ := json.Marshal(payload)
+	return "event: " + event + "\ndata: " + string(data) + "\n\n"
+}
+
+// serveMessagesJSON delivers the buffered provider-native Anthropic
+// Messages reply: the known assistant content and usage block in the
+// protocol's own document shape (messages_native.go parses exactly
+// this). Receipt appended only on successful write, like every family.
+func (f *fixture) serveMessagesJSON(w http.ResponseWriter, rid, model, path string) {
+	resp := map[string]any{
+		"id":   "msg-fixture-" + rid,
+		"type": "message",
+		"role": "assistant",
+		"content": []map[string]any{
+			{"type": "text", "text": fixtureAssistantContent},
+		},
+		"model":       model,
+		"stop_reason": "end_turn",
+		"usage": map[string]any{
+			"input_tokens":  fixturePromptTokens,
+			"output_tokens": fixtureCompletionTokens,
+		},
+	}
+	payload, _ := json.Marshal(resp)
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(payload); err != nil {
+		f.t.Logf("fixture: messages write failed for %s (client gone): %v", rid, err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+}
+
+// serveMessagesStream delivers the native Anthropic Messages family as
+// SSE: message_start (input-token prefix usage in the message envelope),
+// one content-block lifecycle around a text_delta carrying the known
+// assistant content, and the terminal message_delta carrying
+// stop_reason plus output-token usage, closed by message_stop — the
+// sequence nativeEventName/anthropicDeltaText classify while relaying.
+// The stream ends with message_stop (no [DONE] sentinel); the receipt
+// ledger entry is appended only after every frame was written, then the
+// post-terminal barrier (terminal-ordering cases) can hold the upstream
+// connection open past the terminal frame.
+func (f *fixture) serveMessagesStream(w http.ResponseWriter, rid, model, path string) {
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
+		return
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	frames := []string{
+		anthropicFrame("message_start", map[string]any{
+			"type": "message_start",
+			"message": map[string]any{
+				"id": "msg-fixture-" + rid, "type": "message", "role": "assistant", "model": model,
+				"usage": map[string]any{"input_tokens": fixturePromptTokens, "output_tokens": 0},
+			},
+		}),
+		anthropicFrame("content_block_start", map[string]any{
+			"type":          "content_block_start",
+			"index":         0,
+			"content_block": map[string]any{"type": "text", "text": ""},
+		}),
+		anthropicFrame("content_block_delta", map[string]any{
+			"type":  "content_block_delta",
+			"index": 0,
+			"delta": map[string]any{"type": "text_delta", "text": fixtureAssistantContent},
+		}),
+		anthropicFrame("content_block_stop", map[string]any{"type": "content_block_stop", "index": 0}),
+		anthropicFrame("message_delta", map[string]any{
+			"type":  "message_delta",
+			"delta": map[string]any{"stop_reason": "end_turn"},
+			"usage": map[string]any{"output_tokens": fixtureCompletionTokens},
+		}),
+		anthropicFrame("message_stop", map[string]any{"type": "message_stop"}),
+	}
+	for _, frame := range frames {
+		if _, err := w.Write([]byte(frame)); err != nil {
+			f.t.Logf("fixture: messages stream write failed for %s (client gone): %v", rid, err)
+			return
+		}
+		flusher.Flush()
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+	f.awaitPostTerminalHold(rid)
 }
 
 // fixtureImageB64 is the deterministic base64 payload returned for image
@@ -595,6 +735,41 @@ func (f *fixture) ReleaseAll() {
 	}
 }
 
+// HoldAfterTerminal arms the post-terminal barrier for rid: after the
+// terminal frame is written and the receipt recorded, the provider keeps
+// the upstream connection open until ReleasePostTerminal. Terminal-ordering
+// cases use it to prove the gateway relays the terminal frame to the
+// client without waiting for the upstream connection to end.
+func (f *fixture) HoldAfterTerminal(rid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if _, ok := f.postTerm[rid]; !ok {
+		f.postTerm[rid] = make(chan struct{})
+	}
+}
+
+// ReleasePostTerminal releases the post-terminal barrier for rid and lets
+// the serving handler return.
+func (f *fixture) ReleasePostTerminal(rid string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if ch, ok := f.postTerm[rid]; ok {
+		close(ch)
+		delete(f.postTerm, rid)
+	}
+}
+
+// awaitPostTerminalHold blocks the serving goroutine while the
+// post-terminal barrier is armed for rid.
+func (f *fixture) awaitPostTerminalHold(rid string) {
+	f.mu.Lock()
+	ch := f.postTerm[rid]
+	f.mu.Unlock()
+	if ch != nil {
+		<-ch
+	}
+}
+
 // Snapshot captures whole-ledger totals. Deltas between snapshots are the
 // provider-contact oracle for fault windows.
 func (f *fixture) Snapshot() fixtureTotals {
@@ -711,6 +886,13 @@ func (f *fixture) append(name string, rec fixtureRecord) {
 	default:
 		panic(fmt.Sprintf("fixture: unknown ledger %q", name))
 	}
+	f.mirrorLedgerLine(name, rec)
+}
+
+// mirrorLedgerLine appends one record as a JSONL line to the ledger's
+// evidence file. The first failure is latched into writeErr so
+// VerifyEvidence reports it; later failures stay silent. Callers hold f.mu.
+func (f *fixture) mirrorLedgerLine(name string, rec fixtureRecord) {
 	line, err := json.Marshal(rec)
 	if err != nil {
 		if f.writeErr == nil {

@@ -50,8 +50,6 @@ func TestOvershoot_ConcurrentAdmissionRace(t *testing.T) {
 		var admitted atomic.Int64
 		start := make(chan struct{})
 		var wg sync.WaitGroup
-		var mu sync.Mutex // serialize check reads per wave like two gateways would race
-		_ = mu
 		for i := 0; i < concurrency; i++ {
 			wg.Add(1)
 			go func(n int) {

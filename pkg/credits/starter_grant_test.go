@@ -39,9 +39,8 @@ func TestStarterGrantCents_Env(t *testing.T) {
 	})
 }
 
-// starterGrantFixture isolates one org on the shared stand: unique org id,
-// pre-created tables (order-independence with the legacy-shape tests) and
-// exact row cleanup.
+// starterGrantFixture isolates one org on the migrated stand: unique org id
+// and exact row cleanup.
 type starterGrantFixture struct {
 	org string
 }
@@ -49,31 +48,6 @@ type starterGrantFixture struct {
 func newStarterGrantFixture(t *testing.T, pool *pgxpool.Pool) *starterGrantFixture {
 	t.Helper()
 	ctx := context.Background()
-	// The shared stand may be reshaped by this package's legacy-shape tests
-	// under -shuffle: make sure the production-shape tables exist first.
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS org_credits (
-			org_id TEXT PRIMARY KEY,
-			balance_cents BIGINT NOT NULL DEFAULT 0,
-			remainder_micro_usd BIGINT NOT NULL DEFAULT 0 CHECK (remainder_micro_usd >= 0 AND remainder_micro_usd < 10000),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err)
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS credit_transactions (
-			id BIGSERIAL PRIMARY KEY,
-			org_id TEXT NOT NULL,
-			amount_cents BIGINT NOT NULL,
-			balance_after BIGINT NOT NULL,
-			type TEXT NOT NULL CHECK (type IN ('topup', 'usage')),
-			request_id TEXT,
-			invoice_ref TEXT,
-			metadata JSONB DEFAULT '{}',
-			amount_micro_usd BIGINT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err)
-
 	fx := &starterGrantFixture{org: fmt.Sprintf("wcred-%x", time.Now().UnixNano())}
 	t.Cleanup(func() {
 		_, _ = pool.Exec(ctx, `DELETE FROM credit_transactions WHERE org_id = $1`, fx.org)

@@ -1248,12 +1248,14 @@ func TestRelayResponsesSSE_CleanEOFSalvageClosesAndParsesUsage(t *testing.T) {
 
 // errAfterReader serves data then fails: the transport cut fixture.
 type errAfterReader struct {
-	data string
-	err  error
+	errorReads int
+	data       string
+	err        error
 }
 
 func (r *errAfterReader) Read(p []byte) (int, error) {
 	if len(r.data) == 0 {
+		r.errorReads++
 		return 0, r.err
 	}
 	n := copy(p, r.data)
@@ -1337,9 +1339,12 @@ func TestRelayResponsesSSE_LateBreakAfterTerminalKeepsUsageAndOutput(t *testing.
 		`data: {"type":"response.completed","response":{"id":"resp_1","usage":{"input_tokens":7,"output_tokens":3}}}` + "\n\n"
 
 	var buf bytes.Buffer
-	usage, terminal, err := relayResponsesSSE(&recorderWriter{w: &buf}, &errAfterReader{data: created + completed, err: errors.New("cut")})
-	if err == nil {
-		t.Fatal("the transport cut must surface as a drain error")
+	// A subsequent read would encounter the transport cut. Settlement must
+	// finish on the delivered terminal even if that read would hang.
+	source := &errAfterReader{data: created + completed, err: errors.New("cut")}
+	usage, terminal, err := relayResponsesSSE(&recorderWriter{w: &buf}, source)
+	if err != nil || source.errorReads != 0 {
+		t.Fatalf("relay read past the delivered terminal: reads=%d err=%v", source.errorReads, err)
 	}
 	if terminal != "response.completed" {
 		t.Fatalf("the delivered response.completed must be reported, got %q", terminal)

@@ -267,6 +267,10 @@ func (r *fakeRow) Scan(dest ...any) error {
 				*v = r.vals[i].(string)
 			case *any:
 				*v = r.vals[i]
+			case *int:
+				if n, ok := r.vals[i].(int); ok {
+					*v = n
+				}
 			}
 		}
 	}

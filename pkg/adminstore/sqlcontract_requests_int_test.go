@@ -68,12 +68,22 @@ func seedRequestsExtension(t *testing.T, pool *pgxpool.Pool, fx *contractFixture
 		`{"env":"prod","issue":"PAY-9"}`)
 	require.NoError(t, err, "seed extension request_logs row")
 
+	// r2 is the unique legacy carrier for the positive attachment case: one
+	// orgA row, NULL invocation identity, its own web_search fact — the
+	// legacy-attach behavior the r1 pair can no longer provide (adding a
+	// fresh request row would shift the list-count contracts).
 	_, err = pool.Exec(ctx, `
 		INSERT INTO tool_calls (request_id, org_id, task_id, model_used, tool_name) VALUES
 			($1, $2::uuid, 'code-gen', $3, 'web_search'),
 			($1, $2::uuid, 'code-gen', $3, 'code_interpreter'),
-			($4, $2::uuid, NULL, $3, 'web_search')`,
-		fx.Token+"-rx", fx.OrgA, fx.Token+"-m-smart", fx.Token+"-r1")
+			($4, $2::uuid, NULL, $3, 'web_search'),
+			($5, $2::uuid, NULL, $3, 'web_search')`,
+		fx.Token+"-rx", fx.OrgA, fx.Token+"-m-smart", fx.Token+"-r1", fx.Token+"-r2")
+	// The r1 fact is the ambiguous control: the base fixture seeds r1 twice
+	// in orgA (smart + shadow mirror share org and request_id), so under the
+	// unique-carrier association rule its NULL-invocation fact attributes to
+	// neither row — detail stays empty and the report counts no request for
+	// it, while fact-domain totals still include it.
 	require.NoError(t, err, "seed tool_calls")
 
 	_, err = pool.Exec(ctx, `
@@ -909,13 +919,104 @@ func TestSQLContractRequests_YQLInjection(t *testing.T) {
 // TestSQLContractRequests_Labels covers the label attribution surface:
 // request labels (0004) through the list and detail reads, ListLabelKeys,
 // the api-key label write (0014) and its CAS variant.
+// runToolFactDetailContracts holds the tool-fact association detail
+// controls over the shared fixture: r2 is the unique legacy carrier whose
+// pre-0014 fact still attaches, and r1 — seeded twice in orgA (smart +
+// shadow mirror) with one NULL-invocation fact — must attribute that fact
+// to neither row (unique-carrier rule: linkage is never guessed).
+func runToolFactDetailContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetRequestDetail/r2", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r2")
+		if err != nil {
+			return err
+		}
+		if len(d.ToolCalls) != 1 || d.ToolCalls[0].ToolName != "web_search" {
+			t.Errorf("GetRequestDetail/r2: expected the seeded web_search call, got %v", d.ToolCalls)
+		}
+		if len(d.ToolCallInvocations) != 0 {
+			t.Errorf("GetRequestDetail/r2: expected no invocations, got %d", len(d.ToolCallInvocations))
+		}
+		return nil
+	})
+	contract(t, "GetRequestDetail/r1-ambiguous", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r1")
+		if err != nil {
+			return err
+		}
+		if len(d.ToolCalls) != 0 {
+			t.Errorf("GetRequestDetail/r1-ambiguous: ambiguous correlation must attach no facts, got %v", d.ToolCalls)
+		}
+		if len(d.ToolCallInvocations) != 0 {
+			t.Errorf("GetRequestDetail/r1-ambiguous: expected no invocations, got %d", len(d.ToolCallInvocations))
+		}
+		return nil
+	})
+}
+
+// runToolReportContract holds the GetToolCallsReport aggregate control:
+// four facts (rx web_search + code_interpreter, r1 web_search, r2
+// web_search), two tools, but only two request identities — rx's unique
+// carrier and r2's. The r1 fact stays in the fact-domain totals yet counts
+// no request: its correlation is carried by the smart + shadow mirror pair.
+func runToolReportContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetToolCallsReport/orgA", func(ctx context.Context) error {
+		rep, err := store.GetToolCallsReport(ctx, fx.OrgA, 7)
+		if err != nil {
+			return err
+		}
+		if rep.TotalCalls != 4 || rep.DistinctTools != 2 || rep.RequestsUsing != 2 {
+			t.Errorf("GetToolCallsReport/orgA: expected 4 calls / 2 tools / 2 requests, got %+v", rep)
+		}
+		checkToolReportShape(t, rep)
+		return nil
+	})
+}
+
+// checkToolReportShape pins the leaderboard and by-model grouping of the
+// orgA report: web_search leads with 3 of 4 calls (75%), one model group.
+func checkToolReportShape(t *testing.T, rep *ToolCallsReport) {
+	t.Helper()
+	if len(rep.Top) != 2 || rep.Top[0].Tool != "web_search" || rep.Top[0].Calls != 3 {
+		t.Errorf("GetToolCallsReport/orgA: top must lead with web_search×3, got %+v", rep.Top)
+		return
+	}
+	if rep.Top[0].Share < 74.0 || rep.Top[0].Share > 76.0 {
+		t.Errorf("GetToolCallsReport/orgA: share must be 3/4 of calls, got %f", rep.Top[0].Share)
+	}
+	if len(rep.ByModel) != 1 || rep.ByModel[0].Calls != 4 {
+		t.Errorf("GetToolCallsReport/orgA: by-model must group all 4 calls, got %+v", rep.ByModel)
+	}
+}
+
 func TestSQLContractRequests_Labels(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
 	fx := seedContractFixture(t, pool)
 	seedRequestsExtension(t, pool, fx)
 
-	// Detail: labels + tool calls + per-occurrence invocations (0014 reads).
+	// Contract order is load-bearing: the label-key, api-key write and CAS
+	// groups chain state (write -> verify -> clear; unconditional -> match
+	// -> mismatch reads the post-match state).
+	runRxDetailContract(t, store, fx)
+	runRxInvocationContract(t, store, fx)
+	runToolFactDetailContracts(t, store, fx)
+	runDetailBoundaryContracts(t, store, fx)
+	runLabelKeyContracts(t, store, fx)
+	runAPIKeyLabelWriteContract(t, store, pool, fx)
+	runAPIKeyLabelClearContract(t, store, pool, fx)
+	runAPIKeyLabelCASUnconditionalContract(t, store, fx)
+	runAPIKeyLabelCASMatchContract(t, store, fx)
+	runAPIKeyLabelCASErrorContracts(t, store, fx)
+}
+
+// runRxDetailContract covers the rx detail read: labels round-trip and
+// tool calls listed in id order (0014 reads).
+func runRxDetailContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "GetRequestDetail/rx", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-rx")
@@ -927,6 +1028,20 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		if len(d.ToolCalls) != 2 || d.ToolCalls[0].ToolName != "web_search" || d.ToolCalls[1].ToolName != "code_interpreter" {
 			t.Errorf("GetRequestDetail/rx: tool calls must list both names in id order, got %v", d.ToolCalls)
+		}
+		return nil
+	})
+}
+
+// runRxInvocationContract covers the rx per-occurrence invocations (0014):
+// the first carries id and arguments, the second tolerates NULLs.
+func runRxInvocationContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
+	contract(t, "GetRequestDetail/rx-invocations", func(ctx context.Context) error {
+		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
+		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-rx")
+		if err != nil {
+			return err
 		}
 		if len(d.ToolCallInvocations) != 2 {
 			t.Errorf("GetRequestDetail/rx: expected 2 invocations, got %d", len(d.ToolCallInvocations))
@@ -941,25 +1056,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// Detail for a request with a tool_call but no invocations (legacy rows).
-	contract(t, "GetRequestDetail/r1", func(ctx context.Context) error {
-		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
-		d, err := store.GetRequestDetail(contentCtx, fx.OrgA, fx.Token+"-r1")
-		if err != nil {
-			return err
-		}
-		if len(d.ToolCalls) != 1 || d.ToolCalls[0].ToolName != "web_search" {
-			t.Errorf("GetRequestDetail/r1: expected the seeded web_search call, got %v", d.ToolCalls)
-		}
-		if len(d.ToolCallInvocations) != 0 {
-			t.Errorf("GetRequestDetail/r1: expected no invocations, got %d", len(d.ToolCallInvocations))
-		}
-		return nil
-	})
-
-	// Cross-org and missing lookups answer ErrNotFound without leaking
-	// existence.
+// runDetailBoundaryContracts covers the detail ErrNotFound boundary:
+// cross-org and missing lookups never leak existence.
+func runDetailBoundaryContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "GetRequestDetail/cross-org", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		_, err := store.GetRequestDetail(contentCtx, fx.OrgB, fx.Token+"-rx")
@@ -976,8 +1078,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// Label keys over the window (0004 data) and the honest empty answer.
+// runLabelKeyContracts covers ListLabelKeys over the window (0004 data)
+// and the honest empty answer for an unknown org.
+func runLabelKeyContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "ListLabelKeys/orgA", func(ctx context.Context) error {
 		keys, err := store.ListLabelKeys(ctx, fx.OrgA, fx.From, fx.To)
 		if err != nil {
@@ -1006,8 +1112,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// API-key labels (0014): plain write, verify, clear, missing id.
+// runAPIKeyLabelWriteContract covers the plain api-key label write (0014)
+// with flags, verified directly against the row.
+func runAPIKeyLabelWriteContract(t *testing.T, store *Store, pool *pgxpool.Pool, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabels/write", func(ctx context.Context) error {
 		err := store.UpdateAPIKeyLabels(ctx, fx.APIKeyA, map[string]string{"team": "alpha", "issue": "IMP-03E"}, true, true, false)
 		if err != nil {
@@ -1029,6 +1139,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelClearContract covers the clear-to-{} write and the
+// missing-id error.
+func runAPIKeyLabelClearContract(t *testing.T, store *Store, pool *pgxpool.Pool, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabels/clear", func(ctx context.Context) error {
 		if err := store.UpdateAPIKeyLabels(ctx, fx.APIKeyA, nil, false, false, false); err != nil {
 			return err
@@ -1049,9 +1165,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
 
-	// CAS (0014): unconditional, expected-state success, mismatch and a
-	// vanished row.
+// runAPIKeyLabelCASUnconditionalContract covers the CAS unconditional
+// write (0014).
+func runAPIKeyLabelCASUnconditionalContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned", func(ctx context.Context) error {
 		st, err := store.UpdateAPIKeyLabelsPreconditioned(ctx, fx.APIKeyA,
 			map[string]string{"team": "alpha"}, true, false, true, nil)
@@ -1063,6 +1182,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelCASMatchContract covers the CAS expected-state success
+// path (0014).
+func runAPIKeyLabelCASMatchContract(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned/match", func(ctx context.Context) error {
 		expect := &APIKeyLabelsState{
 			Labels: map[string]string{"team": "alpha"}, LabelsLocked: true, CanMintSessions: false, CanReadUsage: true,
@@ -1077,6 +1202,12 @@ func TestSQLContractRequests_Labels(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// runAPIKeyLabelCASErrorContracts covers the CAS failure modes (0014):
+// mismatch (returning the current state) and a vanished row.
+func runAPIKeyLabelCASErrorContracts(t *testing.T, store *Store, fx *contractFixture) {
+	t.Helper()
 	contract(t, "UpdateAPIKeyLabelsPreconditioned/mismatch", func(ctx context.Context) error {
 		stale := &APIKeyLabelsState{
 			Labels: map[string]string{"team": "alpha"}, LabelsLocked: true, CanMintSessions: false, CanReadUsage: true,
@@ -1263,26 +1394,7 @@ func TestSQLContractRequests_ToolCalls(t *testing.T) {
 	fx := seedContractFixture(t, pool)
 	seedRequestsExtension(t, pool, fx)
 
-	contract(t, "GetToolCallsReport/orgA", func(ctx context.Context) error {
-		rep, err := store.GetToolCallsReport(ctx, fx.OrgA, 7)
-		if err != nil {
-			return err
-		}
-		if rep.TotalCalls != 3 || rep.DistinctTools != 2 || rep.RequestsUsing != 2 {
-			t.Errorf("GetToolCallsReport/orgA: expected 3 calls / 2 tools / 2 requests, got %+v", rep)
-		}
-		if len(rep.Top) != 2 || rep.Top[0].Tool != "web_search" || rep.Top[0].Calls != 2 {
-			t.Errorf("GetToolCallsReport/orgA: top must lead with web_search×2, got %+v", rep.Top)
-			return nil
-		}
-		if rep.Top[0].Share < 66.0 || rep.Top[0].Share > 67.0 {
-			t.Errorf("GetToolCallsReport/orgA: share must be 2/3 of calls, got %f", rep.Top[0].Share)
-		}
-		if len(rep.ByModel) != 1 || rep.ByModel[0].Calls != 3 {
-			t.Errorf("GetToolCallsReport/orgA: by-model must group all 3 calls, got %+v", rep.ByModel)
-		}
-		return nil
-	})
+	runToolReportContract(t, store, fx)
 	contract(t, "GetToolCallsReport/unknown-org", func(ctx context.Context) error {
 		rep, err := store.GetToolCallsReport(ctx, "00000000-0000-0000-0000-000000000000", 7)
 		if err != nil {

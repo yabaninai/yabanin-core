@@ -963,8 +963,13 @@ func (c *yqlCompiler) compileCache(cl *yqlClause) string {
 
 // yqlToolExists is the org-scoped existence test over tool_calls. The outer
 // references MUST stay rl-qualified: unqualified request_id/org_id inside the
-// subquery would bind to tool_calls' own columns and become always-true.
-const yqlToolExists = "EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id"
+// subquery would bind to tool_calls' own columns and become always-true. The
+// association rule (toolFactMatchesRow, 0030) makes "used tool X" a row-exact
+// fact: invocation-bearing facts bind to their own invocation's row, and
+// NULL-invocation facts bind only to the org's unique carrier of the
+// correlation — ambiguous correlations match no row, so neither sibling
+// filters in.
+const yqlToolExists = "EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND " + toolFactMatchesRow
 
 func (c *yqlCompiler) compileTool(cl *yqlClause) string {
 	nameCond := func(like bool) string {

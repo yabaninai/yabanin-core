@@ -126,37 +126,50 @@ func (s *stand) assertNoRetryCarrier(t *testing.T, rdb *redis.Client, needle str
 			if err != nil || kind != "stream" {
 				continue
 			}
-			msgs, err := rdb.XRangeN(ctx, key, "-", "+", 200).Result()
-			if err != nil {
-				continue
-			}
-			for _, m := range msgs {
-				if entryContains(m.Values, needle) {
-					t.Fatalf("redis: retry carrier stream %q holds a copy of target %s (entry %s)", key, needle, m.ID)
-				}
-			}
-			if len(msgs) == 200 {
-				// A full page may hide more; keep scanning this stream.
-				for {
-					more, err := rdb.XRangeN(ctx, key, "("+msgs[len(msgs)-1].ID, "+", 200).Result()
-					if err != nil {
-						break
-					}
-					for _, m := range more {
-						if entryContains(m.Values, needle) {
-							t.Fatalf("redis: retry carrier stream %q holds a copy of target %s (entry %s)", key, needle, m.ID)
-						}
-					}
-					if len(more) < 200 {
-						break
-					}
-					msgs = more
-				}
-			}
+			s.assertStreamHoldsNoCopy(ctx, t, rdb, key, needle)
 		}
 		cursor = next
 		if cursor == 0 {
 			return
+		}
+	}
+}
+
+// assertStreamHoldsNoCopy walks every entry of one Redis stream (the
+// event stream is excluded by the caller) and fails the test if the
+// target's notification appears anywhere in it. Full pages are followed
+// with an exclusive-start scan so a long stream cannot hide the tail.
+func (s *stand) assertStreamHoldsNoCopy(ctx context.Context, t *testing.T, rdb *redis.Client, key, needle string) {
+	t.Helper()
+	msgs, err := rdb.XRangeN(ctx, key, "-", "+", 200).Result()
+	if err != nil {
+		return
+	}
+	requireNoStreamCopy(t, key, msgs, needle)
+	if len(msgs) < 200 {
+		return
+	}
+	// A full page may hide more; keep scanning this stream.
+	for {
+		more, err := rdb.XRangeN(ctx, key, "("+msgs[len(msgs)-1].ID, "+", 200).Result()
+		if err != nil {
+			break
+		}
+		requireNoStreamCopy(t, key, more, needle)
+		if len(more) < 200 {
+			break
+		}
+		msgs = more
+	}
+}
+
+// requireNoStreamCopy fails the test when any scanned stream entry
+// carries the target's notification.
+func requireNoStreamCopy(t *testing.T, key string, msgs []redis.XMessage, needle string) {
+	t.Helper()
+	for _, m := range msgs {
+		if entryContains(m.Values, needle) {
+			t.Fatalf("redis: retry carrier stream %q holds a copy of target %s (entry %s)", key, needle, m.ID)
 		}
 	}
 }

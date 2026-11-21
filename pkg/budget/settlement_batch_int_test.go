@@ -358,8 +358,10 @@ func TestSettleOrgBatch_IdempotentNoOpAndIdentityConflict(t *testing.T) {
 }
 
 // A stale worker's lower claim token is rejected even when confirmations
-// race. Replaying the winner's already-settled expense is an idempotent
-// no-op and never debits the wallet or ledger twice.
+// race. Once the winner commits, the finished job belongs to nobody: every
+// nonzero-token replay is stale ownership that moves nothing and never
+// overwrites the terminal state, while the token-0 direct-caller replay
+// stays the idempotent no-op that never debits wallet or ledger twice.
 func TestSettleOrgBatch_ConcurrentFencingAndIdempotentReplay(t *testing.T) {
 	ctx := context.Background()
 	pool := testdb.Postgres(t)
@@ -369,7 +371,9 @@ func TestSettleOrgBatch_ConcurrentFencingAndIdempotentReplay(t *testing.T) {
 	requestID := "fenced-settlement-" + org
 	seedBatchWallet(ctx, t, pool, org, 2_000, 0)
 	jobID := seedBatchJob(ctx, t, pool, org, requestID, SettleKindResale, 1_000_000, []byte(`{}`))
-	_, err := pool.Exec(ctx, `UPDATE settlement_jobs SET attempts = 2 WHERE id = $1`, jobID)
+	// Nonzero fencing only confirms a live claim, never a pending seed: the
+	// row must sit in the state the claiming worker leaves behind.
+	_, err := pool.Exec(ctx, `UPDATE settlement_jobs SET status = 'processing', attempts = 2, lease_until = now() + interval '30s' WHERE id = $1`, jobID)
 	require.NoError(t, err)
 
 	start := make(chan struct{})
@@ -412,8 +416,29 @@ func TestSettleOrgBatch_ConcurrentFencingAndIdempotentReplay(t *testing.T) {
 	balance, _ := settlementWalletState(ctx, t, pool, org)
 	assert.Equal(t, int64(1_900), balance, "the wallet is debited once")
 
+	// Replay of the finished job rejects stale ownership: a settled row is
+	// 'processing' under nobody, so both the stale worker's token and the
+	// winner's own token are fenced without moving wallet or ledger.
+	for _, staleToken := range []int32{1, 2} {
+		_, err := SettleOrgBatch(ctx, pool, org, -100, []SettleEntry{{
+			JobID: jobID, FencingToken: staleToken, RequestID: requestID,
+			Kind: SettleKindResale, Amount: 1_000_000, Payload: []byte(`{}`),
+		}}, BatchSpenders{})
+		assert.ErrorIs(t, err, ErrStaleSettlementToken, "token %d: a settled job confirms no claim", staleToken)
+	}
+	rows, microSum = walletLedger(ctx, t, pool, org)
+	assert.Equal(t, int64(1), rows)
+	assert.Equal(t, int64(-1_000_000), microSum)
+	balance, _ = settlementWalletState(ctx, t, pool, org)
+	assert.Equal(t, int64(1_900), balance, "stale-ownership replays move no money")
+	var status string
+	require.NoError(t, pool.QueryRow(ctx, `SELECT status FROM settlement_jobs WHERE id = $1`, jobID).Scan(&status))
+	assert.Equal(t, "settled", status, "fenced replays never overwrite the terminal state")
+
+	// Idempotency check: the token-0 direct-caller replay of the committed
+	// charge settles as a no-op and never debits twice.
 	dispositions, err := SettleOrgBatch(ctx, pool, org, -100, []SettleEntry{{
-		JobID: jobID, FencingToken: 2, RequestID: requestID,
+		JobID: jobID, RequestID: requestID,
 		Kind: SettleKindResale, Amount: 1_000_000, Payload: []byte(`{}`),
 	}}, BatchSpenders{})
 	require.NoError(t, err)

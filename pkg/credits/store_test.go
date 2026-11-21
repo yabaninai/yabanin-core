@@ -18,6 +18,20 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 	return testdb.Postgres(t)
 }
 
+// setupFixtureDB returns a fixture-owned, isolated-schema pool on the shared
+// stand — the ownership boundary for every raw-DDL fixture in this package
+// (testdb.PostgresOwnedSchema, the A05 primitive). setupTestTables builds
+// the illustrative interim posture (0028 shape including the global usage
+// index that 0029 contracts away) and teardownTestTables DROPs the tables;
+// inside the fixture schema that DDL can never reshape the public migrated
+// schema that overshoot, sqlcontract, the crash/starter corpora and the
+// migrated_posture invariant measure directly. Unqualified fixture DDL
+// keeps resolving through current_schema(); teardown is guaranteed restore.
+func setupFixtureDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	return testdb.PostgresOwnedSchema(t, t.Name())
+}
+
 func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	// Mirrors the migrated shape (0001 + 0018 fractional money); on the
@@ -94,7 +108,7 @@ func teardownTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 
 func TestGetBalance_ZeroWhenNoWallet(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -111,7 +125,7 @@ func TestGetBalance_ZeroWhenNoWallet(t *testing.T) {
 
 func TestTopUp_IncreasesBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -148,7 +162,7 @@ func TestTopUp_IncreasesBalance(t *testing.T) {
 
 func TestDeduct_ReducesBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -178,7 +192,7 @@ func TestDeduct_ReducesBalance(t *testing.T) {
 
 func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -209,7 +223,7 @@ func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 
 func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -277,7 +291,7 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 
 func TestTransactions_Recorded(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -337,7 +351,7 @@ func TestInvalidTopUp_AmountMustBePositive(t *testing.T) {
 
 func TestConcurrentDeductions(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -421,7 +435,7 @@ func TestConcurrentDeductions(t *testing.T) {
 
 func TestDeduct_IdempotentDuplicate(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 

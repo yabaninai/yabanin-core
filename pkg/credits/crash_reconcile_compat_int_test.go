@@ -19,10 +19,7 @@
 //
 // Shared-stand discipline: one Postgres container and one process-global
 // metrics registry per test binary. Every identifier carries a per-run
-// token, cleanup removes exactly the seeded rows, and the production
-// wallet columns are restored additively before seeding because other
-// tests in this package may have dropped the tables into a legacy shape
-// under -shuffle.
+// token and cleanup removes exactly the seeded rows.
 package credits
 
 import (
@@ -65,50 +62,16 @@ type crcCompatFixture struct {
 	org   string
 }
 
-// crcNewCompatFixture restores the production wallet shape (base tables in
-// the migrated layout plus the reservation columns), seeds one wallet and
-// registers cleanup for every row the test can create. ctx is the
-// test-lifetime context the caller already holds (Background in this
-// file), so the registered cleanup may safely keep using it after the
-// test body returns.
+// crcNewCompatFixture seeds one wallet and registers cleanup for every row
+// the test can create, on the migrated stand. ctx is the test-lifetime
+// context the caller already holds (Background in this file), so the
+// registered cleanup may safely keep using it after the test body returns.
 func crcNewCompatFixture(ctx context.Context, t *testing.T, pool *pgxpool.Pool, name string, balanceCents, remainder int64, floor *int64) *crcCompatFixture {
 	t.Helper()
 	token := fmt.Sprintf("crc%s%s%x", name, time.Now().Format("150405"), time.Now().UnixNano()%1e6)
 
-	// Order-independence: store_test.go owns legacy table shapes and drops
-	// the tables on teardown; under -shuffle this file can run before or
-	// after any of that, so make sure the base tables and the reservation
-	// columns exist exactly as the migrated schema defines them.
-	_, err := pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS org_credits (
-			org_id TEXT PRIMARY KEY,
-			balance_cents BIGINT NOT NULL DEFAULT 0,
-			remainder_micro_usd BIGINT NOT NULL DEFAULT 0 CHECK (remainder_micro_usd >= 0 AND remainder_micro_usd < 10000),
-			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err, "ensure the base org_credits table")
-	_, err = pool.Exec(ctx, `
-		ALTER TABLE org_credits
-			ADD COLUMN IF NOT EXISTS reserved_micro_usd bigint NOT NULL DEFAULT 0 CHECK (reserved_micro_usd >= 0),
-			ADD COLUMN IF NOT EXISTS grace_floor_cents bigint CHECK (grace_floor_cents BETWEEN -100000 AND 0)`)
-	require.NoError(t, err, "restore the reservation wallet columns")
-	_, err = pool.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS credit_transactions (
-			id BIGSERIAL PRIMARY KEY,
-			org_id TEXT NOT NULL,
-			amount_cents BIGINT NOT NULL,
-			balance_after BIGINT NOT NULL,
-			type TEXT NOT NULL CHECK (type IN ('topup', 'usage')),
-			request_id TEXT,
-			invoice_ref TEXT,
-			metadata JSONB DEFAULT '{}',
-			amount_micro_usd BIGINT,
-			created_at TIMESTAMPTZ NOT NULL DEFAULT now()
-		)`)
-	require.NoError(t, err, "ensure the base credit_transactions table")
-
 	fx := &crcCompatFixture{t: t, pool: pool, token: token, org: token + "-org"}
-	_, err = pool.Exec(ctx, `
+	_, err := pool.Exec(ctx, `
 		INSERT INTO org_credits (org_id, balance_cents, remainder_micro_usd, reserved_micro_usd, grace_floor_cents)
 		VALUES ($1, $2, $3, 0, $4)`, fx.org, balanceCents, remainder, floor)
 	require.NoError(t, err, "seed wallet %s", fx.org)

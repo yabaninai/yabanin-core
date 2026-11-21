@@ -178,19 +178,28 @@ func TestRequestListWhere_WithYQL(t *testing.T) {
 
 // The tool EXISTS subquery MUST reference the outer row as rl.*: an
 // unqualified request_id/org_id would bind to tool_calls' own columns and
-// turn the existence test into an org-blind always-true.
+// turn the existence test into an org-blind always-true. It must also carry
+// the package's single association rule (toolFactMatchesRow): exact
+// invocation identity, or unique-carrier for NULL-invocation facts.
 func TestYQLWhere_ToolExistsIsOrgScoped(t *testing.T) {
 	rq, err := ParseYQL("tool = bash")
 	require.NoError(t, err)
 	w, _ := requestListWhere(RequestListFilters{OrgID: "org-1", Query: rq})
 	require.Contains(t, w,
-		"EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND tc.tool_name = $2)")
+		"EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND "+
+			"((tc.invocation_id IS NOT NULL AND tc.invocation_id = rl.invocation_id) OR "+
+			"(tc.invocation_id IS NULL AND "+
+			"(SELECT COUNT(*) FROM request_logs c WHERE c.org_id = tc.org_id AND c.request_id = tc.request_id) = 1)) AND tc.tool_name = $2)")
 	require.NotContains(t, w, "tc.request_id = request_id")
 
 	rq, err = ParseYQL("tool is empty")
 	require.NoError(t, err)
 	w, _ = requestListWhere(RequestListFilters{OrgID: "org-1", Query: rq})
-	require.Contains(t, w, "NOT EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id)")
+	require.Contains(t, w,
+		"NOT EXISTS (SELECT 1 FROM tool_calls tc WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND "+
+			"((tc.invocation_id IS NOT NULL AND tc.invocation_id = rl.invocation_id) OR "+
+			"(tc.invocation_id IS NULL AND "+
+			"(SELECT COUNT(*) FROM request_logs c WHERE c.org_id = tc.org_id AND c.request_id = tc.request_id) = 1))")
 }
 
 func TestYQLWhere_FragmentsPerKind(t *testing.T) {

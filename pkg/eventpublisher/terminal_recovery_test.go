@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"testing"
 
+	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -49,4 +50,31 @@ func TestTerminalFactsCannotCommitNegativeUsage(t *testing.T) {
 	event.TokensOut = -1
 	_, err := event.TerminalAccountingFields()
 	require.Error(t, err)
+}
+
+func TestTerminalSettlementQuoteRange(t *testing.T) {
+	// One more whole USD than fits in a signed 64-bit micro-USD ledger.
+	const outside = 9223372036855
+	for _, tc := range []struct {
+		field string
+		set   func(*Event, float64)
+	}{
+		{"estimated_cost_usd", func(e *Event, n float64) { e.EstimatedCostUSD = n }},
+		{"resale_cost_usd", func(e *Event, n float64) { e.ResaleCostUSD = n }},
+	} {
+		t.Run(tc.field, func(t *testing.T) {
+			event := accountingFixture()
+			facts, err := event.TerminalAccountingFields()
+			require.NoError(t, err)
+			tc.set(&event, outside)
+			_, writeErr := event.TerminalAccountingFields()
+			assert.Error(t, writeErr)
+
+			facts[tc.field] = "9223372036855"
+			raw, err := json.Marshal(facts)
+			require.NoError(t, err)
+			_, readErr := DecodeTerminalAccounting(raw, event.InvocationID, event.OrgID)
+			assert.Error(t, readErr)
+		})
+	}
 }
