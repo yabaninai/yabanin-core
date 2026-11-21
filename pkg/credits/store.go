@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -335,6 +336,26 @@ func (s *Store) Deduct(ctx context.Context, orgID string, amountCents int64, req
 	return s.DeductMicro(ctx, orgID, amount, requestID, metadata)
 }
 
+// DeductMicroInvocation deducts an exact micro-USD amount keyed by the
+// billed invocation identity (0028+). invocationID is either empty — the
+// legacy request-keyed domain above, byte-identical — or a canonical uuid;
+// any other value is rejected before touching the database so a
+// present-but-malformed identity can never silently downgrade onto the
+// legacy idempotency key. On 0028+ schemas the usage row's idempotency key
+// is the invocation alone (uniq_credit_transactions_invocation): two
+// legitimate invocations from one org sharing a client request id bill
+// independently. On a pre-0028 schema the invocation-keyed insert fails
+// loudly (missing column) — retry, then requires_attention — instead of
+// billing under the shared legacy key.
+func (s *Store) DeductMicroInvocation(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
+	if invocationID != "" {
+		if _, err := uuid.Parse(invocationID); err != nil {
+			return fmt.Errorf("deduct: invalid invocation id %q: %w", invocationID, err)
+		}
+	}
+	return s.deductMicroKeyed(ctx, orgID, amount, requestID, invocationID, metadata)
+}
+
 // DeductMicro deducts an exact micro-USD amount for a completed request
 // (AF-05). The amount is applied to the wallet in two durable parts within
 // one serializable transaction: whole cents reduce balance_cents (and are
@@ -351,6 +372,10 @@ func (s *Store) Deduct(ctx context.Context, orgID string, amountCents int64, req
 //
 // Idempotency, retries and error semantics mirror Deduct.
 func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID string, metadata map[string]interface{}) error {
+	return s.DeductMicroInvocation(ctx, orgID, amount, requestID, "", metadata)
+}
+
+func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
 	if orgID == "" || s.db == nil {
 		return fmt.Errorf("deduct: invalid parameters")
 	}
@@ -361,7 +386,7 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 
 	var lastErr error
 	for attempt := 0; attempt <= maxDeductRetries; attempt++ {
-		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, metadata)
+		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, invocationID, metadata)
 		if lastErr == nil {
 			return nil
 		}
@@ -398,7 +423,7 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 // so the floor check and the idempotency read are evaluated against a stable
 // wallet state and never race. Serializable conflicts (deadlocks etc.) stay
 // retryable by the caller as a safety net.
-func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID string, metadata map[string]interface{}) error {
+func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("deduct begin tx: %w", err)
@@ -415,9 +440,17 @@ func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.
 		return fmt.Errorf("deduct advisory lock: %w", err)
 	}
 
-	// Step 1: Idempotency check — is this request_id already deducted?
+	// Step 1: Idempotency check — is this charge already applied? The key
+	// follows the domain of the row being written: the invocation alone for
+	// invocation-keyed charges (server-minted uuids are globally unique;
+	// this is exactly uniq_credit_transactions_invocation), the legacy
+	// (org, request) pair otherwise.
 	var existingID int64
-	err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage'`, orgID, requestID).Scan(&existingID)
+	if invocationID != "" {
+		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE invocation_id = $1 AND type = 'usage'`, invocationID).Scan(&existingID)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage'`, orgID, requestID).Scan(&existingID)
+	}
 	if err == nil {
 		// Already deducted — idempotent success (no-op).
 		if rerr := tx.Rollback(ctx); rerr != nil {
@@ -516,7 +549,17 @@ func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.
 		reqID = sql.NullString{String: requestID, Valid: true}
 	}
 
-	if _, err = tx.Exec(ctx, `
+	if invocationID != "" {
+		if _, err = tx.Exec(ctx, `
+			INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd, invocation_id)
+			VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6, $7)
+		`, orgID, -chargeCents, newBalance, reqID, string(metaBytes), -int64(amount), invocationID); err != nil {
+			if rerr := tx.Rollback(ctx); rerr != nil {
+				s.log.Warn("deduct rollback failed", "error", rerr)
+			}
+			return fmt.Errorf("deduct insert transaction: %w", err)
+		}
+	} else if _, err = tx.Exec(ctx, `
 		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd)
 		VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6)
 	`, orgID, -chargeCents, newBalance, reqID, string(metaBytes), -int64(amount)); err != nil {

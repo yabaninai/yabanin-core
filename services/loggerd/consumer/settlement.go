@@ -117,6 +117,30 @@ const (
 		FROM claimed
 		ORDER BY id`
 
+	// claimReadyJobsQueryInvocation is the 0028+ projection: same lease
+	// semantics, plus the invocation identity so the resale deduction can
+	// key its idempotency on the billed invocation rather than the shared
+	// client request id. Picked by probe (settlementInvocationSchema);
+	// pre-0028 schemas keep the legacy projection above.
+	claimReadyJobsQueryInvocation = `WITH claimed AS (
+			UPDATE settlement_jobs SET
+				status = 'processing',
+				attempts = attempts + 1,
+				lease_until = now() + make_interval(secs => $1),
+				updated_at = now()
+			WHERE id IN (
+				SELECT id FROM settlement_jobs
+				WHERE status IN ('pending', 'retry') AND next_attempt_at <= now()
+				ORDER BY created_at, id
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING id, org_id, request_id, charge_kind, amount_micro_usd, amount_cents, payload, attempts, invocation_id
+		)
+		SELECT id, org_id, request_id, charge_kind, amount_micro_usd, amount_cents, payload, attempts, invocation_id
+		FROM claimed
+		ORDER BY id`
+
 	// recoverExpiredLeases returns processing jobs whose executor died
 	// (lease deadline passed) to the retry queue. The attempts counter
 	// already includes the dead attempt; the normal retry budget and
@@ -361,6 +385,10 @@ type settlementJob struct {
 	Payload     []byte
 	Attempts    int
 	NextBackoff time.Duration // filled at claim time for observability
+	// InvocationID is the billed invocation identity on 0028+ schemas
+	// (nil for legacy-domain rows); it keys the resale deduction's
+	// idempotency check instead of the shared client request id.
+	InvocationID *string
 }
 
 // SettlementWorker drains and settles settlement_jobs. Run owns one
@@ -379,6 +407,9 @@ type SettlementWorker struct {
 	lastCleanup  time.Time
 	lastSettled  time.Time
 	cleanupNower func() time.Time
+
+	invocationOnce      sync.Once
+	settlementHasInvCol bool
 }
 
 // NewSettlementWorker builds the worker over a database pool, the credit
@@ -611,7 +642,12 @@ func (w *SettlementWorker) expirePendingPrice(ctx context.Context) {
 }
 
 func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, error) {
-	rows, err := w.db.Query(ctx, claimReadyJobsQuery, w.cfg.LeaseTTL.Seconds(), w.cfg.BatchSize)
+	query := claimReadyJobsQuery
+	withInvocation := w.settlementInvocationSchema(ctx)
+	if withInvocation {
+		query = claimReadyJobsQueryInvocation
+	}
+	rows, err := w.db.Query(ctx, query, w.cfg.LeaseTTL.Seconds(), w.cfg.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("claim settlement jobs: %w", err)
 	}
@@ -621,7 +657,11 @@ func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, err
 	for rows.Next() {
 		var job settlementJob
 		var amountMicro int64
-		if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts); err != nil {
+		if withInvocation {
+			if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts, &job.InvocationID); err != nil {
+				return nil, fmt.Errorf("scan settlement job: %w", err)
+			}
+		} else if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts); err != nil {
 			return nil, fmt.Errorf("scan settlement job: %w", err)
 		}
 		job.AmountMicro = money.MicroUSD(amountMicro)
@@ -629,6 +669,16 @@ func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, err
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+// settlementInvocationSchema resolves (once per worker) whether the claim
+// may project invocation_id; it shares the stream consumer's probe so both
+// surfaces agree on the live schema within one process.
+func (w *SettlementWorker) settlementInvocationSchema(ctx context.Context) bool {
+	w.invocationOnce.Do(func() {
+		w.settlementHasInvCol = probeSettlementInvocationColumn(ctx, w.db)
+	})
+	return w.settlementHasInvCol
 }
 
 // executeJob runs one claimed job and records the outcome. Only a committed
@@ -677,7 +727,11 @@ func (w *SettlementWorker) executeResaleDeduction(ctx context.Context, job *sett
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
 		return fmt.Errorf("%w: decode resale payload for job %d: %v", ErrPoisonJob, job.ID, err)
 	}
-	return w.deductor.ProcessDeduction(ctx, job.OrgID, payload.Model, job.RequestID, job.AmountMicro, money.QuotePositive, payload.TokensIn, payload.TokensOut)
+	invocation := ""
+	if job.InvocationID != nil {
+		invocation = *job.InvocationID
+	}
+	return w.deductor.ProcessDeductionInvocation(ctx, job.OrgID, payload.Model, job.RequestID, invocation, job.AmountMicro, money.QuotePositive, payload.TokensIn, payload.TokensOut)
 }
 
 // beginMoneyTx opens a settlement transaction under the per-org advisory

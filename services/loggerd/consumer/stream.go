@@ -168,12 +168,23 @@ func (c *StreamConsumer) settlementInvocationSchema(ctx context.Context) bool {
 		if c.dbPool == nil {
 			return
 		}
-		var n int
-		if err := c.dbPool.QueryRow(ctx, settlementSchemaProbeQuery, "invocation_id").Scan(&n); err == nil && n > 0 {
-			c.settlementHasInvocationID = true
-		}
+		c.settlementHasInvocationID = probeSettlementInvocationColumn(ctx, c.dbPool)
 	})
 	return c.settlementHasInvocationID
+}
+
+// probeSettlementInvocationColumn reports whether the live schema carries
+// invocation_id on settlement_jobs (migration 0028+). Shared by the stream
+// consumer (intent statements) and the settlement worker (claim projection);
+// each caches the result once per process.
+func probeSettlementInvocationColumn(ctx context.Context, db interface {
+	QueryRow(ctx context.Context, query string, args ...any) pgx.Row
+}) bool {
+	var n int
+	if err := db.QueryRow(ctx, settlementSchemaProbeQuery, "invocation_id").Scan(&n); err == nil && n > 0 {
+		return true
+	}
+	return false
 }
 
 // Reservations modes of an organization (ADR-0001 §9). The consumer reads

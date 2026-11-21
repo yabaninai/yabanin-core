@@ -59,6 +59,16 @@ func NewDeductor(store *credits.Store, logger *slog.Logger) *Deductor {
 // no-op with a distinct skip metric, while any store failure is returned,
 // never swallowed.
 func (d *Deductor) ProcessDeduction(ctx context.Context, orgID, modelUsed, requestID string, amount money.MicroUSD, state money.QuoteState, tokensIn, tokensOut int64) error {
+	return d.ProcessDeductionInvocation(ctx, orgID, modelUsed, requestID, "", amount, state, tokensIn, tokensOut)
+}
+
+// ProcessDeductionInvocation performs one credit-deduction attempt for a
+// completed request, keyed by the billed invocation when one exists.
+// invocationID must be either empty (legacy request-keyed domain — the
+// pre-0028 idempotency key) or a canonical uuid minted at admission; the
+// credits store rejects anything else instead of silently downgrading a
+// present-but-malformed identity onto the legacy key.
+func (d *Deductor) ProcessDeductionInvocation(ctx context.Context, orgID, modelUsed, requestID, invocationID string, amount money.MicroUSD, state money.QuoteState, tokensIn, tokensOut int64) error {
 	if d == nil || d.store == nil || orgID == "" {
 		return fmt.Errorf("%w: store=%v org=%q", ErrNoChargeTarget, d != nil && d.store != nil, orgID)
 	}
@@ -92,7 +102,7 @@ func (d *Deductor) ProcessDeduction(ctx context.Context, orgID, modelUsed, reque
 		return fmt.Errorf("%w: invalid resale deduction charge: request_id=%q amount=%d", ErrPoisonJob, requestID, int64(amount))
 	}
 
-	err := d.store.DeductMicro(ctx, orgID, amount, requestID, map[string]interface{}{
+	err := d.store.DeductMicroInvocation(ctx, orgID, amount, requestID, invocationID, map[string]interface{}{
 		"model":            modelUsed,
 		"tokens":           tokensIn + tokensOut,
 		"amount_micro_usd": int64(amount),
