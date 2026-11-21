@@ -2610,44 +2610,115 @@ def collect_containers() -> list:
     return out
 
 
+# Discovery must never load rootfs layers or other large blobs into Python:
+# index.json and index blobs are small JSON documents, bounded hard by this.
+_RECEIPT_SNIFF_LIMIT = 1 << 20
+_RECEIPT_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+
+
+def _receipt_layout_candidates(store: Path):
+    """(layout_present, candidate digests) for a retained OCI layout.
+
+    Absent index.json -> (False, None): the legacy metadata-only
+    fallback may run. A present but unreadable, oversize or malformed
+    index.json is a defective layout: (True, []) fails closed -- never a
+    silent fallback to orphan blobs. A candidate must declare the index
+    mediaType, a bounded descriptor size, and an on-disk blob of exactly
+    that size, so check_image never loads a layer-sized candidate
+    however the layout describes it."""
+    index_json = store / "index.json"
+    if not index_json.is_file():
+        return False, None
+    try:
+        if index_json.stat().st_size > _RECEIPT_SNIFF_LIMIT:
+            return True, []
+        manifests = json.loads(index_json.read_bytes())["manifests"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return True, []
+    out = []
+    if isinstance(manifests, list):
+        for desc in manifests:
+            if not isinstance(desc, dict):
+                continue
+            digest, size = desc.get("digest"), desc.get("size")
+            if (not isinstance(digest, str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    or digest in out):
+                continue
+            blob_file = store / digest[7:]
+            if (desc.get("mediaType") != _RECEIPT_INDEX_MEDIA_TYPE
+                    or type(size) is not int
+                    or not 0 < size <= _RECEIPT_SNIFF_LIMIT
+                    or not blob_file.is_file()
+                    or blob_file.stat().st_size != size):
+                continue
+            out.append(digest)
+    return True, out
+
+
+def _receipt_sniffed_candidates(store: Path) -> list:
+    """Index-shaped blobs of a metadata-only store (no layout retained).
+
+    Size-capped and mediaType-checked before any verification read: a
+    rootfs-layer-sized file is classified by stat alone and never read."""
+    out = []
+    for blob_file in sorted(store.iterdir()):
+        name = blob_file.name
+        if (not re.fullmatch(r"[0-9a-f]{64}", name) or not blob_file.is_file()
+                or blob_file.stat().st_size > _RECEIPT_SNIFF_LIMIT):
+            continue
+        try:
+            record = json.loads(blob_file.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(record, dict)
+                and record.get("mediaType") == _RECEIPT_INDEX_MEDIA_TYPE
+                and record.get("schemaVersion") == 2):
+            out.append("sha256:" + name)
+    return out
+
+
 def collect_quickstart_build(root: Path, head: str):
     """Retained BuildKit receipts -> the bound quickstart image record.
 
-    Generator side of the receipt verifier: for each built subject the
-    retained OCI receipt store must contain EXACTLY ONE index blob that
-    oci_build_receipt.check_image accepts for THIS candidate (platform,
-    head, build recipe, pinned bases). Anything else -- no store, no
-    verifying index, several candidates, or inputs the verifier itself
-    cannot re-derive -- leaves the images unbound, so absence stays the
-    recorded PENDING gap instead of an invented row. Returns the
-    quickstart_images rows plus the quickstart_build record, or None.
+    Generator side of the receipt verifier: per subject the retained
+    store must yield EXACTLY ONE index that oci_build_receipt.check_image
+    accepts for THIS candidate (platform, head, build recipe, pinned
+    bases); zero, several, or verifier inputs that cannot be re-derived
+    leave the images unbound -- absence stays the recorded PENDING gap,
+    never an invented row. Candidates come from the retained layout's
+    index.json when present, else from size-capped sniffing of
+    index-shaped blobs (metadata-only stores stay compatible).
 
-    Capture recipe (genuine engine outputs; executed only in the
-    authorized bounded docker-build lane, never fabricated here): per
-    subject, at the exact candidate head,
-
+    Capture (authorized bounded docker-build lane only; never run or
+    fabricated here): per subject, at the exact candidate head,
       docker buildx build --provenance=mode=max \\
         --file <recipe> <context> --output=type=oci,dest=/tmp/<role>.oci.tar
       tar -xf /tmp/<role>.oci.tar -C /tmp/<role>-layout
-      # index.json's first manifest descriptor digest IS the image id;
-      # blobs/sha256/<hex> are the raw index/manifest/config/statement
-      # bytes the engine produced and signed into the layout.
-      cp /tmp/<role>-layout/blobs/sha256/* \\
-         artifacts/release-evidence/build-receipts/<role>/
+    Retain the METADATA CHAIN ONLY into artifacts/release-evidence/
+    build-receipts/<role>/: oci-layout, index.json, and the index/
+    manifest/config/attestation/statement blobs reachable from the
+    index.json descriptors, excluding the platform image manifests'
+    rootfs layers entries ONLY -- the attestation manifest's layers
+    carry the in-toto statement and must be retained. Rootfs layers
+    are neither retained nor read back; the retained bytes are
+    engine-produced (unsigned -- BuildKit provenance is not a
+    signature).
 
-    Readback (this checkout, offline, no engine): 'release_evidence.py
-    generate' binds the rows from those bytes alone, and 'verify'
-    re-checks every descriptor digest, the BuildKit-recorded vcs
-    revision/context/dockerfile, the target platform and the pinned
-    bases against the live tree. Test fixtures simulate only the byte
-    SHAPE of that capture; nothing here substitutes for running it.
+    Readback (offline, no engine): 'release_evidence.py generate' binds
+    the rows; 'verify' re-checks every descriptor digest plus the
+    BuildKit-recorded revision/context/dockerfile, platform and pinned
+    bases against the live tree. Candidate discovery: a retained
+    index.json is authoritative -- its index descriptors (index
+    mediaType, bounded size, on-disk blob of exactly that size) are the
+    only candidates, and a present-but-defective layout binds nothing;
+    only a cleanly absent layout falls back to sniffing index-shaped
+    blobs (metadata-only stores stay compatible).
 
-    Scope: this binds the RETAINED BUILD ARTIFACTS' facts (source head,
-    platform, recipe, bases, image id). It does not establish which
-    image a STARTED Compose service ran -- the running services'
-    physical image ids are an independent engine-side inspection
-    (docker compose ps / docker inspect readback) that belongs to the
-    deployment lane, not to this collector."""
+    Scope: each bound id is the OCI INDEX digest -- not the engine's
+    per-platform image ID (the config digest 'docker inspect' reports)
+    -- and which image a STARTED compose service ran is a separate
+    engine-side check (deployment lane), not asserted here."""
     services, errors = _compose_model(root)
     if errors:
         return None
@@ -2655,23 +2726,25 @@ def collect_quickstart_build(root: Path, head: str):
     rows, subjects, platforms = [], {}, {}
     for role in _QUICKSTART_IMAGE_SUBJECTS:
         store = root / oci_build_receipt.STORE / role
-        bound = []
+        candidates = []
         if store.is_dir():
-            for receipt in sorted(store.iterdir()):
-                if not re.fullmatch(r"[0-9a-f]{64}", receipt.name) or not receipt.is_file():
-                    continue
-                image_id = "sha256:" + receipt.name
-                try:
-                    oci_build_receipt.check_image(root, role, image_id,
-                                                  _QS_PLATFORM, head, pins)
-                except (ValueError, KeyError, AttributeError, TypeError,
-                        OSError, RuntimeError):
-                    continue
-                bound.append(image_id)
+            layout_present, candidates = _receipt_layout_candidates(store)
+            if not layout_present:
+                candidates = _receipt_sniffed_candidates(store)
+        bound = []
+        for image_id in candidates:
+            try:
+                oci_build_receipt.check_image(root, role, image_id,
+                                              _QS_PLATFORM, head, pins)
+            except (ValueError, KeyError, AttributeError, TypeError,
+                    OSError, RuntimeError):
+                continue
+            bound.append(image_id)
         if len(bound) != 1:
             return None
         subjects[role] = bound[0]
         platforms[role] = _QS_PLATFORM
+        # the verifier schema names the bound OCI index digest "image_id"
         rows.append({"name": role, "image_id": bound[0], "platform": _QS_PLATFORM})
     tree = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
                            f"{head}^{{tree}}"], check=False, capture_output=True,
@@ -2731,15 +2804,17 @@ def collect_distribution(head: str | None = None) -> dict:
                                          "evidence lane")
     else:
         out.update(bound)
-        out["quickstart_images_note"] = ("bound to retained BuildKit receipts "
-                                         "(artifacts/release-evidence/"
-                                         "build-receipts/<subject>/): each image "
-                                         "id re-verified offline against this "
+        out["quickstart_images_note"] = ("bound to retained BuildKit receipt "
+                                         "metadata (artifacts/release-evidence/"
+                                         "build-receipts/<subject>/): the OCI "
+                                         "index digest per subject (not the "
+                                         "engine's per-platform image ID), "
+                                         "re-verified offline against this "
                                          "candidate's head, platform, build "
-                                         "recipe and pinned bases; the physical "
-                                         "image ids of STARTED compose services "
-                                         "are an independent engine-side check, "
-                                         "not asserted here")
+                                         "recipe and pinned bases; the images "
+                                         "of STARTED compose services are an "
+                                         "independent engine-side check, not "
+                                         "asserted here")
     return out
 
 

@@ -2996,6 +2996,129 @@ class QuickstartBuildCollectionTest(unittest.TestCase):
                           selected_platform="arm64")
             self.assertIsNone(re_ev.collect_quickstart_build(td, head))
 
+    def _stray_verifying_index(self, store, index_digest):
+        """A second, equally verifying index beside the genuine one."""
+        record = json.loads((store / index_digest[7:]).read_text())
+        record["annotations"] = {"fixture": "duplicate candidate"}
+        data = json.dumps(record, sort_keys=True).encode()
+        (store / hashlib.sha256(data).hexdigest()).write_bytes(data)
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _write_layer_sized_blob(store, name="e" * 64, size=9 << 20):
+        (store / name).write_bytes(b"\0" * size)
+        return "sha256:" + name
+
+    def test_large_unrelated_blobs_are_never_loaded(self):
+        # discovery classifies by stat/mediaType only: a rootfs-layer-sized
+        # blob is skipped without ever being read or verified (metadata-only
+        # store, sniff path)
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            big = self._write_layer_sized_blob(store)
+            with patch.object(re_ev.oci_build_receipt, "check_image",
+                              wraps=re_ev.oci_build_receipt.check_image) as spy:
+                collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            checked = [c.args[2] for c in spy.call_args_list if c.args[1] == "core"]
+            self.assertNotIn(big, checked)
+            self.assertEqual(checked,
+                             [ev["distribution"]["quickstart_build"]["subjects"]["core"]])
+
+    def test_layout_index_locates_candidate_indexes(self):
+        # with a retained OCI layout, index.json alone names the candidates:
+        # a stray verifying index and a layer-sized blob are not candidates
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            self._stray_verifying_index(store, index_digest)
+            big = self._write_layer_sized_blob(store)
+            (store / "index.json").write_text(json.dumps(
+                {"schemaVersion": 2,
+                 "manifests": [{"mediaType":
+                                "application/vnd.oci.image.index.v1+json",
+                                "digest": index_digest,
+                                "size": (store / index_digest[7:]).stat().st_size}]}))
+            with patch.object(re_ev.oci_build_receipt, "check_image",
+                              wraps=re_ev.oci_build_receipt.check_image) as spy:
+                collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_build"]["subjects"]["core"],
+                             index_digest)
+            checked = [c.args[2] for c in spy.call_args_list if c.args[1] == "core"]
+            self.assertEqual(checked, [index_digest])
+            self.assertNotIn(big, checked)
+
+    def test_layout_ambiguity_not_bound(self):
+        # two verifying indexes declared by the layout itself stay ambiguous
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            stray = self._stray_verifying_index(store, index_digest)
+            (store / "index.json").write_text(json.dumps(
+                {"schemaVersion": 2,
+                 "manifests": [{"mediaType":
+                                "application/vnd.oci.image.index.v1+json",
+                                "digest": d,
+                                "size": (store / d[7:]).stat().st_size}
+                               for d in (index_digest, stray)]}))
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_defective_layout_fails_closed(self):
+        # a present but malformed/oversize index.json must never silently
+        # fall back to sniffing the orphan blobs beside it
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_json = store / "index.json"
+            garbage = b"{not json"
+            oversize = b" " * ((1 << 20) + 1)
+            shapeless = json.dumps({"manifests": "not-a-list"})
+            for payload in (garbage, oversize, shapeless):
+                index_json.write_bytes(payload if isinstance(payload, bytes)
+                                       else payload.encode())
+                self.assertIsNone(re_ev.collect_quickstart_build(td, head),
+                                  repr(payload[:12]))
+
+    def test_layout_wrong_size_descriptor_not_loaded(self):
+        # a layer-sized blob described as an index with a wrong/oversize
+        # descriptor is skipped before any candidate bytes are loaded; the
+        # genuine index still binds, and the big blob is never verified
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            big = self._write_layer_sized_blob(store)
+            bogus = {"mediaType": "application/vnd.oci.image.index.v1+json",
+                     "digest": big, "size": 9 << 20}
+            lying = {"mediaType": "application/vnd.oci.image.index.v1+json",
+                     "digest": big, "size": 128}
+            for extra in (bogus, lying):
+                (store / "index.json").write_text(json.dumps(
+                    {"schemaVersion": 2,
+                     "manifests": [
+                         {"mediaType": "application/vnd.oci.image.index.v1+json",
+                          "digest": index_digest,
+                          "size": (store / index_digest[7:]).stat().st_size},
+                         extra]}))
+                with patch.object(re_ev.oci_build_receipt, "check_image",
+                                  wraps=re_ev.oci_build_receipt.check_image) as spy:
+                    collected = re_ev.collect_quickstart_build(td, head)
+                self.assertIsNotNone(collected, repr(extra))
+                self.assertEqual(collected["quickstart_build"]["subjects"]["core"],
+                                 index_digest)
+                checked = [c.args[2] for c in spy.call_args_list
+                           if c.args[1] == "core"]
+                self.assertEqual(checked, [index_digest])
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
