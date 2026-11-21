@@ -43,6 +43,9 @@ func TestPaidStreamTerminalDelivery(t *testing.T) {
 	t.Run("zero_bytes_failed_delivery", func(t *testing.T) {
 		client := &rejectTerminalWriter{httptest.NewRecorder()}
 		watch := newSSETerminalWatch(client)
+		n, err := watch.Write(nil)
+		require.NoError(t, err)
+		require.Zero(t, n)
 		watch.armDoneHold()
 		_, _ = watch.Write([]byte("data: [DONE]\n\n"))
 		watch.releaseDoneHold()

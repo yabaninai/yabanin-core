@@ -2091,11 +2091,14 @@ func (sw *sseTerminalWatch) failDoneHold() {
 }
 
 func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
 	sw.heldMu.Lock()
 	defer sw.heldMu.Unlock()
 	if !sw.armed {
 		n, err := sw.ResponseWriter.Write(p)
-		if n > 0 && !sw.seen.Load() && isSSEDoneFrame(p[:n]) {
+		if !sw.seen.Load() && isSSEDoneFrame(p[:n]) {
 			sw.seen.Store(true)
 		}
 		return n, err
