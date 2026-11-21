@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useHashParam } from '../hooks/useHashParam'
+import { useHashParam, useHashParamValues } from '../hooks/useHashParam'
 import { useInspectParam } from '../hooks/useInspectParam'
 import { useRequestLabelKeys } from '../hooks/useRequestLabelKeys'
 import {
   getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
-import { currentHashQuery, INSPECT_ROW_PARAM, readInspectRowKeys, relatedListHref } from '../lib/inspectUrl'
+import { currentHashQuery, INSPECT_ROW_PARAM, relatedListHref } from '../lib/inspectUrl'
 import {
   appendClause, parseYQL, serializeYQL, YQL_FIELDS, type YqlFieldMeta,
 } from '../lib/queryLang'
@@ -845,7 +845,13 @@ export function RequestExplorerPage() {
   // inspector targets — the list's row_key, kept next to the inspect id so
   // a deep link reproduces the exact row the link author clicked. Absent
   // param = '' like the inspect id; back/forward changes it and refetches.
-  const [inspectRowParam, setInspectRowParam] = useHashParam(INSPECT_ROW_PARAM)
+  // 0028: the row selector must be REACTIVE over its complete ordered value
+  // list. A scalar hook reads .get() (first value), so a same-mounted-page
+  // hash mutation like row_key=12 -> row_key=12&row_key=99 — or absent ->
+  // row_key= — leaves the scalar dependency identical and the previous
+  // successful detail stays shown for a URL the server would reject. The
+  // values hook re-renders on any list change (absent/blank/duplicates).
+  const [inspectRowKeys, setInspectRowKey] = useHashParamValues(INSPECT_ROW_PARAM)
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
   const [inspectDetail, setInspectDetail] = useState<RequestDetail | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
@@ -1036,18 +1042,19 @@ export function RequestExplorerPage() {
   // drawer's honest unknown/failed notice) — the client never collapses
   // duplicates to the first sibling and never silently falls back to the
   // ambiguous correlation read.
+  const rowKeysJSON = JSON.stringify(inspectRowKeys)
   useEffect(() => {
     if (!inspectId) return
     let cancelled = false
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectorLoading(true)
-    const rowKeys = readInspectRowKeys(currentHashQuery())
+    const rowKeys = inspectRowKeys.length > 0 ? inspectRowKeys : undefined
     const lineage = getLineage(inspectId)
       .then(rec => ({ ok: true as const, rec }))
       .catch(() => ({ ok: false as const, rec: null }))
     const detail = org
-      ? getRequestDetail(org, inspectId, undefined, rowKeys ?? undefined)
+      ? getRequestDetail(org, inspectId, undefined, rowKeys)
         .then(rec => ({ ok: true as const, rec }))
         .catch(() => ({ ok: false as const, rec: null }))
       : Promise.resolve({ ok: false as const, rec: null })
@@ -1058,7 +1065,10 @@ export function RequestExplorerPage() {
       setInspectorLoading(false)
     })
     return () => { cancelled = true }
-  }, [inspectId, org, inspectRowParam])
+    // rowKeysJSON (JSON.stringify of the complete ordered selector) is the
+    // effect identity: a stable string that differs for EVERY selector
+    // mutation, including ones a scalar .get() cannot see.
+  }, [inspectId, org, rowKeysJSON])
 
   // Fetch the decision-log rows for this request. First page
   // only — the drawer shows the freshest evaluations plus a link into the
@@ -1092,12 +1102,12 @@ export function RequestExplorerPage() {
   // next inspector.
   const openInspector = (requestId: string, rowKey?: string) => {
     if (!requestId) return
-    setInspectRowParam(rowKey ?? '')
+    setInspectRowKey(rowKey ?? '')
     setInspectParam(`request:${requestId}`)
   }
   const closeInspector = () => {
     setInspectParam(null)
-    setInspectRowParam('')
+    setInspectRowKey('')
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectDecisions(null)
@@ -1111,14 +1121,11 @@ export function RequestExplorerPage() {
   // on the forwarded selector, so the highlight never pretends the first
   // sibling was chosen. Legacy links keep the open product decision
   // (which sibling a selector-less correlation opens) untouched.
-  const rowSelectorUsable = (() => {
-    const keys = readInspectRowKeys(currentHashQuery())
-    return keys !== null && keys.length === 1 && keys[0].trim() !== ''
-  })()
+  const rowSelectorUsable = inspectRowKeys.length === 1 && inspectRowKeys[0].trim() !== ''
   const selectedRowId = inspectId === ''
     ? undefined
     : rowSelectorUsable
-      ? inspectRowParam
+      ? inspectRowKeys[0]
       : rows.find(r => r.request_id === inspectId)?.row_key || inspectId
 
   // Chips, the add-filter builder, the YQL input with the error

@@ -74,7 +74,7 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
       /\}, \[inspectId, org\]\)/,
       'drawer data effect depends on both the request id and the org',
     )
-    const effect = page.slice(page.indexOf('setInspectRecord(null)'), page.indexOf('}, [inspectId, org])'))
+    const effect = page.slice(page.indexOf('setInspectRecord(null)'), page.indexOf('}, [inspectId, org, rowKeysJSON])'))
     assert.ok(effect.includes('setInspectDetail(null)'), 'detail state is cleared on scope change')
     assert.ok(effect.includes('setInspectorLoading(true)'), 'loading state is reset on scope change')
   })
@@ -88,23 +88,30 @@ describe('RequestExplorerPage recorded journey (CV-02)', () => {
     assert.match(page, /detailRequestUnknownTitle/, 'the unknown-request diagnosis is titled')
     assert.match(
       page,
-      /getRequestDetail\(org, inspectId, undefined, rowKeys \?\? undefined\)/,
+      /getRequestDetail\(org, inspectId, undefined, rowKeys\)/,
       'the detail is fetched within the current org scope only, forwarding the URL selector values when present',
     )
   })
 
   it('a malformed row selector is forwarded, never collapsed or silently retried', () => {
-    // 0028: the selector is read with ALL its values (getAll), so a
-    // duplicated row_key reaches the server's strict 400 instead of being
-    // collapsed to the first sibling by URLSearchParams.get.
+    // 0028: the selector is REACTIVE over its complete ordered value list.
+    // A scalar hook reads .get() (first value), so row_key=12 ->
+    // row_key=12&row_key=99 — or absent -> row_key= — leaves the
+    // dependency IDENTICAL on a mounted page and the previous successful
+    // detail stays shown for a URL the server would reject with 400.
     assert.match(
       page,
-      /readInspectRowKeys\(currentHashQuery\(\)\)/,
-      'the selector is read with all its values, not collapsed to the first sibling',
+      /useHashParamValues\(INSPECT_ROW_PARAM\)/,
+      'the selector is hook state over ALL ordered values, not the scalar first value',
     )
     assert.match(
       page,
-      /rowKeys \?\? undefined/,
+      /JSON\.stringify\(inspectRowKeys\)/,
+      'the detail effect identity is the full selector snapshot, so every selector mutation re-runs it',
+    )
+    assert.match(
+      page,
+      /inspectRowKeys\.length > 0 \? inspectRowKeys : undefined/,
       'an absent selector keeps the legacy correlation read; present values forward verbatim',
     )
     // The row highlight must not pretend a malformed selector chose a row.

@@ -80,3 +80,50 @@ export function useHashParam(key: string): [string, (v: string) => void] {
 
   return [value, set]
 }
+
+/** 0028: URLSearchParams.get collapses a multi-valued param to its first
+ *  value, so the scalar hook above cannot even OBSERVE selector-only
+ *  mutations (row_key=12 -> row_key=12&row_key=99 keeps .get() at '12';
+ *  absent -> row_key= keeps it at ''). This variant adopts the COMPLETE
+ *  ordered value list as hook state: absent -> [], blank present -> [''],
+ *  duplicates preserved in order, so any selector change re-renders. The
+ *  setter writes one value (or deletes it) with useHashParam's exact
+ *  replaceState semantics, minus the org memory (org-specific by design). */
+export function useHashParamValues(key: string): [string[], (v: string) => void] {
+  const [values, setValues] = useState<string[]>(() => readHashQuery().getAll(key))
+
+  // Same two adoption sources as useHashParam (hashchange + scope store):
+  // a page writing the hash with replaceState fires no hashchange, so a
+  // selector rewritten by any other surface still re-adopts here.
+  useEffect(() => {
+    const adopt = () => {
+      const next = readHashQuery().getAll(key)
+      setValues(prev => (
+        prev.length === next.length && prev.every((v, i) => v === next[i]) ? prev : next
+      ))
+    }
+    window.addEventListener('hashchange', adopt)
+    const unsubscribe = subscribeGlobalScope(adopt)
+    adopt()
+    return () => {
+      window.removeEventListener('hashchange', adopt)
+      unsubscribe()
+    }
+  }, [key])
+
+  const set = useCallback((v: string) => {
+    const trimmed = v.trim()
+    setValues(trimmed ? [trimmed] : [])
+    const path = window.location.hash.split('?')[0].replace(/^#+/, '')
+    const params = new URLSearchParams(window.location.hash.split('?')[1] ?? '')
+    if (trimmed) params.set(key, trimmed)
+    else params.delete(key)
+    const qs = params.toString()
+    window.history.replaceState(
+      null, '',
+      `${window.location.pathname}${window.location.search}#${path}${qs ? `?${qs}` : ''}`,
+    )
+  }, [key])
+
+  return [values, set]
+}
