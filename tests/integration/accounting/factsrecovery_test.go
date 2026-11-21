@@ -52,7 +52,7 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 	}()
 
 	s.serveWhileConsumerDown(t, rid)
-	s.requireTerminalFactsWhileConsumerDown(t, rid)
+	invocationID := s.requireTerminalFactsWhileConsumerDown(t, rid)
 	entries := s.removeUndeliveredFactsNotification(t, rdb, rid)
 	s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
 	s.restartLoggerd()
@@ -61,7 +61,9 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "facts recovery")
 	wantKinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "facts recovery")
 	s.requireReconciledFromFacts(t, rid)
+	s.requireRecoveredChargeIdentity(t, rid, invocationID, "facts recovery")
 	s.replayAfterFactsRecovery(t, rdb, rid, entries, wantKinds)
+	s.requireRecoveredChargeIdentity(t, rid, invocationID, "late live replay")
 	s.controlRequest(t, "facts-post")
 }
 
@@ -141,11 +143,21 @@ func (s *stand) requireReconciledFromFacts(t *testing.T, rid string) {
 		return nil
 	})
 
-	// Provider ledger unchanged by recovery.
-	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
-		t.Fatalf("facts: provider ledger after recovery = %d/%d/%d, want 1/1/1", arr, disp, recv)
-	}
+	s.requireSingleProviderRoundTrip(t, rid, "facts recovery")
+}
 
+func (s *stand) requireRecoveredChargeIdentity(t *testing.T, rid, invocationID, phase string) {
+	t.Helper()
+	if got := s.requireUUIDKeyedCharge(t, rid, s.oracleDB.orgID, phase); got != invocationID {
+		t.Fatalf("%s: charge attached to invocation %s, want pre-restart invocation %s", phase, got, invocationID)
+	}
+}
+
+func (s *stand) requireSingleProviderRoundTrip(t *testing.T, rid, phase string) {
+	t.Helper()
+	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
+		t.Fatalf("%s: provider arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1", phase, arr, disp, recv)
+	}
 }
 
 func (s *stand) replayAfterFactsRecovery(t *testing.T, rdb *redis.Client, rid string, entries []streamEntry, wantKinds map[string]int) {
@@ -173,8 +185,5 @@ func (s *stand) replayAfterFactsRecovery(t *testing.T, rdb *redis.Client, rid st
 	if rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID); len(rows) != 1 || rows[0].State != "reconciled" || rows[0].ResolveReason.String != reasonRecovered {
 		t.Fatalf("facts: admission changed after late live replay: %s (want reconciled/%s)", fmtAdmissions(rows), reasonRecovered)
 	}
-	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
-		t.Fatalf("facts: provider ledger after late live replay = %d/%d/%d, want 1/1/1", arr, disp, recv)
-	}
-
+	s.requireSingleProviderRoundTrip(t, rid, "late live replay")
 }

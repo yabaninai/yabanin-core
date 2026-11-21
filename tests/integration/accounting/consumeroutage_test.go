@@ -46,9 +46,10 @@ func TestAccountingConsumerOutageDrainsOnRestart(t *testing.T) {
 	}()
 
 	s.serveWhileConsumerDown(t, rid)
-	s.requireTerminalFactsWhileConsumerDown(t, rid)
+	invocationID := s.requireTerminalFactsWhileConsumerDown(t, rid)
 	s.requireAccountingMaterializedAfterRestart(t, rid)
 	s.requireOutageAdmissionSettled(t, rid)
+	s.requireRecoveredChargeIdentity(t, rid, invocationID, "consumer outage")
 
 	s.controlRequest(t, "outage-post")
 }
@@ -78,7 +79,7 @@ func (s *stand) serveWhileConsumerDown(t *testing.T, rid string) {
 // commit while the consumer is verifiably still down: usage/attribution/
 // exact cost land in exactly one request_terminal_facts row for the
 // admitted invocation BEFORE the completion event is consumed.
-func (s *stand) requireTerminalFactsWhileConsumerDown(t *testing.T, rid string) {
+func (s *stand) requireTerminalFactsWhileConsumerDown(t *testing.T, rid string) string {
 	t.Helper()
 	if s.loggerdCmd != nil {
 		t.Fatalf("consumer outage: loggerd is running while the durable facts are asserted — the outage oracle requires the consumer down end to end")
@@ -89,15 +90,16 @@ func (s *stand) requireTerminalFactsWhileConsumerDown(t *testing.T, rid string) 
 	if n := s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID); n != 1 {
 		t.Fatalf("consumer outage: %d request_terminal_facts rows for served %s while consumer is down, want exactly 1 — pre-publish durable commit violated", n, rid)
 	}
-	s.requireTerminalFactsMatchFixture(t, rid)
+	invocationID := s.requireTerminalFactsMatchFixture(t, rid)
 	t.Logf("consumer outage: terminal facts durably present for %s with consumer down", rid)
+	return invocationID
 }
 
 // requireTerminalFactsMatchFixture asserts the single terminal-facts row
 // carries the fixture usage, identity attribution and expected cost: the
 // durable projection the reconciler recovers from must be the one the
 // served invocation actually produced.
-func (s *stand) requireTerminalFactsMatchFixture(t *testing.T, rid string) {
+func (s *stand) requireTerminalFactsMatchFixture(t *testing.T, rid string) string {
 	t.Helper()
 	fact := func(field string) string {
 		v, ok := s.oracleQueryRowString(t,
@@ -135,6 +137,7 @@ func (s *stand) requireTerminalFactsMatchFixture(t *testing.T, rid string) {
 	}
 	s.requireTerminalFactCost(t, "estimated_cost_usd", fact("estimated_cost_usd"))
 	s.requireTerminalFactCost(t, "resale_cost_usd", fact("resale_cost_usd"))
+	return invocationID
 }
 
 // requireTerminalFactCost asserts a terminal-facts cost field carries
