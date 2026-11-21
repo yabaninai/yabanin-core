@@ -201,43 +201,16 @@ type BatchSpenders struct {
 // graceFloorCents is the global grace fallback (credits.GracePeriodCents);
 // an org's explicit grace_floor_cents column (ADR §8) wins when present.
 func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCents int64, entries []SettleEntry, spenders BatchSpenders) (map[int64]BatchDisposition, error) {
-	if orgID == "" {
-		return nil, fmt.Errorf("settlement batch: empty org id")
-	}
-	if db == nil {
-		return nil, fmt.Errorf("settlement batch: nil db")
-	}
-	// Dispositions are keyed by JobID, so a batch that lists the same job
-	// twice would collapse two settle attempts into one disposition (an
-	// applied entry overwritten by its replay's Applied=false would even
-	// hide the decrement). One job = one claimed row = one entry; refuse
-	// anything else and let the per-job fallback execute each job exactly
-	// once — a repeated event must never charge twice.
-	seenJobs := make(map[int64]struct{}, len(entries))
-	for _, e := range entries {
-		if _, dup := seenJobs[e.JobID]; dup {
-			return nil, fmt.Errorf("settlement batch: duplicate job id %d", e.JobID)
-		}
-		seenJobs[e.JobID] = struct{}{}
+	if err := validateSettlementBatch(db, orgID, entries); err != nil {
+		return nil, err
 	}
 	tx, err := db.Begin(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("settlement batch begin tx: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	// pgx's zero-value TxOptions issues a plain BEGIN and leaves
-	// synchronous_commit at the server/session setting. Pin WAL flush
-	// acknowledgement locally for this financial transaction, independently
-	// of an operator's weaker session default.
-	if _, err := tx.Exec(ctx, `SET LOCAL synchronous_commit = on`); err != nil {
-		return nil, fmt.Errorf("settlement batch synchronous commit: %w", err)
-	}
-
-	// Serialize money writers per org — the same lock key as DeductMicro,
-	// Grant and SettleDecrement, so batch and per-job executors can never
-	// interleave on one wallet.
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
-		return nil, fmt.Errorf("settlement batch advisory lock: %w", err)
+	if err := lockSettlementBatch(ctx, tx, orgID); err != nil {
+		return nil, err
 	}
 	if err := verifySettlementFencing(ctx, tx, entries); err != nil {
 		return nil, err
@@ -274,6 +247,47 @@ func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCen
 	return dispositions, nil
 }
 
+func validateSettlementBatch(db BatchDB, orgID string, entries []SettleEntry) error {
+	if orgID == "" {
+		return fmt.Errorf("settlement batch: empty org id")
+	}
+	if db == nil {
+		return fmt.Errorf("settlement batch: nil db")
+	}
+	// Dispositions are keyed by JobID, so a batch that lists the same job
+	// twice would collapse two settle attempts into one disposition (an
+	// applied entry overwritten by its replay's Applied=false would even
+	// hide the decrement). One job = one claimed row = one entry; refuse
+	// anything else and let the per-job fallback execute each job exactly
+	// once — a repeated event must never charge twice.
+	seenJobs := make(map[int64]struct{}, len(entries))
+	for _, e := range entries {
+		if _, dup := seenJobs[e.JobID]; dup {
+			return fmt.Errorf("settlement batch: duplicate job id %d", e.JobID)
+		}
+		seenJobs[e.JobID] = struct{}{}
+	}
+	return nil
+}
+
+func lockSettlementBatch(ctx context.Context, tx pgx.Tx, orgID string) error {
+	// pgx's zero-value TxOptions issues a plain BEGIN and leaves
+	// synchronous_commit at the server/session setting. Pin WAL flush
+	// acknowledgement locally for this financial transaction, independently
+	// of an operator's weaker session default.
+	if _, err := tx.Exec(ctx, `SET LOCAL synchronous_commit = on`); err != nil {
+		return fmt.Errorf("settlement batch synchronous commit: %w", err)
+	}
+
+	// Serialize money writers per org — the same lock key as DeductMicro,
+	// Grant and SettleDecrement, so batch and per-job executors can never
+	// interleave on one wallet.
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
+		return fmt.Errorf("settlement batch advisory lock: %w", err)
+	}
+	return nil
+}
+
 // verifySettlementFencing locks claimed jobs and ensures each non-zero claim
 // token still matches settlement_jobs.attempts ON a row that is still
 // 'processing'. A retry/claim increments attempts, so a paused worker cannot
@@ -290,13 +304,9 @@ func verifySettlementFencing(ctx context.Context, tx pgx.Tx, entries []SettleEnt
 		if entry.FencingToken <= 0 {
 			continue
 		}
-		if prior, ok := expected[entry.JobID]; ok && prior != entry.FencingToken {
-			return fmt.Errorf("%w: conflicting tokens for job %d", ErrStaleSettlementToken, entry.JobID)
-		}
-		if _, ok := expected[entry.JobID]; !ok {
-			ids = append(ids, entry.JobID)
-			expected[entry.JobID] = entry.FencingToken
-		}
+		// validateSettlementBatch already rejected duplicate job IDs before BEGIN.
+		ids = append(ids, entry.JobID)
+		expected[entry.JobID] = entry.FencingToken
 	}
 	if len(ids) == 0 {
 		return nil
@@ -379,28 +389,17 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 		return nil
 	}
 
-	var balance, remainder int64
-	var floor *int64
+	w := batchWallet{floor: graceFloorCents}
+	var override *int64
 	var err error
 	if schema.hasGraceColumn {
-		// The reservation-schema wallet read includes the org's explicit
-		// grace floor (ADR §8), which wins over the global fallback.
-		err = tx.QueryRow(ctx, `
-			SELECT balance_cents, remainder_micro_usd, grace_floor_cents
-			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder, &floor)
+		err = tx.QueryRow(ctx, `SELECT balance_cents, remainder_micro_usd, grace_floor_cents
+			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&w.balance, &w.remainder, &override)
 	} else {
-		// Pre-reservation schema: read the row without the column and use
-		// the global grace floor — the exact per-job semantics until the
-		// reservation schema exists. Selected up front: an undefined-column
-		// failure would abort the transaction (25P02).
-		err = tx.QueryRow(ctx, `
-			SELECT balance_cents, remainder_micro_usd
-			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder)
+		err = tx.QueryRow(ctx, `SELECT balance_cents, remainder_micro_usd
+			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&w.balance, &w.remainder)
 	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		// No wallet: every resale entry is durable debt, exactly like the
-		// per-job path's no_wallet disposition. The wallet UPDATE below is
-		// skipped (nothing applied).
 		for _, e := range wallet {
 			out[e.JobID] = BatchDisposition{Reason: ReasonNoWallet}
 		}
@@ -409,67 +408,63 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 	if err != nil {
 		return fmt.Errorf("settlement batch wallet read: %w", err)
 	}
-	floorCents := graceFloorCents
-	if floor != nil {
-		floorCents = *floor
+	if override != nil {
+		w.floor = *override
 	}
+	return w.applyEntries(ctx, tx, orgID, wallet, out, schema)
+}
 
+type batchWallet struct {
+	balance   int64
+	remainder int64
+	floor     int64
+}
+
+func (w *batchWallet) applyEntries(ctx context.Context, tx pgx.Tx, orgID string, entries []SettleEntry, out map[int64]BatchDisposition, schema batchSchema) error {
 	anyApplied := false
-	for _, e := range wallet {
-		if e.RequestID == "" || e.Amount <= 0 {
-			out[e.JobID] = BatchDisposition{Reason: ReasonPoisonPayload}
-			continue
-		}
-		// Idempotency FIRST — the exact DeductMicro order (advisory lock →
-		// idempotency read → floor math). A replayed job whose charge
-		// already committed settles as a no-op regardless of the wallet's
-		// current depth under the floor; the §5.5 equivalence is defined on
-		// that order. The lookup domain follows the entry identity, the
-		// same key split as the per-job DeductMicroInvocation check.
-		existingOrg, storedMicro, exists, err := existingUsageOrg(ctx, tx, e.RequestID, e.InvocationID, schema)
+	for _, e := range entries {
+		result, err := w.applyEntry(ctx, tx, orgID, e, schema)
 		if err != nil {
 			return err
 		}
-		if exists {
-			if existingOrg != orgID {
-				out[e.JobID] = BatchDisposition{Reason: ReasonIdentityConflict}
-				continue
-			}
-			if e.InvocationID != "" && storedMicro != -int64(e.Amount) {
-				// The minted identity already charged a DIFFERENT amount —
-				// the per-job path's ErrChargeIdentityConflict check: a
-				// replay must never silently settle a changed amount, and
-				// the earlier charge must never be silently re-based.
-				out[e.JobID] = BatchDisposition{Reason: ReasonIdentityConflict}
-				continue
-			}
-			// The earlier run committed this charge, its settle-mark and
-			// its reserve decrement atomically — an idempotent no-op
-			// settle, never a second debit (§5.5).
-			out[e.JobID] = BatchDisposition{Settled: true}
-			continue
-		}
-		newBalance, newRemainder, chargeCents, applied := carryWalletCharge(balance, remainder, int64(e.Amount), floorCents)
-		if !applied {
-			out[e.JobID] = BatchDisposition{Reason: ReasonInsufficientCredits}
-			continue
-		}
-		if err := insertWalletLedgerRow(ctx, tx, orgID, e, newBalance, chargeCents, schema); err != nil {
-			return err
-		}
-		balance, remainder = newBalance, newRemainder
-		anyApplied = true
-		out[e.JobID] = BatchDisposition{Settled: true, Applied: true}
+		out[e.JobID] = result
+		anyApplied = anyApplied || result.Applied
 	}
-
-	if anyApplied {
-		if _, err := tx.Exec(ctx,
-			`UPDATE org_credits SET balance_cents = $2, remainder_micro_usd = $3, updated_at = now() WHERE org_id = $1`,
-			orgID, balance, remainder); err != nil {
-			return fmt.Errorf("settlement batch wallet update: %w", err)
-		}
+	if !anyApplied {
+		return nil
+	}
+	_, err := tx.Exec(ctx, `UPDATE org_credits SET balance_cents = $2, remainder_micro_usd = $3, updated_at = now() WHERE org_id = $1`,
+		orgID, w.balance, w.remainder)
+	if err != nil {
+		return fmt.Errorf("settlement batch wallet update: %w", err)
 	}
 	return nil
+}
+
+func (w *batchWallet) applyEntry(ctx context.Context, tx pgx.Tx, orgID string, e SettleEntry, schema batchSchema) (BatchDisposition, error) {
+	if e.RequestID == "" || e.Amount <= 0 {
+		return BatchDisposition{Reason: ReasonPoisonPayload}, nil
+	}
+	// A matching committed charge settles even if the wallet is now below its floor.
+	existingOrg, storedMicro, exists, err := existingUsageOrg(ctx, tx, e.RequestID, e.InvocationID, schema)
+	if err != nil {
+		return BatchDisposition{}, err
+	}
+	if exists {
+		if existingOrg != orgID || (e.InvocationID != "" && storedMicro != -int64(e.Amount)) {
+			return BatchDisposition{Reason: ReasonIdentityConflict}, nil
+		}
+		return BatchDisposition{Settled: true}, nil
+	}
+	balance, remainder, cents, applied := carryWalletCharge(w.balance, w.remainder, int64(e.Amount), w.floor)
+	if !applied {
+		return BatchDisposition{Reason: ReasonInsufficientCredits}, nil
+	}
+	if err := insertWalletLedgerRow(ctx, tx, orgID, e, balance, cents, schema); err != nil {
+		return BatchDisposition{}, err
+	}
+	w.balance, w.remainder = balance, remainder
+	return BatchDisposition{Settled: true, Applied: true}, nil
 }
 
 // existingUsageOrg reads the idempotency state of one usage identity: the

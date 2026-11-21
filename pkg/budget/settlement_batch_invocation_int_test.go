@@ -12,7 +12,6 @@ package budget
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"testing"
 
@@ -73,7 +72,6 @@ func TestSettleOrgBatchInvocationDomains(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := testdb.Postgres(t)
-	defer pool.Close()
 	applyReservationSchemaFixture(ctx, t, pool)
 
 	const orgA = "11111111-1111-4111-8111-1111111111a1"
@@ -177,7 +175,6 @@ func TestSettleOrgBatchLegacyCrossTenantConflict(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := testdb.Postgres(t)
-	defer pool.Close()
 	applyReservationSchemaFixture(ctx, t, pool)
 
 	const orgA = "11111111-1111-4111-8111-1111111111a1"
@@ -217,7 +214,6 @@ func TestSettleOrgBatchFencingLostOwnership(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := testdb.Postgres(t)
-	defer pool.Close()
 	applyReservationSchemaFixture(ctx, t, pool)
 
 	const org = "11111111-1111-4111-8111-1111111111a1"
@@ -294,7 +290,6 @@ func TestSettleOrgBatchReleasedAllowance(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	pool := testdb.Postgres(t)
-	defer pool.Close()
 	applyReservationSchemaFixture(ctx, t, pool)
 
 	const org = "11111111-1111-4111-8111-1111111111a1"
