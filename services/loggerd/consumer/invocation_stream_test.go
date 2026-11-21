@@ -2,6 +2,7 @@ package consumer
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
 	"github.com/reireirei/yabanin/pkg/credits"
+	"github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -21,44 +23,100 @@ import (
 
 const testInvocationID = "0f0e0d0c-0b0a-4901-8203-040506070809"
 
+// chargedProducerEvent is the canonical producer event behind both the
+// wire fixture and the stored facts fixture: deriving the two from the one
+// producer call keeps them byte-consistent and keeps the fixtures honest
+// against schema drift — a producer keyset change fails here loudly
+// instead of silently narrowing the comparison.
+func chargedProducerEvent() eventpublisher.Event {
+	return eventpublisher.Event{
+		OrgID:             "org-abc",
+		RequestID:         "req-inv-1",
+		InvocationID:      testInvocationID,
+		EventType:         "request.completed",
+		TS:                1732212000000,
+		ModelRequested:    "gpt-4",
+		ModelUsed:         "gpt-4",
+		StatusCode:        200,
+		TokensIn:          12,
+		TokensOut:         34,
+		EstimatedCostUSD:  0.0123,
+		ResaleCostUSD:     0.05,
+		CostStatus:        "billed",
+	}
+}
+
+// chargedTerminalFacts is the canonical facts map the gateway stores for
+// invocationChargedMsg — the full producer keyset, all stringified.
+func chargedTerminalFacts() map[string]any {
+	ev := chargedProducerEvent()
+	facts, err := ev.TerminalAccountingFields()
+	if err != nil {
+		panic(err)
+	}
+	typed := make(map[string]any, len(facts))
+	for key, value := range facts {
+		typed[key] = value
+	}
+	return typed
+}
+
 // invocationChargedMsg is a request.completed event whose resale quote makes
-// the wallet plan carry a positive charge.
+// the wallet plan carry a positive charge. The accounting scalars are the
+// producer's own stringifications; canonical empties may be absent from the
+// wire (the consumer's empty-string equivalence), everything else must
+// match the stored facts exactly.
 func invocationChargedMsg(id string) redis.XMessage {
-	return redis.XMessage{ID: id, Values: map[string]interface{}{
-		"event_type":         "request.completed",
-		"request_id":         "req-inv-1",
-		"org_id":             "org-abc",
-		"model_requested":    "gpt-4",
-		"model_used":         "gpt-4",
-		"status_code":        float64(200),
-		"estimated_cost_usd": float64(0.0123),
-		"resale_cost_usd":    float64(0.05),
-		"invocation_id":      testInvocationID,
-	}}
+	wire := make(map[string]interface{})
+	for key, value := range chargedTerminalFacts() {
+		if s := value.(string); s != "" {
+			wire[key] = s
+		}
+	}
+	return redis.XMessage{ID: id, Values: wire}
 }
 
 // invocationCacheHitMsg is a zero-quote invocation event — the cache-hit
-// shape: minted identity, no admission row, no charge.
+// shape: minted identity, no admission row, no charge, and the gateway's
+// free-cache accounting (usage_source none, cost_status cache_hit).
 func invocationCacheHitMsg(id string) redis.XMessage {
 	msg := invocationChargedMsg(id)
-	msg.Values["estimated_cost_usd"] = float64(0)
-	msg.Values["resale_cost_usd"] = float64(0)
+	msg.Values["estimated_cost_usd"] = "0"
+	msg.Values["resale_cost_usd"] = "0"
 	msg.Values["cache_hit_type"] = "exact"
+	msg.Values["usage_source"] = "none"
+	msg.Values["cost_status"] = "cache_hit"
 	return msg
 }
 
 // admissionRow routes the mock QueryRow surface: the schema probe (0028+ =
-// 1 / pre-0028 = 0) and the admission lookup (row or no-rows).
-func admissionRow(schemaCols int, admission *fakeRow) func(context.Context, string, ...any) pgx.Row {
+// 1 / pre-0028 = 0), the admission lookup (row or no-rows) and the
+// terminal-facts lookup (jsonb of the canonical map, or no-rows).
+func admissionRow(schemaCols int, admission *fakeRow, facts map[string]any) func(context.Context, string, ...any) pgx.Row {
 	return func(_ context.Context, query string, _ ...any) pgx.Row {
 		if strings.Contains(query, "information_schema.columns") {
 			return &fakeRow{vals: []any{schemaCols}}
+		}
+		if strings.Contains(query, "FROM organizations") {
+			// reservations mode: off by default — partial-usage billing of
+			// failed events stays inert unless a test overrides this route.
+			return &fakeRow{vals: []any{"off"}}
 		}
 		if strings.Contains(query, "FROM request_admissions") {
 			if admission == nil {
 				return errRow{err: pgx.ErrNoRows}
 			}
 			return admission
+		}
+		if strings.Contains(query, "FROM request_terminal_facts") {
+			if facts == nil {
+				return errRow{err: pgx.ErrNoRows}
+			}
+			raw, err := json.Marshal(facts)
+			if err != nil {
+				return errRow{err: err}
+			}
+			return &fakeRow{vals: []any{string(raw)}}
 		}
 		return errRow{err: pgx.ErrNoRows}
 	}
@@ -127,7 +185,7 @@ func TestInvocationAdmissionBindingParks(t *testing.T) {
 			var mu sync.Mutex
 			execQueries := []string{}
 			db := &mockDB{
-				QueryRowFn: admissionRow(1, tt.admission),
+				QueryRowFn: admissionRow(1, tt.admission, nil), // parks precede any facts lookup
 				ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
 					mu.Lock()
 					execQueries = append(execQueries, q)
@@ -157,7 +215,7 @@ func TestCacheHitWithoutAdmissionRecordsInvocationHistory(t *testing.T) {
 	var logArgs [][]any
 	var intentInserts int
 	db := &mockDB{
-		QueryRowFn: admissionRow(1, nil), // probe: 0028+; admission: no rows
+		QueryRowFn: admissionRow(1, nil, nil), // probe: 0028+; admission: no rows; cache hit needs no facts
 		ExecFn: func(_ context.Context, q string, a ...any) (pgconn.CommandTag, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -195,7 +253,7 @@ func TestDuplicateInvocationEnrichesWithoutRecharge(t *testing.T) {
 	var intentInserts int
 	var transitions int
 	db := &mockDB{
-		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}),
+		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}, chargedTerminalFacts()),
 		ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -240,7 +298,7 @@ func TestChargedInvocationDeliversWithAdmissionTransition(t *testing.T) {
 	var intentQueries []string
 	var transitions int
 	db := &mockDB{
-		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}),
+		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}, chargedTerminalFacts()),
 		ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
 			mu.Lock()
 			defer mu.Unlock()
@@ -275,6 +333,10 @@ func TestLegacyEventSkipsAdmissionBinding(t *testing.T) {
 		QueryRowFn: func(_ context.Context, query string, _ ...any) pgx.Row {
 			if strings.Contains(query, "FROM request_admissions") {
 				seenAdmissionLookup = true
+			}
+			if strings.Contains(query, "information_schema.columns") {
+				// Pre-0028 probe answer: the bare legacy arbiter.
+				return &fakeRow{vals: []any{0}}
 			}
 			return errRow{err: pgx.ErrNoRows}
 		},
@@ -316,7 +378,7 @@ func TestFailedEventAdmissionBindingMirrorsComplete(t *testing.T) {
 	var mu sync.Mutex
 	var wroteLog bool
 	db := &mockDB{
-		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-other", "admitted"}}),
+		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-other", "admitted"}}, nil), // org conflict parks before facts
 		ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
 			mu.Lock()
 			defer mu.Unlock()

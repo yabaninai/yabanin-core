@@ -51,6 +51,37 @@ func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	if err != nil {
 		t.Fatalf("create credit_transactions: %v", err)
 	}
+	// 0001 usage-identity backstop, restored alongside the 0028 expansion:
+	// sibling tests drop and recreate credit_transactions in older shapes
+	// and -shuffle decides who runs first, so every setup guarantees the
+	// full interim posture (original global index live next to the
+	// domain-split arbiters) instead of inheriting whatever shape the
+	// previous test left behind.
+	_, err = pool.Exec(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_request_id
+		ON credit_transactions (request_id)
+		WHERE request_id IS NOT NULL AND type = 'usage'::text;
+	`)
+	if err != nil {
+		t.Fatalf("restore the production usage-identity unique index: %v", err)
+	}
+	// 0028 invocation identity (expand), byte-mirrored: the invocation
+	// column plus the domain-split usage arbiters. The original global
+	// index above intentionally stays live alongside them — the interim
+	// posture pinned by the migration: same-correlation usage rows still
+	// collide loudly until 0029 contracts it away.
+	_, err = pool.Exec(ctx, `
+		ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS invocation_id uuid;
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_legacy
+			ON credit_transactions (request_id)
+			WHERE ((request_id IS NOT NULL) AND (invocation_id IS NULL) AND (type = 'usage'::text));
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_invocation
+			ON credit_transactions (invocation_id)
+			WHERE ((invocation_id IS NOT NULL) AND (type = 'usage'::text));
+	`)
+	if err != nil {
+		t.Fatalf("apply 0028 invocation scaffolding: %v", err)
+	}
 }
 
 func teardownTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {

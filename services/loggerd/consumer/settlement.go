@@ -408,8 +408,9 @@ type SettlementWorker struct {
 	lastSettled  time.Time
 	cleanupNower func() time.Time
 
-	invocationOnce      sync.Once
-	settlementHasInvCol bool
+	invocationMu       sync.Mutex
+	invocationResolved bool
+	hasInvocationCol   bool
 }
 
 // NewSettlementWorker builds the worker over a database pool, the credit
@@ -642,8 +643,16 @@ func (w *SettlementWorker) expirePendingPrice(ctx context.Context) {
 }
 
 func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, error) {
+	// Resolve the claim projection BEFORE claiming anything: a transient
+	// probe failure must not claim under an unknown schema — the legacy
+	// projection drops invocation_id and would settle invoked jobs under
+	// the shared request identity. The probe runs on the pool with no
+	// transaction held; only its successful result is cached.
+	withInvocation, err := w.settlementInvocationSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve settlement schema before claim: %w", err)
+	}
 	query := claimReadyJobsQuery
-	withInvocation := w.settlementInvocationSchema(ctx)
 	if withInvocation {
 		query = claimReadyJobsQueryInvocation
 	}
@@ -671,14 +680,23 @@ func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, err
 	return jobs, rows.Err()
 }
 
-// settlementInvocationSchema resolves (once per worker) whether the claim
-// may project invocation_id; it shares the stream consumer's probe so both
-// surfaces agree on the live schema within one process.
-func (w *SettlementWorker) settlementInvocationSchema(ctx context.Context) bool {
-	w.invocationOnce.Do(func() {
-		w.settlementHasInvCol = probeSettlementInvocationColumn(ctx, w.db)
-	})
-	return w.settlementHasInvCol
+// settlementInvocationSchema resolves (per worker) whether the claim may
+// project invocation_id. It shares the stream consumer's probe query so
+// both surfaces agree on the live schema within one process. Only a
+// successful probe is cached; a transient failure propagates and the next
+// tick re-probes — no job is ever claimed under an unknown schema.
+func (w *SettlementWorker) settlementInvocationSchema(ctx context.Context) (bool, error) {
+	w.invocationMu.Lock()
+	defer w.invocationMu.Unlock()
+	if w.invocationResolved {
+		return w.hasInvocationCol, nil
+	}
+	has, err := probeSettlementInvocationColumn(ctx, w.db)
+	if err != nil {
+		return false, err
+	}
+	w.invocationResolved, w.hasInvocationCol = true, has
+	return has, nil
 }
 
 // executeJob runs one claimed job and records the outcome. Only a committed

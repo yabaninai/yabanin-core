@@ -107,7 +107,7 @@ func TestParseRequestEvent_InvocationDomain(t *testing.T) {
 // recovery is content-free by construction; editing the set is deliberate.
 func TestTerminalFactsFields_AllowlistPinned(t *testing.T) {
 	assert.Equal(t, []string{
-		"event_type", "org_id", "request_id", "invocation_id",
+		"event_type", "used_org_key", "org_id", "request_id", "invocation_id",
 		"model_requested", "model_used", "status_code", "duration_ms",
 		"tokens_in", "tokens_out", "estimated_cost_usd", "resale_cost_usd",
 		"cost_status", "usage_source", "termination", "ts",

@@ -32,7 +32,43 @@ var (
 	ErrInsufficientCredits = errors.New("insufficient credits")
 	// ErrNoWallet means the org has no billing wallet yet.
 	ErrNoWallet = errors.New("no billing wallet found; contact admin to set up credits")
+	// ErrChargeIdentityConflict means a usage row exists under the charged
+	// invocation identity but its org or exact amount disagrees with the
+	// charge: the identity is authoritative and globally unique, so this
+	// is an integrity violation (poison for the settlement worker), never
+	// an idempotent success and never a re-charge.
+	ErrChargeIdentityConflict = errors.New("charge identity conflict")
 )
+
+// creditSchemaProbeQuery reports whether credit_transactions carries the
+// invocation_id column (migration 0028+). column_name is a bind parameter
+// so a probe against an unexpected surface cannot echo a row back as
+// truth. The probe runs on the pool before any transaction is held and
+// only a successful read is cached.
+const creditSchemaProbeQuery = `SELECT count(*) FROM information_schema.columns
+	WHERE table_schema = current_schema() AND table_name = 'credit_transactions' AND column_name = $1`
+
+// creditInvocationColumn resolves (per store) whether the ledger carries
+// the invocation identity column. A transient read failure returns the
+// error — the caller fails the deduction and the settlement worker
+// retries, instead of caching "old schema" forever and mis-keying every
+// subsequent idempotency lookup.
+func (s *Store) creditInvocationColumn(ctx context.Context) (bool, error) {
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+	if s.ledgerResolved {
+		return s.ledgerHasInvCol, nil
+	}
+	if s.db == nil {
+		return false, nil
+	}
+	var n int
+	if err := s.db.QueryRow(ctx, creditSchemaProbeQuery, "invocation_id").Scan(&n); err != nil {
+		return false, err
+	}
+	s.ledgerResolved, s.ledgerHasInvCol = true, n > 0
+	return s.ledgerHasInvCol, nil
+}
 
 // IsInsufficientCredits returns true if the error indicates insufficient credits (including no wallet).
 func IsInsufficientCredits(err error) bool {
@@ -170,6 +206,15 @@ type Store struct {
 	log   *slog.Logger
 	cache map[string]*cachedBalance
 	mu    sync.RWMutex
+
+	// Ledger schema probe: whether credit_transactions carries the
+	// invocation_id column (migration 0028+). Only a successful probe is
+	// cached — a transient failure propagates and the next deduction
+	// re-probes, never a silent legacy fallback that would mis-key the
+	// idempotency lookup.
+	ledgerMu        sync.Mutex
+	ledgerResolved  bool
+	ledgerHasInvCol bool
 }
 
 type cachedBalance struct {
@@ -338,22 +383,29 @@ func (s *Store) Deduct(ctx context.Context, orgID string, amountCents int64, req
 
 // DeductMicroInvocation deducts an exact micro-USD amount keyed by the
 // billed invocation identity (0028+). invocationID is either empty — the
-// legacy request-keyed domain above, byte-identical — or a canonical uuid;
-// any other value is rejected before touching the database so a
-// present-but-malformed identity can never silently downgrade onto the
-// legacy idempotency key. On 0028+ schemas the usage row's idempotency key
-// is the invocation alone (uniq_credit_transactions_invocation): two
+// legacy request-keyed domain above — or a canonical uuid (nil, URN,
+// braced or re-spelled variants are rejected before touching the database,
+// so a malformed identity can never reach an idempotency key). On 0028+
+// schemas the usage row's idempotency key is the invocation alone
+// (uniq_credit_transactions_invocation), verified against the charged org
+// and the exact signed amount before counting as idempotent: two
 // legitimate invocations from one org sharing a client request id bill
-// independently. On a pre-0028 schema the invocation-keyed insert fails
-// loudly (missing column) — retry, then requires_attention — instead of
-// billing under the shared legacy key.
+// independently, while the same identity under another tenant or a
+// different amount is an integrity conflict, never a silent no-op. On a
+// pre-0028 schema the invocation-keyed insert fails loudly (missing
+// column) — retry, then requires_attention — instead of billing under the
+// shared legacy key.
 func (s *Store) DeductMicroInvocation(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
 	if invocationID != "" {
-		if _, err := uuid.Parse(invocationID); err != nil {
-			return fmt.Errorf("deduct: invalid invocation id %q: %w", invocationID, err)
+		if id, err := uuid.Parse(invocationID); err != nil || id == uuid.Nil || id.String() != invocationID {
+			return fmt.Errorf("deduct: invocation id %q is not a canonical non-nil UUID", invocationID)
 		}
 	}
-	return s.deductMicroKeyed(ctx, orgID, amount, requestID, invocationID, metadata)
+	hasInvocationColumn, err := s.creditInvocationColumn(ctx)
+	if err != nil {
+		return fmt.Errorf("deduct: resolve ledger schema: %w", err)
+	}
+	return s.deductMicroKeyed(ctx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
 }
 
 // DeductMicro deducts an exact micro-USD amount for a completed request
@@ -375,7 +427,7 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 	return s.DeductMicroInvocation(ctx, orgID, amount, requestID, "", metadata)
 }
 
-func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
+func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
 	if orgID == "" || s.db == nil {
 		return fmt.Errorf("deduct: invalid parameters")
 	}
@@ -386,7 +438,7 @@ func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money
 
 	var lastErr error
 	for attempt := 0; attempt <= maxDeductRetries; attempt++ {
-		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, invocationID, metadata)
+		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
 		if lastErr == nil {
 			return nil
 		}
@@ -423,7 +475,7 @@ func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money
 // so the floor check and the idempotency read are evaluated against a stable
 // wallet state and never race. Serializable conflicts (deadlocks etc.) stay
 // retryable by the caller as a safety net.
-func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
+func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("deduct begin tx: %w", err)
@@ -441,13 +493,46 @@ func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.
 	}
 
 	// Step 1: Idempotency check — is this charge already applied? The key
-	// follows the domain of the row being written: the invocation alone for
-	// invocation-keyed charges (server-minted uuids are globally unique;
-	// this is exactly uniq_credit_transactions_invocation), the legacy
-	// (org, request) pair otherwise.
+	// follows the domain of the row being written. An invocation-keyed
+	// charge matches the invocation alone (server-minted uuids are
+	// globally unique; exactly uniq_credit_transactions_invocation) and
+	// must then verify the charged org and the exact signed amount before
+	// counting as idempotent — a row under the same identity but another
+	// tenant or a different amount is an integrity conflict, never a
+	// silent no-op. A legacy charge matches the (org, request) pair
+	// constrained to the legacy domain (invocation_id IS NULL on 0028+
+	// schemas, exactly uniq_credit_transactions_usage_legacy): an invoked
+	// row under the same correlation must never suppress a genuine legacy
+	// charge. Pre-0028 schemas keep the original bytes — no invoked rows
+	// can exist there.
 	var existingID int64
 	if invocationID != "" {
-		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE invocation_id = $1 AND type = 'usage'`, invocationID).Scan(&existingID)
+		var rowOrg string
+		var rowMicro int64
+		err = tx.QueryRow(ctx, `SELECT org_id, amount_micro_usd FROM credit_transactions WHERE invocation_id = $1 AND type = 'usage'`, invocationID).Scan(&rowOrg, &rowMicro)
+		if err == nil {
+			if rowOrg != orgID || rowMicro != -int64(amount) {
+				if rerr := tx.Rollback(ctx); rerr != nil {
+					s.log.Warn("deduct rollback failed", "error", rerr)
+				}
+				s.log.Error("usage row found under the charged invocation with a different org or amount — integrity conflict, never idempotent",
+					"org_id", orgID,
+					"invocation_id", invocationID,
+					"row_org_id", rowOrg,
+					"amount_micro_usd", int64(amount),
+					"row_amount_micro_usd", rowMicro,
+				)
+				return ErrChargeIdentityConflict
+			}
+			// Already deducted under the authoritative identity — idempotent
+			// success (no-op).
+			if rerr := tx.Rollback(ctx); rerr != nil {
+				s.log.Warn("deduct rollback failed", "error", rerr)
+			}
+			return nil
+		}
+	} else if hasInvocationColumn {
+		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage' AND invocation_id IS NULL`, orgID, requestID).Scan(&existingID)
 	} else {
 		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage'`, orgID, requestID).Scan(&existingID)
 	}

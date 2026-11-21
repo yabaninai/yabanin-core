@@ -118,6 +118,10 @@ func (m *mockRedis) DEL(ctx context.Context, keys ...string) *redis.IntCmd {
 type mockDB struct {
 	ExecFn     func(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error)
 	QueryRowFn func(ctx context.Context, query string, args ...any) pgx.Row
+	// BeginTxFn, when set, replaces the default mockTx slice — for tests
+	// proving a read is routed through the delivery transaction rather
+	// than the pool (e.g. schema probes under MaxConns=1).
+	BeginTxFn func(ctx context.Context) (InboxTx, error)
 
 	// Transactional event_inbox model (AF-04): claims are visible inside
 	// their own transaction, become globally visible on Commit and are
@@ -133,7 +137,10 @@ type mockDB struct {
 	holders   map[string]*mockTx
 }
 
-func (m *mockDB) BeginTx(_ context.Context) (InboxTx, error) {
+func (m *mockDB) BeginTx(ctx context.Context) (InboxTx, error) {
+	if m.BeginTxFn != nil {
+		return m.BeginTxFn(ctx)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.committed == nil {

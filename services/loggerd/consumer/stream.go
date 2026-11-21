@@ -159,32 +159,41 @@ func pendingPriceIntentStatement(hasColumn bool, invocation any) string {
 const settlementSchemaProbeQuery = `SELECT count(*) FROM information_schema.columns
 	WHERE table_schema = current_schema() AND table_name = 'settlement_jobs' AND column_name = $1`
 
-// settlementInvocationSchema resolves (once per consumer) whether intent
-// statements may carry the invocation predicates. A probe error resolves
-// false: on a genuinely pre-0028 schema the WHERE-qualified arbiters are
-// invalid SQL, so the legacy bytes are the only safe fallback.
-func (c *StreamConsumer) settlementInvocationSchema(ctx context.Context) bool {
-	c.schemaOnce.Do(func() {
-		if c.dbPool == nil {
-			return
-		}
-		c.settlementHasInvocationID = probeSettlementInvocationColumn(ctx, c.dbPool)
-	})
-	return c.settlementHasInvocationID
+// settlementInvocationSchemaTx resolves whether legacy-domain intent
+// statements need the partial arbiter, using the delivery's own
+// transaction: a pool-level probe here could wait on a connection the
+// caller already holds — fatal at MaxConns=1. Only a successful probe is
+// cached; a transient failure propagates (the delivery retries, the probe
+// re-runs) instead of resolving false forever. Invoked events never call
+// this: their statements are schema-self-evidencing (valid on 0028+, a
+// loud 42703 before it).
+func (c *StreamConsumer) settlementInvocationSchemaTx(ctx context.Context, tx InboxTx) (bool, error) {
+	c.schemaMu.Lock()
+	defer c.schemaMu.Unlock()
+	if c.schemaResolved {
+		return c.schemaHasInvocationID, nil
+	}
+	has, err := probeSettlementInvocationColumn(ctx, tx)
+	if err != nil {
+		return false, err
+	}
+	c.schemaResolved, c.schemaHasInvocationID = true, has
+	return has, nil
 }
 
 // probeSettlementInvocationColumn reports whether the live schema carries
-// invocation_id on settlement_jobs (migration 0028+). Shared by the stream
-// consumer (intent statements) and the settlement worker (claim projection);
-// each caches the result once per process.
+// invocation_id on settlement_jobs (migration 0028+). column_name is a bind
+// parameter so schema-less test doubles answer 0 (int scan) instead of
+// echoing a probe row back as truth. A read failure returns the error —
+// callers must retry, never cache it as the old schema.
 func probeSettlementInvocationColumn(ctx context.Context, db interface {
 	QueryRow(ctx context.Context, query string, args ...any) pgx.Row
-}) bool {
+}) (bool, error) {
 	var n int
-	if err := db.QueryRow(ctx, settlementSchemaProbeQuery, "invocation_id").Scan(&n); err == nil && n > 0 {
-		return true
+	if err := db.QueryRow(ctx, settlementSchemaProbeQuery, "invocation_id").Scan(&n); err != nil {
+		return false, err
 	}
-	return false
+	return n > 0, nil
 }
 
 // Reservations modes of an organization (ADR-0001 §9). The consumer reads
@@ -282,15 +291,18 @@ type StreamConsumer struct {
 	reclaimIdle  time.Duration
 	reclaimEvery time.Duration
 
-	// schemaOnce caches the settlement schema probe — whether
-	// settlement_jobs carries the invocation_id column (migration 0028).
-	// The exact ON CONFLICT bytes must match the live schema: on a
-	// pre-0028 schema a WHERE-qualified arbiter is invalid SQL (42703,
-	// the predicate references a missing column), while on a 0028+
-	// schema the partial unique indexes are only inferable from an
-	// arbiter carrying the matching predicate.
-	schemaOnce                sync.Once
-	settlementHasInvocationID bool
+	// The settlement schema probe caches whether settlement_jobs carries
+	// the invocation_id column (migration 0028). The exact ON CONFLICT
+	// bytes must match the live schema: on a pre-0028 schema a
+	// WHERE-qualified arbiter is invalid SQL (42703, the predicate
+	// references a missing column), while on a 0028+ schema the partial
+	// unique indexes are only inferable from an arbiter carrying the
+	// matching predicate. Only a successful probe is cached — a transient
+	// probe failure propagates so the next delivery re-probes instead of
+	// sealing "old schema" forever and downgrading invoked events.
+	schemaMu              sync.Mutex
+	schemaResolved        bool
+	schemaHasInvocationID bool
 }
 
 // redisXAckWrapper bridges *redis.Client's variadic XAck to our interface.
@@ -759,6 +771,43 @@ func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context,
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
+	// An invocation-bearing budget refusal must respect the admission the
+	// gateway minted: a bound admission of another tenant can never be
+	// claimed (that identity is paid elsewhere), and a genuinely
+	// unadmitted refusal is a pre-dispatch event — it records in the
+	// legacy domain without claiming the minted uuid. Refusals carry no
+	// charge, so no facts comparison applies.
+	if ev.invocationIDValue != nil {
+		b, err := c.resolveAdmission(ctx, tx, ev)
+		if err != nil {
+			return err
+		}
+		switch {
+		case !b.found:
+			c.logger.Info("unadmitted budget refusal — recording legacy-domain history without claiming the invocation",
+				slog.String("invocation_id", ev.invocationID),
+				slog.String("request_id", ev.requestID),
+				slog.String("org_id", ev.orgID),
+			)
+			ev.invocationIDValue = nil
+			ev.invocationID = ""
+		case b.orgID != ev.orgID:
+			c.logger.Error("budget refusal admission belongs to another org — parking, never claiming a paid identity",
+				slog.String("invocation_id", ev.invocationID),
+				slog.String("request_id", ev.requestID),
+				slog.String("admission_org_id", b.orgID),
+				slog.String("event_org_id", ev.orgID),
+			)
+			return errAdmissionOrgConflict
+		case b.state == "voided":
+			c.logger.Error("budget refusal for a voided invocation admission — parking",
+				slog.String("invocation_id", ev.invocationID),
+				slog.String("request_id", ev.requestID),
+			)
+			return errAdmissionVoided
+		}
+	}
+
 	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
 	row := budgetRequestLogRow(ev, sessionIDStr, errorMsg)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
@@ -825,7 +874,11 @@ func (c *StreamConsumer) handleRequestFailedProfile(ctx context.Context, msg red
 	case absorbedUpstream:
 		emitAbsorbedUpstreamMetrics(ev, chargeMicro, chargeState)
 	case partialUsageKnown:
-		plan = c.billablePlanForMode(ctx, ev, chargeMicro, chargeState)
+		var err error
+		plan, err = c.billablePlanForMode(ctx, ev, chargeMicro, chargeState)
+		if err != nil {
+			return err
+		}
 	}
 	// A priced-and-absorbed upstream failure is not an unknown cost — its
 	// bound belongs to the absorbed metric, not to uncharged_unknown.
@@ -862,23 +915,31 @@ func emitAbsorbedUpstreamMetrics(ev requestEvent, chargeMicro money.MicroUSD, ch
 // billablePlanForMode resolves the enforce-mode charge plan for a failed
 // request with known partial usage: shadow only observes what enforce
 // WOULD bill (WouldBillPartialMicroUSD), off keeps the legacy behavior
-// (failed requests are never billed). A mode-lookup error bills nothing —
-// the durable settlement path stays authoritative.
-func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEvent, chargeMicro money.MicroUSD, chargeState money.QuoteState) []scopeCharge {
+// (failed requests are never billed). A mode-lookup error on a LEGACY
+// event bills nothing — failing closed to off preserves the exact
+// pre-invocation behavior and the durable settlement path stays
+// authoritative. An INVOKED event instead fails the delivery: committing a
+// zero charge under an unknown mode would mint an invocation-domain row
+// the settlement worker could never reprice, so the delivery retries
+// until the mode is readable.
+func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEvent, chargeMicro money.MicroUSD, chargeState money.QuoteState) ([]scopeCharge, error) {
 	mode, modeErr := c.reservationsMode(ctx, ev.orgID)
 	if modeErr != nil {
-		return nil
+		if ev.invocationIDValue != nil {
+			return nil, fmt.Errorf("resolve reservations mode for invoked partial billing: %w", modeErr)
+		}
+		return nil, nil
 	}
 	switch mode {
 	case modeEnforce:
-		return scopeChargePlan(ev, chargeMicro, chargeState)
+		return scopeChargePlan(ev, chargeMicro, chargeState), nil
 	case modeShadow:
 		for _, sc := range scopeChargePlan(ev, chargeMicro, chargeState) {
 			metrics.WouldBillPartialMicroUSD.WithLabelValues(sc.scope).Add(float64(sc.amount))
 		}
 	default: // off — legacy: failed requests are never billed
 	}
-	return nil
+	return nil, nil
 }
 
 // persistFailedDelivery writes one request.failed delivery inside the
@@ -914,7 +975,9 @@ func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, 
 		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
 			return err
 		}
-		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+			return err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit delivery transaction: %w", err)
 		}
@@ -943,6 +1006,13 @@ func (c *StreamConsumer) persistFailedDelivery(ctx context.Context, tx InboxTx, 
 	// pending_price record in the same transaction — never billed, expires
 	// to terminal 'unknown' after the pending deadline.
 	if err := c.insertPendingPriceIntent(ctx, tx, ev, chargeState); err != nil {
+		return err
+	}
+
+	// The FIRST successful failed-delivery insert resolves the admission:
+	// waiting for a duplicate would leave a delivered terminal unresolved
+	// forever when no redelivery ever happens.
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
 		return err
 	}
 
@@ -1052,7 +1122,9 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 		if err := c.enrichPolicyDecisionIfAbsent(ctx, tx, ev); err != nil {
 			return err
 		}
-		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+			return err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit delivery transaction: %w", err)
 		}
@@ -1070,7 +1142,9 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 		return err
 	}
 
-	c.transitionAdmissionDelivered(ctx, tx, ev)
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delivery transaction: %w", err)
@@ -1301,7 +1375,9 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 		if err := c.enrichDuplicateInvocation(ctx, tx, ev); err != nil {
 			return err
 		}
-		c.transitionAdmissionDelivered(ctx, tx, ev)
+		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+			return err
+		}
 		if err := tx.Commit(ctx); err != nil {
 			return fmt.Errorf("commit delivery transaction: %w", err)
 		}
@@ -1339,7 +1415,9 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 		return err
 	}
 
-	c.transitionAdmissionDelivered(ctx, tx, ev)
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+		return err
+	}
 
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit delivery transaction: %w", err)
@@ -1560,15 +1638,27 @@ func (c *StreamConsumer) beginDelivery(ctx context.Context, eventID string) (Inb
 //     established cache accounting.
 // ---------------------------------------------------------------------------
 
-const admissionLookupQuery = `SELECT org_id, state FROM request_admissions WHERE invocation_id = $1`
+// admissionLookupQuery reads the admission row bound to the event's
+// invocation FOR UPDATE: the row lock lives for the delivery transaction
+// and serializes this binding against a concurrent gateway void or a
+// reconciler transition, so the state read here cannot be invalidated
+// before the delivery commits.
+const admissionLookupQuery = `SELECT org_id, state FROM request_admissions WHERE invocation_id = $1 FOR UPDATE`
+
+// admissionFactsQuery selects the authoritative terminal fact of an
+// admitted invocation FOR UPDATE. The gateway commits this row before
+// publishing the event (single ts stamped before both), so the stream
+// delivery must find it present and equal — a missing or divergent fact
+// means the stream event cannot be trusted to resolve or charge.
+const admissionFactsQuery = `SELECT event FROM request_terminal_facts WHERE invocation_id = $1 AND org_id = $2 FOR UPDATE`
 
 // admissionResolveEventQuery is the consumer-owned guarded transition after
 // a live delivery committed the accounting. The state guard makes it a
 // no-op when recovery already reconciled the admission, and 'voided' rows
 // are terminal and never touched here.
 const admissionResolveEventQuery = `UPDATE request_admissions
-	SET state = 'reconciled', resolved_at = now(), resolve_reason = 'event_delivered'
-	WHERE invocation_id = $1 AND state IN ('admitted', 'unresolved')`
+	SET state = 'reconciled', resolved_at = now(), resolve_reason = $1
+	WHERE invocation_id = $2 AND state IN ('admitted', 'unresolved')`
 
 // invocationEnrichmentLockQuery serializes duplicate-invocation enrichment
 // against concurrent redeliveries (reclaim overlap): the second delivery
@@ -1585,6 +1675,24 @@ var (
 	errAdmissionOrgConflict  = errors.New("invocation admission belongs to a different org")
 	errAdmissionVoided       = errors.New("terminal event for a voided invocation admission")
 	errPaidWithoutAdmission  = errors.New("positive charge without a bound invocation admission")
+	// errAdmissionSchemaMissing surfaces an invocation-bearing event on a
+	// schema without request_admissions (pre-0028): the failed lookup has
+	// already aborted the transaction, and treating it as unbound would
+	// both continue on an aborted transaction and silently downgrade the
+	// identity domain.
+	errAdmissionSchemaMissing = errors.New("invocation event on a schema without request_admissions")
+	// errUnadmittedTerminal parks a terminal event without an admission
+	// that does not carry explicit free cache semantics: zero-charge,
+	// unpriced and provider-BYOK terminals are not cache history.
+	errUnadmittedTerminal = errors.New("terminal event without an admission or explicit free cache semantics")
+	// errTerminalFactsMissing parks an admitted invocation's terminal
+	// event whose authoritative facts row is absent: the stream cannot
+	// resolve or charge ahead of the fact the gateway commits first.
+	errTerminalFactsMissing = errors.New("admitted invocation has no authoritative terminal facts row")
+	// errTerminalFactsDivergent parks a terminal event whose accounting
+	// fields disagree with the authoritative facts row (different model,
+	// usage, cost or timestamp under the same invocation id).
+	errTerminalFactsDivergent = errors.New("wire event accounting fields diverge from the terminal facts")
 )
 
 // admissionBinding is the resolved durable admission of one event.
@@ -1595,8 +1703,10 @@ type admissionBinding struct {
 }
 
 // resolveAdmission reads the admission row bound to the event's invocation,
-// if any. A pre-0028 schema (no request_admissions table) counts as unbound;
-// every other read error fails the delivery.
+// if any, under FOR UPDATE. Every read error fails the delivery: a missing
+// request_admissions table (42P01, pre-0028) has already aborted the
+// transaction, and an invocation event on that schema must surface instead
+// of proceeding unbound.
 func (c *StreamConsumer) resolveAdmission(ctx context.Context, tx InboxTx, ev requestEvent) (admissionBinding, error) {
 	if ev.invocationIDValue == nil {
 		return admissionBinding{}, nil
@@ -1612,7 +1722,11 @@ func (c *StreamConsumer) resolveAdmission(ctx context.Context, tx InboxTx, ev re
 	}
 	var pgErr *pgconn.PgError
 	if errors.As(err, &pgErr) && pgErr.Code == "42P01" {
-		return admissionBinding{}, nil
+		c.logger.Error("invocation event but request_admissions is missing — parking (schema predates 0028)",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+		)
+		return admissionBinding{}, errAdmissionSchemaMissing
 	}
 	return admissionBinding{}, fmt.Errorf("resolve invocation admission: %w", err)
 }
@@ -1637,9 +1751,23 @@ func (c *StreamConsumer) bindAdmission(ctx context.Context, tx InboxTx, ev reque
 			)
 			return b, errPaidWithoutAdmission
 		}
-		// Cache-hit identities: record the history under the event's own
-		// org — no charge exists to bind.
-		c.logger.Info("invocation event without admission — recording history without charge (cache-hit identity)",
+		if !genuineCacheHit(ev, plan) {
+			// Zero-charge, unpriced and provider-BYOK terminals are not
+			// cache history: without an admission row the identity is
+			// unaccounted for, and recording it as cache would silently
+			// lose it.
+			c.logger.Error("terminal event without an admission and without explicit free cache semantics — parking",
+				slog.String("invocation_id", ev.invocationID),
+				slog.String("request_id", ev.requestID),
+				slog.String("org_id", ev.orgID),
+			)
+			return b, errUnadmittedTerminal
+		}
+		// A genuine cache hit mints an identity with no admission row and
+		// carries no charge, reservation or payable scope: its history
+		// records under the event's own org, keeping the established
+		// cache accounting.
+		c.logger.Info("cache-hit identity without admission — recording history without charge",
 			slog.String("invocation_id", ev.invocationID),
 			slog.String("request_id", ev.requestID),
 			slog.String("org_id", ev.orgID),
@@ -1663,7 +1791,137 @@ func (c *StreamConsumer) bindAdmission(ctx context.Context, tx InboxTx, ev reque
 		)
 		return b, errAdmissionVoided
 	}
+	// The bound admission's authoritative facts row is the terminal record
+	// of truth: the delivery compares against it (locked) before any live
+	// write, so a divergent or missing fact can neither resolve the
+	// admission nor charge from the stream.
+	if err := c.verifyTerminalFacts(ctx, tx, ev); err != nil {
+		return b, err
+	}
 	return b, nil
+}
+
+// genuineCacheHitKind enumerates the cache kinds the gateway actually mints
+// for a free, fully-cached response. Anything else on the wire — an unknown
+// kind, a gateway "none" placeholder, free-form text — is not cache
+// evidence and must not excuse a missing admission.
+var genuineCacheHitKinds = map[string]bool{
+	"exact":    true,
+	"pg_exact": true,
+	"semantic": true,
+}
+
+// genuineCacheHit reports whether an admission-less invocation event
+// carries explicit free cache semantics — the only legitimate
+// admission-less terminal. The evidence must be explicit on every axis: a
+// gateway-declared cache_hit_type (a real cache kind, never an arbitrary
+// string), the gateway's cache accounting shape (usage_source "none" and
+// cost_status "cache_hit"), quotes resolved to a genuine zero (not
+// unknown/unpriced), no reservation linkage, and no payable scope in the
+// plan (wallet, team, agent or session). Anything else parks.
+func genuineCacheHit(ev requestEvent, plan []scopeCharge) bool {
+	kind, ok := ev.cacheHitType.(string)
+	if !ok || !genuineCacheHitKinds[kind] {
+		return false
+	}
+	if ev.acct.usageSource != "none" || ev.acct.costStatus != "cache_hit" {
+		return false
+	}
+	if ev.resaleQuoteState != money.QuoteZero || ev.costQuoteState != money.QuoteZero {
+		return false
+	}
+	if len(ev.reservations) > 0 {
+		return false
+	}
+	for _, sc := range plan {
+		switch sc.kind {
+		case ChargeKindAgentSpend, ChargeKindTeamSpend, ChargeKindSessionSpend:
+			return false
+		case ChargeKindResaleDeduction:
+			if sc.amount > 0 {
+				return false
+			}
+		}
+	}
+	return true
+}
+
+// verifyTerminalFacts selects the admission's terminal fact row FOR UPDATE
+// and compares its accounting fields against the wire event's published
+// scalars. The gateway stamps one ts and commits the fact before
+// publishing, so equality is the expected outcome of a genuine delivery;
+// a missing row or any field divergence parks the event (recovery owns
+// fact-authoritative materialization, never the live stream).
+func (c *StreamConsumer) verifyTerminalFacts(ctx context.Context, tx InboxTx, ev requestEvent) error {
+	// The gateway stores the canonical facts map (all values stringified)
+	// as jsonb; scanning into a string keeps the value bytes exact.
+	var factsJSON string
+	err := tx.QueryRow(ctx, admissionFactsQuery, ev.invocationID, ev.orgID).Scan(&factsJSON)
+	if errors.Is(err, pgx.ErrNoRows) {
+		c.logger.Error("admitted invocation has no terminal facts row — parking (the gateway commits the fact before publishing)",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+		)
+		return errTerminalFactsMissing
+	}
+	if err != nil {
+		return fmt.Errorf("select terminal facts: %w", err)
+	}
+	// The producer-side decoder re-derives the exact schema — field count,
+	// scalar validity, invocation/org attribution — so the stored side of
+	// the comparison is the full producer keyset, never a consumer-chosen
+	// subset.
+	facts, err := eventpublisher.DecodeTerminalAccounting([]byte(factsJSON), ev.invocationID, ev.orgID)
+	if err != nil {
+		c.logger.Error("terminal facts row fails the canonical producer contract — parking",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("org_id", ev.orgID),
+			slog.String("error", err.Error()),
+		)
+		return errTerminalFactsDivergent
+	}
+	if diff, ok := compareAccountingFields(facts, ev.raw); !ok {
+		c.logger.Error("wire event accounting fields diverge from the terminal facts — parking, never resolving or charging from the stream",
+			slog.String("invocation_id", ev.invocationID),
+			slog.String("request_id", ev.requestID),
+			slog.String("org_id", ev.orgID),
+			slog.String("field", diff),
+		)
+		return errTerminalFactsDivergent
+	}
+	return nil
+}
+
+// compareAccountingFields checks the stored facts map against the wire
+// event's raw scalars. The decoded facts row covers exactly the producer
+// keyset, so every stored scalar must appear on the wire as the equal
+// string — the published values are exactly these scalars, and a canonical
+// wire value the facts row does not carry (an added payer, a second
+// event_type) has no facts-side counterpart to match and cannot pass. The
+// one normalization: a stored canonical empty string ("") matches an absent
+// wire scalar, because the producer always writes the full keyset while
+// older wire events may omit empty fields. Returns the first divergent
+// field for the park diagnostic.
+func compareAccountingFields(facts map[string]any, wire map[string]interface{}) (string, bool) {
+	for key, factValue := range facts {
+		factStr, ok := factValue.(string)
+		if !ok {
+			return key, false
+		}
+		raw, ok := wire[key]
+		if !ok {
+			if factStr == "" {
+				continue // canonical empty ≡ absent wire scalar
+			}
+			return key, false
+		}
+		wireValue, ok := raw.(string)
+		if !ok || wireValue != factStr {
+			return key, false
+		}
+	}
+	return "", true
 }
 
 // chargePlanCarriesCharge reports whether the plan would create a positive
@@ -1683,19 +1941,32 @@ func (c *StreamConsumer) chargePlanCarriesCharge(plan []scopeCharge) bool {
 }
 
 // transitionAdmissionDelivered moves the bound admission to 'reconciled'
-// inside the delivery transaction. Fail-soft by contract: the accounting
-// writes are already committed-or-committing and the reconciler's grace
-// sweep is the backstop, so a failure here only logs.
-func (c *StreamConsumer) transitionAdmissionDelivered(ctx context.Context, tx InboxTx, ev requestEvent) {
+// inside the delivery transaction. A failed UPDATE has aborted the
+// transaction, so the error propagates — logging and continuing would
+// commit nothing (25P02) while reporting the delivery as done. The
+// reconciler's grace sweep remains the backstop for deliveries that never
+// reach this point.
+func (c *StreamConsumer) transitionAdmissionDelivered(ctx context.Context, tx InboxTx, ev requestEvent, policy deliveryPolicy) error {
 	if ev.invocationIDValue == nil {
-		return
+		return nil
 	}
-	if _, err := tx.Exec(ctx, admissionResolveEventQuery, ev.invocationID); err != nil {
-		c.logger.Warn("admission transition to reconciled failed — reconciler backstop will retry",
+	// The resolve reason separates live stream delivery from the
+	// PostgreSQL facts-recovery materialization: only the recovery policy
+	// sets recoveredFromFacts, so the audit trail names which path made
+	// the admission durable.
+	reason := "event_delivered"
+	if policy.recoveredFromFacts {
+		reason = "recovered_from_facts"
+	}
+	if _, err := tx.Exec(ctx, admissionResolveEventQuery, reason, ev.invocationID); err != nil {
+		c.logger.Warn("admission transition to reconciled failed — delivery rolls back, reconciler backstop will retry",
 			slog.String("invocation_id", ev.invocationID),
+			slog.String("resolve_reason", reason),
 			slog.String("error", err.Error()),
 		)
+		return fmt.Errorf("transition admission to reconciled: %w", err)
 	}
+	return nil
 }
 
 // enrichDuplicateInvocation fills optional history for a duplicate
@@ -1900,9 +2171,20 @@ func (c *StreamConsumer) insertScopeIntent(ctx context.Context, tx InboxTx, orgI
 	}
 
 	// The invocation-domain statements carry invocation_id in their column
-	// list; the legacy statements keep the exact pre-invocation bytes and
-	// argument vector.
-	plainStmt, withAllowanceStmt := settlementIntentStatements(c.settlementInvocationSchema(ctx), invocation)
+	// list and are schema-self-evidencing (invalid before 0028 — a loud
+	// failure, never a silent downgrade). Only legacy-domain rows need the
+	// probe: their arbiter differs between the pre-0028 bytes and the
+	// partial index of 0028+.
+	var plainStmt, withAllowanceStmt string
+	if invocation == nil {
+		hasColumn, perr := c.settlementInvocationSchemaTx(ctx, tx)
+		if perr != nil {
+			return fmt.Errorf("probe settlement schema for legacy intent: %w", perr)
+		}
+		plainStmt, withAllowanceStmt = settlementIntentStatements(hasColumn, nil)
+	} else {
+		plainStmt, withAllowanceStmt = settlementIntentStatements(false, invocation)
+	}
 	var tag pgconn.CommandTag
 	switch {
 	case invocation != nil && sc.link.AllowanceID > 0:
@@ -1956,7 +2238,14 @@ func (c *StreamConsumer) insertPendingPriceIntent(ctx context.Context, tx InboxT
 	if err != nil {
 		payload = []byte("{}")
 	}
-	stmt := pendingPriceIntentStatement(c.settlementInvocationSchema(ctx), ev.invocationIDValue)
+	stmt := pendingPriceIntentStatement(true, ev.invocationIDValue)
+	if ev.invocationIDValue == nil {
+		hasColumn, perr := c.settlementInvocationSchemaTx(ctx, tx)
+		if perr != nil {
+			return fmt.Errorf("probe settlement schema for pending_price intent: %w", perr)
+		}
+		stmt = pendingPriceIntentStatement(hasColumn, nil)
+	}
 	var execErr error
 	if ev.invocationIDValue != nil {
 		_, execErr = tx.Exec(ctx, stmt, ev.orgID, ev.requestID, ev.invocationIDValue, ChargeKindPendingPrice, payload)

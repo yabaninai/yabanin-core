@@ -371,7 +371,7 @@ func parseRequestEventPolicy(raw map[string]interface{}, policy deliveryPolicy) 
 // recovery binds NULL for them, and the metadata-only recovery policy also
 // fails closed if a corrupt projection ever carried content.
 var terminalFactsFields = []string{
-	"event_type", "org_id", "request_id", "invocation_id",
+	"event_type", "used_org_key", "org_id", "request_id", "invocation_id",
 	"model_requested", "model_used", "status_code", "duration_ms",
 	"tokens_in", "tokens_out", "estimated_cost_usd", "resale_cost_usd",
 	"cost_status", "usage_source", "termination", "ts",
