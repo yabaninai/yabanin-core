@@ -13,6 +13,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // The barrier holds only PostgreSQL replies. Requests keep reaching the
@@ -46,9 +48,7 @@ func (w ackReplyWriter) Write(p []byte) (int, error) {
 func gatewayAckRelay(t *testing.T, upstream string) (string, *ackBarrier) {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
 	b := new(ackBarrier)
 	var workers sync.WaitGroup
@@ -85,12 +85,10 @@ func gatewayAckRelay(t *testing.T, upstream string) (string, *ackBarrier) {
 	return ln.Addr().String(), b
 }
 
-func TestAccountingCommittedStartLostAck(t *testing.T) {
-	s := startStand(t)
+func (s *stand) installGatewayAckRelay(t *testing.T) *ackBarrier {
+	t.Helper()
 	dsn, err := url.Parse(s.appDSN)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	relay, b := gatewayAckRelay(t, dsn.Host)
 	s.killGatewaySIGKILL()
 	dsn.Host = relay
@@ -104,10 +102,14 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
 			updated = true
 		}
 	}
-	if !updated {
-		t.Fatal("gateway database environment missing")
-	}
+	require.True(t, updated, "gateway database environment missing")
 	s.restartGateway()
+	return b
+}
+
+func TestAccountingCommittedStartLostAck(t *testing.T) {
+	s := startStand(t)
+	b := s.installGatewayAckRelay(t)
 	s.controlRequest(t, "ack-pre")
 	rid := s.reqPrefix + "ack"
 	db := s.oracleDB.db
@@ -116,21 +118,16 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
 	// The stand owns this database. Filtering on this request prevents a
 	// concurrent health check or another admission from opening the barrier.
 	literal := "'" + strings.ReplaceAll(rid, "'", "''") + "'"
-	_, err = db.ExecContext(ctx, `CREATE FUNCTION acc_hold_start() RETURNS trigger LANGUAGE plpgsql AS $$
+	_, err := db.ExecContext(ctx, `CREATE FUNCTION acc_hold_start() RETURNS trigger LANGUAGE plpgsql AS $$
  BEGIN PERFORM pg_advisory_xact_lock(1921,112); RETURN NEW; END $$;
  CREATE TRIGGER acc_hold_start AFTER INSERT ON request_admissions
  FOR EACH ROW WHEN (NEW.client_request_id = `+literal+`) EXECUTE FUNCTION acc_hold_start()`)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	lock, err := db.BeginTx(ctx, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer lock.Rollback()
-	if _, err = lock.ExecContext(ctx, "SELECT pg_advisory_xact_lock(1921,112)"); err != nil {
-		t.Fatal(err)
-	}
+	_, err = lock.ExecContext(ctx, "SELECT pg_advisory_xact_lock(1921,112)")
+	require.NoError(t, err)
 	before := s.fixture.Snapshot()
 	type response struct {
 		status int
@@ -143,9 +140,8 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
 		t.Helper()
 		for {
 			var n int
-			if err := db.QueryRowContext(ctx, query, args...).Scan(&n); err != nil {
-				t.Fatal(err)
-			}
+			require.NoError(t, db.QueryRowContext(ctx, query, args...).Scan(&n))
+			require.LessOrEqual(t, n, 1)
 			if n == 1 {
 				return
 			}
@@ -164,9 +160,7 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
 	func() {
 		b.Lock()
 		defer b.Unlock()
-		if err := lock.Commit(); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, lock.Commit())
 		waitCount(`SELECT count(*) FROM request_admissions WHERE client_request_id=$1 AND org_id=$2`, rid, s.oracleDB.orgID)
 		b.generation.Add(1)
 	}()
@@ -177,38 +171,33 @@ func TestAccountingCommittedStartLostAck(t *testing.T) {
 		t.Fatal(ctx.Err())
 	}
 	code, ok := decodeErrorCode(r.body)
-	if r.err != nil || r.status != 503 || !ok || code != "history_unavailable" || b.dropped.Load() == 0 {
-		t.Fatalf("committed start with discarded reply: status=%d code=%q transport=%v discarded=%d", r.status, code, r.err, b.dropped.Load())
-	}
+	require.NoError(t, r.err)
+	require.Equal(t, 503, r.status, r.body)
+	require.True(t, ok, "structured error missing")
+	require.Equal(t, "history_unavailable", code)
+	require.Positive(t, b.dropped.Load(), "gateway received no discarded reply")
 	s.fixture.VerifyEvidence()
-	if d := s.fixture.Since(before); d.arrivals != 0 || d.dispatches != 0 || d.receipts != 0 {
-		t.Fatalf("provider activity after lost start acknowledgement: %+v", d)
-	}
+	require.Equal(t, fixtureTotals{}, s.fixture.Since(before))
 	s.controlRequest(t, "ack-post")
+	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1, receipts: 1}, s.fixture.Since(before), "only the healthy post-control should reach upstream")
 	for _, table := range []string{"request_terminal_facts", "settlement_jobs", "credit_transactions"} {
 		var count int
 		query := fmt.Sprintf("SELECT count(*) FROM %s WHERE invocation_id IN (SELECT invocation_id FROM request_admissions WHERE org_id=$1 AND client_request_id=$2)", table)
-		if err := db.QueryRowContext(ctx, query, s.oracleDB.orgID, rid).Scan(&count); err != nil || count != 0 {
-			t.Fatalf("%s rows=%d err=%v", table, count, err)
-		}
-	}
-	if d := s.fixture.Since(before); d.arrivals != 1 || d.dispatches != 1 || d.receipts != 1 {
-		t.Fatalf("only the healthy post-control should reach upstream: %+v", d)
+		require.NoError(t, db.QueryRowContext(ctx, query, s.oracleDB.orgID, rid).Scan(&count))
+		require.Zero(t, count, table)
 	}
 	var count int
-	if err := db.QueryRowContext(ctx, `SELECT
+	err = db.QueryRowContext(ctx, `SELECT
   (SELECT count(*) FROM settlement_jobs WHERE org_id=$1 AND request_id=$2) +
-  (SELECT count(*) FROM credit_transactions WHERE org_id=$1 AND request_id=$2 AND type='usage')`, s.oracleDB.orgID, rid).Scan(&count); err != nil || count != 0 {
-		t.Fatalf("correlation-keyed charges or jobs=%d err=%v", count, err)
-	}
+  (SELECT count(*) FROM credit_transactions WHERE org_id=$1 AND request_id=$2 AND type='usage')`, s.oracleDB.orgID, rid).Scan(&count)
+	require.NoError(t, err)
+	require.Zero(t, count, "correlation-keyed charges or jobs")
 
 }
 
 func TestAccountingAckRelayControl(t *testing.T) {
 	server, err := net.Listen("tcp4", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	defer server.Close()
 	observed := make(chan byte, 3)
 	go func() {
@@ -235,33 +224,26 @@ func TestAccountingAckRelayControl(t *testing.T) {
 	addr, b := gatewayAckRelay(t, server.Addr().String())
 	dial := func() net.Conn {
 		c, err := net.DialTimeout("tcp", addr, time.Second)
-		if err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, err)
 		t.Cleanup(func() { c.Close() })
-		if err := c.SetDeadline(time.Now().Add(3 * time.Second)); err != nil {
-			t.Fatal(err)
-		}
+		require.NoError(t, c.SetDeadline(time.Now().Add(3*time.Second)))
 		return c
 	}
 	send := func(c net.Conn, value byte) {
-		if _, err := c.Write([]byte{value}); err != nil {
-			t.Fatal(err)
-		}
+		_, err := c.Write([]byte{value})
+		require.NoError(t, err)
 		select {
 		case seen := <-observed:
-			if seen != value {
-				t.Fatalf("upstream saw %d, want %d", seen, value)
-			}
+			require.Equal(t, value, seen)
 		case <-time.After(time.Second):
 			t.Fatal("upstream did not observe request")
 		}
 	}
 	receive := func(c net.Conn, value byte) {
 		var p [1]byte
-		if _, err := io.ReadFull(c, p[:]); err != nil || p[0] != value {
-			t.Fatalf("received %d err=%v want %d", p[0], err, value)
-		}
+		_, err := io.ReadFull(c, p[:])
+		require.NoError(t, err)
+		require.Equal(t, value, p[0])
 	}
 	first := dial()
 	send(first, 1)
