@@ -193,5 +193,14 @@ func TestFixtureHeldPeerDisconnect(t *testing.T) {
 	if a, d, r := f.Counts(rid); a != 1 || d != 1 || r != 0 {
 		t.Fatalf("cancelled request arrivals/dispatches/receipts = %d/%d/%d, want 1/1/0", a, d, r)
 	}
+	// A new invocation with the same correlation must proceed normally after
+	// the disconnected one, as in the client-retry recovery scenario.
+	status, _, err := httpPostJSON(5*time.Second, f.baseURL()+"/v1/chat/completions", "unit-token", rid, `{"model":"m"}`)
+	if err != nil || status != http.StatusOK {
+		t.Fatalf("same-correlation control: status=%d err=%v", status, err)
+	}
+	if a, d, r := f.Counts(rid); a != 2 || d != 2 || r != 1 {
+		t.Fatalf("after healthy retry arrivals/dispatches/receipts = %d/%d/%d, want 2/2/1", a, d, r)
+	}
 	f.VerifyEvidence()
 }
