@@ -448,6 +448,19 @@ REVIEW_AREAS = ("python", "containers", "models", "assets", "ownership",
                 "enterprise", "distribution")
 
 
+PENDING_REVIEW_NOTE = ("PENDING scoped human review; machine-generated placeholder, "
+                       "not an approval or rights clearance")
+PENDING_REVIEW_EVIDENCE = "see machine facts in this file; review not yet performed"
+
+
+def has_review_details(review):
+    for field in ("owner", "reason", "evidence"):
+        value = review.get(field)
+        if not isinstance(value, str) or value.strip() in ("", PENDING_REVIEW_NOTE, PENDING_REVIEW_EVIDENCE):
+            return False
+    return True
+
+
 def release_gaps(files, fingerprint, evidence_path=None):
     """Human attestations supplement dependency checks; never suppress them."""
     gaps = []
@@ -481,9 +494,7 @@ def release_gaps(files, fingerprint, evidence_path=None):
         raise ScannerError("release evidence reviews must be an object")
     for area in REVIEW_AREAS:
         review = reviews.get(area, {})
-        if not isinstance(review, dict) or review.get("approved") is not True or not all(
-                isinstance(review.get(k), str) and review[k].strip()
-                for k in ("owner", "reason", "evidence")):
+        if not isinstance(review, dict) or review.get("approved") is not True or not has_review_details(review):
             gaps.append(f"{area}: needs scoped review with owner/reason/evidence (or justified N/A)")
     return gaps
 

@@ -2465,6 +2465,8 @@ def review_failures(ev: dict) -> list:
                 fails.append(f"reviews: {area}.{key} empty")
         if not isinstance(rec.get("approved"), bool):
             fails.append(f"reviews: {area}.approved must be a boolean")
+        elif rec["approved"] and not license_check.has_review_details(rec):
+            fails.append(f"reviews: {area} approval requires completed review details")
     return fails
 
 
@@ -2496,10 +2498,9 @@ def verify(root: Path, ev: dict, with_fingerprint: bool,
 
 
 def pending_reviews() -> dict:
-    note = ("PENDING scoped human review; machine-generated placeholder, "
-            "not an approval or rights clearance")
+    note = license_check.PENDING_REVIEW_NOTE
     return {area: {"approved": False, "owner": note, "reason": note,
-                   "evidence": "see machine facts in this file; review not yet performed"}
+                   "evidence": license_check.PENDING_REVIEW_EVIDENCE}
             for area in AREAS}
 
 

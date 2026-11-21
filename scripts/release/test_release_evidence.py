@@ -1794,6 +1794,24 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
             ev["reviews"]["assets"]["approved"] = "yes"
         self.verify_fails(nonbool, "reviews: assets.approved must be a boolean")
 
+    def test_generated_pending_text_cannot_support_an_approval(self):
+        reviews = re_ev.pending_reviews()
+        original = reviews["assets"].copy()
+        reviewed = {"approved": True, "owner": "Fixture reviewer",
+                    "reason": "Fixture scope examined", "evidence": "Fixture review record"}
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "review.json"
+            for field in ("owner", "reason", "evidence", None):
+                with self.subTest(field=field):
+                    reviews["assets"] = reviewed.copy()
+                    if field:
+                        reviews["assets"][field] = original[field]
+                    packet = {"source_sha256": "fixture-fingerprint", "reviews": reviews}
+                    evidence.write_text(json.dumps(packet))
+                    gaps = re_ev.license_check.release_gaps([], packet["source_sha256"], evidence)
+                    self.assertEqual(any(g.startswith("assets:") for g in gaps), bool(field))
+                    self.assertEqual(bool(re_ev.review_failures(packet)), bool(field))
+
     def test_review_structured_approval_not_rejected(self):
         def approve(td, ev):
             for rec in ev["reviews"].values():
