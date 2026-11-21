@@ -1299,6 +1299,7 @@ func TestGoldenEvent_Shadow_ExcludedFromPrimary(t *testing.T) {
 	}.Validate()
 	require.NoError(t, err)
 	gw.cfg.Shadow = sc
+	gw.invocations = &shadowAccountingFixture{}
 	gw.shadow = shadow.NewDispatcher(vcfg, testLogger())
 	gw.shadow.SetPinnedOrgFunc(func(context.Context, string) bool { return false })
 
@@ -1346,7 +1347,13 @@ func TestGoldenEvent_Shadow_ExcludedFromPrimary(t *testing.T) {
 	})
 	require.NoError(t, mErr)
 
+	require.NotEmpty(t, primaryEv.InvocationID)
+	require.NotEmpty(t, shadowEv.InvocationID)
+	require.NotEqual(t, primaryEv.InvocationID, shadowEv.InvocationID)
+	require.Positive(t, shadowEv.TS)
 	goldenEvent(t, "shadow event", shadowEv, &eventpub.Event{
+		InvocationID:     shadowEv.InvocationID,
+		TS:               shadowEv.TS,
 		EventType:        "request.shadow_completed",
 		Source:           "gateway",
 		SessionID:        "sess-g1",
@@ -1539,6 +1546,7 @@ func TestGoldenEvent_ContentProfile_ShadowSanitized(t *testing.T) {
 	}.Validate()
 	require.NoError(t, err)
 	gw.cfg.Shadow = sc
+	gw.invocations = &shadowAccountingFixture{}
 	gw.shadow = shadow.NewDispatcher(vcfg, testLogger())
 	gw.shadow.SetPinnedOrgFunc(func(context.Context, string) bool { return false })
 
