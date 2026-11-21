@@ -239,7 +239,7 @@ func (f *fixture) serveAccepted(w http.ResponseWriter, path, rid string, body fi
 func (f *fixture) serveAcceptedExtra(w http.ResponseWriter, path, rid string, body fixtureBody) {
 	switch path {
 	case "/v1/completions":
-		f.serveCompletionsJSON(w, rid, body.Model, path)
+		f.serveCompletions(w, rid, body, path)
 	case "/v1/moderations":
 		f.serveModerationsJSON(w, rid, body.Model, path)
 	case "/v1/rerank":
@@ -585,14 +585,13 @@ func (f *fixture) serveRealtimeStream(w http.ResponseWriter, rid, model, path st
 	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
 }
 
-// serveCompletionsJSON delivers a protocol-valid legacy text-completion
-// reply with the known usage.
-func (f *fixture) serveCompletionsJSON(w http.ResponseWriter, rid, model, path string) {
+// serveCompletions emits a legacy text completion with the fixture usage.
+func (f *fixture) serveCompletions(w http.ResponseWriter, rid string, body fixtureBody, path string) {
 	resp := map[string]any{
 		"id":      "cmpl-fixture-" + rid,
 		"object":  "text_completion",
 		"created": time.Now().Unix(),
-		"model":   model,
+		"model":   body.Model,
 		"choices": []map[string]any{{
 			"index":         0,
 			"text":          fixtureAssistantContent,
@@ -605,7 +604,12 @@ func (f *fixture) serveCompletionsJSON(w http.ResponseWriter, rid, model, path s
 		},
 	}
 	payload, _ := json.Marshal(resp)
-	w.Header().Set("Content-Type", "application/json")
+	if body.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		payload = []byte("data: " + string(payload) + "\n\ndata: [DONE]\n\n")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
 	if _, err := w.Write(payload); err != nil {
 		f.t.Logf("fixture: completions write failed for %s (client gone): %v", rid, err)
 		return

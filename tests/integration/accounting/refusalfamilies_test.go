@@ -159,6 +159,7 @@ func refusalFamilies() []refusalFamily {
 		{name: "responses native buffered", outputTokens: fixtureCompletionTokens, request: requestResponsesBuffered, upstream: "/v1/responses", validate: validateResponsesReply},
 		{name: "responses native sse", outputTokens: fixtureCompletionTokens, request: requestResponsesSSE, upstream: "/v1/responses", validate: validateResponsesSSE},
 		{name: "completions legacy", outputTokens: fixtureCompletionTokens, request: requestCompletions, upstream: "/v1/completions", validate: validateCompletionsReply},
+		{name: "completions legacy sse", outputTokens: fixtureCompletionTokens, request: requestCompletionsSSE, upstream: "/v1/completions", validate: validateCompletionsSSE},
 		{name: "moderations", outputTokens: 0, request: requestModerations, upstream: "/v1/moderations", validate: validateModerationsReply},
 		{name: "rerank", outputTokens: 0, request: requestRerank, upstream: "/v1/rerank", validate: validateRerankReply},
 		{name: "images generation", outputTokens: fixtureCompletionTokens, request: requestImages, upstream: "/v1/images/generations", validate: validateImagesReply},
@@ -199,6 +200,11 @@ func requestResponsesSSE(t *testing.T, s *stand, rid string) (int, string, error
 
 func requestCompletions(t *testing.T, s *stand, rid string) (int, string, error) {
 	payload := fmt.Sprintf(`{"model":%q,"prompt":"accounting acceptance completions probe"}`, s.model)
+	return httpPostJSON(45*time.Second, s.gatewayURL+"/v1/completions", s.apiKey, rid, payload)
+}
+
+func requestCompletionsSSE(t *testing.T, s *stand, rid string) (int, string, error) {
+	payload := fmt.Sprintf(`{"model":%q,"prompt":"accounting acceptance streamed completions probe","stream":true,"stream_options":{"include_usage":true}}`, s.model)
 	return httpPostJSON(45*time.Second, s.gatewayURL+"/v1/completions", s.apiKey, rid, payload)
 }
 
@@ -481,6 +487,15 @@ func validateResponsesSSE(t *testing.T, s *stand, body string) {
 		completed.Response.Usage.InputTokens != fixturePromptTokens || completed.Response.Usage.OutputTokens != fixtureCompletionTokens {
 		t.Fatalf("families: responses sse completed frame usage malformed (body %s)", clip(body))
 	}
+}
+
+func validateCompletionsSSE(t *testing.T, s *stand, body string) {
+	t.Helper()
+	frames := controlSSEFrames(t, body)
+	if len(frames) != 2 || frames[1] != (sseFrame{Data: "[DONE]"}) || frames[0].Event != "" {
+		t.Fatalf("legacy completions: expected a text completion and a final [DONE], got %s", clip(body))
+	}
+	validateCompletionsReply(t, s, frames[0].Data)
 }
 
 // validateCompletionsReply asserts the legacy text_completion contract.
