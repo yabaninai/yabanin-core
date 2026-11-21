@@ -72,6 +72,14 @@ func (s *retentionCompatStore) GetRequestDetail(ctx context.Context, orgID, requ
 	return s.mockStore.GetRequestDetail(ctx, orgID, requestID)
 }
 
+// GetRequestDetailRow mirrors GetRequestDetail for the 0031 grant path: the
+// detail contract asserts the verified grant reaches the store through the
+// row-key pinned read too.
+func (s *retentionCompatStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	s.access, _ = adminstore.RequestPayloadAccessFromContext(ctx)
+	return s.mockStore.GetRequestDetailRow(ctx, orgID, rowKey)
+}
+
 func (s *retentionCompatStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
