@@ -205,13 +205,18 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 	// The relay writes through the tail tracker so a torn last event is
 	// closed before the response.failed frame composes (chat F2 canon).
 	tail := &ssePassthroughTail{w: w}
-	usage, relayErr := relayResponsesSSE(tail, body)
+	usage, terminal, relayErr := relayResponsesSSE(tail, body)
 	// N03-P06-T02: SSE headers are already committed; the provider
 	// prompt-cache outcome rides the HTTP trailer. Covers both ends: the
 	// completed branch and the failure branch (the partial usage parsed
 	// before the break is still the real upstream usage).
 	setPromptCacheTrailer(w, usage)
-	if relayErr != nil && r.Context().Err() == nil {
+	// A delivered terminal is authoritative: once the client received
+	// response.completed/incomplete/failed the stream ended on the wire
+	// and the settlement follows that terminal — a late transport error
+	// cannot retroactively fail a response that was fully produced and
+	// delivered. Only a cut BEFORE any terminal is a stream failure.
+	if relayErr != nil && r.Context().Err() == nil && terminal == "" {
 		// D1 canon applied to /v1/responses: request.failed creates no charge
 		// intent; the consumed prefix is recorded for token budgets only. A
 		// request.completed with the partial usage billed.
@@ -231,6 +236,19 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 		tail.complete()
 		writeResponsesStreamFailed(w, detail)
 		gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", detail, term)
+		return
+	}
+	if terminal == "response.failed" {
+		// The upstream itself failed the response and that terminal was
+		// delivered: settle as failed with the provider usage (recorded,
+		// no charge intent) and no second client terminal.
+		gw.accountUsage(r.Context(), w, usageRecord{
+			orgID:     admitted.OrgID,
+			taskID:    admitted.TaskID,
+			sessionID: admitted.SessionID,
+			usage:     usage,
+		})
+		gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", "upstream response.failed", "")
 		return
 	}
 	gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "", "")
@@ -263,34 +281,50 @@ func writeResponsesStreamFailed(w http.ResponseWriter, message string) {
 }
 
 // relayResponsesSSE pipes the upstream Responses SSE stream to the client
-// verbatim and returns the usage parsed off the terminal events plus the
-// read error that ended the drain, if any. Frames are dispatched whole: a
-// consumer decodes an event only once its blank separator has arrived
-// (the payload is the data lines joined with LF), so lines of an
-// unterminated frame are held back with bounded memory. On an upstream
-// break the held frame is dispatched only when it is a decodable event
-// missing just its separator; otherwise it is dropped so the caller's
-// failure frame composes at an event boundary. On clean EOF the held
-// bytes are flushed verbatim — the chat canon: EOF is not a drain
-// failure. An oversized line or frame ends the drain as an upstream
-// error; every other read error is reported so the caller can classify
-// the break.
-func relayResponsesSSE(w http.ResponseWriter, body io.Reader) (provider.Usage, error) {
+// verbatim. It returns three facts the caller needs to settle the request:
+// the provider usage parsed off the events read from upstream (already
+// consumed there, so authoritative even when the client disconnected
+// mid-drain), the name of the terminal event (response.completed/
+// incomplete/failed) the client actually received — "" when none was
+// delivered — and the error that ended the drain: the first failed client
+// write, or the upstream read error. After a failed write no further bytes
+// are written, but the drain continues so the usage stays truthful. Frames
+// are dispatched whole: a consumer decodes an event only once its blank
+// separator has arrived, so lines of an unterminated frame are held back
+// with bounded memory. On an upstream break — or a clean EOF, which is not
+// a drain failure — the held frame is dispatched only when the end aligned
+// to a line boundary AND it is a decodable event missing just its
+// separator; the salvaged frame is closed with a CRLF blank separator,
+// valid after an LF, CRLF or lone-CR last line alike, so every terminator
+// dialect dispatches instead of lingering as a pending event the client
+// discards at stream end. It flows through the same usage parser, keeping
+// the client stream and the settlement on the same events. Any other
+// unterminated frame is dropped so the caller's failure frame composes at
+// an event boundary. The delivered-terminal return lets the caller honor
+// the one-terminal contract: a late failure after a delivered terminal
+// must not emit a second terminal event. An oversized line or frame ends
+// the drain as an upstream error.
+func relayResponsesSSE(w http.ResponseWriter, body io.Reader) (usage provider.Usage, terminal string, err error) {
 	reader := bufio.NewReader(body)
 	var parser apiformat.SSEParser
-	var usage provider.Usage
 	var flusher http.Flusher
 	if f, ok := w.(http.Flusher); ok {
 		flusher = f
 	}
-	note := func(ev apiformat.SSEEvent) {
-		switch responsesEventName(ev) {
-		// input-token part of usage, so a client cancel mid-stream still
-		// bills the consumed prefix; any later terminal event
-		// (completed/incomplete/failed) overwrites it with the full usage.
+	var werr error // first client-write failure; writes stop and no further provider bytes are pulled (usage is read-based)
+	note := func(ev apiformat.SSEEvent, delivered bool) {
+		switch name := responsesEventName(ev); name {
+		// The input-token part arrives on response.created, so a cut
+		// mid-stream still bills the consumed prefix; any later terminal
+		// event overwrites it with the full usage. Terminal tracking is
+		// delivered-only: an event the client never received is not one of
+		// the client stream's terminals.
 		case "response.created", "response.completed", "response.incomplete", "response.failed":
 			if next := parseResponsesUsage([]byte(ev.Data)); next.Source != "" {
 				usage = next
+			}
+			if delivered && name != "response.created" {
+				terminal = name
 			}
 		}
 	}
@@ -299,58 +333,79 @@ func relayResponsesSSE(w http.ResponseWriter, body io.Reader) (provider.Usage, e
 		if len(blob) == 0 {
 			return
 		}
-		_, _ = w.Write(blob)
-		if flusher != nil {
-			flusher.Flush()
+		delivered := werr == nil
+		if delivered {
+			if _, e := w.Write(blob); e != nil {
+				werr, delivered = e, false
+			} else if flusher != nil {
+				flusher.Flush()
+			}
 		}
 		for _, ev := range parser.Feed(blob) {
-			note(ev)
+			note(ev, delivered)
 		}
 	}
+	lr := apiformat.NewSSELineReader(reader, apiformat.SSEStreamLineLimit)
 	for {
-		line, err := apiformat.ReadSSELine(reader, apiformat.SSEStreamLineLimit)
-		if err == apiformat.ErrSSELineLimit {
-			// Oversized upstream line: drop it and the held frame, end the
-			// drain as an upstream error; the caller's response.failed
-			// frame closes the client stream.
-			return usage, apiformat.ErrSSELineLimit
+		if werr != nil && !lr.Buffered() {
+			// The client write failed: stop pulling provider bytes — a
+			// streaming upstream on the live connection would keep doing
+			// paid work for a client that is gone. Frames already read
+			// still settle usage (the loop above parsed them for exactly
+			// this); the parser flush below applies the same delivered
+			// rule. No buffered bytes means nothing already-paid remains.
+			break
 		}
-		if err != nil && !errors.Is(err, io.EOF) {
+		line, rerr := lr.ReadLine()
+		if rerr == apiformat.ErrSSELineLimit {
+			// Oversized upstream line: drop it and the held frame; the
+			// caller's response.failed frame closes the client stream.
+			return usage, terminal, apiformat.ErrSSELineLimit
+		}
+		if rerr != nil && !errors.Is(rerr, io.EOF) {
 			// Broken upstream (cut mid-line): the unterminated partial is
-			// withheld, and the held frame goes out only when it is a
-			// decodable event missing just its separator — the failure
-			// frame the caller writes composes at an event boundary
-			// instead of gluing into a truncated event.
-			if frames.Salvageable() {
-				writeFrame(frames.Take())
+			// withheld; salvage a boundary-aligned decodable frame closed
+			// with its separator so the failure frame composes at an
+			// event boundary.
+			if len(line) == 0 && frames.Salvageable() {
+				writeFrame(append(frames.Take(), '\r', '\n'))
 			}
-			return usage, err
+			if werr != nil {
+				return usage, terminal, werr
+			}
+			return usage, terminal, rerr
 		}
-		if err != nil {
-			// io.EOF — clean end. The held frame goes out only when it is
-			// a decodable event missing just its separator; an
-			// unterminated trailing partial can never become an event and
-			// is withheld.
-			if frames.Salvageable() {
-				writeFrame(frames.Take())
+		if rerr != nil {
+			// io.EOF — clean end, same boundary-aligned salvage.
+			if len(line) == 0 && frames.Salvageable() {
+				writeFrame(append(frames.Take(), '\r', '\n'))
 			}
 			break
 		}
+		if apiformat.SSECommentLine(line) {
+			// Keepalive comments ride no event: forward immediately
+			// instead of frame-batching them.
+			writeFrame(line)
+			continue
+		}
 		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
 		if overflow {
-			return usage, apiformat.ErrSSELineLimit
+			return usage, terminal, apiformat.ErrSSELineLimit
 		}
 		if blank {
 			// Blank separator: the frame is complete — dispatch it whole,
 			// verbatim, separator included.
 			writeFrame(append(frames.Take(), line...))
-			continue
 		}
 	}
+	// The parser may still hold the last frame's event: a blob ending in
+	// a lone CR leaves the separator pending until the next bytes or this
+	// flush. Its bytes were written unless the client write already
+	// failed, so it settles with the same delivered rule.
 	for _, ev := range parser.Flush() {
-		note(ev)
+		note(ev, werr == nil)
 	}
-	return usage, nil
+	return usage, terminal, werr
 }
 
 func responsesEventName(ev apiformat.SSEEvent) string {

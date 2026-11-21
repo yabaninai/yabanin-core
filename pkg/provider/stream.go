@@ -265,13 +265,49 @@ func openAIEventData(frame []byte) []byte {
 	return data
 }
 
+// FrameEndsWithDoneLine reports whether an assembled SSE frame's final
+// line is the [DONE] terminator: a malformed upstream that omits the blank
+// separator before [DONE] glues it into the previous event as its last
+// data field. A JSON chunk line never ends a frame with a bare terminator
+// line, so content merely mentioning "[DONE]" cannot trip the check (same
+// argument as isDoneDataLine).
+func FrameEndsWithDoneLine(frame []byte) bool {
+	f := bytes.TrimSuffix(frame, []byte("\n"))
+	if len(f) == 0 {
+		return false
+	}
+	return isDoneDataLine(f[bytes.LastIndexByte(f, '\n')+1:])
+}
+
+// compactSingleDataLine reports whether the frame is exactly one
+// no-space "data:" line. The RM-03 suppression and usage parsers
+// deliberately do not recognize the usage chunk in this compact form:
+// it relays verbatim and usage falls back to estimated (documented
+// accuracy boundary, N03P1T07-CS-05). Error frames carrying usage and
+// every other shape still parse normally.
+func compactSingleDataLine(frame []byte) bool {
+	f := bytes.TrimSuffix(frame, []byte("\n"))
+	return bytes.HasPrefix(f, []byte("data:")) && !bytes.HasPrefix(f, []byte("data: ")) && !bytes.ContainsRune(f, '\n')
+}
+
 func (r *openAIStreamRun) emit(w io.Writer, flusher http.Flusher, suppressUsage, trailing bool) error {
 	data := openAIEventData(r.frame)
 	done := isDoneDataLine(data)
+	if !done && FrameEndsWithDoneLine(r.frame) {
+		// FIX-11 (upstream side): the terminator arrived glued to an
+		// unfinished event. The event's final data field IS the
+		// terminator: the bytes pass through verbatim (the passthrough
+		// contract), but the terminal is recognized so the drain
+		// succeeds — an unrecognized one fails with ErrStreamIncomplete
+		// and the finisher appends a duplicate terminator the client
+		// already effectively received.
+		done = true
+	}
 	if trailing && !done && !json.Valid(bytes.TrimPrefix(data, []byte("data: "))) {
 		return nil
 	}
-	if suppressUsage && isUsageOnlyChunk(data) {
+	compact := compactSingleDataLine(r.frame)
+	if suppressUsage && !compact && isUsageOnlyChunk(data) {
 		r.usage = parseOpenAIChunkUsage(data, r.usage)
 		r.frame = r.frame[:0]
 		return nil
@@ -281,7 +317,9 @@ func (r *openAIStreamRun) emit(w io.Writer, flusher http.Flusher, suppressUsage,
 	}
 	r.sawDone = r.sawDone || done
 	r.completionBytes += streamDeltaBytes(data)
-	r.usage = parseOpenAIChunkUsage(data, r.usage)
+	if !compact || !isUsageOnlyChunk(data) {
+		r.usage = parseOpenAIChunkUsage(data, r.usage)
+	}
 	return nil
 }
 

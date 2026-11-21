@@ -183,27 +183,44 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 		defer idle.Stop()
 		body = idle
 	}
-	usage := relayAnthropicSSE(w, body)
+	usage, _ := relayAnthropicSSE(w, body)
 	// N03-P06-T02: SSE headers are already committed; the provider
 	// prompt-cache outcome rides the HTTP trailer (usage is final here).
+	// The settlement keeps the D1 canon on every end: an explicit upstream
+	// error event is the provider closing the stream in-protocol (billed
+	// as produced output), while cuts and cancels complete per D1 — the
+	// delivered-usage asymmetry is pinned by
+	// TestMessagesNative_EventAsymmetry_CutStream.
 	setPromptCacheTrailer(w, usage)
 	gw.finishNativeMessages(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "")
 }
 
 // relayAnthropicSSE forwards the upstream Anthropic SSE stream to the client
-// byte-identically while accounting usage. Only complete upstream lines are
-// forwarded: a line cut before its terminator is withheld — a delimiter
-// cannot make truncated JSON decodable for event-by-event SDK consumers —
-// so the client never receives a partial event. It also tracks stream lifecycle:
-// when the upstream ends without a terminal event — transport cut,
-// ErrAbortHandler, or the idle watchdog canceling the read — the still-open
-// content blocks are closed (ascending index order) and one terminal error
-// frame in the shared adapted shape is synthesized (N07-P02-T03, the native
-// twin of the adapted writer's D2 closing in emitStreamErrorLocked).
-// message_stop is never fabricated, an explicit upstream error event is
-// never duplicated, and the finish classification is untouched (D1: native
-// stays request.completed with the partial usage).
-func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
+// byte-identically while accounting usage. It returns the provider usage
+// parsed off the events read from upstream (authoritative even when the
+// client disconnected mid-drain) and the first failed client write, if
+// any: after it no further bytes are written and no further provider
+// bytes are pulled — a streaming upstream on the live connection would
+// keep doing paid work for a client that is gone — while frames already
+// read still settle usage. Only complete upstream lines are forwarded: a
+// line cut before its terminator is withheld — a delimiter cannot make
+// truncated JSON decodable for event-by-event SDK consumers — so the
+// client never receives a partial event; a boundary-aligned decodable
+// frame missing just its separator is salvaged and closed with a CRLF
+// blank separator, valid after an LF, CRLF or lone-CR last line alike.
+// The relay also tracks stream lifecycle: when the upstream ends without
+// a terminal event — transport cut, ErrAbortHandler, or the idle
+// watchdog canceling the read — the still-open content blocks are
+// closed (ascending index order) and one terminal error frame in the
+// shared adapted shape is synthesized (N07-P02-T03, the native twin of
+// the adapted writer's D2 closing in emitStreamErrorLocked).
+// message_stop is never fabricated and an explicit upstream error event
+// is never duplicated. A blob ending in a lone CR leaves its event
+// pending in the parser until more bytes arrive or the final Flush; the
+// Flush events settle under the same delivered rule (written bytes
+// only), so terminator dialects cannot desynchronize lifecycle tracking
+// from what the client saw.
+func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) (usage provider.Usage, err error) {
 	// The relay writes through the tail tracker so a torn last event is
 	// closed before the synthesized terminal frames compose (chat F2 canon).
 	tail := &ssePassthroughTail{w: w}
@@ -217,6 +234,7 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 	if f, ok := w.(http.Flusher); ok {
 		flusher = f
 	}
+	var werr error // first client-write failure; writes stop and no further provider bytes are pulled (usage is read-based)
 	track := func(ev apiformat.SSEEvent) {
 		switch ev.Event {
 		case "content_block_start":
@@ -245,23 +263,40 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 	// Frames are dispatched whole: an event is only decodable once its
 	// blank separator has arrived, so lines of an unterminated frame are
 	// held back and only a decodable event missing just the separator is
-	// salvaged on a break (apiformat.SSEFrameBuffer).
+	// salvaged on a boundary-aligned end (apiformat.SSEFrameBuffer).
 	var frames apiformat.SSEFrameBuffer
 	writeFrame := func(blob []byte) {
 		if len(blob) == 0 {
 			return
 		}
-		_, _ = w.Write(blob)
-		if flusher != nil {
-			flusher.Flush()
+		delivered := werr == nil
+		if delivered {
+			if _, e := w.Write(blob); e != nil {
+				werr, delivered = e, false
+			} else if flusher != nil {
+				flusher.Flush()
+			}
 		}
+		// Usage is fed from what was read; lifecycle tracking only from
+		// what the client actually received.
 		for _, ev := range parser.Feed(blob) {
 			acc.note(ev)
-			track(ev)
+			if delivered {
+				track(ev)
+			}
 		}
 	}
+	lr := apiformat.NewSSELineReader(reader, apiformat.SSEStreamLineLimit)
 	for {
-		line, err := apiformat.ReadSSELine(reader, apiformat.SSEStreamLineLimit)
+		if werr != nil && !lr.Buffered() {
+			// The client write failed: stop pulling provider bytes — a
+			// streaming upstream on the live connection would keep doing
+			// paid work for a client that is gone. Frames already read
+			// still settle usage; the parser flush below applies the
+			// same delivered rule to lifecycle tracking.
+			break
+		}
+		line, err := lr.ReadLine()
 		if err == apiformat.ErrSSELineLimit {
 			// Oversized upstream line: drop it and the held frame, stop
 			// relaying. The synthesis below closes the client stream (no
@@ -274,13 +309,26 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 		if err != nil {
 			// Upstream ended mid-line (transport cut, or EOF without the
 			// terminator): the unterminated partial is withheld, and the
-			// held frame is dispatched only when it is a decodable event
-			// missing just its separator — otherwise it is dropped so the
-			// synthesis below composes at an event boundary.
-			if frames.Salvageable() {
-				writeFrame(frames.Take())
+			// held frame is dispatched only when the end aligned to a
+			// line boundary (no partial followed it — observing a cut
+			// partial proves the event was still being written, so
+			// salvaging a valid-JSON prefix of it would fabricate a
+			// shorter event) AND it is a decodable event missing just
+			// the separator — closed with its CRLF blank separator so
+			// the parser emits it here, delivered or not. Otherwise it
+			// is dropped so the synthesis below composes at an event
+			// boundary.
+			if len(line) == 0 && frames.Salvageable() {
+				writeFrame(append(frames.Take(), '\r', '\n'))
 			}
 			break
+		}
+		if apiformat.SSECommentLine(line) {
+			// Keepalive comments ride no event: forward them immediately
+			// instead of frame-batching them; the buffer holds only
+			// field lines.
+			writeFrame(line)
+			continue
 		}
 		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
 		if overflow {
@@ -291,12 +339,18 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 			// Blank separator: the frame is complete — dispatch it whole,
 			// verbatim, separator included.
 			writeFrame(append(frames.Take(), line...))
-			continue
 		}
 	}
+	// The parser may still hold the last frame's event: a blob ending in
+	// a lone CR leaves its separator pending until the next bytes or this
+	// flush. Those bytes were written unless the client write already
+	// failed, so lifecycle tracking applies with the same delivered rule.
+	delivered := werr == nil
 	for _, ev := range parser.Flush() {
 		acc.note(ev)
-		track(ev)
+		if delivered {
+			track(ev)
+		}
 	}
 	// Close a torn tail (dangling line or cut mid-line) before the
 	// synthesized stop/error frames glue into it; no-op on whole-frame tails.
@@ -304,7 +358,7 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 	if !sawStop && !sawError {
 		closeOpenAnthropicBlocks(w, flusher, open)
 	}
-	return acc.usage()
+	return acc.usage(), werr
 }
 
 // closeOpenAnthropicBlocks terminates a truncated native stream: every

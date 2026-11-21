@@ -1,9 +1,9 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"strings"
@@ -295,16 +295,26 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 
 // realtimeRelay pipes the upstream SSE session to the client byte-honestly:
 // raw chunks feed the side parser (last usage-bearing event for actual
-// billing, D3) and the bounded analytics tee unchanged, while client
-// writes are frame-batched — a consumer decodes an event only once its
-// blank separator has arrived (the payload is the data lines joined with
-// LF), so lines of an unterminated frame are held back with bounded
-// memory. On an upstream break — and at clean EOF, which is not a drain
-// failure — the held frame is dispatched only when it is a decodable
-// event missing just its separator; the unterminated trailing line is
-// dropped either way, as it can never become an event. Returns the parsed
-// usage, the tee, the drain error (nil on clean EOF) and its Finalize
-// termination class (§5.3).
+// billing, D3 — usage is read-based and stays truthful even after the
+// client disconnects) and the bounded analytics tee unchanged, while
+// client writes are frame-batched — a consumer decodes an event only
+// once its blank separator has arrived, so lines of an unterminated
+// frame are held back with bounded memory. On an upstream break — and
+// at clean EOF, which is not a drain failure — the held frame is
+// dispatched only when the end aligned to a line boundary (no
+// unterminated partial followed it) and it is a decodable event missing
+// just its separator; the salvaged frame is closed with a CRLF blank
+// separator — valid after an LF, CRLF or lone-CR last line alike — and
+// followed by the usage parser's Flush, so the client stream and the
+// settlement see the same terminal event. When the frame is dropped the
+// parser is not flushed: a torn event is never billed. The
+// unterminated trailing line is dropped either way, as it can never
+// become an event. After a failed client write no further bytes are
+// written and no further provider bytes are pulled — a streaming upstream
+// on the live connection would keep doing paid work for a client that is
+// gone; the usage already covers every byte read. Returns the parsed
+// usage, the tee, the drain error (nil on clean EOF; a write failure
+// settles as a client cancel) and its Finalize termination class (§5.3).
 func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, flusher http.Flusher, body io.Reader, cancelStream context.CancelFunc) (usage provider.Usage, tee *boundedBuffer, term budget.Termination, drainErr error) {
 	var capture boundedBuffer
 	tee = &capture
@@ -318,17 +328,78 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 	}
 	term = budget.TerminationUpstreamErr
 	var relayed int64
-	var lines sseLineAssembler
+	var lines apiformat.SSELineSplitter
 	var frames apiformat.SSEFrameBuffer
+	var werr error // first client-write failure; writes stop and no further provider bytes are pulled
 	buf := make([]byte, 32*1024)
-	writeBlob := func(blob []byte) error {
-		if len(blob) == 0 {
-			return nil
+	writeBlob := func(blob []byte) {
+		if len(blob) == 0 || werr != nil {
+			return
 		}
-		if _, werr := w.Write(blob); werr != nil {
-			return werr
+		if _, e := w.Write(blob); e != nil {
+			werr = e
+			return
 		}
 		flusher.Flush()
+	}
+	// processLine routes one complete upstream line: keepalive comments
+	// ride no event and pass through immediately (downstream idle
+	// timeouts stay reset; the frame buffer never grows on them), field
+	// lines batch into the frame buffer, and a blank separator flushes
+	// the whole frame to the client.
+	processLine := func(line []byte) error {
+		if apiformat.SSECommentLine(line) {
+			writeBlob(line)
+			return nil
+		}
+		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
+		if overflow {
+			// An unterminated frame grew past the buffering limit: the
+			// relay aborts as an upstream error (bounded memory).
+			return errRealtimeLineTooLarge{}
+		}
+		if blank {
+			writeBlob(append(frames.Take(), line...))
+		}
+		return nil
+	}
+	// lineAbort ends the drain for a line-processing error: an oversized
+	// line/frame is an upstream abort; any other error is a failed client
+	// write — the client walked away mid-session, and the consumed
+	// prefix is billed by the caller (G3 cancel-settle parity).
+	lineAbort := func(lerr error) (provider.Usage, *boundedBuffer, budget.Termination, error) {
+		var tooLarge errRealtimeLineTooLarge
+		if errors.As(lerr, &tooLarge) {
+			return usage, tee, budget.TerminationUpstreamErr, lerr
+		}
+		return usage, tee, budget.TerminationClientCancel, lerr
+	}
+	// settleTail ends the framing at a stream break or clean EOF: the
+	// splitter's trailing lone CR resolves into a complete line (the CR
+	// was received — it terminates its line under the grammar whether or
+	// not a further LF ever arrives); the held frame is salvaged only
+	// when no unterminated partial followed it and it is a decodable
+	// event missing just its separator. The salvaged frame is closed
+	// with a CRLF blank separator — valid after an LF, CRLF or lone-CR
+	// last line alike — and followed by the usage parser's Flush, so the
+	// settlement bills what the upstream actually sent; a dropped frame
+	// leaves the parser unflushed — a torn event is never billed.
+	settleTail := func() error {
+		flushLines, partial := lines.Flush()
+		for _, line := range flushLines {
+			if lerr := processLine(line); lerr != nil {
+				return lerr
+			}
+		}
+		if len(partial) > 0 || !frames.Salvageable() {
+			return nil
+		}
+		writeBlob(append(frames.Take(), '\r', '\n'))
+		for _, ev := range parser.Flush() {
+			if u, ok := realtimeUsageFromEvent([]byte(ev.Data)); ok {
+				usage = u
+			}
+		}
 		return nil
 	}
 	for {
@@ -350,64 +421,48 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			// Frame-batch the client writes: only whole frames (through
 			// their blank separator) leave the relay while the upstream is
 			// still running.
-			if out := lines.emit(chunk); len(out) > 0 {
-				for len(out) > 0 {
-					i := bytes.IndexByte(out, '\n')
-					var line []byte
-					if i < 0 {
-						line, out = out, nil
-					} else {
-						line, out = out[:i+1], out[i+1:]
-					}
-					blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
-					if overflow {
-						// An unterminated frame grew past the buffering
-						// limit: the relay aborts as an upstream error
-						// (bounded memory).
-						return usage, tee, budget.TerminationUpstreamErr, errRealtimeLineTooLarge{}
-					}
-					if blank {
-						if werr := writeBlob(append(frames.Take(), line...)); werr != nil {
-							// Client walked away mid-session — the consumed
-							// prefix is billed by the caller (G3
-							// cancel-settle parity).
-							return usage, tee, budget.TerminationClientCancel, werr
-						}
-					}
+			for _, line := range lines.Feed(chunk) {
+				if lerr := processLine(line); lerr != nil {
+					return lineAbort(lerr)
 				}
 			}
-			if len(lines.pending) > apiformat.SSEStreamLineLimit {
+			if lines.Pending() > apiformat.SSEStreamLineLimit {
 				// An unterminated line grew past the buffering limit: the
 				// relay aborts as an upstream error (bounded memory).
 				return usage, tee, budget.TerminationUpstreamErr, errRealtimeLineTooLarge{}
 			}
 		}
+		if werr != nil {
+			// The client write failed: stop pulling provider bytes — a
+			// streaming upstream on the live connection would keep doing
+			// paid work for a client that is gone. The usage parser was
+			// fed above from every byte this chunk carried, so the usage
+			// already covers what was paid for.
+			return usage, tee, budget.TerminationClientCancel, werr
+		}
 		if rerr == io.EOF {
-			// Clean end: EOF is not a drain failure. The held frame goes
-			// out only when it is a decodable event missing just its
-			// separator; an unterminated trailing line can never become
-			// an event and is dropped.
-			if frames.Salvageable() {
-				if werr := writeBlob(frames.Take()); werr != nil {
-					return usage, tee, budget.TerminationClientCancel, werr
-				}
+			// Clean end: EOF is not a drain failure; the tail settles with
+			// the same boundary-aligned salvage rule. A recorded client
+			// write failure still settles as a cancel — the client never
+			// saw the stream through.
+			if lerr := settleTail(); lerr != nil {
+				return lineAbort(lerr)
 			}
-			for _, ev := range parser.Flush() {
-				if u, ok := realtimeUsageFromEvent([]byte(ev.Data)); ok {
-					usage = u
-				}
+			if werr != nil {
+				return usage, tee, budget.TerminationClientCancel, werr
 			}
 			return usage, tee, budget.TerminationCompleted, nil
 		}
 		if rerr != nil {
-			// Broken upstream: the held unterminated line is dropped; the
-			// held frame is dispatched only when it is a decodable event
-			// missing just its separator — the tail tracker closes it and
-			// the terminal frames compose at an event boundary.
-			if frames.Salvageable() {
-				if werr := writeBlob(frames.Take()); werr != nil {
-					return usage, tee, budget.TerminationClientCancel, werr
-				}
+			// Broken upstream: same boundary-aligned salvage as EOF — the
+			// closed frame keeps the client stream and the settlement on
+			// the same event — then the termination class and the read
+			// error return.
+			if lerr := settleTail(); lerr != nil {
+				return lineAbort(lerr)
+			}
+			if werr != nil {
+				return usage, tee, budget.TerminationClientCancel, werr
 			}
 			switch {
 			case idle != nil && idle.Fired():
@@ -418,27 +473,6 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			return usage, tee, term, rerr
 		}
 	}
-}
-
-// sseLineAssembler turns raw upstream chunks into complete lines: emit
-// returns the bytes of one chunk that already belong to whole lines and
-// holds the unterminated trailing partial back. Held bytes are bounded by
-// the caller (apiformat.SSEStreamLineLimit); both a broken upstream and
-// a clean EOF drop them — an unterminated line can never become an event.
-type sseLineAssembler struct {
-	pending []byte
-}
-
-// emit returns the complete-line prefix of chunk plus any previously held
-// partial and records the new trailing partial, if any.
-func (a *sseLineAssembler) emit(chunk []byte) []byte {
-	combined := append(a.pending, chunk...)
-	if i := bytes.LastIndexByte(combined, '\n'); i >= 0 {
-		a.pending = combined[i+1:]
-		return combined[:i+1]
-	}
-	a.pending = combined
-	return nil
 }
 
 // errRealtimeStreamTooLarge marks a relay aborted at realtimeStreamLimit.
