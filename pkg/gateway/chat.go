@@ -808,192 +808,15 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 	if err := gw.checkBreaker(); err != nil {
 		l.Error("circuit breaker open, rejecting request", "error", err)
 		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		gw.voidUndispatchedInvocation(ctx, l)
 		apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
 		return nil, false
 	}
 
-	// RT-03: trusted identity captured once — every provider attempt below
-	// (primary and every fallback hop) is gated under the same identity.
-	gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
-
-	// Per-model retry + fallback: retry.Do handles transient errors against a
-	// single upstream; fallbackExecutor walks the failover_models chain when
-	// retry is exhausted (or the error is non-retryable per classifier).
-	type respHolder struct {
-		body    []byte
-		info    resolver.ModelInfo
-		headers http.Header
-		sent    []byte           // what actually went upstream (post model override)
-		orgUse  orgCredentialUse // winning hop's org credential (BYOK); zero = none
-	}
-	var holder respHolder
-
-	// totalRetries accumulates intra-model retries across all fallback hops
-	// (observability parity: Bifrost-style retry accounting per request).
-	var totalRetries int
-
-	// number of chain attempts, EVERY candidate's circuit is open and the
-	// request terminates with the same 503 envelope the global-scope entry
-	// gate produces (per-endpoint parity, see below).
+	ex := new(chatExecution)
 	var openRejections atomic.Int32
-
 	perModel := func(ctx context.Context, mi resolver.ModelInfo) (int, error) {
-		// Cancellation is terminal before anything else: gating with a dead
-		// context would misreport the cancel as a policy-store outage.
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		// RT-03: every actual provider attempt re-passes the shared gate. A
-		// policy denial/unavailable is chain-terminal (router.PolicyError) —
-		// the transport fallback must not route around a policy decision.
-		mi, pol := gw.gateAttemptCandidate(ctx, gateID, cc.req.Model, mi)
-		if pol != nil {
-			return pol.Status, pol
-		}
-		url := gw.upstreamURL(mi)
-		// breaker. An open primary circuit fails this hop immediately
-		// (retryable) so the chain advances to a candidate on another
-		// endpoint, whose breaker is independent; only when every candidate's
-		// breaker is open does the request terminate with 503. In global
-		// scope this is a no-op (the entry checkBreaker gate rules).
-		if berr := gw.allowEndpoint(url); berr != nil {
-			openRejections.Add(1)
-			return http.StatusServiceUnavailable, berr
-		}
-		// W-BYOK-CORE: request path resolves the credential in priority
-		// order — org credential (BYOK) → this candidate's per-model
-		// upstream_api_key → global default (see resolveUpstreamKey). An
-		// infrastructure failure while the org plausibly holds a credential
-		// for this endpoint is fail-closed (never route the GLOBAL key to an
-		// org-registered endpoint).
-		key, use, kerr := gw.resolveUpstreamKey(ctx, cc.orgID, mi)
-		if kerr != nil {
-			return 0, kerr
-		}
-
-		// Reasoning-effort injection (v15 E1, opt-in): per-model body, after
-		// the cache lookup, so the cache key is unchanged. The retry body
-		// stays fwdBody for this attempt.
-		fwdBody := gw.maybeInjectEffort(cc.body, mi, classifier.Class(cc.classifierClass))
-		if eff := gw.effortForModel(mi.ModelName); eff != "" {
-			cc.dec.Effort = eff
-		}
-
-		start := time.Now()
-		client, perr := gw.pool.Get(url, mi.Provider)
-		if perr != nil {
-			// Pool initialisation failure (unknown provider / SSRF-allowlist
-			// violation) is a configuration error, not transient: no retries —
-			return http.StatusBadGateway, fmt.Errorf("upstream client for %s: %w", mi.Provider, perr)
-		}
-		var attemptNum int // tracks how many times the retry loop has run
-		res := retry.Do(ctx, chatRetryPolicy(gw.retryPolicy), func(ctx context.Context) retry.Result {
-			attemptNum++
-			hdrs, b, sentBody, ferr := client.ForwardJSONCapturing(ctx, fwdBody, mi.ModelName, key, mi.UpstreamTimeout)
-			if ferr != nil {
-				if capErr, ok := provider.Refusal(ferr); ok {
-					// Adapter capability refusal: the feature check failed
-					// before any byte left the gateway. Client-shaped 400 on
-					// a terminal policy carrier — no retry, no failover to
-					// another model (no silent downgrade), no breaker or
-					// credential penalty, no upstream accounting.
-					return retry.Result{
-						StatusCode: http.StatusBadRequest,
-						Err:        capabilityPolicy(capErr),
-						Safety:     retry.OutcomeNotExecuted,
-					}
-				}
-				// Real upstream/transport failure. Carry the failed attempt's
-				// headers (nil for refusals / not-sent) so Retry-After hints
-				// feed the retry scheduler; Status/Err/Safety semantics below
-				// are unchanged.
-				result := retry.Result{StatusCode: extractUpstreamStatus(ferr), Err: ferr, Headers: upstreamFailureHeaders(ferr)}
-				switch {
-				case result.StatusCode > 0 || retry.DefinitelyNotSent(ferr):
-					result.Safety = retry.OutcomeNotExecuted
-				case provider.IsUnsupportedFeature(ferr):
-					// N07-P05-T02: a deterministic pre-flight capability
-					// rejection (image part / unmapped content-part type).
-					// Proof of non-execution, but never same-candidate
-					// retryable (the answer cannot change) — keep the typed
-					// error unwrapped so the terminal handler answers an
-					// explicit 400 unsupported_feature instead of the opaque
-					// upstream_outcome_unknown 502.
-				case retry.IsRequestNotSent(ferr):
-					// Translate-layer refusal (N07-P01-T05): typed proof the
-					// request never left this process. Safety intentionally
-					// stays Unknown — MayRepeat forbids repeating Unknown
-					// attempts (a deterministic refusal must not be retried),
-					// while the router classifier still sees NotExecuted via
-					// retry.Classify and advances the fallback chain. The
-					// error stays unwrapped so the terminal render can
-					// errors.As the typed proof and surface the exact reason.
-				default:
-					result.Err = unknownOutcomeError(ferr)
-				}
-				return result
-			}
-			holder.sent = sentBody
-			return retry.Result{StatusCode: http.StatusOK, Headers: hdrs, Body: b}
-		})
-
-		// Capability refusals ride the terminal policy carrier: nothing was
-		// sent, the chain stops here, and no upstream accounting applies —
-		// skip the metrics/quarantine/breaker path below entirely.
-		var capPolicyErr *router.PolicyError
-		if res.Err != nil && errors.As(res.Err, &capPolicyErr) {
-			return res.StatusCode, res.Err
-		}
-
-		// Emit metrics for the attempt. Usage is parsed from body on success.
-		var u provider.Usage
-		if res.Err == nil && len(res.Body) > 0 {
-			u = client.Adapter().ParseUsage(res.Body)
-		}
-		ext := provider.ComputeCost(u, mi.Provider, mi.ModelName)
-		gw.emitUpstreamMetrics(mi.Provider, mi.ModelName, res.StatusCode, time.Since(start), u, ext.EstimatedCostUSD)
-
-		// Emit retry_total for retries that occurred (attemptNum > 1 means
-		// at least one retry was performed). The attempt label is the number
-		// of the retry (1 = first retry, 2 = second retry, ...).
-		if attemptNum > 1 {
-			statusLabel := strconv.Itoa(res.StatusCode)
-			if res.Err != nil && res.StatusCode == 0 {
-				statusLabel = "0"
-			}
-			for r := 1; r < attemptNum; r++ {
-				metrics.RetryTotal.WithLabelValues(strconv.Itoa(r), statusLabel).Inc()
-			}
-		}
-		totalRetries += attemptNum - 1
-
-		// — a 401/429 quarantines the CREDENTIAL that authenticated this
-		// hop (never the endpoint breaker). Bookkeeping only: it can never
-		// fail the request, and the hop's already-resolved plaintext is
-		// unaffected.
-		gw.recordOrgCredOutcome(ctx, cc.orgID, mi.Provider, use, res.StatusCode)
-
-		if res.Err == nil && res.StatusCode < 500 {
-			// (per-endpoint scope; no-op in global scope).
-			gw.recordEndpointSuccess(url)
-			holder.body = res.Body
-			holder.info = mi
-			holder.headers = res.Headers
-			holder.orgUse = use
-			return res.StatusCode, nil
-		}
-		// endpoint the chain touches (per-endpoint scope; no-op in global).
-		// A translate-layer refusal (N07-P01-T05) never contacted the
-		// endpoint — counting it as an endpoint failure would trip the
-		// breaker on a client-side request problem.
-		if !retry.IsRequestNotSent(res.Err) {
-			gw.recordEndpointFailure(url)
-		}
-		errOut := res.Err
-		if errOut == nil {
-			errOut = fmt.Errorf("upstream error %d", res.StatusCode)
-		}
-		return res.StatusCode, errOut
+		return gw.tryChatModel(ctx, cc, mi, ex, &openRejections)
 	}
 
 	start := time.Now()
@@ -1015,68 +838,7 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 	finalURL := gw.upstreamURL(finalInfo)
 
 	if lastErr != nil {
-		// N07-P05-T02 (order restored by N07-RECON): a media-capability
-		// rejection (image part on an adapter without image input, unmapped
-		// content-part type) is a CLIENT format error the adapter raised
-		// before any byte left the gateway. The typed branch is matched
-		// BEFORE the plain request-not-sent branch: the translate seam wraps
-		// the refusal in retry.RequestNotSentError, and the refusal must
-		// render 400 unsupported_feature with the adapter's exact reason —
-		// never an opaque 5xx, no breaker penalty, and no analytics event
-		// (the escrow settles locally; parity with the policy-denial path).
-		var unsupportedFeatureErr *provider.UnsupportedFeatureError
-		if errors.As(lastErr, &unsupportedFeatureErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			l.Warn("provider adapter rejected unsupported request feature",
-				"error", lastErr, "attempts", len(attempts))
-			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-				unsupportedFeatureErr.Error(), apierrors.CodeUnsupportedFeature)
-			return nil, false
-		}
-		// N07-P01-T05: a translate-layer refusal is a client-side request
-		// problem — the request never reached any endpoint, so the exact
-		// reason (which modeled field was lost, and why) renders as 400
-		// invalid_request_error, never disguised as a generic upstream
-		// failure (I51: no silent drop, and no misleading status). Typed
-		// unsupported-feature refusals are matched by the dedicated branch
-		// above.
-		var notSentErr *retry.RequestNotSentError
-		if errors.As(lastErr, &notSentErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
-			apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, notSentErr.Error())
-			return nil, false
-		}
-		// RT-03: a terminal policy outcome from a fallback hop ends the
-		// request with the gate envelope. The denied candidate was never
-		// called, so this is not an upstream failure: no provider error
-		// mapping and no circuit-breaker penalty.
-		var policyErr *router.PolicyError
-		var unknownErr *unknownOutcomeErrorType
-		if errors.As(lastErr, &unknownErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
-			status := lastCode
-			if status < 400 {
-				status = http.StatusBadGateway
-			}
-			apierrors.Write(w, status, apierrors.ErrorCodeAPI, "upstream outcome unknown; request was not retried")
-			return nil, false
-		}
-		if errors.As(lastErr, &policyErr) {
-			// NEXT-18c: no analytics event is published on this path — settle
-			// the local escrow (zero spend, in-flight bound released).
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			writeGateDenial(w, gateResultFromPolicy(policyErr))
-			return nil, false
-		}
-
-		// parity of the global-scope entry rejection: same 503 envelope, no
-		// analytics event, the escrow settles locally. No endpoint was
-		// dialed, so this is not an upstream failure to record.
-		if lastCode == http.StatusServiceUnavailable && int(openRejections.Load()) == len(attempts) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			l.Error("circuit breaker open, rejecting request (all candidate endpoints open)",
-				"attempts", len(attempts))
-			apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
+		if gw.rejectChatAttempt(ctx, cc, lastErr, lastCode, len(attempts), int(openRejections.Load())) {
 			return nil, false
 		}
 
@@ -1105,7 +867,7 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 			ClassifierConfidence: cc.classifierConfidence,
 			ClassifierSource:     cc.classifierSource,
 			AttemptCount:         len(attempts),
-			RetryCount:           totalRetries,
+			RetryCount:           ex.totalRetries,
 			Labels:               labelsFrom(ctx),
 		}
 		// NEXT-18c: the reserve tuples ride the failure event (§5.3
@@ -1133,19 +895,244 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 		return nil, false
 	}
 
-	return &chatExecution{
-		body:         holder.body,
-		sent:         holder.sent,
-		headers:      holder.headers,
-		finalInfo:    finalInfo,
-		finalURL:     finalURL,
-		durationMs:   durationMs,
-		attempts:     len(attempts),
-		totalRetries: totalRetries,
-		lastCode:     lastCode,
-		usedOrgKey:   holder.orgUse.used,
-		orgCredRef:   holder.orgUse.ref(),
-	}, true
+	ex.finalInfo, ex.finalURL = finalInfo, finalURL
+	ex.durationMs, ex.attempts, ex.lastCode = durationMs, len(attempts), lastCode
+	return ex, true
+}
+
+func (gw *gateway) tryChatModel(ctx context.Context, cc *chatContext, mi resolver.ModelInfo, ex *chatExecution, openRejections *atomic.Int32) (int, error) {
+	// Cancellation is terminal before anything else: gating with a dead
+	// context would misreport the cancel as a policy-store outage.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// RT-03: every actual provider attempt re-passes the shared gate. A
+	// policy denial/unavailable is chain-terminal (router.PolicyError) —
+	// the transport fallback must not route around a policy decision.
+	mi, pol := gw.gateAttemptCandidate(ctx, candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}, cc.req.Model, mi)
+	if pol != nil {
+		return pol.Status, pol
+	}
+	url := gw.upstreamURL(mi)
+	// breaker. An open primary circuit fails this hop immediately
+	// (retryable) so the chain advances to a candidate on another
+	// endpoint, whose breaker is independent; only when every candidate's
+	// breaker is open does the request terminate with 503. In global
+	// scope this is a no-op (the entry checkBreaker gate rules).
+	if berr := gw.allowEndpoint(url); berr != nil {
+		openRejections.Add(1)
+		return http.StatusServiceUnavailable, berr
+	}
+	// W-BYOK-CORE: request path resolves the credential in priority
+	// order — org credential (BYOK) → this candidate's per-model
+	// upstream_api_key → global default (see resolveUpstreamKey). An
+	// infrastructure failure while the org plausibly holds a credential
+	// for this endpoint is fail-closed (never route the GLOBAL key to an
+	// org-registered endpoint).
+	key, use, kerr := gw.resolveUpstreamKey(ctx, cc.orgID, mi)
+	if kerr != nil {
+		return 0, kerr
+	}
+
+	// Reasoning-effort injection (v15 E1, opt-in): per-model body, after
+	// the cache lookup, so the cache key is unchanged. The retry body
+	// stays fwdBody for this attempt.
+	fwdBody := gw.maybeInjectEffort(cc.body, mi, classifier.Class(cc.classifierClass))
+	if eff := gw.effortForModel(mi.ModelName); eff != "" {
+		cc.dec.Effort = eff
+	}
+
+	start := time.Now()
+	client, perr := gw.pool.Get(url, mi.Provider)
+	if perr != nil {
+		// Pool initialisation failure (unknown provider / SSRF-allowlist
+		// violation) is a configuration error, not transient: no retries —
+		return http.StatusBadGateway, fmt.Errorf("upstream client for %s: %w", mi.Provider, perr)
+	}
+	var attemptNum int // tracks how many times the retry loop has run
+	res := retry.Do(ctx, chatRetryPolicy(gw.retryPolicy), func(ctx context.Context) retry.Result {
+		attemptNum++
+		return forwardChatAttempt(ctx, client, fwdBody, mi, key, ex)
+	})
+
+	// Capability refusals ride the terminal policy carrier: nothing was
+	// sent, the chain stops here, and no upstream accounting applies —
+	// skip the metrics/quarantine/breaker path below entirely.
+	var capPolicyErr *router.PolicyError
+	if res.Err != nil && errors.As(res.Err, &capPolicyErr) {
+		return res.StatusCode, res.Err
+	}
+
+	gw.recordChatAttemptMetrics(client, mi, res, attemptNum, start)
+	ex.totalRetries += attemptNum - 1
+
+	gw.recordOrgCredOutcome(ctx, cc.orgID, mi.Provider, use, res.StatusCode)
+
+	return gw.finishChatHop(url, res, use, ex)
+}
+
+func forwardChatAttempt(ctx context.Context, client *upstream.Client, fwdBody []byte, mi resolver.ModelInfo, key string, ex *chatExecution) retry.Result {
+	hdrs, b, sentBody, ferr := client.ForwardJSONCapturing(ctx, fwdBody, mi.ModelName, key, mi.UpstreamTimeout)
+	if ferr != nil {
+		return chatRetryError(ferr)
+	}
+	ex.sent = sentBody
+	return retry.Result{StatusCode: http.StatusOK, Headers: hdrs, Body: b}
+}
+
+func chatRetryError(ferr error) retry.Result {
+	if capErr, ok := provider.Refusal(ferr); ok {
+		// Adapter capability refusal: the feature check failed
+		// before any byte left the gateway. Client-shaped 400 on
+		// a terminal policy carrier — no retry, no failover to
+		// another model (no silent downgrade), no breaker or
+		// credential penalty, no upstream accounting.
+		return retry.Result{
+			StatusCode: http.StatusBadRequest,
+			Err:        capabilityPolicy(capErr),
+			Safety:     retry.OutcomeNotExecuted,
+		}
+	}
+	// Real upstream/transport failure. Carry the failed attempt's
+	// headers (nil for refusals / not-sent) so Retry-After hints
+	// feed the retry scheduler; Status/Err/Safety semantics below
+	// are unchanged.
+	result := retry.Result{StatusCode: extractUpstreamStatus(ferr), Err: ferr, Headers: upstreamFailureHeaders(ferr)}
+	switch {
+	case result.StatusCode > 0 || retry.DefinitelyNotSent(ferr):
+		result.Safety = retry.OutcomeNotExecuted
+	case provider.IsUnsupportedFeature(ferr):
+		// N07-P05-T02: a deterministic pre-flight capability
+		// rejection (image part / unmapped content-part type).
+		// Proof of non-execution, but never same-candidate
+		// retryable (the answer cannot change) — keep the typed
+		// error unwrapped so the terminal handler answers an
+		// explicit 400 unsupported_feature instead of the opaque
+		// upstream_outcome_unknown 502.
+	case retry.IsRequestNotSent(ferr):
+		// Translate-layer refusal (N07-P01-T05): typed proof the
+		// request never left this process. Safety intentionally
+		// stays Unknown — MayRepeat forbids repeating Unknown
+		// attempts (a deterministic refusal must not be retried),
+		// while the router classifier still sees NotExecuted via
+		// retry.Classify and advances the fallback chain. The
+		// error stays unwrapped so the terminal render can
+		// errors.As the typed proof and surface the exact reason.
+	default:
+		result.Err = unknownOutcomeError(ferr)
+	}
+	return result
+}
+
+func (gw *gateway) recordChatAttemptMetrics(client *upstream.Client, mi resolver.ModelInfo, res retry.Result, attemptNum int, start time.Time) {
+	// Emit metrics for the attempt. Usage is parsed from body on success.
+	var u provider.Usage
+	if res.Err == nil && len(res.Body) > 0 {
+		u = client.Adapter().ParseUsage(res.Body)
+	}
+	ext := provider.ComputeCost(u, mi.Provider, mi.ModelName)
+	gw.emitUpstreamMetrics(mi.Provider, mi.ModelName, res.StatusCode, time.Since(start), u, ext.EstimatedCostUSD)
+
+	// Emit retry_total for retries that occurred (attemptNum > 1 means
+	// at least one retry was performed). The attempt label is the number
+	// of the retry (1 = first retry, 2 = second retry, ...).
+	for n := 1; n < attemptNum; n++ {
+		metrics.RetryTotal.WithLabelValues(strconv.Itoa(n), strconv.Itoa(res.StatusCode)).Inc()
+	}
+}
+
+func (gw *gateway) finishChatHop(url string, res retry.Result, use orgCredentialUse, ex *chatExecution) (int, error) {
+	if res.Err == nil && res.StatusCode < 500 {
+		// (per-endpoint scope; no-op in global scope).
+		gw.recordEndpointSuccess(url)
+		ex.body = res.Body
+		ex.headers = res.Headers
+		ex.usedOrgKey, ex.orgCredRef = use.used, use.ref()
+		return res.StatusCode, nil
+	}
+	// endpoint the chain touches (per-endpoint scope; no-op in global).
+	// A translate-layer refusal (N07-P01-T05) never contacted the
+	// endpoint — counting it as an endpoint failure would trip the
+	// breaker on a client-side request problem.
+	if !retry.IsRequestNotSent(res.Err) {
+		gw.recordEndpointFailure(url)
+	}
+	errOut := res.Err
+	if errOut == nil {
+		errOut = fmt.Errorf("upstream error %d", res.StatusCode)
+	}
+	return res.StatusCode, errOut
+}
+
+func (gw *gateway) rejectChatAttempt(ctx context.Context, cc *chatContext, lastErr error, lastCode, attemptCount, openRejections int) bool {
+	w, l := cc.w, cc.l
+	// N07-P05-T02 (order restored by N07-RECON): a media-capability
+	// rejection (image part on an adapter without image input, unmapped
+	// content-part type) is a CLIENT format error the adapter raised
+	// before any byte left the gateway. The typed branch is matched
+	// BEFORE the plain request-not-sent branch: the translate seam wraps
+	// the refusal in retry.RequestNotSentError, and the refusal must
+	// render 400 unsupported_feature with the adapter's exact reason —
+	// never an opaque 5xx, no breaker penalty, and no analytics event
+	// (the escrow settles locally; parity with the policy-denial path).
+	var unsupportedFeatureErr *provider.UnsupportedFeatureError
+	if errors.As(lastErr, &unsupportedFeatureErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("provider adapter rejected unsupported request feature",
+			"error", lastErr, "attempts", attemptCount)
+		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			unsupportedFeatureErr.Error(), apierrors.CodeUnsupportedFeature)
+		return true
+	}
+	// N07-P01-T05: a translate-layer refusal is a client-side request
+	// problem — the request never reached any endpoint, so the exact
+	// reason (which modeled field was lost, and why) renders as 400
+	// invalid_request_error, never disguised as a generic upstream
+	// failure (I51: no silent drop, and no misleading status). Typed
+	// unsupported-feature refusals are matched by the dedicated branch
+	// above.
+	var notSentErr *retry.RequestNotSentError
+	if errors.As(lastErr, &notSentErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, notSentErr.Error())
+		return true
+	}
+	// RT-03: a terminal policy outcome from a fallback hop ends the
+	// request with the gate envelope. The denied candidate was never
+	// called, so this is not an upstream failure: no provider error
+	// mapping and no circuit-breaker penalty.
+	var policyErr *router.PolicyError
+	var unknownErr *unknownOutcomeErrorType
+	if errors.As(lastErr, &unknownErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
+		status := lastCode
+		if status < 400 {
+			status = http.StatusBadGateway
+		}
+		apierrors.Write(w, status, apierrors.ErrorCodeAPI, "upstream outcome unknown; request was not retried")
+		return true
+	}
+	if errors.As(lastErr, &policyErr) {
+		// NEXT-18c: no analytics event is published on this path — settle
+		// the local escrow (zero spend, in-flight bound released).
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		writeGateDenial(w, gateResultFromPolicy(policyErr))
+		return true
+	}
+
+	// parity of the global-scope entry rejection: same 503 envelope, no
+	// analytics event, the escrow settles locally. No endpoint was
+	// dialed, so this is not an upstream failure to record.
+	if allCircuitsOpen(lastCode, openRejections, attemptCount) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		gw.voidUndispatchedInvocation(ctx, l)
+		l.Error("circuit breaker open, rejecting request (all candidate endpoints open)",
+			"attempts", attemptCount)
+		apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
+		return true
+	}
+
+	return false
 }
 
 // serveChatCache (stage 4b) tries the RT-05 cache branch after the full

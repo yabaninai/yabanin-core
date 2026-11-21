@@ -2,6 +2,7 @@ package cli
 
 import (
 	"fmt"
+	"net/http"
 	"strings"
 
 	"github.com/reireirei/yabanin/pkg/circuit"
@@ -47,4 +48,10 @@ func ResolveCircuitScope(v string) (circuit.Scope, string) {
 	default:
 		return circuit.ScopePerEndpoint, fmt.Sprintf("YABANIN_CIRCUIT_SCOPE %q is not per-endpoint|global — using per-endpoint", v)
 	}
+}
+
+// A breaker refusal on the last hop proves no dispatch only if every
+// attempted hop was refused by its breaker.
+func allCircuitsOpen(status, open, attempts int) bool {
+	return status == http.StatusServiceUnavailable && open == attempts
 }
