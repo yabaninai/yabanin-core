@@ -155,8 +155,13 @@ type terminalReservation struct {
 	BoundMicroUSD *int64  `json:"bound_micro_usd"`
 }
 
+func (tuple terminalReservation) hasRequiredFields() bool {
+	return tuple.ScopeKey != "" && tuple.Period != nil && tuple.AllowanceID > 0 &&
+		tuple.BoundMicroUSD != nil && *tuple.BoundMicroUSD >= 0
+}
+
 func (tuple terminalReservation) matches(event *Event) bool {
-	if tuple.ScopeKey == "" || tuple.Period == nil || tuple.AllowanceID <= 0 || tuple.BoundMicroUSD == nil || *tuple.BoundMicroUSD < 0 {
+	if !tuple.hasRequiredFields() {
 		return false
 	}
 	switch tuple.ScopeKind {
