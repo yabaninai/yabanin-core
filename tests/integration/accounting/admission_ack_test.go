@@ -4,94 +4,149 @@ package accounting
 
 import (
 	"context"
+	"database/sql"
+	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/url"
 	"strings"
 	"sync"
-	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/require"
 )
 
-// The barrier holds only PostgreSQL replies. Requests keep reaching the
-// server, and the independent oracle uses its own direct connection.
-type ackBarrier struct {
-	sync.RWMutex
-	generation atomic.Uint64
-	dropped    atomic.Uint64
+type ackCut struct {
+	held      chan struct{}
+	forward   chan bool
+	discarded chan time.Time
 }
 
-func (b *ackBarrier) reply(dst io.Writer, p []byte, generation uint64) (int, error) {
-	b.RLock()
-	defer b.RUnlock()
-	if b.generation.Load() != generation {
-		b.dropped.Add(1)
-		return 0, net.ErrClosed
+// The disposable PostgreSQL stand uses plaintext loopback. BackendKeyData
+// identifies a connection and ReadyForQuery('I') ends its transaction.
+type ackRelay struct {
+	sync.Mutex
+	cuts map[uint32]*ackCut
+}
+
+func (r *ackRelay) arm(pid uint32) *ackCut {
+	r.Lock()
+	defer r.Unlock()
+	cut := &ackCut{make(chan struct{}), make(chan bool, 1), make(chan time.Time, 1)}
+	r.cuts[pid] = cut
+	return cut
+}
+func (r *ackRelay) take(pid uint32) *ackCut {
+	r.Lock()
+	defer r.Unlock()
+	cut := r.cuts[pid]
+	delete(r.cuts, pid)
+	return cut
+}
+func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.Reader) error {
+	var pid uint32
+	var header [5]byte
+	for {
+		if _, err := io.ReadFull(backend, header[:]); err != nil {
+			return err
+		}
+		size := int(binary.BigEndian.Uint32(header[1:])) - 4
+		if size < 0 || size > 64<<20 {
+			return errors.New("invalid stand PostgreSQL reply length")
+		}
+		frame := make([]byte, 5+size)
+		copy(frame, header[:])
+		if _, err := io.ReadFull(backend, frame[5:]); err != nil {
+			return err
+		}
+		if header[0] == 'K' && size == 8 {
+			pid = binary.BigEndian.Uint32(frame[5:9])
+		}
+		if header[0] == 'Z' && size == 1 && frame[5] == 'I' {
+			if cut := r.take(pid); cut != nil {
+				if err := cut.deliver(ctx, client); err != nil {
+					return err
+				}
+			}
+		}
+		if err := client.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
+			return err
+		}
+		if _, err := client.Write(frame); err != nil {
+			return err
+		}
 	}
-	return dst.Write(p)
+}
+func (c *ackCut) deliver(ctx context.Context, client net.Conn) error {
+	close(c.held)
+	select {
+	case forward := <-c.forward:
+		if forward {
+			return nil
+		}
+		at := time.Now()
+		err := client.Close()
+		c.discarded <- at
+		if err != nil {
+			return err
+		}
+		return net.ErrClosed
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-time.After(5 * time.Second):
+		return errors.New("unreleased commit acknowledgement")
+	}
 }
 
-type ackReplyWriter struct {
-	barrier    *ackBarrier
-	client     net.Conn
-	generation uint64
-}
-
-func (w ackReplyWriter) Write(p []byte) (int, error) {
-	return w.barrier.reply(w.client, p, w.generation)
-}
-
-func gatewayAckRelay(t *testing.T, upstream string) (string, *ackBarrier) {
+func gatewayAckRelay(t *testing.T, upstream string) (string, *ackRelay) {
 	t.Helper()
 	ln, err := net.Listen("tcp4", "127.0.0.1:0")
 	require.NoError(t, err)
 	ctx, cancel := context.WithCancel(context.Background())
-	b := new(ackBarrier)
+	relay := &ackRelay{cuts: make(map[uint32]*ackCut)}
 	var workers sync.WaitGroup
 	workers.Add(1)
 	go func() {
 		defer workers.Done()
 		for {
-			client, err := ln.Accept()
+			c, err := ln.Accept()
 			if err != nil {
 				return
 			}
-			generation := b.generation.Load()
 			workers.Add(1)
-			go func() {
-				defer workers.Done()
-				defer client.Close()
-				dialer := net.Dialer{Timeout: 3 * time.Second}
-				backend, err := dialer.DialContext(ctx, "tcp", upstream)
-				if err != nil {
-					return
-				}
-				defer backend.Close()
-				stop := context.AfterFunc(ctx, func() { client.Close(); backend.Close() })
-				defer stop()
-				done := make(chan struct{})
-				go func() { _, _ = io.Copy(backend, client); backend.Close(); close(done) }()
-				_, _ = io.Copy(ackReplyWriter{b, client, generation}, backend)
-				client.Close()
-				<-done
-			}()
+			go func() { defer workers.Done(); relay.bridge(ctx, c, upstream) }()
 		}
 	}()
 	t.Cleanup(func() { cancel(); ln.Close(); workers.Wait() })
-	return ln.Addr().String(), b
+	return ln.Addr().String(), relay
+}
+func (r *ackRelay) bridge(ctx context.Context, client net.Conn, upstream string) {
+	defer client.Close()
+	d := net.Dialer{Timeout: 3 * time.Second}
+	backend, err := d.DialContext(ctx, "tcp", upstream)
+	if err != nil {
+		return
+	}
+	defer backend.Close()
+	stop := context.AfterFunc(ctx, func() { client.Close(); backend.Close() })
+	defer stop()
+	done := make(chan struct{})
+	go func() { defer close(done); _, _ = io.Copy(backend, client); backend.Close() }()
+	_ = r.copyReplies(ctx, client, backend)
+	client.Close()
+	<-done
 }
 
-func (s *stand) installGatewayAckRelay(t *testing.T) *ackBarrier {
+func (s *stand) installGatewayAckRelay(t *testing.T) (*ackRelay, string) {
 	t.Helper()
 	dsn, err := url.Parse(s.appDSN)
 	require.NoError(t, err)
-	relay, b := gatewayAckRelay(t, dsn.Host)
+	addr, b := gatewayAckRelay(t, dsn.Host)
 	s.killGatewaySIGKILL()
-	dsn.Host = relay
+	dsn.Host = addr
 	q := dsn.Query()
 	q.Set("application_name", "acceptance_ack_gateway")
 	dsn.RawQuery = q.Encode()
@@ -104,159 +159,188 @@ func (s *stand) installGatewayAckRelay(t *testing.T) *ackBarrier {
 	}
 	require.True(t, updated, "gateway database environment missing")
 	s.restartGateway()
-	return b
+	return b, dsn.String()
 }
 
-func TestAccountingCommittedStartLostAck(t *testing.T) {
-	s := startStand(t)
-	b := s.installGatewayAckRelay(t)
-	s.controlRequest(t, "ack-pre")
-	rid := s.reqPrefix + "ack"
-	db := s.oracleDB.db
-	ctx, cancel := context.WithTimeout(t.Context(), 45*time.Second)
+type ackResponse struct {
+	status int
+	body   string
+	err    error
+	at     time.Time
+}
+
+func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn, rid string, forward bool) string {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
 	defer cancel()
-	// The stand owns this database. Filtering on this request prevents a
-	// concurrent health check or another admission from opening the barrier.
-	literal := "'" + strings.ReplaceAll(rid, "'", "''") + "'"
-	_, err := db.ExecContext(ctx, `CREATE FUNCTION acc_hold_start() RETURNS trigger LANGUAGE plpgsql AS $$
- BEGIN PERFORM pg_advisory_xact_lock(1921,112); RETURN NEW; END $$;
- CREATE TRIGGER acc_hold_start AFTER INSERT ON request_admissions
- FOR EACH ROW WHEN (NEW.client_request_id = `+literal+`) EXECUTE FUNCTION acc_hold_start()`)
-	require.NoError(t, err)
+	db := s.oracleDB.db
 	lock, err := db.BeginTx(ctx, nil)
 	require.NoError(t, err)
 	defer lock.Rollback()
 	_, err = lock.ExecContext(ctx, "SELECT pg_advisory_xact_lock(1921,112)")
 	require.NoError(t, err)
-	before := s.fixture.Snapshot()
-	type response struct {
-		status int
-		body   string
-		err    error
-	}
-	result := make(chan response, 1)
-	go func() { status, body, err := s.chat(t, rid, 35*time.Second); result <- response{status, body, err} }()
-	waitCount := func(query string, args ...any) {
-		t.Helper()
-		for {
-			var n int
-			require.NoError(t, db.QueryRowContext(ctx, query, args...).Scan(&n))
-			require.LessOrEqual(t, n, 1)
-			if n == 1 {
-				return
-			}
-			select {
-			case r := <-result:
-				t.Fatalf("client returned before commit acknowledgement fault: status=%d err=%v", r.status, r.err)
-			case <-ctx.Done():
-				t.Fatal(ctx.Err())
-			case <-time.After(10 * time.Millisecond):
-			}
-		}
-	}
-	waitCount(`SELECT count(*) FROM pg_locks l JOIN pg_stat_activity a USING(pid)
- WHERE a.application_name='acceptance_ack_gateway' AND l.locktype='advisory'
- AND l.classid=1921 AND l.objid=112 AND NOT l.granted`)
-	func() {
-		b.Lock()
-		defer b.Unlock()
-		require.NoError(t, lock.Commit())
-		waitCount(`SELECT count(*) FROM request_admissions WHERE client_request_id=$1 AND org_id=$2`, rid, s.oracleDB.orgID)
-		b.generation.Add(1)
+	result := make(chan ackResponse, 1)
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		status, body, err := s.chat(t, rid, 30*time.Second)
+		result <- ackResponse{status, body, err, time.Now()}
 	}()
-	var r response
+	t.Cleanup(func() { <-done })
+	var pid uint32
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+   WHERE a.application_name='acceptance_ack_gateway' AND l.locktype='advisory'
+   AND l.classid=1921 AND l.objid=112 AND NOT l.granted`).Scan(&pid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+		return err == nil && pid > 0
+	}, 8*time.Second, 10*time.Millisecond, "gateway did not reach the admission trigger")
+	t.Logf("holding transaction-ready acknowledgement for request %s backend %d", rid, pid)
+	cut := relay.arm(pid)
+	require.NoError(t, lock.Commit())
 	select {
-	case r = <-result:
+	case <-cut.held:
+	case r := <-result:
+		t.Fatalf("client returned before commit reply: %d %v", r.status, r.err)
 	case <-ctx.Done():
 		t.Fatal(ctx.Err())
 	}
-	code, ok := decodeErrorCode(r.body)
-	require.NoError(t, r.err)
-	require.Equal(t, 503, r.status, r.body)
-	require.True(t, ok, "structured error missing")
+	var id string
+	require.NoError(t, db.QueryRowContext(ctx, `SELECT invocation_id::text FROM request_admissions WHERE client_request_id=$1 AND org_id=$2`, rid, s.oracleDB.orgID).Scan(&id))
+	t.Logf("independent database observation confirmed invocation %s for request %s", id, rid)
+	// A second, already-established connection through the same relay must
+	// still be live while the selected gateway session is parked.
+	pingCtx, stop := context.WithTimeout(ctx, time.Second)
+	err = other.PingContext(pingCtx)
+	stop()
+	require.NoError(t, err)
+	require.Empty(t, result, "client finished while its commit reply was held")
+	cut.forward <- forward
+	var resp ackResponse
+	select {
+	case resp = <-result:
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	require.NoError(t, resp.err)
+	if forward {
+		require.Equal(t, httpOK, resp.status, resp.body)
+		require.Contains(t, resp.body, fixtureAssistantContent)
+		return id
+	}
+	select {
+	case at := <-cut.discarded:
+		require.False(t, resp.at.Before(at), "client refused before the selected reply was discarded")
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+	code, ok := decodeErrorCode(resp.body)
+	require.Equal(t, 503, resp.status, resp.body)
+	require.True(t, ok)
 	require.Equal(t, "history_unavailable", code)
-	require.Positive(t, b.dropped.Load(), "gateway received no discarded reply")
+	return id
+}
+
+func TestAccountingCommittedStartLostAck(t *testing.T) {
+	s := startStand(t)
+	b, dsn := s.installGatewayAckRelay(t)
+	db, err := sql.Open("pgx", dsn)
+	require.NoError(t, err)
+	defer db.Close()
+	other, err := db.Conn(t.Context())
+	require.NoError(t, err)
+	defer other.Close()
+	require.NoError(t, other.PingContext(t.Context()))
+	s.controlRequest(t, "ack-pre")
+	forwardRID, dropRID := s.reqPrefix+"ack-forward", s.reqPrefix+"ack-lost"
+	// Only this temporary stand's two named requests enter the barrier.
+	quoted := func(v string) string { return "'" + strings.ReplaceAll(v, "'", "''") + "'" }
+	_, err = s.oracleDB.db.ExecContext(t.Context(), `CREATE FUNCTION acc_hold_start() RETURNS trigger LANGUAGE plpgsql AS $$
+ BEGIN PERFORM pg_advisory_xact_lock(1921,112); RETURN NEW; END $$;
+ CREATE TRIGGER acc_hold_start AFTER INSERT ON request_admissions FOR EACH ROW WHEN (NEW.client_request_id IN (`+quoted(forwardRID)+","+quoted(dropRID)+`)) EXECUTE FUNCTION acc_hold_start()`)
+	require.NoError(t, err)
+	before := s.fixture.Snapshot()
+	s.exerciseStartAck(t, b, other, forwardRID, true)
+	require.Equal(t, fixtureTotals{1, 1, 1}, s.fixture.Since(before))
+	a, d, r := s.fixture.Counts(forwardRID)
+	require.Equal(t, []int{1, 1, 1}, []int{a, d, r})
+	before = s.fixture.Snapshot()
+	id := s.exerciseStartAck(t, b, other, dropRID, false)
 	s.fixture.VerifyEvidence()
 	require.Equal(t, fixtureTotals{}, s.fixture.Since(before))
 	s.controlRequest(t, "ack-post")
-	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1, receipts: 1}, s.fixture.Since(before), "only the healthy post-control should reach upstream")
+	require.Equal(t, fixtureTotals{1, 1, 1}, s.fixture.Since(before))
+	a, d, r = s.fixture.Counts(s.reqPrefix + "ctl-ack-post")
+	require.Equal(t, []int{1, 1, 1}, []int{a, d, r})
+	var count int
+	require.NoError(t, s.oracleDB.db.QueryRowContext(t.Context(), "SELECT count(*) FROM request_admissions WHERE invocation_id=$1 AND org_id=$2 AND client_request_id=$3", id, s.oracleDB.orgID, dropRID).Scan(&count))
+	require.Equal(t, 1, count)
 	for _, table := range []string{"request_terminal_facts", "settlement_jobs", "credit_transactions"} {
-		var count int
-		query := fmt.Sprintf("SELECT count(*) FROM %s WHERE invocation_id IN (SELECT invocation_id FROM request_admissions WHERE org_id=$1 AND client_request_id=$2)", table)
-		require.NoError(t, db.QueryRowContext(ctx, query, s.oracleDB.orgID, rid).Scan(&count))
+		query := fmt.Sprintf("SELECT count(*) FROM %s WHERE invocation_id=$1", table)
+		require.NoError(t, s.oracleDB.db.QueryRowContext(t.Context(), query, id).Scan(&count))
 		require.Zero(t, count, table)
 	}
-	var count int
-	err = db.QueryRowContext(ctx, `SELECT
+	require.NoError(t, s.oracleDB.db.QueryRowContext(t.Context(), `SELECT
   (SELECT count(*) FROM settlement_jobs WHERE org_id=$1 AND request_id=$2) +
-  (SELECT count(*) FROM credit_transactions WHERE org_id=$1 AND request_id=$2 AND type='usage')`, s.oracleDB.orgID, rid).Scan(&count)
-	require.NoError(t, err)
-	require.Zero(t, count, "correlation-keyed charges or jobs")
-
+  (SELECT count(*) FROM credit_transactions WHERE org_id=$1 AND request_id=$2 AND type='usage')`, s.oracleDB.orgID, dropRID).Scan(&count))
+	require.Zero(t, count, "correlation-keyed jobs or charges")
 }
 
 func TestAccountingAckRelayControl(t *testing.T) {
-	server, err := net.Listen("tcp4", "127.0.0.1:0")
-	require.NoError(t, err)
-	defer server.Close()
-	observed := make(chan byte, 3)
-	go func() {
-		for i := 0; i < 2; i++ {
-			c, err := server.Accept()
-			if err != nil {
-				return
-			}
-			go func() {
-				defer c.Close()
-				var p [1]byte
-				for {
-					if _, err := io.ReadFull(c, p[:]); err != nil {
-						return
-					}
-					observed <- p[0]
-					if _, err := c.Write(p[:]); err != nil {
-						return
-					}
-				}
-			}()
-		}
-	}()
-	addr, b := gatewayAckRelay(t, server.Addr().String())
-	dial := func() net.Conn {
-		c, err := net.DialTimeout("tcp", addr, time.Second)
+	relay := &ackRelay{cuts: make(map[uint32]*ackCut)}
+	// Drive real net.Conn writes through PostgreSQL backend frames. The
+	// sibling connection remains usable throughout the target's held reply.
+	open := func(pid uint32) (net.Conn, net.Conn) {
+		input, producer := net.Pipe()
+		relaySide, reader := net.Pipe()
+		t.Cleanup(func() { producer.Close(); reader.Close() })
+		go func() {
+			defer input.Close()
+			defer relaySide.Close()
+			_ = relay.copyReplies(t.Context(), relaySide, input)
+		}()
+		key := []byte{'K', 0, 0, 0, 12, 0, 0, 0, 0, 0, 0, 0, 0}
+		binary.BigEndian.PutUint32(key[5:9], pid)
+		_, err := producer.Write(key)
 		require.NoError(t, err)
-		t.Cleanup(func() { c.Close() })
-		require.NoError(t, c.SetDeadline(time.Now().Add(3*time.Second)))
-		return c
+		buf := make([]byte, len(key))
+		_, err = io.ReadFull(reader, buf)
+		require.NoError(t, err)
+		require.Equal(t, key, buf)
+		return producer, reader
 	}
-	send := func(c net.Conn, value byte) {
-		_, err := c.Write([]byte{value})
+	target, client := open(17)
+	sibling, healthy := open(19)
+	ready := []byte{'Z', 0, 0, 0, 5, 'I'}
+	readReady := func(conn net.Conn) {
+		buf := make([]byte, len(ready))
+		require.NoError(t, conn.SetReadDeadline(time.Now().Add(time.Second)))
+		_, err := io.ReadFull(conn, buf)
+		require.NoError(t, err)
+		require.Equal(t, ready, buf)
+	}
+	for _, forward := range []bool{true, false} {
+		cut := relay.arm(17)
+		_, err := target.Write(ready)
 		require.NoError(t, err)
 		select {
-		case seen := <-observed:
-			require.Equal(t, value, seen)
+		case <-cut.held:
 		case <-time.After(time.Second):
-			t.Fatal("upstream did not observe request")
+			t.Fatal("target reply not held")
 		}
-	}
-	receive := func(c net.Conn, value byte) {
-		var p [1]byte
-		_, err := io.ReadFull(c, p[:])
+		_, err = sibling.Write(ready)
 		require.NoError(t, err)
-		require.Equal(t, value, p[0])
+		readReady(healthy)
+		require.NoError(t, client.SetReadDeadline(time.Now().Add(time.Second)))
+		cut.forward <- forward
+		if forward {
+			readReady(client)
+			continue
+		}
+		var v [1]byte
+		_, err = client.Read(v[:])
+		require.ErrorIs(t, err, io.EOF)
 	}
-	first := dial()
-	send(first, 1)
-	receive(first, 1)
-	func() { b.Lock(); defer b.Unlock(); send(first, 2); b.generation.Add(1) }()
-	var p [1]byte
-	if _, err := first.Read(p[:]); err != io.EOF {
-		t.Fatalf("old client received %d err=%v, want EOF", p[0], err)
-	}
-	if b.dropped.Load() != 1 {
-		t.Fatalf("discarded writes %d, want 1", b.dropped.Load())
-	}
-	fresh := dial()
-	send(fresh, 3)
-	receive(fresh, 3)
 }
