@@ -68,6 +68,10 @@ type chatContext struct {
 	orgID, teamID, apiKeyID            string
 	sessionID, taskID, agentID, userID string
 
+	// invocation is the Preview2 durable-accounting holder minted at the
+	// shared admission core; stashed on the request context below.
+	invocation *invocationIdentity
+
 	// Candidate state: what the client asked for and what will be called.
 	requestedModel  string
 	unknownFallback bool
@@ -134,6 +138,7 @@ func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	if !gw.policyPreChat(ctx, cc) {
 		return
 	}
+	ctx = withInvocationIdentity(ctx, cc.invocation)
 	ctx = withRequestPolicyEntryOutcome(ctx, cc.r, gw.policyRuntime, cc.orgID)
 	// request context so every downstream routing site sees it.
 	ctx = withRequestRouteHint(ctx, cc.r)
@@ -155,6 +160,24 @@ func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// Cache miss: reserve locally (granting from Postgres on shortage).
 	if !gate.reserve(ctx) {
+		return
+	}
+	// Preview2 durable accounting: the confirmed start commits BEFORE the
+	// first paid provider dispatch — post-cache-miss like the reservation,
+	// one admission per request (the stream and JSON branches below share
+	// it; the kind binds to the transport actually dispatched). Fail
+	// closed: an unwritten start (write error, timeout or lost ACK —
+	// outcome unknown) refuses the request with ZERO provider arrivals
+	// under the history_unavailable envelope.
+	if err := gw.confirmPaidInvocation(ctx, invocationKindForChat(cc.req.Stream)); err != nil {
+		// Escrow parity with the other never-dispatched refusals (stream
+		// breaker-open path): release the just-reserved local escrow
+		// exactly once (finalizeNoEvent is done-flag guarded) — a failed
+		// or lost-ACK durable start leaves no spend and must not hold
+		// enforce-mode reservation credit.
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		cc.l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(cc.w, err)
 		return
 	}
 	if cc.req.Stream {
@@ -257,6 +280,7 @@ func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) 
 		agentID:        core.AgentID,
 		userID:         core.UserID,
 		fairTicket:     core.FairTicket,
+		invocation:     core.Invocation,
 	}
 
 	l.Debug("chat request", "model", cc.model, "session", cc.sessionID, "org", cc.orgID, "msgs", len(req.Messages))
@@ -1087,12 +1111,12 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 		// NEXT-18c: the reserve tuples ride the failure event (§5.3
 		// Finalize); no usage accrued — the worker bills nothing and the
 		// idle return sweeps the escrow.
-		gw.finishRequest(ctx, requestFinish{
+		gw.finishRequestLogged(ctx, cc.l, requestFinish{
 			base:        errBase,
 			attestModel: finalInfo.ModelName,
 			info:        finalInfo,
 			termination: budget.TerminationUpstreamErr,
-		}, nil)
+		})
 
 		httpStatus, errType, errCode, errMsg := gw.mapProviderUpstream(finalInfo.Provider, lastCode, lastErr)
 		// RATELIMIT-FALLBACK P2: on a decision-bearing upstream rate limit,
@@ -1275,7 +1299,7 @@ func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
 		}
 
 		// P4.13: Publish cache-aware analytics event for savings tracking.
-		gw.finishRequest(ctx, requestFinish{
+		gw.finishRequestLogged(ctx, cc.l, requestFinish{
 			base: eventBase{
 				EventType: "request.completed",
 				RequestID: cc.reqID,
@@ -1308,7 +1332,7 @@ func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
 			// Cache hits never reserve: publish without a settle.
 			noSettle: true,
 			info:     cc.info,
-		}, nil)
+		})
 
 		return true
 	}
@@ -1330,7 +1354,7 @@ func (gw *gateway) serveChatCachePolicyDenied(ctx context.Context, cc *chatConte
 	}
 	l.Warn("policy denied cache hit", "org_id", cc.orgID, "request_id", cc.reqID,
 		"model", cc.model, "source", hit.SourceType, "mode", string(gw.policyRuntime.mode))
-	gw.finishRequest(ctx, requestFinish{
+	gw.finishRequestLogged(ctx, l, requestFinish{
 		base: eventBase{
 			EventType:            "request.failed",
 			RequestID:            cc.reqID,
@@ -1359,7 +1383,7 @@ func (gw *gateway) serveChatCachePolicyDenied(ctx context.Context, cc *chatConte
 		// Cache hits never reserve: publish without a settle.
 		noSettle: true,
 		info:     cc.info,
-	}, nil)
+	})
 	apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 		"response blocked by organization policy", policyDenyErrorCode)
 }
@@ -1600,12 +1624,21 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 		ProviderEntityJurisdiction: finalInfo.Provider,
 		Labels:                     labelsFrom(ctx),
 	}
-	gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base:        base,
 		info:        finalInfo,
 		resp:        upResp,
 		termination: budget.TerminationCompleted,
 	}, evalgateHook)
+	// Central binding: client success is ordered after persistence. A
+	// failed terminal write (even after transient-PG retries) must not
+	// surface the upstream body as a payable success — and the event is
+	// already withheld inside the funnel. No cache write, no shadow
+	// mirror: the response being failed must not outlive this call.
+	if ferr != nil {
+		writeTerminalAccountingFailure(w)
+		return
+	}
 
 	// P4/RT-05: write to cache asynchronously (non-blocking) under the route
 	// identity of the model that ACTUALLY generated the response (the winning
@@ -1674,7 +1707,7 @@ func (gw *gateway) finishPolicyDeniedJSON(ctx context.Context, cc *chatContext, 
 	// the analytics ledger irreproducible from its own fields (the invariant
 	// documented at completions_endpoint.go:295–299). Parity with the
 	// completed path in finalizeChatJSON.
-	gw.finishRequest(ctx, requestFinish{
+	if _, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.failed",
 			RequestID:                  cc.reqID,
@@ -1723,7 +1756,13 @@ func (gw *gateway) finishPolicyDeniedJSON(ctx context.Context, cc *chatContext, 
 		attestModel: finalModelName,
 		info:        finalInfo,
 		termination: budget.TerminationPolicyDenied,
-	}, nil)
+	}, nil); ferr != nil {
+		// Facts gate the client outcome for dispatched-then-denied
+		// responses too: without the durable record the withheld
+		// response cannot be reconciled — fail instead of answering 400.
+		writeTerminalAccountingFailure(w)
+		return
+	}
 
 	apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 		"response blocked by organization policy", policyDenyErrorCode)

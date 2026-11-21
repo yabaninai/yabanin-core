@@ -215,6 +215,11 @@ type eventBase struct {
 	SessionKeyID string
 	TaskID       string
 
+	// InvocationID is the Preview2 server-minted per-invocation identity
+	// (distinct from the client correlation RequestID). Stamped at the
+	// finishRequest funnel from the admission holder; empty on legacy.
+	InvocationID string
+
 	// Model + transport outcome.
 	ModelRequested string
 	ModelUsed      string
@@ -301,6 +306,7 @@ func (b eventBase) build() *eventpub.Event {
 		EventType:                  b.EventType,
 		Source:                     "gateway",
 		RequestID:                  b.RequestID,
+		InvocationID:               b.InvocationID,
 		SessionID:                  b.SessionID,
 		Payload:                    eventpub.StripInlineMedia(b.Payload),
 		OrgID:                      b.OrgID,
@@ -491,7 +497,7 @@ type requestFinish struct {
 // sampling), attaches the lineage attestation, settles the reservation,
 // fires the eventNote hook where the pipeline historically does, and
 // publishes. It returns the built event.
-func (gw *gateway) finishRequest(ctx context.Context, fin requestFinish, beforeAttest func(*eventpub.Event)) *eventpub.Event {
+func (gw *gateway) finishRequest(ctx context.Context, fin requestFinish, beforeAttest func(*eventpub.Event)) (*eventpub.Event, error) {
 	l := logctx.From(ctx, gw.log)
 	// N02-P06 producer boundary: the retention gate must be wired before the
 	// first publish so the pre-XADD strip is active for every capture-bearing
@@ -520,6 +526,32 @@ func (gw *gateway) finishRequest(ctx context.Context, fin requestFinish, beforeA
 	if fin.eventNote && gw.eventNote != nil {
 		gw.eventNote(ev)
 	}
+	// Preview2 durable accounting (central binding): for admitted
+	// invocations the terminal facts commit BEFORE the payable success is
+	// published — client success is ordered after persistence because the
+	// chat JSON response write happens downstream of this funnel, and a
+	// facts failure withholds the event entirely (the consumer parks a
+	// completion whose facts row is absent; the reconciler instead owns
+	// the admitted-without-facts row via the unresolved sweep). The commit
+	// runs on a bounded independent context so client cancellation cannot
+	// kill the accounting write.
+	if ferr := gw.stampAndCommitInvocationTerminal(ctx, ev, l); ferr != nil {
+		// Central binding: the event is withheld from the consumer (it
+		// parks completions whose facts row is absent) and the caller
+		// learns the failure to convert its client success — the
+		// reconciler owns the admitted-without-facts row instead.
+		return nil, ferr
+	}
 	publishEvent(gw.publisher, l, ev) //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-	return ev
+	return ev, nil
+}
+
+// finishRequestLogged ends requests whose client response is already
+// determined (upstream-failure envelopes, cache documents): the funnel
+// still commits/withholds facts, but no client success is at stake, so
+// the failure is only logged loudly.
+func (gw *gateway) finishRequestLogged(ctx context.Context, l *slog.Logger, fin requestFinish) {
+	if _, ferr := gw.finishRequest(ctx, fin, nil); ferr != nil {
+		l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+	}
 }

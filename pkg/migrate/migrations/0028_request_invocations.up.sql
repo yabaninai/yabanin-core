@@ -79,6 +79,17 @@ CREATE INDEX idx_request_admissions_open
     ON public.request_admissions (admitted_at)
     WHERE state = 'admitted';
 
+-- Recovery keyset sweep: the consumer scans PENDING admissions — still
+-- 'admitted' or already reclassified 'unresolved' — by invocation uuid to
+-- pair terminal facts with their confirmed starts. The partial btree keeps
+-- that sweep proportional to the pending set after many completed requests
+-- instead of walking the full primary-key index. Time-based unresolved
+-- classification (grace-window expiry) rides idx_request_admissions_open
+-- above; this index serves only the pending-facts keyset pagination.
+CREATE INDEX idx_request_admissions_pending
+    ON public.request_admissions (invocation_id)
+    WHERE state IN ('admitted', 'unresolved');
+
 CREATE TABLE public.request_terminal_facts (
     invocation_id uuid NOT NULL,
     org_id text NOT NULL,
