@@ -65,8 +65,8 @@ func jointDeliver(t *testing.T, pool *pgxpool.Pool, rdb *redis.Client, fields ma
 
 	var raw []byte
 	require.NoError(t, pool.QueryRow(context.Background(),
-		"SELECT row_to_json(rl.*) FROM request_logs rl WHERE request_id = $1",
-		fields["request_id"]).Scan(&raw), "request_logs row must exist for %v", fields["request_id"])
+		"SELECT row_to_json(rl.*) FROM request_logs rl WHERE org_id = $1 AND request_id = $2",
+		fields["org_id"], fields["request_id"]).Scan(&raw), "request_logs row must exist for %v", fields["request_id"])
 	var row map[string]interface{}
 	require.NoError(t, json.Unmarshal(raw, &row))
 	return row
@@ -217,12 +217,21 @@ func TestIntegration_OriginalRetention_JointToggleAndReadMatrix(t *testing.T) {
 		grant, err := store.CreateRequestPayloadGrantScope(orgOn, requestID, rootID,
 			adminstore.RequestPayloadScopeOriginals, time.Minute, now)
 		require.NoError(t, err)
-		require.NoError(t, store.ConsumeRequestPayloadGrantScope(grant.Token, orgOn, requestID, rootID,
-			adminstore.RequestPayloadScopeOriginals, time.Now().UTC()),
-			"the originals grant consumes against the stored originals")
-		assert.Error(t, store.ConsumeRequestPayloadGrantScope(grant.Token, orgOn, requestID, rootID,
-			adminstore.RequestPayloadScopeOriginals, time.Now().UTC()),
-			"the grant is single-use")
+		var storedKey int64
+		require.NoError(t, pool.QueryRow(ctx,
+			"SELECT id FROM request_logs WHERE org_id = $1 AND request_id = $2", orgOn, requestID).Scan(&storedKey))
+		require.Equal(t, storedKey, grant.RowKey)
+		_, err = store.ConsumeRequestPayloadGrantScope(grant.Token, orgOn, requestID, storedKey, rootID,
+			adminstore.RequestPayloadScopeRead, time.Now().UTC())
+		require.ErrorIs(t, err, adminstore.ErrInvalidRequestPayloadGrant)
+
+		used, err := store.ConsumeRequestPayloadGrantScope(grant.Token, orgOn, requestID, storedKey, rootID,
+			adminstore.RequestPayloadScopeOriginals, time.Now().UTC())
+		require.NoError(t, err, "the originals grant consumes against the stored originals")
+		require.Equal(t, storedKey, used.RowKey)
+		_, err = store.ConsumeRequestPayloadGrantScope(grant.Token, orgOn, requestID, storedKey, rootID,
+			adminstore.RequestPayloadScopeOriginals, time.Now().UTC())
+		assert.ErrorIs(t, err, adminstore.ErrInvalidRequestPayloadGrant, "the grant is single-use")
 	})
 
 	t.Run("toggle flip mid-journey: no retroactive rewrite; new deliveries processed-only", func(t *testing.T) {
