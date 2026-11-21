@@ -13,6 +13,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	pgconn "github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/require"
 )
 
 type payloadGrantFakeDB struct {
@@ -196,10 +197,10 @@ func (db *payloadGrantFakeDB) exec(query string, args ...interface{}) (pgconn.Co
 			db.auditDetails = append(db.auditDetails, args[3].(string))
 		}
 	case strings.Contains(query, "UPDATE request_payload_grants SET revoked_at"):
-		id, now := args[0].(string), args[1].(time.Time)
+		id := args[0].(string)
 		for hash, grant := range db.grants {
-			if grant.ID == id {
-				grant.ExpiresAt = minTime(grant.ExpiresAt, now)
+			if grant.ID == id && !grantRevoked(grant) {
+				grant.Scope = "revoked:" + grant.Scope
 				db.grants[hash] = grant
 			}
 		}
@@ -247,7 +248,7 @@ func (tx *payloadGrantFakeTx) Rollback(context.Context) error {
 }
 
 func hashArg(value interface{}) [32]byte {
-	return sha256.Sum256(value.([]byte))
+	return [sha256.Size]byte(value.([]byte))
 }
 
 func grantConsumed(grant RequestPayloadGrant) bool {
@@ -256,13 +257,6 @@ func grantConsumed(grant RequestPayloadGrant) bool {
 
 func grantRevoked(grant RequestPayloadGrant) bool {
 	return strings.HasPrefix(grant.Scope, "revoked:")
-}
-
-func minTime(a, b time.Time) time.Time {
-	if a.Before(b) {
-		return a
-	}
-	return b
 }
 
 func TestRequestPayloadGrant_FailsClosedWithoutDurableStore(t *testing.T) {
@@ -299,65 +293,36 @@ func TestRequestPayloadGrant_DurableIssueConsumeRevokeAndList(t *testing.T) {
 	db := newPayloadGrantFakeDB()
 	store := newForTest(db, newTestLogger(), nil)
 	grant, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
-	if err != nil {
-		t.Fatal(err)
-	}
-
+	require.NoError(t, err)
 	t.Run("issue binds the carrier row and journals", func(t *testing.T) {
-		if grant.RowKey != 4242 {
-			t.Fatalf("issuance must bind the physical row key; got %d want 4242", grant.RowKey)
-		}
-		if len(db.audited) != 1 || db.audited[0] != "request_payload.grant_issued" {
-			t.Fatalf("issue must be audited before returning token; actions=%v", db.audited)
-		}
+		require.Equal(t, int64(4242), grant.RowKey)
+		require.Equal(t, []string{"request_payload.grant_issued"}, db.audited)
 	})
-
 	t.Run("consume honors binding, party and single use", func(t *testing.T) {
-		if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-b", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
-			t.Fatal("cross-organization grant redemption succeeded")
+		consume := func(org string, rowKey int64) error {
+			_, err := store.ConsumeRequestPayloadGrantScope(grant.Token, org, "request-a", rowKey, "root-a", RequestPayloadScopeRead, now)
+			return err
 		}
-		if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4243, "root-a", RequestPayloadScopeRead, now); err == nil {
-			t.Fatal("redemption addressed a row the grant is not bound to")
-		}
-		if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err != nil {
-			t.Fatalf("valid grant consumption failed: %v", err)
-		}
-		if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
-			t.Fatal("consumed grant was reusable")
-		}
+		require.Error(t, consume("org-b", 4242))
+		require.Error(t, consume("org-a", 4243))
+		require.NoError(t, consume("org-a", 4242))
+		require.Error(t, consume("org-a", 4242))
 	})
-
 	t.Run("list exposes metadata without tokens", func(t *testing.T) {
-		listed, err := store.ListRequestPayloadGrants(context.Background(), "root-a")
-		if err != nil || len(listed) != 1 || listed[0].Token != "" {
-			t.Fatalf("metadata list leaked/missed grant: grants=%+v err=%v", listed, err)
-		}
+		listed, err := store.ListRequestPayloadGrants(t.Context(), "root-a")
+		require.NoError(t, err)
+		require.Len(t, listed, 1)
+		require.Empty(t, listed[0].Token)
 	})
-
 	t.Run("revocation", func(t *testing.T) {
-		if err := store.RevokeRequestPayloadGrant(grant.Token, "root-other"); err == nil {
-			t.Fatal("another root revoked the grant")
-		}
-		if err := store.RevokeRequestPayloadGrant(grant.Token, "root-a"); err == nil {
-			t.Fatal("consumed grant was revocable")
-		}
-		if len(db.audited) != 2 || db.audited[1] != "request_payload.grant_used" {
-			t.Fatalf("consume audit missing or unexpected: %v", db.audited)
-		}
-
+		require.Error(t, store.RevokeRequestPayloadGrant(grant.Token, "root-other"))
+		require.Error(t, store.RevokeRequestPayloadGrant(grant.Token, "root-a"))
+		require.Equal(t, []string{"request_payload.grant_issued", "request_payload.grant_used"}, db.audited)
 		revokable, err := store.CreateRequestPayloadGrant("org-a", "request-b", "root-a", time.Minute, now)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if err := store.RevokeRequestPayloadGrant(revokable.Token, "root-a"); err != nil {
-			t.Fatalf("active grant revocation failed: %v", err)
-		}
-		if store.ConsumeRequestPayloadGrant(revokable.Token, "org-a", "request-b", "root-a", now) {
-			t.Fatal("revoked grant was consumable")
-		}
-		if db.audited[len(db.audited)-1] != "request_payload.grant_revoked" {
-			t.Fatalf("revoke audit missing: %v", db.audited)
-		}
+		require.NoError(t, err)
+		require.NoError(t, store.RevokeRequestPayloadGrant(revokable.Token, "root-a"))
+		require.False(t, store.ConsumeRequestPayloadGrant(revokable.Token, "org-a", "request-b", "root-a", now))
+		require.Equal(t, "request_payload.grant_revoked", db.audited[len(db.audited)-1])
 	})
 }
 
@@ -419,51 +384,24 @@ func TestRequestPayloadGrant_LifecycleAuditDetailsDecode(t *testing.T) {
 
 	hostile := "req\x01\x1b\xff"
 	grant, err := store.CreateRequestPayloadGrantScope("org-1", hostile, "root-1", RequestPayloadScopeRead, time.Minute, time.Now().UTC())
-	if err != nil {
-		t.Fatalf("issue grant for hostile request id: %v", err)
-	}
-	if grant.RowKey != 4242 {
-		t.Fatalf("issuance binds the seeded carrier row: got %d", grant.RowKey)
-	}
-	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-1", hostile, grant.RowKey, "root-1", RequestPayloadScopeRead, time.Now().UTC()); err != nil {
-		t.Fatalf("consume the issued grant: %v", err)
-	}
-
-	if len(db.auditDetails) != len(db.audited) {
-		t.Fatalf("audit capture mismatch: actions=%v details=%d", db.audited, len(db.auditDetails))
-	}
-	if len(db.audited) < 2 {
-		t.Fatalf("issue and consume must both journal: %v", db.audited)
-	}
-	const wantRequestID = "req\x01\x1b\ufffd"
-	actions := map[string]bool{}
-	for i, raw := range db.auditDetails {
-		if !json.Valid([]byte(raw)) {
-			t.Fatalf("lifecycle details must be valid JSON for a hostile request id, got %q", raw)
-		}
-		var d requestPayloadGrantAuditDetail
-		if err := json.Unmarshal([]byte(raw), &d); err != nil {
-			t.Fatalf("decode lifecycle details: %v", err)
-		}
-		if d.RequestID != wantRequestID {
-			t.Fatalf("request id must round trip (invalid UTF-8 replaced by U+FFFD): got %q", d.RequestID)
-		}
-		if d.RowKey != 4242 {
-			t.Fatalf("bound row key must round trip: got %d", d.RowKey)
-		}
-		if d.GrantID == "" || d.OrgID != "org-1" || d.Scope != RequestPayloadScopeRead {
-			t.Fatalf("lifecycle details lost grant fields: %+v", d)
-		}
-		if _, err := time.Parse(time.RFC3339Nano, d.ExpiresAt); err != nil {
-			t.Fatalf("expires_at must stay RFC3339Nano: %q", d.ExpiresAt)
-		}
-		if strings.Contains(raw, grant.Token) {
-			t.Fatal("the bearer token must never reach the lifecycle journal")
-		}
-		actions[db.audited[i]] = true
-	}
-	if !actions["request_payload.grant_issued"] || !actions["request_payload.grant_used"] {
-		t.Fatalf("lifecycle actions must cover issue and use: %v", db.audited)
+	require.NoError(t, err)
+	require.Equal(t, int64(4242), grant.RowKey)
+	_, err = store.ConsumeRequestPayloadGrantScope(grant.Token, "org-1", hostile, grant.RowKey, "root-1", RequestPayloadScopeRead, time.Now().UTC())
+	require.NoError(t, err)
+	require.Equal(t, []string{"request_payload.grant_issued", "request_payload.grant_used"}, db.audited)
+	require.Len(t, db.auditDetails, len(db.audited))
+	for _, raw := range db.auditDetails {
+		var detail requestPayloadGrantAuditDetail
+		require.NoError(t, json.Unmarshal([]byte(raw), &detail))
+		require.Equal(t, "req\x01\x1b\ufffd", detail.RequestID)
+		require.Equal(t, int64(4242), detail.RowKey)
+		require.Equal(t, grant.ID, detail.GrantID)
+		require.NotEmpty(t, detail.GrantID)
+		require.Equal(t, "org-1", detail.OrgID)
+		require.Equal(t, RequestPayloadScopeRead, detail.Scope)
+		_, err := time.Parse(time.RFC3339Nano, detail.ExpiresAt)
+		require.NoError(t, err)
+		require.NotContains(t, raw, grant.Token)
 	}
 }
 
@@ -538,6 +476,14 @@ func TestRequestPayloadGrant_LegacyUnboundGrantIsPermanentlyUnusable(t *testing.
 	if grantConsumed(grant) {
 		t.Fatal("denied legacy grant must not be burned")
 	}
+	// Control: changing only the binding makes this same seeded row reachable.
+	grant.RowKey = 4242
+	db.grants[hash] = grant
+	row, err := store.PeekRequestPayloadGrantTarget(t.Context(), "legacy-token", "org-a", "request-a", "root-a", now)
+	require.NoError(t, err)
+	require.Equal(t, int64(4242), row)
+	require.True(t, store.ConsumeRequestPayloadGrant("legacy-token", "org-a", "request-a", "root-a", now))
+
 }
 
 func TestRequestPayloadDenyOwnHistoryPolicy(t *testing.T) {
@@ -565,56 +511,26 @@ func TestRequestPayloadGrantAuditInterruptionCompensatesAndRetryConverges(t *tes
 	// Attempt 1: the audit write fails after the grant row committed.
 	db.auditErr = errors.New("audit journal unavailable")
 	interrupted, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
-	if err == nil {
-		t.Fatal("issuance succeeded without its mandatory audit write")
+	require.ErrorContains(t, err, "audit payload grant")
+	require.Empty(t, interrupted.Token)
+	require.Empty(t, db.audited)
+	require.Len(t, db.grants, 1)
+	var retiredHash [32]byte
+	var retired RequestPayloadGrant
+	for retiredHash, retired = range db.grants {
+		require.True(t, grantRevoked(retired), "the committed row must be revoked after the journal write fails")
 	}
-
-	t.Run("audit failure surfaces and compensates", func(t *testing.T) {
-		if !strings.Contains(err.Error(), "audit payload grant") {
-			t.Fatalf("audit failure not surfaced: %v", err)
-		}
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		if len(db.audited) != 0 {
-			t.Fatalf("failed issuance left audit rows: %v", db.audited)
-		}
-		// The compensating revoke retired the unaudited grant: not consumable.
-		if store.ConsumeRequestPayloadGrant(interrupted.Token, "org-a", "request-a", "root-a", now.Add(time.Second)) {
-			t.Fatal("unaudited (compensated) grant was redeemable")
-		}
-	})
-
 	t.Run("retry converges to one usable grant", func(t *testing.T) {
 		db.auditErr = nil
 		retried, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now.Add(time.Second))
-		if err != nil {
-			t.Fatalf("retry after audit recovery failed: %v", err)
-		}
-		if retried.ID == interrupted.ID || retried.Token == interrupted.Token {
-			t.Fatal("retry must mint a fresh grant, not resurrect the compensated row")
-		}
-		// The interrupted token stays dead (no double grant) and the
-		// retried token redeems exactly once.
-		if store.ConsumeRequestPayloadGrant(interrupted.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)) {
-			t.Fatal("compensated grant resurrected by the retry")
-		}
-		if !store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)) {
-			t.Fatal("retried grant must redeem cleanly")
-		}
-		if store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)) {
-			t.Fatal("retried grant redeemed twice")
-		}
-		db.mu.Lock()
-		defer db.mu.Unlock()
-		issued := 0
-		for _, action := range db.audited {
-			if action == "request_payload.grant_issued" {
-				issued++
-			}
-		}
-		if issued != 1 {
-			t.Fatalf("grant_issued audit rows = %d, want exactly 1", issued)
-		}
+		require.NoError(t, err)
+		require.NotEqual(t, retired.ID, retried.ID)
+		require.NotEmpty(t, retried.Token)
+		require.Len(t, db.grants, 2)
+		require.True(t, grantRevoked(db.grants[retiredHash]))
+		require.True(t, store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)))
+		require.False(t, store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)))
+		require.Equal(t, []string{"request_payload.grant_issued", "request_payload.grant_used"}, db.audited)
 	})
 
 	t.Run("compensated row does not consume the active cap", func(t *testing.T) {
