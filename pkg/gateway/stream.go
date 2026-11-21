@@ -2009,9 +2009,11 @@ type sseTerminalWatch struct {
 	flusher http.Flusher
 	seen    atomic.Bool
 
-	heldMu sync.Mutex
-	armed  bool
-	held   []byte
+	heldMu  sync.Mutex
+	armed   bool
+	held    []byte
+	prefix  []byte // possible terminator split across writes, at most one marker
+	midLine bool   // an ordinary, already forwarded line has no delimiter yet
 }
 
 // newSSETerminalWatch wraps w; the watch itself stays a Flusher for
@@ -2044,28 +2046,24 @@ func (sw *sseTerminalWatch) releaseDoneHold() {
 	}
 	sw.heldMu.Lock()
 	defer sw.heldMu.Unlock()
-	if !sw.armed || sw.held == nil {
+	if !sw.armed {
 		return
 	}
-	// Normalize a line-form hold ("data: [DONE]\n" without its blank
-	// line) to a complete frame — under LF or CRLF framing — so the
-	// released terminator is well-formed.
-	switch {
-	case bytes.HasSuffix(sw.held, []byte("\n\n")), bytes.HasSuffix(sw.held, []byte("\r\n\r\n")):
-	case bytes.HasSuffix(sw.held, []byte("\r\n")):
-		sw.held = append(sw.held, '\r', '\n')
-	case bytes.HasSuffix(sw.held, []byte("\n")):
-		sw.held = append(sw.held, '\n')
-	default:
-		sw.held = append(sw.held, '\n', '\n')
+	sw.armed = false
+	if sw.held == nil {
+		// An incomplete ordinary line retains its original wire bytes.
+		if len(sw.prefix) != 0 {
+			_, _ = sw.ResponseWriter.Write(sw.prefix)
+		}
+		sw.prefix = nil
+		return
 	}
-	_, _ = sw.ResponseWriter.Write(sw.held)
-	sw.seen.Store(true)
+	n, err := sw.ResponseWriter.Write(sw.held)
+	sw.seen.Store(n == len(sw.held) && err == nil)
+	sw.held = nil
 	if sw.flusher != nil {
 		sw.flusher.Flush()
 	}
-	sw.armed = false
-	sw.held = nil
 }
 
 // doneHoldPending reports whether a terminator is captured and awaiting
@@ -2089,133 +2087,92 @@ func (sw *sseTerminalWatch) failDoneHold() {
 	defer sw.heldMu.Unlock()
 	sw.armed = false
 	sw.held = nil
+	sw.prefix = nil
 }
 
 func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
-	if len(p) == 0 {
-		return 0, nil
-	}
 	sw.heldMu.Lock()
 	defer sw.heldMu.Unlock()
 	if !sw.armed {
-		// Free stream (no accounting hold, or the hold already settled):
-		// observe and forward — the unarmed watch's measured N03-P01
-		// behavior, byte-for-byte.
-		if !sw.seen.Load() && isSSEDoneFrame(p) {
+		n, err := sw.ResponseWriter.Write(p)
+		if n > 0 && !sw.seen.Load() && isSSEDoneFrame(p[:n]) {
 			sw.seen.Store(true)
 		}
-		return sw.ResponseWriter.Write(p)
+		return n, err
 	}
-	if sw.held == nil {
-		head, term, ok := splitSSETerminal(p)
-		if !ok {
-			return sw.ResponseWriter.Write(p)
-		}
-		// Ordering contract: bytes that preceded the terminator inside
-		// this same write reach the client first; only the terminator
-		// (plus its own blank-line run) waits for the facts commit.
-		if len(head) > 0 {
-			if _, err := sw.ResponseWriter.Write(head); err != nil {
-				return 0, err
+	total := 0
+	for len(p) > 0 && sw.held == nil {
+		end := bytes.IndexAny(p, "\r\n")
+		line, separator := p, []byte(nil)
+		if end >= 0 {
+			line = p[:end]
+			separator = p[end : end+1]
+			if bytes.HasPrefix(p[end:], []byte("\r\n")) {
+				separator = p[end : end+2]
 			}
 		}
-		sw.held = append(sw.held[:0], term...)
-		return len(p), nil
+		n, err := sw.writeHeldLine(line, separator)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		p = p[n:]
 	}
-	// A terminator is already held: absorb the blank lines that complete
-	// its frame (the passthrough writes the line and its newline
-	// separately — releasing them early would reorder the client's
-	// terminator) and DROP duplicate upstream terminators leaked during
-	// the hold, so the client sees exactly one. Anything else (content
-	// after a terminator is a broken upstream) still forwards — losing
-	// bytes helps nobody.
-	if isAllNewlines(p) {
-		sw.held = append(sw.held, p...)
-		return len(p), nil
-	}
-	if onlySSEDoneLines(p) {
-		return len(p), nil
-	}
-	return sw.ResponseWriter.Write(p)
+	// Once a terminal is held, the client's SSE stream has no further
+	// events. Ignore trailing upstream bytes, including duplicate markers.
+	return total + len(p), nil
 }
 
-// splitSSETerminal splits p at its first standalone SSE terminator line
-// (the same line-exact rule as isSSEDoneFrame, so terminators are found
-// anywhere in a write, including batched behind prior frames). head is
-// everything before the terminator; term is the terminator line plus its
-// immediately following blank-line run — duplicate terminator lines after
-// that run are excluded (they are dropped by the caller, never released).
-func splitSSETerminal(p []byte) (head, term []byte, ok bool) {
-	offset := 0
-	for offset < len(p) {
-		line, next := nextSSELine(p, offset)
-		if isSSEDoneLine(line) {
-			head = p[:offset]
-			end := next
-			for end < len(p) {
-				cont, contNext := nextSSELine(p, end)
-				if !isAllNewlines(bytes.TrimSuffix(cont, []byte("\r"))) {
-					break
-				}
-				end = contNext
+// writeHeldLine streams ordinary lines immediately. Only a prefix that can
+// still become an exact terminator needs storage across Write boundaries.
+func (sw *sseTerminalWatch) writeHeldLine(line, separator []byte) (int, error) {
+	consumed := len(line) + len(separator)
+	if !sw.midLine && sw.captureTerminal(line, separator) {
+		return consumed, nil
+	}
+	if len(sw.prefix) > 0 {
+		_, err := writeSSEBytes(sw.ResponseWriter, sw.prefix)
+		if err != nil {
+			return 0, err
+		}
+		sw.prefix = nil
+	}
+	sw.midLine = len(separator) == 0
+	// line and separator are consecutive slices of the original write.
+	return writeSSEBytes(sw.ResponseWriter, line[:consumed])
+}
+
+func writeSSEBytes(w io.Writer, p []byte) (int, error) {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (sw *sseTerminalWatch) captureTerminal(line, separator []byte) bool {
+	for _, marker := range sseDoneFrames {
+		if !bytes.HasPrefix(marker, sw.prefix) || !bytes.HasPrefix(marker[len(sw.prefix):], line) {
+			continue
+		}
+		if len(separator) == 0 {
+			sw.prefix = append(sw.prefix, line...)
+			return true
+		}
+		if len(sw.prefix)+len(line) == len(marker) {
+			sw.held = append([]byte(nil), marker...)
+			// A split CRLF is indistinguishable from CR until the next write.
+			// Normalize CR to LF for downstream clients that use a line scanner.
+			if len(separator) == 1 {
+				sw.held = append(sw.held, '\n', '\n')
+			} else {
+				sw.held = append(sw.held, "\r\n\r\n"...)
 			}
-			return head, p[offset:end], true
-		}
-		if next >= len(p) {
-			return nil, nil, false
-		}
-		offset = next
-	}
-	return nil, nil, false
-}
-
-// nextSSELine returns the line starting at offset (CR stripped) and the
-// offset just past its newline (len(p) when the chunk ends without one).
-func nextSSELine(p []byte, offset int) (line []byte, next int) {
-	if i := bytes.IndexByte(p[offset:], '\n'); i >= 0 {
-		return bytes.TrimSuffix(p[offset:offset+i], []byte("\r")), offset + i + 1
-	}
-	return p[offset:], len(p)
-}
-
-// isSSEDoneLine reports whether a CR-stripped line is a [DONE] terminator.
-func isSSEDoneLine(line []byte) bool {
-	for _, frame := range sseDoneFrames {
-		if bytes.Equal(line, frame) {
+			sw.prefix = nil
 			return true
 		}
 	}
 	return false
-}
-
-// onlySSEDoneLines reports whether every line of p is blank or a [DONE]
-// terminator line — the shape of a duplicate upstream terminator leaked
-// while the first one is held.
-func onlySSEDoneLines(p []byte) bool {
-	only := true
-	for offset := 0; offset < len(p); {
-		line, next := nextSSELine(p, offset)
-		stripped := bytes.TrimSuffix(line, []byte("\r"))
-		if len(stripped) > 0 && !isSSEDoneLine(stripped) {
-			only = false
-			break
-		}
-		if next <= offset {
-			break
-		}
-		offset = next
-	}
-	return only
-}
-
-// isAllNewlines reports a chunk consisting solely of line terminators.
-func isAllNewlines(p []byte) bool {
-	for _, b := range p {
-		if b != '\n' && b != '\r' {
-			return false
-		}
-	}
-	return true
 }
 
 // Flush forwards to the wrapped writer's flusher.
