@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -83,4 +84,62 @@ func TestAdmissionRecoveryExpiryFailureIsRetried(t *testing.T) {
 	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
 	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
 	require.Len(t, scan.execsBySubstring("UPDATE request_admissions"), 1)
+}
+
+type brokenFactPage struct {
+	recoveryScan
+	ids         []string
+	checked     []string
+	failListing bool
+}
+type interruptedRows struct{ fakeRows }
+
+func (*interruptedRows) Err() error { return errors.New("page interrupted") }
+func (s *brokenFactPage) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	if query == pendingFactsSQL {
+		return &interruptedRows{}, nil
+	}
+	if s.failListing {
+		return nil, errors.New("connection reset")
+	}
+	start := args[0].(string)
+	rows := &fakeRows{}
+	for _, id := range s.ids {
+		if id > start {
+			rows.vals = append(rows.vals, []any{id})
+		}
+		if len(rows.vals) == recoveryBatchSize {
+			break
+		}
+	}
+	return rows, nil
+}
+func (s *brokenFactPage) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	id := args[0].(string)
+	s.checked = append(s.checked, id)
+	if id == s.ids[recoveryBatchSize-1] {
+		return errRow{err: errors.New("unreadable individual record")}
+	}
+	return errRow{err: pgx.ErrNoRows} // live delivery already won
+}
+func TestAdmissionRecoveryBrokenPagePreservesCursor(t *testing.T) {
+	scan := new(brokenFactPage)
+	for i := 1; i <= 129; i++ {
+		scan.ids = append(scan.ids, fmt.Sprintf("10000000-0000-4000-8000-%012x", i))
+	}
+	c := New(nil, nil, "events", silentLogger())
+	cursor, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.NoError(t, err)
+	require.True(t, more)
+	require.Equal(t, scan.ids[127], cursor)
+	scan.failListing = true
+	resumed, _, err := c.recoverAdmissionBatch(t.Context(), scan, cursor)
+	require.Error(t, err)
+	require.Equal(t, cursor, resumed)
+	scan.failListing = false
+	end, more, err := c.recoverAdmissionBatch(t.Context(), scan, resumed)
+	require.NoError(t, err)
+	require.False(t, more)
+	require.Equal(t, initialRecoveryCursor, end)
+	require.Equal(t, scan.ids, scan.checked)
 }
