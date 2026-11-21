@@ -25,6 +25,7 @@ import (
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/httpmw"
 	"github.com/reireirei/yabanin/pkg/resolver"
+	"github.com/stretchr/testify/require"
 )
 
 // markers that must never appear in any gateway-generated error envelope.
@@ -282,18 +283,10 @@ func TestImagesGenerations_ClientCancelMidResponse(t *testing.T) {
 		t.Fatal("gateway did not finish after client cancellation")
 	}
 
-	if rec.Code != http.StatusBadGateway {
-		t.Fatalf("status %d, want 502: %s", rec.Code, rec.Body.String())
-	}
-	if got := errorType(t, rec); got != "api_error" {
-		t.Fatalf("type %q body %s", got, rec.Body.String())
-	}
-	if ev != nil {
-		t.Fatalf("cancelled request published %+v — must never read as success", ev)
-	}
-	if !strings.Contains(rec.Body.String(), "failed to read upstream response") {
-		t.Fatalf("body %s", rec.Body.String())
-	}
+	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+	require.Equal(t, "api_error", errorType(t, rec))
+	require.Nil(t, ev, "a cancelled response cannot publish completion")
+	require.Contains(t, rec.Body.String(), "failed to read upstream response")
 }
 
 // through the real httpmw.MaxBody middleware answers 413 before any
