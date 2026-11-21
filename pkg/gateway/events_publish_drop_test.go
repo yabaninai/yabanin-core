@@ -148,6 +148,35 @@ func TestPublishEventBacklogFreeStillPublishes(t *testing.T) {
 	require.InDelta(t, before, silentFailureValue(t, "event_publish", "backlog_full"),
 		1e-9,
 		"a publish that acquired a slot must not count a backlog-full drop")
+	// The publish handoff detached a publisher goroutine that keeps the
+	// acquired slot until after publishAttempt — including its terminal
+	// Warn write into this test's log buffer — has returned (the same
+	// hold-until-after-the-write invariant requirePublishQuiescence
+	// relies on). Wait for that release before reading the buffer:
+	// reading `logs` while the detached goroutine may still be logging
+	// raced its Write under -race (write: events.go publishAttempt Warn,
+	// read: the NotContains below). The wait must be a REAL channel
+	// operation: the kth receive on a buffered channel happens-before
+	// the (k+C)th send completes, so a send into the slot the goroutine
+	// just released happens-after its release, which is program-ordered
+	// after the Warn write — everything after that send in the test is
+	// race-free to read the buffer. (Polling len(eventPublishSem) has
+	// no such happens-before edge: the 100x -race gate flagged the same
+	// read/write pair even when the release had long been observed.)
+	// The probe token is handed straight back so the test's own cap-1
+	// slot ledger stays exact for the deferred drain. Same expectation,
+	// synchronized observation; the bounded deadline catches a hung
+	// publish ladder.
+	require.Eventually(t, func() bool {
+		select {
+		case eventPublishSem <- struct{}{}:
+			<-eventPublishSem
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond,
+		"the detached publisher must release its slot once its retry ladder exhausts")
 	require.NotContains(t, logs.String(), "backlog full",
 		"a published event must not log the backlog warning")
 }
