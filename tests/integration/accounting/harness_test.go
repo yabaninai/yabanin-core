@@ -196,14 +196,48 @@ func startStand(t *testing.T) *stand {
 func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	t.Helper()
 
-	s := &stand{t: t}
+	s := &stand{t: t, extraGatewayEnv: extraGatewayEnv}
+	s.initRun(t)
+	s.startDataPlanes(t)
+	s.buildProductArtifact(t)
+	keyFile := s.provisionFixtureAndKeys(t)
+	appEnv := s.migrateAndSeedTenant(t, keyFile)
+
+	// Run-unique Redis stream so this stand's event traffic is isolated.
+	s.eventStream = "events:" + s.runID
+	gwPort := freePort(t)
+	ldPort := freePort(t)
+	s.gatewayURL = fmt.Sprintf("http://127.0.0.1:%d", gwPort)
+	s.gatewayEnv = append([]string{
+		"YABANIN_GATEWAY_LISTEN=127.0.0.1:" + fmt.Sprint(gwPort),
+		"YABANIN_AUTH_MODE=header",
+		"YABANIN_PROVIDER_ADDR=" + s.fixture.baseURL(),
+		"YABANIN_EVENT_STREAM=" + s.eventStream,
+		"YABANIN_CACHE_HMAC_SECRET=" + s.encKey,
+		"YABANIN_LOG_LEVEL=info",
+		"YABANIN_LOG_FORMAT=text",
+	}, append(s.extraGatewayEnv, appEnv...)...)
+	s.loggerdEnv = append([]string{
+		"YABANIN_LOGGERD_LISTEN=127.0.0.1:" + fmt.Sprint(ldPort),
+		"YABANIN_LOGGERD_STREAM=" + s.eventStream,
+		"YABANIN_LOGGERD_LOG_LEVEL=info",
+	}, appEnv...)
+
+	s.startLoggerd()
+	s.startGateway()
+	return s
+}
+
+// initRun stamps the run identity fields and allocates the stand's runtime
+// temp directory.
+func (s *stand) initRun(t *testing.T) {
+	t.Helper()
 	s.runID = newRunID(t)
 	s.reqPrefix = s.runID + "-req-"
 	s.orgName = "acc-org-" + s.runID
 	s.model = "acc-model-" + s.runID
 	s.pricingInputPerM = 2.0
 	s.pricingOutputPerM = 6.0
-	s.extraGatewayEnv = extraGatewayEnv
 
 	// Runtime temp outside every Git worktree: the acceptance standard
 	// requires that repository metadata is not discoverable from the
@@ -220,7 +254,12 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 		t.Fatalf("harness: temp dir %s unexpectedly resolves as a Git worktree", s.tempDir)
 	}
 	t.Logf("harness: run %s temp dir %s", s.runID, s.tempDir)
+}
 
+// startDataPlanes brings up the stand's PostgreSQL and Redis containers,
+// pinned to the quickstart digests, and records their connection points.
+func (s *stand) startDataPlanes(t *testing.T) {
+	t.Helper()
 	ctx := context.Background()
 
 	// Real PostgreSQL with the quickstart's owner credentials, pinned to
@@ -271,8 +310,12 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 		t.Fatalf("harness: redis port: %v", err)
 	}
 	s.redisAddr = net.JoinHostPort(rdHost, rdPort.Port())
+}
 
-	// The actual product binary, built from this worktree.
+// buildProductArtifact builds the actual product binary from this worktree
+// and retains CLI artifact evidence for the run.
+func (s *stand) buildProductArtifact(t *testing.T) {
+	t.Helper()
 	root := repoRoot(t)
 	s.binary = filepath.Join(s.tempDir, "bin", "yabanin")
 	if err := os.MkdirAll(filepath.Dir(s.binary), 0o750); err != nil {
@@ -289,6 +332,13 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	// config exists, so this check needs no database, Redis or config
 	// file — and its hash is retained as run evidence.
 	s.verifyCLIArtifact(t)
+}
+
+// provisionFixtureAndKeys starts the controllable provider fixture with a
+// fresh bearer token, mints the stand's encryption key, and writes the
+// upstream credential file consumed by seed. It returns the key file path.
+func (s *stand) provisionFixtureAndKeys(t *testing.T) string {
+	t.Helper()
 
 	// Controllable provider fixture and its bearer token.
 	tokRaw := make([]byte, 18)
@@ -307,12 +357,26 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	encKey := hex.EncodeToString(keyRaw)
 	s.encKey = encKey
 
+	keyFile := filepath.Join(s.tempDir, "upstream.key")
+	if err := os.WriteFile(keyFile, []byte(s.fixtureTok+"\n"), 0o600); err != nil {
+		t.Fatalf("harness: upstream key file: %v", err)
+	}
+	return keyFile
+}
+
+// migrateAndSeedTenant applies the embedded migrations on the owner login,
+// bootstraps and proves the app role, then seeds the organization routed at
+// the fixture and installs the operator-known pricing. It returns the
+// yabanin_app login env used by the long-running product processes.
+func (s *stand) migrateAndSeedTenant(t *testing.T, keyFile string) []string {
+	t.Helper()
+
 	// Owner login env: used by migrate and seed exactly like the
 	// quickstart's one-shot services (the controlled-elevation path).
 	ownerEnv := []string{
 		"YABANIN_PG_URI=" + s.ownerDSN,
 		"YABANIN_REDIS_ADDR=" + s.redisAddr,
-		"YABANIN_ENCRYPTION_KEY=" + encKey,
+		"YABANIN_ENCRYPTION_KEY=" + s.encKey,
 		"YABANIN_REGION=test",
 	}
 	// yabanin_app login env: used only by the long-running product
@@ -321,7 +385,7 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	appEnv := []string{
 		"YABANIN_PG_URI=" + s.appDSN,
 		"YABANIN_REDIS_ADDR=" + s.redisAddr,
-		"YABANIN_ENCRYPTION_KEY=" + encKey,
+		"YABANIN_ENCRYPTION_KEY=" + s.encKey,
 		"YABANIN_REGION=test",
 	}
 
@@ -339,15 +403,11 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	// Bootstrap yabanin_app from the production SQL, exactly like the
 	// quickstart's db-app-role one-shot that runs after migrate, then
 	// prove the app role actually works before anything uses it.
-	s.bootstrapAppRole(t, filepath.Join(root, "deploy", "quickstart", "bootstrap-app-role.sql"))
+	s.bootstrapAppRole(t, filepath.Join(repoRoot(t), "deploy", "quickstart", "bootstrap-app-role.sql"))
 	s.verifyAppRoleLogin(t)
 
 	// Seed one organization whose model routes at the fixture, then
 	// install the operator-known pricing the billed-row oracle uses.
-	keyFile := filepath.Join(s.tempDir, "upstream.key")
-	if err := os.WriteFile(keyFile, []byte(s.fixtureTok+"\n"), 0o600); err != nil {
-		t.Fatalf("harness: upstream key file: %v", err)
-	}
 	seedStdin := strings.NewReader("acc-admin-password-" + s.runID + "\n")
 	seedOut, err := s.runCmd(120*time.Second, ownerEnv, seedStdin,
 		"seed", "--profile", "provider",
@@ -386,30 +446,7 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 	// the identical path for the neighbor tenant.
 	s.ownerSeedEnv = ownerEnv
 	s.upstreamKeyFile = keyFile
-
-	// Run-unique Redis stream so this stand's event traffic is isolated.
-	s.eventStream = "events:" + s.runID
-	gwPort := freePort(t)
-	ldPort := freePort(t)
-	s.gatewayURL = fmt.Sprintf("http://127.0.0.1:%d", gwPort)
-	s.gatewayEnv = append([]string{
-		"YABANIN_GATEWAY_LISTEN=127.0.0.1:" + fmt.Sprint(gwPort),
-		"YABANIN_AUTH_MODE=header",
-		"YABANIN_PROVIDER_ADDR=" + s.fixture.baseURL(),
-		"YABANIN_EVENT_STREAM=" + s.eventStream,
-		"YABANIN_CACHE_HMAC_SECRET=" + hex.EncodeToString(keyRaw),
-		"YABANIN_LOG_LEVEL=info",
-		"YABANIN_LOG_FORMAT=text",
-	}, append(s.extraGatewayEnv, appEnv...)...)
-	s.loggerdEnv = append([]string{
-		"YABANIN_LOGGERD_LISTEN=127.0.0.1:" + fmt.Sprint(ldPort),
-		"YABANIN_LOGGERD_STREAM=" + s.eventStream,
-		"YABANIN_LOGGERD_LOG_LEVEL=info",
-	}, appEnv...)
-
-	s.startLoggerd()
-	s.startGateway()
-	return s
+	return appEnv
 }
 
 // bootstrapAppRole applies the production quickstart role bootstrap over
