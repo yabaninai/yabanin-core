@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -199,7 +200,11 @@ type streamRun struct {
 	// later. Same-goroutine discipline as the field above.
 	// doneWatch observes the client-bound bytes below every wrapper
 	// (cache record, history capture, policy seam, tool gate): nil in
-	// hand-assembled test chains that skip wrapWriters.
+	// hand-assembled test chains that skip wrapWriters. For admitted
+	// invocations it also carries the facts-ordered DONE hold — while
+	// armed it buffers the terminator and seen only flips when the frame
+	// actually reaches this client-facing seam. Its methods are
+	// nil-receiver safe.
 	doneWatch *sseTerminalWatch
 
 	// connection-phase results (connect).
@@ -688,7 +693,7 @@ func (r *streamRun) finishConnectFailure() {
 		"error", r.lastErr, "attempts", len(r.attempts))
 
 	// PB1: Lineage attestation for streaming error path.
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base: eventBase{
 			EventType:       "request.failed",
 			RequestID:       r.reqID,
@@ -725,6 +730,14 @@ func (r *streamRun) finishConnectFailure() {
 		// event (§5.3 Finalize); no usage accrued on the connection phase.
 		termination: budget.TerminationUpstreamErr,
 	}, nil)
+	// The client's stream already ended in an error envelope — its held
+	// [DONE] (if any) must never follow a failure; drop it and log the
+	// withheld event loudly.
+	r.doneWatch.failDoneHold()
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 
 	_, errType, _, errMsg := r.gw.mapProviderUpstream(r.finalInfo.Provider, r.lastCode, r.lastErr)
 	// RATELIMIT-FALLBACK P2: on a decision-bearing upstream rate limit,
@@ -1076,12 +1089,26 @@ func (r *streamRun) finishStreamPolicyDenied(usage provider.Usage, ttftMs int64,
 	if hasTTFT {
 		deniedBase.FirstTokenMs = ttftMs
 	}
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        deniedBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: budget.TerminationPolicyDenied,
 	}, nil)
+	// The seam's AbortFrame rode the armed hold — its error frame is
+	// already on the wire and its [DONE] is the held terminator: release
+	// it after the denial's facts commit so the client's error frame is
+	// properly terminated (it follows an error, never a success). A
+	// failed facts write drops it instead — the client must NOT observe
+	// a terminator for an unaccounted denial — and the withheld event is
+	// logged loudly.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
 }
 
 // drain pipes the committed upstream stream to the client through the
@@ -1118,6 +1145,14 @@ func (r *streamRun) drain(flusher http.Flusher) (usage provider.Usage, drainErr 
 	if r.doneWatch == nil {
 		r.doneWatch = newSSETerminalWatch(r.w)
 		r.w = r.doneWatch
+	}
+	// Central binding (Preview2 durable accounting): an admitted
+	// invocation holds the client-facing [DONE] until its terminal facts
+	// commit in finishSuccess — release happens exactly once after the
+	// durable write; a failed write drops the terminator and surfaces the
+	// typed accounting error frame instead.
+	if h := invocationIdentityFrom(r.ctx); h != nil && h.Admitted() && r.gw.invocations != nil {
+		r.doneWatch.armDoneHold()
 	}
 	handler := provider.NewStreamHandlerWithOptions(r.finalInfo.Provider, r.finalInfo.ModelName,
 		provider.StreamOptions{SuppressUsageOnlyChunk: !r.clientWantsUsage, RequestBytes: len(r.body)})
@@ -1502,11 +1537,16 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 	}
 	r.l.Warn("stream drain ended with error",
 		"error", drainErr, "model", r.finalInfo.ModelName, "idle_abort", idleAbort)
+	// Drop any held terminator FIRST: the drain failed, so the client's
+	// terminal is the error frame below, and with the watch innermost
+	// that frame's own trailing [DONE] must pass a disarmed hold (an
+	// armed hold would absorb it and leave the client stream unterminated).
 	// N03-P01: when the client already received the [DONE] terminator, the
 	// stream is over on the wire — a late failure must not emit a second
 	// terminal event (an error frame + duplicate [DONE] after [DONE] is an
 	// invalid stream per pkg/apiformat.ValidateChatStream). The failure is
 	// still logged here and reported as request.failed below.
+	r.doneWatch.failDoneHold()
 	if !r.clientTerminalDelivered() {
 		if idleAbort {
 			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
@@ -1603,12 +1643,18 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 	case r.ctx.Err() != nil:
 		term = budget.TerminationClientCancel
 	}
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        drainBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: term,
 	}, nil)
+	// The held [DONE] (if any) was already dropped above, before the
+	// client's error frame; a facts failure here only withholds the event.
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 }
 
 // finishSuccess finalizes a fully drained stream: breaker success, budget
@@ -1694,22 +1740,38 @@ func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsa
 	// FIX-20: the processed-response envelope of what the client received.
 	// A stream that ended cleanly without the [DONE] terminator is honest
 	// about it: partial + missing_done_frame. A budget-truncated capture is
-	// upgraded to partial + capture_limit inside finishEnvelope.
+	// upgraded to partial + capture_limit inside finishEnvelope. A
+	// terminator still in the facts-ordered hold counts as delivered: its
+	// release is this path's very next durable step (ferr handling below
+	// drops it instead, and withholds this event).
 	if r.history != nil {
 		status, reason := responseHistoryStatusComplete, ""
-		if !r.clientTerminalDelivered() {
+		if !r.clientTerminalDelivered() && !r.doneWatch.doneHoldPending() {
 			status, reason = responseHistoryStatusPartial, responseHistoryReasonMissingDoneFram
 		}
 		successBase.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
 	}
 	// NEXT-18c: settle the reservation with the actual spend (§5.3
 	// Finalize) and stamp the tuples + completed termination on the event.
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        successBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: budget.TerminationCompleted,
 	}, nil)
+	// Central binding: the held terminator is released only after the
+	// durable record committed. On failure it is dropped and replaced by
+	// the accounting error frame — deliberately NO safe-retry language:
+	// the work already ran under this invocation identity.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		writeSSEErrorWithCode(r.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		r.l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
 }
 
 // cachedCompletion is the minimal shape of a chat.completion document stored
@@ -1928,10 +1990,24 @@ func isSSEDoneFrame(p []byte) bool {
 // stream too and counts; a JSON chunk line never ends with a bare
 // terminator line, so a content delta merely mentioning "data: [DONE]"
 // cannot trip the detection.
+//
+// Preview2 durable accounting adds the facts-ordered hold: when armed
+// (admitted invocation), the FIRST recognized terminator — anywhere in a
+// write, including batched behind prior frames, whose delivery order is
+// preserved — is buffered instead of forwarded, and `seen` flips only
+// when the frame is actually written through this seam (at release, or
+// immediately on unarmed streams): a fully formed [DONE] observed before
+// the terminal facts commit is held, never counted as delivered.
+// Duplicate upstream terminators leaked during the hold are dropped, so
+// the client sees exactly one terminator, and only after the facts commit.
 type sseTerminalWatch struct {
 	http.ResponseWriter
 	flusher http.Flusher
 	seen    atomic.Bool
+
+	heldMu sync.Mutex
+	armed  bool
+	held   []byte
 }
 
 // newSSETerminalWatch wraps w; the watch itself stays a Flusher for
@@ -1944,11 +2020,198 @@ func newSSETerminalWatch(w http.ResponseWriter) *sseTerminalWatch {
 // sawDone reports whether the [DONE] terminator was written to the client.
 func (sw *sseTerminalWatch) sawDone() bool { return sw.seen.Load() }
 
+// armDoneHold makes the watch buffer the terminal [DONE] frame instead of
+// forwarding it: stream success is ordered after the terminal-facts
+// commit (central binding), so the client's terminator waits.
+func (sw *sseTerminalWatch) armDoneHold() {
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = true
+}
+
+// releaseDoneHold writes the held [DONE] frame after the facts committed.
+// It runs exactly once: the hold disarms (a later release or re-arm is a
+// no-op path-ordering bug, not a second terminator) and the delivery
+// finally flips `seen`. Nil-receiver safe: unwatched/free streams never
+// arm.
+func (sw *sseTerminalWatch) releaseDoneHold() {
+	if sw == nil {
+		return
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	if !sw.armed || sw.held == nil {
+		return
+	}
+	// Normalize a line-form hold ("data: [DONE]\n" without its blank
+	// line) to a complete frame — under LF or CRLF framing — so the
+	// released terminator is well-formed.
+	switch {
+	case bytes.HasSuffix(sw.held, []byte("\n\n")), bytes.HasSuffix(sw.held, []byte("\r\n\r\n")):
+	case bytes.HasSuffix(sw.held, []byte("\r\n")):
+		sw.held = append(sw.held, '\r', '\n')
+	case bytes.HasSuffix(sw.held, []byte("\n")):
+		sw.held = append(sw.held, '\n')
+	default:
+		sw.held = append(sw.held, '\n', '\n')
+	}
+	_, _ = sw.ResponseWriter.Write(sw.held)
+	sw.seen.Store(true)
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
+	sw.armed = false
+	sw.held = nil
+}
+
+// doneHoldPending reports whether a terminator is captured and awaiting
+// its facts-ordered release. Nil-receiver safe.
+func (sw *sseTerminalWatch) doneHoldPending() bool {
+	if sw == nil {
+		return false
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	return sw.armed && sw.held != nil
+}
+
+// failDoneHold drops the held [DONE] frame: the client must NOT observe a
+// success terminator for an unaccounted stream. Nil-receiver safe.
+func (sw *sseTerminalWatch) failDoneHold() {
+	if sw == nil {
+		return
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = false
+	sw.held = nil
+}
+
 func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
-	if !sw.seen.Load() && isSSEDoneFrame(p) {
-		sw.seen.Store(true)
+	if len(p) == 0 {
+		return 0, nil
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	if !sw.armed {
+		// Free stream (no accounting hold, or the hold already settled):
+		// observe and forward — the unarmed watch's measured N03-P01
+		// behavior, byte-for-byte.
+		if !sw.seen.Load() && isSSEDoneFrame(p) {
+			sw.seen.Store(true)
+		}
+		return sw.ResponseWriter.Write(p)
+	}
+	if sw.held == nil {
+		head, term, ok := splitSSETerminal(p)
+		if !ok {
+			return sw.ResponseWriter.Write(p)
+		}
+		// Ordering contract: bytes that preceded the terminator inside
+		// this same write reach the client first; only the terminator
+		// (plus its own blank-line run) waits for the facts commit.
+		if len(head) > 0 {
+			if _, err := sw.ResponseWriter.Write(head); err != nil {
+				return 0, err
+			}
+		}
+		sw.held = append(sw.held[:0], term...)
+		return len(p), nil
+	}
+	// A terminator is already held: absorb the blank lines that complete
+	// its frame (the passthrough writes the line and its newline
+	// separately — releasing them early would reorder the client's
+	// terminator) and DROP duplicate upstream terminators leaked during
+	// the hold, so the client sees exactly one. Anything else (content
+	// after a terminator is a broken upstream) still forwards — losing
+	// bytes helps nobody.
+	if isAllNewlines(p) {
+		sw.held = append(sw.held, p...)
+		return len(p), nil
+	}
+	if onlySSEDoneLines(p) {
+		return len(p), nil
 	}
 	return sw.ResponseWriter.Write(p)
+}
+
+// splitSSETerminal splits p at its first standalone SSE terminator line
+// (the same line-exact rule as isSSEDoneFrame, so terminators are found
+// anywhere in a write, including batched behind prior frames). head is
+// everything before the terminator; term is the terminator line plus its
+// immediately following blank-line run — duplicate terminator lines after
+// that run are excluded (they are dropped by the caller, never released).
+func splitSSETerminal(p []byte) (head, term []byte, ok bool) {
+	offset := 0
+	for offset < len(p) {
+		line, next := nextSSELine(p, offset)
+		if isSSEDoneLine(line) {
+			head = p[:offset]
+			end := next
+			for end < len(p) {
+				cont, contNext := nextSSELine(p, end)
+				if !isAllNewlines(bytes.TrimSuffix(cont, []byte("\r"))) {
+					break
+				}
+				end = contNext
+			}
+			return head, p[offset:end], true
+		}
+		if next >= len(p) {
+			return nil, nil, false
+		}
+		offset = next
+	}
+	return nil, nil, false
+}
+
+// nextSSELine returns the line starting at offset (CR stripped) and the
+// offset just past its newline (len(p) when the chunk ends without one).
+func nextSSELine(p []byte, offset int) (line []byte, next int) {
+	if i := bytes.IndexByte(p[offset:], '\n'); i >= 0 {
+		return bytes.TrimSuffix(p[offset:offset+i], []byte("\r")), offset + i + 1
+	}
+	return p[offset:], len(p)
+}
+
+// isSSEDoneLine reports whether a CR-stripped line is a [DONE] terminator.
+func isSSEDoneLine(line []byte) bool {
+	for _, frame := range sseDoneFrames {
+		if bytes.Equal(line, frame) {
+			return true
+		}
+	}
+	return false
+}
+
+// onlySSEDoneLines reports whether every line of p is blank or a [DONE]
+// terminator line — the shape of a duplicate upstream terminator leaked
+// while the first one is held.
+func onlySSEDoneLines(p []byte) bool {
+	only := true
+	for offset := 0; offset < len(p); {
+		line, next := nextSSELine(p, offset)
+		stripped := bytes.TrimSuffix(line, []byte("\r"))
+		if len(stripped) > 0 && !isSSEDoneLine(stripped) {
+			only = false
+			break
+		}
+		if next <= offset {
+			break
+		}
+		offset = next
+	}
+	return only
+}
+
+// isAllNewlines reports a chunk consisting solely of line terminators.
+func isAllNewlines(p []byte) bool {
+	for _, b := range p {
+		if b != '\n' && b != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 // Flush forwards to the wrapped writer's flusher.

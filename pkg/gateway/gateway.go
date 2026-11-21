@@ -1695,6 +1695,11 @@ type gatewayCore struct {
 	ruleStore      *rulestore.Store
 	eng            *evaluator.SnapshotCache
 	publisher      *eventpub.RedisPublisher
+	// invocations is the Preview2 durable-accounting store. Production
+	// wiring binds it to the request pool (NewPGInvocationStore); a nil
+	// store REFUSES paid dispatch (central binding: no production bypass)
+	// and the store itself fails closed on a nil pool.
+	invocations invocationStore
 	// eventNote, when set, observes events before they are published. Tests only.
 	eventNote   func(*eventpub.Event)
 	retryPolicy retry.Policy

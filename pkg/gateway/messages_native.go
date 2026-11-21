@@ -498,7 +498,7 @@ func (gw *gateway) finishNativeMessages(w http.ResponseWriter, ctx context.Conte
 	if eventType == "request.completed" {
 		term = completionTermination(ctx)
 	}
-	gw.finishRequest(ctx, requestFinish{
+	_, _ = gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  eventType,
 			RequestID:                  admitted.RequestID,

@@ -111,6 +111,9 @@ func (gw *gateway) buildShadowJob(ctx context.Context, body []byte, model, orgID
 	// target is what produced the tokens; its adapter knows its schema).
 	providerName := providerForModel(ctx, gw, sc.Model)
 	adapter, _ := provider.New(providerName)
+	apiKeyID, sessionKeyID := eventKeyID(ctx), eventSessionID(ctx)
+	invocation := newInvocationIdentity(orgID, reqID, sessionID, apiKeyID, sessionKeyID, model)
+	accountingCtx := withInvocationIdentity(context.WithoutCancel(ctx), invocation)
 
 	return shadow.Job{
 		RequestID:    reqID,
@@ -133,6 +136,12 @@ func (gw *gateway) buildShadowJob(ctx context.Context, body []byte, model, orgID
 			if err != nil {
 				return nil, fmt.Errorf("shadow upstream client for %s: %w", providerName, err)
 			}
+			// Run has admitted the mirror to its concurrency and daily budget limits.
+			// Only this separate paid dispatch needs its own durable start.
+			if err := gw.confirmPaidInvocation(withInvocationIdentity(ctx, invocation), invocationKindShadow); err != nil {
+				l.Warn("shadow admission unavailable", "request_id", reqID, "error", err)
+				return nil, err
+			}
 			return client.ForwardJSON(ctx, shadowBody, sc.Model, key)
 		},
 		ParseUsage: func(b []byte) provider.Usage {
@@ -145,8 +154,10 @@ func (gw *gateway) buildShadowJob(ctx context.Context, body []byte, model, orgID
 			return provider.ComputeCost(u, providerName, modelName).EstimatedCostUSD
 		},
 		Publish: func(ev *eventpub.Event) { //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-			// Bounded, retrying publisher (50-slot semaphore, 2s timeout,
-			// 3 retries) — same delivery guarantees as primary events.
+			ev.APIKeyID, ev.SessionKeyID = apiKeyID, sessionKeyID
+			if err := gw.stampAndCommitInvocationTerminal(accountingCtx, ev, l); err != nil {
+				return
+			}
 			publishEvent(gw.publisher, l, ev)
 		},
 	}

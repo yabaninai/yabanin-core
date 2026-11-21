@@ -162,7 +162,7 @@ func (gw *gateway) embeddings(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	gw.finishRequest(rctx, requestFinish{
+	_, _ = gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,

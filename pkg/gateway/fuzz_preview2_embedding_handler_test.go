@@ -157,7 +157,7 @@ func TestEmbeddingsFinishRequestHookOrder(t *testing.T) {
 	defer restore()
 	gw.eventNote = func(*eventpub.Event) { order = append(order, "event_note") }
 
-	finEv := gw.finishRequest(context.Background(), requestFinish{
+	finEv, _ := gw.finishRequest(context.Background(), requestFinish{
 		base:        eventBase{EventType: "request.completed", RequestID: "fz-finish", OrgID: "org-fz", ModelUsed: "m"},
 		attestModel: "embed-b",
 		info:        resolver.ModelInfo{ModelName: "embed-b", Provider: "openai", Enabled: true},

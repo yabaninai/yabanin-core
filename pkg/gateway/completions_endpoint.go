@@ -296,7 +296,7 @@ func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, 
 		costUSD:    ext.EstimatedCostUSD,
 		priceKnown: ext.PriceKnown,
 	})
-	gw.finishRequest(ctx, requestFinish{
+	_, _ = gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:      "request.completed",
 			RequestID:      admitted.RequestID,
