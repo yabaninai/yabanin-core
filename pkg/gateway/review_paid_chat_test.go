@@ -55,9 +55,12 @@ func TestReviewPaidChatHTTP(t *testing.T) {
 			require.Equal(t, tc.calls, calls.Load())
 			if tc.calls == 0 {
 				require.Equal(t, 503, rec.Code)
-				var body struct{ Error struct{ Code string } }
+				var body struct {
+					Error struct{ Code, Message string }
+				}
 				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &body))
 				require.Equal(t, "history_unavailable", body.Error.Code)
+				require.Contains(t, body.Error.Message, "the paid call was not sent")
 				return
 			}
 			if tc.store.factsErr != nil {
