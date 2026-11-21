@@ -5,15 +5,13 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"os"
 	"strings"
 	"testing"
 )
 
 func TestConfigFromEnv_MissingKey_Errors(t *testing.T) {
-	prev := os.Getenv("TOKENROUTER_API_KEY")
-	os.Unsetenv("TOKENROUTER_API_KEY")
-	defer os.Setenv("TOKENROUTER_API_KEY", prev)
+	t.Setenv("YABANIN_API_KEY", "")
+	t.Setenv("TOKENROUTER_API_KEY", "")
 
 	_, err := ConfigFromEnv()
 	if err == nil {
@@ -22,13 +20,12 @@ func TestConfigFromEnv_MissingKey_Errors(t *testing.T) {
 }
 
 func TestNew_DefaultBaseURL(t *testing.T) {
-	os.Setenv("YABANIN_DEPLOY_MODE", "saas")
-	prevKey := os.Getenv("TOKENROUTER_API_KEY")
-	os.Setenv("TOKENROUTER_API_KEY", "pa_test-key")
-	defer func() {
-		os.Unsetenv("YABANIN_DEPLOY_MODE")
-		os.Setenv("TOKENROUTER_API_KEY", prevKey)
-	}()
+	t.Setenv("YABANIN_DEPLOY_MODE", "saas")
+	t.Setenv("YABANIN_REGION", "")
+	t.Setenv("YABANIN_BASE_URL", "")
+	t.Setenv("TOKENROUTER_BASE_URL", "")
+	t.Setenv("YABANIN_API_KEY", "")
+	t.Setenv("TOKENROUTER_API_KEY", "pa_test-key")
 
 	cfg, err := ConfigFromEnv()
 	if err != nil {
@@ -48,26 +45,17 @@ func TestNew_DefaultBaseURL(t *testing.T) {
 }
 
 func TestNew_EmptyKey_Errors(t *testing.T) {
-	os.Setenv("TOKENROUTER_API_KEY", "")
-	defer os.Unsetenv("TOKENROUTER_API_KEY")
-
-	cfg, err := ConfigFromEnv()
-	if err != nil {
-		t.Skip("ConfigFromEnv already errored")
-	}
-	_, err = New(Config{BaseURL: cfg.BaseURL, APIKey: ""})
+	_, err := New(Config{BaseURL: "http://localhost:8082"})
 	if err == nil {
 		t.Error("expected error for empty key")
 	}
 }
 
 func TestNew_OnPremDefault(t *testing.T) {
-	os.Setenv("YABANIN_DEPLOY_MODE", "onprem")
-	os.Setenv("TOKENROUTER_API_KEY", "pa_test-key")
-	defer func() {
-		os.Unsetenv("YABANIN_DEPLOY_MODE")
-		os.Unsetenv("TOKENROUTER_API_KEY")
-	}()
+	t.Setenv("YABANIN_DEPLOY_MODE", "onprem")
+	t.Setenv("YABANIN_BASE_URL", "")
+	t.Setenv("TOKENROUTER_BASE_URL", "")
+	t.Setenv("YABANIN_API_KEY", "pa_test-key")
 
 	cfg, err := ConfigFromEnv()
 	if err != nil {
