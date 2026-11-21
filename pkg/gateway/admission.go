@@ -539,39 +539,8 @@ func (gw *gateway) admit(w http.ResponseWriter, r *http.Request, in admitInput) 
 		Invocation:     core.Invocation,
 	}
 
-	if gw.residencyEnforcer != nil && out.OrgID != "" {
-		resDec := gw.residencyEnforcer.Enforce(r.Context(), out.OrgID, out.Info.ModelName, policy.Region(out.Info.Region), out.Info.Provider)
-		if !resDec.Allowed {
-			l.Warn("residency enforcement denied",
-				"org_id", out.OrgID, "region", resDec.Region,
-				"pack", resDec.PackID, "reason", resDec.Reason,
-				"violations", resDec.Violations)
-			metrics.ResidencyEnforcementTotal.WithLabelValues(string(resDec.Region), "denied").Inc()
-			apierrors.Write(w, http.StatusForbidden, "residency_policy_violation",
-				"request violates organization residency policy: "+resDec.Reason)
-			return admitted{}, false
-		}
-		if resDec.RemappedModel != "" {
-			if in.NoRemap {
-				apierrors.Write(w, http.StatusForbidden, "residency_policy_violation",
-					"model is not allowed in the organization's region and cannot be remapped for this endpoint")
-				return admitted{}, false
-			}
-			l.Debug("residency remap", "org_id", out.OrgID, "from", out.Info.ModelName, "to", resDec.RemappedModel)
-			nfo, resErr := gw.resolveModelInfo(r.Context(), resDec.RemappedModel)
-			if resErr != nil {
-				l.Warn("remapped model resolution unavailable, denying request", "error", resErr, "requested", resDec.RemappedModel)
-				writeResolutionUnavailable(w)
-				return admitted{}, false
-			}
-			out.Info = nfo
-			metrics.ResidencyRemapTotal.WithLabelValues(string(resDec.Region)).Inc()
-		}
-		metrics.ResidencyEnforcementTotal.WithLabelValues(string(resDec.Region), "allowed").Inc()
-		w.Header().Set("X-Residency-Region", string(resDec.Region))
-		if resDec.PackID != "" && resDec.PackID != "none" {
-			w.Header().Set("X-Residency-Pack", resDec.PackID)
-		}
+	if !gw.enforceResidency(w, r, l, &out, in.NoRemap) {
+		return admitted{}, false
 	}
 
 	// RT-02: final-candidate policy gate. Non-chat paths do not run the
@@ -583,4 +552,50 @@ func (gw *gateway) admit(w http.ResponseWriter, r *http.Request, in admitInput) 
 		return admitted{}, false
 	}
 	return out, true
+}
+
+// enforceResidency runs the non-chat residency gate on the admitted request
+// (admit's post-core step, in its original position): org policy
+// enforcement, the NoRemap refusal for remap-incompatible endpoints, the
+// remapped candidate's re-resolution and the region/pack response headers.
+// A remap rewrites out.Info in place so the caller's final-candidate gate
+// sees the replaced candidate. ok is false when a response was already
+// written; a nil enforcer or an unattributable request passes through.
+func (gw *gateway) enforceResidency(w http.ResponseWriter, r *http.Request, l *slog.Logger, out *admitted, noRemap bool) bool {
+	if gw.residencyEnforcer == nil || out.OrgID == "" {
+		return true
+	}
+	resDec := gw.residencyEnforcer.Enforce(r.Context(), out.OrgID, out.Info.ModelName, policy.Region(out.Info.Region), out.Info.Provider)
+	if !resDec.Allowed {
+		l.Warn("residency enforcement denied",
+			"org_id", out.OrgID, "region", resDec.Region,
+			"pack", resDec.PackID, "reason", resDec.Reason,
+			"violations", resDec.Violations)
+		metrics.ResidencyEnforcementTotal.WithLabelValues(string(resDec.Region), "denied").Inc()
+		apierrors.Write(w, http.StatusForbidden, "residency_policy_violation",
+			"request violates organization residency policy: "+resDec.Reason)
+		return false
+	}
+	if resDec.RemappedModel != "" {
+		if noRemap {
+			apierrors.Write(w, http.StatusForbidden, "residency_policy_violation",
+				"model is not allowed in the organization's region and cannot be remapped for this endpoint")
+			return false
+		}
+		l.Debug("residency remap", "org_id", out.OrgID, "from", out.Info.ModelName, "to", resDec.RemappedModel)
+		nfo, resErr := gw.resolveModelInfo(r.Context(), resDec.RemappedModel)
+		if resErr != nil {
+			l.Warn("remapped model resolution unavailable, denying request", "error", resErr, "requested", resDec.RemappedModel)
+			writeResolutionUnavailable(w)
+			return false
+		}
+		out.Info = nfo
+		metrics.ResidencyRemapTotal.WithLabelValues(string(resDec.Region)).Inc()
+	}
+	metrics.ResidencyEnforcementTotal.WithLabelValues(string(resDec.Region), "allowed").Inc()
+	w.Header().Set("X-Residency-Region", string(resDec.Region))
+	if resDec.PackID != "" && resDec.PackID != "none" {
+		w.Header().Set("X-Residency-Pack", resDec.PackID)
+	}
+	return true
 }
