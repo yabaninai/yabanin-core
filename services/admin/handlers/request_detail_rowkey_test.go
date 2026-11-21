@@ -43,8 +43,8 @@ func TestRequestDetailRowKeySelectsPhysicalRow(t *testing.T) {
 	require.NotContains(t, row2.Body.String(), `"tokens_in":100`)
 
 	for _, target := range []string{
-		"/api/organizations/org-1/requests/req-1?row_key=3", // key of another correlation
-		"/api/organizations/org-1/requests/req-1?row_key=4", // key of another org
+		"/api/organizations/org-1/requests/req-1?row_key=3",  // key of another correlation
+		"/api/organizations/org-1/requests/req-1?row_key=4",  // key of another org
 		"/api/organizations/org-1/requests/req-1?row_key=99", // unknown key
 	} {
 		rec := runRootDetail(h, target)
