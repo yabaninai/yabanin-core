@@ -36,7 +36,6 @@ import (
 	"crypto/rand"
 	"fmt"
 	"io"
-	"log/slog"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -47,9 +46,8 @@ import (
 
 	"github.com/go-chi/chi/v5"
 	"github.com/reireirei/yabanin/pkg/batchstore"
-	"github.com/reireirei/yabanin/pkg/config"
 	"github.com/reireirei/yabanin/pkg/httpmw"
-	"github.com/reireirei/yabanin/pkg/upstream"
+	"github.com/reireirei/yabanin/pkg/resolver"
 )
 
 // startLimitsWireServer mounts the production middleware order on the
@@ -85,13 +83,11 @@ func wireImagesGateway(t *testing.T, calls *atomic.Int64) *gateway {
 		_, _ = w.Write([]byte(`{"created":1,"data":[{"b64_json":"aGk="}]}`))
 	}))
 	t.Cleanup(up.Close)
-	return &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: up.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": {ModelName: "gpt-image-1-canon", Provider: "openai", UpstreamURL: up.URL, Enabled: true}},
-		pool: upstream.NewPool(upstream.Options{}),
-	}
+	gw := imagesTestGateway(t, resolver.ModelInfo{
+		ModelName: "gpt-image-1-canon", Provider: "openai", UpstreamURL: up.URL, Enabled: true,
+	}, up.URL)
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-wire", nil))
+	return gw
 }
 
 // T05: chunked framing cannot hide the body size. The header carries no
