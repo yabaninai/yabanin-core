@@ -118,8 +118,14 @@ func paidBackup(t *testing.T, s *stand) string {
 
 func restorePaidDatabase(t *testing.T, s *stand, dump string) (*sql.DB, *sql.DB) {
 	t.Helper()
+	// v0.45.0 Run only starts and inspects; it does not wait. The source
+	// container survives because binaries build before first use, but this
+	// DR target runs bootstrap over the local socket right away and can hit
+	// the temporary-init postmaster. Wait for the double readiness log and
+	// the listening port first.
 	target, err := testpostgres.Run(t.Context(), pgImage, testpostgres.WithDatabase(pgDatabase),
-		testpostgres.WithUsername(pgOwnerUser), testpostgres.WithPassword(pgOwnerPass))
+		testpostgres.WithUsername(pgOwnerUser), testpostgres.WithPassword(pgOwnerPass),
+		testpostgres.BasicWaitStrategies())
 	require.NoError(t, err)
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
