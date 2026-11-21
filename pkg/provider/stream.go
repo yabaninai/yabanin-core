@@ -7,11 +7,12 @@
 //
 // Retry and fallback (P3.13b/c) operate only at the connection-setup phase —
 // once a 200 response is received and the handler is invoked, the stream is
-// committed and the handler drains it directly to the client without buffering.
+// committed and the handler forwards events as they complete.
 package provider
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -29,12 +30,8 @@ import (
 //   - Honour ctx cancellation: when ctx is cancelled, stop reading from
 //     resp.Body and return ctx.Err().
 //
-// Mid-stream errors (malformed events, upstream disconnect) are surfaced as
-// the returned error; the caller is responsible for emitting a terminal SSE
-// error event + [DONE] since partial data has already been flushed. The relay
-// emits only complete SSE frames: under cancel/error a dangling partial line
-// is NOT completed at handler level — the gateway tail-completion owns it
-// (pkg/gateway/stream.go completePassthroughTail).
+// Return a mid-stream transport error to the gateway so it can send a terminal
+// error event and [DONE] after the complete events already delivered.
 //
 // Saw-terminal contract (H3, audit extra §R-1): a stream that ends at EOF
 // without its provider terminal event ([DONE] line, anthropic message_stop,
@@ -63,6 +60,9 @@ type StreamOptions struct {
 	// stream_options.include_usage. The chunk is still parsed for Usage —
 	// only the client-facing bytes are suppressed.
 	SuppressUsageOnlyChunk bool
+	// RecoverLegacyCompletionLine keeps a complete JSON data line received
+	// by /v1/completions just before a transport failure at the separator.
+	RecoverLegacyCompletionLine bool
 	// RequestBytes is the upstream request body length. When a stream ends
 	// without provider usage, prompt tokens are estimated as ceil(RequestBytes/4).
 	RequestBytes int
@@ -93,6 +93,7 @@ func NewStreamHandlerWithOptions(providerName, model string, opts StreamOptions)
 	}
 	return &openAIStreamHandler{
 		suppressUsageOnlyChunk: opts.SuppressUsageOnlyChunk,
+		recoverLegacyLine:      opts.RecoverLegacyCompletionLine,
 		requestBytes:           opts.RequestBytes,
 	}
 }
@@ -112,6 +113,7 @@ type openAIStreamHandler struct {
 	// for. Set via NewStreamHandlerWithOptions to drop that chunk from the
 	// client bytes while still parsing its usage.
 	suppressUsageOnlyChunk bool
+	recoverLegacyLine      bool
 	requestBytes           int
 }
 
@@ -119,105 +121,181 @@ func (h *openAIStreamHandler) HandleStream(ctx context.Context, w http.ResponseW
 	scanner := bufio.NewScanner(resp.Body)
 	scanner.Buffer(make([]byte, 64*1024), maxStreamLineBytes)
 
-	// sseTerm is the per-line suffix we write. SSE framing: each line is
-	// terminated by LF; frame separators are an additional empty line (LF).
-	// Writing each scanned line followed by a single LF reproduces the
-	// original stream byte-for-byte, including blank-line frame separators
-	// (which the scanner yields as zero-length lines).
-
-	var usage Usage
-	var completionBytes int
-	lastLineEmpty := true
-	sawDone := false   // H3: did the upstream carry its [DONE] terminal event?
-	skipBlank := false // a suppressed usage-only chunk also eats its frame separator
+	var lines streamLineSplitter
+	scanner.Split(lines.split)
+	first := true
+	var run openAIStreamRun
 	for scanner.Scan() {
-		// Surface client-disconnect / ctx cancellation promptly. The next
-		// resp.Body.Read would eventually error, but this avoids one more
-		// upstream round-trip when the client is already gone. The prefix
-		// that already streamed is still billable information: the byte
-		// estimate is attached exactly like the scanner-error exit so a
-		// cancel never flips the event between "estimated" and "none" by
-		// scheduling luck (§8.2: estimate over what actually streamed).
+		if lines.unterminated && scanner.Err() != nil {
+			break
+		}
 		if err := ctx.Err(); err != nil {
-			return h.withByteEstimate(usage, completionBytes), err
+			return h.withByteEstimate(run.usage, run.completionBytes), err
 		}
-
 		line := scanner.Bytes()
-		lastLineEmpty = len(line) == 0
-		if isDoneDataLine(line) {
-			sawDone = true
+		if first {
+			line = bytes.TrimPrefix(line, []byte("\xef\xbb\xbf"))
+			first = false
 		}
-
-		// RM-03: the gateway-requested usage-only chunk. Parse its usage,
-		// write nothing, and swallow the blank separator that follows so
-		// the client sees a well-formed stream.
-		var swallow bool
-		usage, skipBlank, swallow = h.suppressUsageOnly(line, usage, skipBlank)
-		if swallow {
-			continue
+		if err := run.line(line, w, flusher, h.suppressUsageOnlyChunk); err != nil {
+			return h.withByteEstimate(run.usage, run.completionBytes), err
 		}
-
-		// IMPORTANT: scanner.Bytes() aliases the scanner's internal buffer.
-		// We must not pass it through append() (which would mutate the
-		// buffer and corrupt subsequent tokens) — write the line and the
-		// terminator as separate calls instead. A write failure means the
-		// client is gone: same §8.2 estimate treatment as the cancel exit.
-		if _, err := w.Write(line); err != nil {
-			return h.withByteEstimate(usage, completionBytes), fmt.Errorf("stream write failed: %w", err)
-		}
-		if _, err := io.WriteString(w, sseTerm); err != nil {
-			return h.withByteEstimate(usage, completionBytes), fmt.Errorf("stream write failed: %w", err)
-		}
-		flusher.Flush()
-
-		completionBytes += streamDeltaBytes(line)
-		usage = parseOpenAIChunkUsage(line, usage)
 	}
-
-	if err := scanner.Err(); err != nil {
-		// The request was accepted and the prefix was consumed upstream, so
-		// the drain-failure cost is the estimate over what actually streamed
-		// (contract §8.2), not zero.
-		return h.withByteEstimate(usage, completionBytes), fmt.Errorf("stream read failed: %w", err)
-	}
-	// Some compatible providers end with "data: [DONE]" and omit the
-	// event's empty separator line; completeFinalFrame handles that so
-	// downstream SSE filters can wait for full events without swallowing
-	// the terminator. A write failure means the client is gone: same §8.2
-	// estimate treatment as every other abnormal exit.
-	if err := completeFinalFrame(w, flusher, lastLineEmpty); err != nil {
-		return h.withByteEstimate(usage, completionBytes), err
-	}
-	usage = h.withByteEstimate(usage, completionBytes)
-	// H3 (saw-terminal contract): EOF without [DONE] means the upstream cut
-	// the stream mid-flight (load balancer timeout, crash, network tear).
-	// The prefix may look complete but no terminal event was seen — report
-	// the run as incomplete so the gateway never caches it and never
-	// accounts it as a completed request. The bytes already flushed stay
-	// as-is; the gateway's drain-failure path owns the client-facing
-	// error frame + [DONE].
-	if !sawDone {
-		return usage, fmt.Errorf("openai stream ended without [DONE] terminator: %w", ErrStreamIncomplete)
-	}
-	return usage, nil
+	err := run.finish(ctx, scanner.Err(), w, flusher, h.suppressUsageOnlyChunk, h.recoverLegacyLine && !lines.unterminated)
+	return h.withByteEstimate(run.usage, run.completionBytes), err
 }
 
-// sseTerm is the per-line terminator written when reconstructing an SSE
-// stream; a frame separator is an additional empty line (see HandleStream).
-const sseTerm = "\n"
+func (r *openAIStreamRun) finish(ctx context.Context, readErr error, w io.Writer, flusher http.Flusher, suppressUsage, recoverLegacyLine bool) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if readErr != nil {
+		return r.finishReadFailure(ctx, readErr, w, flusher, suppressUsage, recoverLegacyLine)
+	}
+	// Some providers omit the blank line after their final JSON or [DONE].
+	if len(r.frame) > 0 {
+		if err := r.emit(w, flusher, suppressUsage, true); err != nil {
+			return err
+		}
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if !r.sawDone {
+		return fmt.Errorf("openai stream ended without [DONE] terminator: %w", ErrStreamIncomplete)
+	}
+	return nil
+}
 
-// completeFinalFrame finishes an upstream SSE stream whose last line was
-// data-carrying: some compatible providers end with "data: [DONE]" and omit
-// the event's empty separator line, so the terminator is appended here to
-// let downstream SSE filters wait for full events without swallowing it.
-func completeFinalFrame(w io.Writer, flusher http.Flusher, lastLineEmpty bool) error {
-	if lastLineEmpty {
+func (r *openAIStreamRun) finishReadFailure(ctx context.Context, readErr error, w io.Writer, flusher http.Flusher, suppressUsage, recoverLegacyLine bool) error {
+	if recoverLegacyLine && r.hasRecoverableJSONLine(readErr) {
+		if err := r.emit(w, flusher, suppressUsage, true); err != nil {
+			return err
+		}
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+	}
+	return fmt.Errorf("stream read failed: %w", readErr)
+}
+
+// A CR ends a line immediately. A following LF belongs to the same
+// terminator even if it arrives in a later read.
+type streamLineSplitter struct {
+	afterCR      bool
+	unterminated bool
+}
+
+func (s *streamLineSplitter) split(data []byte, atEOF bool) (int, []byte, error) {
+	start := 0
+	if s.afterCR && len(data) != 0 {
+		if data[0] == '\n' {
+			start = 1
+		}
+		s.afterCR = false
+	}
+	i := bytes.IndexAny(data[start:], "\r\n")
+	if i < 0 {
+		if atEOF && len(data) > start {
+			s.unterminated = true
+			return len(data), data[start:], nil
+		}
+		return start, nil, nil
+	}
+	end := start + i
+	s.afterCR = data[end] == '\r'
+	return end + 1, data[start:end], nil
+}
+
+type openAIStreamRun struct {
+	frame           []byte
+	usage           Usage
+	completionBytes int
+	sawDone         bool
+}
+
+func (r *openAIStreamRun) hasRecoverableJSONLine(readErr error) bool {
+	line := bytes.TrimSuffix(r.frame, []byte("\n"))
+	payload, isData := bytes.CutPrefix(line, []byte("data:"))
+	return !errors.Is(readErr, bufio.ErrTooLong) && isData && !bytes.ContainsRune(line, '\n') && json.Valid(payload)
+}
+
+func (r *openAIStreamRun) line(line []byte, w io.Writer, flusher http.Flusher, suppressUsage bool) error {
+	// Many small data fields can form one SSE event. Bound their combined
+	// size independently of the scanner's per-line limit.
+	const maxEventBytes = 8 << 20
+	if len(r.frame)+len(line)+1 > maxEventBytes {
+		return fmt.Errorf("openai stream event exceeds %d bytes", maxEventBytes)
+	}
+	if len(r.frame) == 0 && bytes.HasPrefix(line, []byte(":")) {
+		r.frame = append(r.frame, line...)
+		return r.write(w, flusher)
+	}
+	if len(line) == 0 {
+		return r.emit(w, flusher, suppressUsage, false)
+	}
+	r.frame = append(r.frame, line...)
+	r.frame = append(r.frame, '\n')
+	return nil
+}
+
+// openAIEventData joins SSE data fields with LF into the single data line
+// used by the usage and delta parsers. Keep the common single field zero-copy.
+func openAIEventData(frame []byte) []byte {
+	frame = bytes.TrimSuffix(frame, []byte("\n"))
+	if bytes.HasPrefix(frame, []byte("data: ")) && !bytes.ContainsRune(frame, '\n') {
+		return frame
+	}
+	var data []byte
+	for line := range bytes.SplitSeq(frame, []byte("\n")) {
+		value, ok := bytes.CutPrefix(line, []byte("data:"))
+		if !ok {
+			if !bytes.Equal(line, []byte("data")) {
+				continue
+			}
+			value = nil
+		}
+		if data == nil {
+			data = append(data, "data: "...)
+		} else {
+			data = append(data, '\n')
+		}
+		data = append(data, bytes.TrimPrefix(value, []byte(" "))...)
+	}
+	return data
+}
+
+func (r *openAIStreamRun) emit(w io.Writer, flusher http.Flusher, suppressUsage, trailing bool) error {
+	data := openAIEventData(r.frame)
+	done := isDoneDataLine(data)
+	if trailing && !done && !json.Valid(bytes.TrimPrefix(data, []byte("data: "))) {
 		return nil
 	}
-	if _, err := io.WriteString(w, sseTerm); err != nil {
+	if suppressUsage && isUsageOnlyChunk(data) {
+		r.usage = parseOpenAIChunkUsage(data, r.usage)
+		r.frame = r.frame[:0]
+		return nil
+	}
+	if err := r.write(w, flusher); err != nil {
+		return err
+	}
+	r.sawDone = r.sawDone || done
+	r.completionBytes += streamDeltaBytes(data)
+	r.usage = parseOpenAIChunkUsage(data, r.usage)
+	return nil
+}
+
+func (r *openAIStreamRun) write(w io.Writer, flusher http.Flusher) error {
+	frame := append(r.frame, '\n')
+	n, err := w.Write(frame)
+	if err == nil && n != len(frame) {
+		err = io.ErrShortWrite
+	}
+	if err != nil {
 		return fmt.Errorf("stream write failed: %w", err)
 	}
 	flusher.Flush()
+	r.frame = frame[:0]
 	return nil
 }
 
@@ -230,25 +308,6 @@ func (h *openAIStreamHandler) withByteEstimate(usage Usage, completionBytes int)
 		return estimatedStreamUsage(h.requestBytes, completionBytes)
 	}
 	return usage
-}
-
-// suppressUsageOnly implements the RM-03 gateway-requested usage-only-chunk
-// suppression: swallow=true means the caller skips writing this line; the
-// returned skipBlank carries the "swallow the following blank separator"
-// state across calls. A malformed non-separator follower is written
-// normally (skipBlank consumed, swallow=false).
-func (h *openAIStreamHandler) suppressUsageOnly(line []byte, usage Usage, skipBlank bool) (Usage, bool, bool) {
-	if h.suppressUsageOnlyChunk && isUsageOnlyChunk(line) {
-		return parseOpenAIChunkUsage(line, usage), true, true
-	}
-	if skipBlank {
-		skipBlank = false
-		if len(line) == 0 {
-			return usage, skipBlank, true
-		}
-		// Malformed upstream: next line isn't a separator — write it.
-	}
-	return usage, skipBlank, false
 }
 
 // isDoneDataLine reports whether an SSE line is the OpenAI [DONE] terminator.
@@ -280,11 +339,12 @@ func isUsageOnlyChunk(line []byte) bool {
 	var chunk struct {
 		Choices []json.RawMessage `json:"choices"`
 		Usage   json.RawMessage   `json:"usage"`
+		Error   *json.RawMessage  `json:"error"`
 	}
 	if err := json.Unmarshal(payload, &chunk); err != nil {
 		return false
 	}
-	return len(chunk.Choices) == 0 && len(chunk.Usage) > 0 && !equal(chunk.Usage, []byte("null"))
+	return chunk.Choices != nil && len(chunk.Choices) == 0 && chunk.Error == nil && len(chunk.Usage) > 0 && !equal(chunk.Usage, []byte("null"))
 }
 
 // parseOpenAIChunkUsage updates usage in-place when the line is a data: line
