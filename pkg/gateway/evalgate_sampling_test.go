@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/reireirei/yabanin/pkg/classifier"
 	"github.com/reireirei/yabanin/pkg/config"
 	"github.com/reireirei/yabanin/pkg/evalgate"
@@ -408,5 +410,32 @@ func TestTP03_JudgeErrorSkipsInsertVerdict(t *testing.T) {
 	}
 	if got := store.count(); got != 0 {
 		t.Fatalf("InsertVerdict calls = %d, want 0 (judge error must not reach the store)", got)
+	}
+}
+
+func TestEvalgateConfiguredEvaluatorModelReachesProvider(t *testing.T) {
+	for _, tc := range []struct{ configured, want string }{{"custom-evaluator", "custom-evaluator"}, {"", "gpt-4o-mini"}} {
+		t.Run(tc.want, func(t *testing.T) {
+			arrived := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct{ Model string }
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+				}
+				arrived <- req.Model
+				http.Error(w, "fixture refusal", http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			wire := gatewayWiring{cfg: config.Gateway{EvalgateURL: server.URL, EvalgateModel: tc.configured}, l: slog.Default(), pool: &pgxpool.Pool{}}
+			var gw gateway
+			buildGatewayObservability(t.Context(), &wire, &gw, nil)
+			_, call, err := gw.judge.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+			if err == nil || call.Status != http.StatusServiceUnavailable {
+				t.Fatalf("unexpected call: %+v, %v", call, err)
+			}
+			if model := <-arrived; model != tc.want || call.Model != tc.want {
+				t.Fatalf("configured %q: provider received %q, recorded %q", tc.configured, model, call.Model)
+			}
+		})
 	}
 }

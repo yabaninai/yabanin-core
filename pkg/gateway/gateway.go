@@ -1457,7 +1457,9 @@ func buildGatewayObservability(ctx context.Context, w *gatewayWiring, gw *gatewa
 		judge := evalgate.NewJudge(w.cfg.EvalgateURL, w.l.With("component", "evalgate"))
 		store := evalgate.NewStore(w.pool, w.l.With("component", "evalgate-store"))
 
-		// Wire judge API key if configured.
+		if w.cfg.EvalgateModel != "" {
+			judge.SetModel(w.cfg.EvalgateModel)
+		}
 		if w.cfg.EvalgateAPIKey != "" {
 			judge.SetAPIKey(w.cfg.EvalgateAPIKey)
 		}
