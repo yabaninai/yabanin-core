@@ -1011,6 +1011,18 @@ func (c *StreamConsumer) writeFirstDeliverySideEffects(ctx context.Context, tx I
 	return tx.Commit(ctx)
 }
 
+// persistCompletedSideEffects writes the post-log persistence of a
+// first-delivery request.completed as one unit: the retained tool-call
+// aggregate, then the shared first-delivery side effects with their commit.
+// request.failed keeps its own envelope (persistFailedDelivery) and its
+// semantics are unchanged — failures carry no tool-call aggregate.
+func (c *StreamConsumer) persistCompletedSideEffects(ctx context.Context, tx InboxTx, ev requestEvent, plan []scopeCharge, chargeState money.QuoteState, policy deliveryPolicy) error {
+	if err := c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse, ev.invocationIDValue); err != nil {
+		return err
+	}
+	return c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy)
+}
+
 // persistFailedDelivery writes one request.failed delivery inside the
 // claimed transaction and commits it: the request log row (raw error text
 // and raw status code — the failed-shape contract), the policy decision
@@ -1395,18 +1407,17 @@ func (c *StreamConsumer) handleRequestCompleteProfile(ctx context.Context, msg r
 		return c.finishDuplicateInvocation(ctx, tx, ev, policy)
 	}
 
-	// Tool-call aggregate: the calls the model requested are extracted from
-	// the raw sample (pre-truncation) so the analytics table stays queryable.
-	// The tool facts carry this delivery's invocation identity when it has
-	// one (0030); a legacy delivery binds the NULL domain unchanged. Errors
-	// fail the delivery (rollback, no ack, redelivery) — see insertToolCalls
-	// for why nothing inside a PostgreSQL transaction is fail-soft, and how
-	// redelivery converges without duplicate children.
-	if err := c.insertToolCalls(ctx, tx, ev.requestIDValue, ev.orgIDValue, ev.g2.taskIDStr, ev.modelUsed, ev.upstreamResponse, ev.invocationIDValue); err != nil {
-		return err
-	}
-
-	if err := c.writeFirstDeliverySideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
+	// Tool-call aggregate + first-delivery accounting as one atomic unit:
+	// the calls the model requested are extracted from the raw sample
+	// (pre-truncation) so the analytics table stays queryable, then the
+	// shared side effects (policy decision, charge intents, admission
+	// transition, commit) run in the same transaction. The tool facts carry
+	// this delivery's invocation identity when it has one (0030); a legacy
+	// delivery binds the NULL domain unchanged. Errors fail the delivery
+	// (rollback, no ack, redelivery) — see insertToolCalls for why nothing
+	// inside a PostgreSQL transaction is fail-soft, and how redelivery
+	// converges without duplicate children.
+	if err := c.persistCompletedSideEffects(ctx, tx, ev, plan, chargeState, policy); err != nil {
 		return err
 	}
 

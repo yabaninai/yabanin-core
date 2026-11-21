@@ -171,7 +171,7 @@ func TestRun_ResumesInterruptedApplyWithoutDuplicatesOrLosses(t *testing.T) {
 	require.Equal(t, 1, retry.Applied)
 	requireRowCount(t, ctx, pool, "organizations", 1,
 		"the retry must not duplicate the probe row")
-	requireBookkeeping(t, ctx, pool, jointScenario.headVersion, false)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 }
 
 // TestRun_RecoversAfterRealFailedMigration — a migration that fails mid-apply
@@ -226,7 +226,7 @@ func TestRun_RecoversAfterRealFailedMigration(t *testing.T) {
 
 	// No duplicates, no losses: exactly one bookkeeping row, the probe row
 	// intact, the previously failing step now completed properly.
-	requireBookkeeping(t, ctx, pool, jointScenario.headVersion, false)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 	requireRowCount(t, ctx, pool, "organizations", 1,
 		"the probe row must survive the recovery untouched")
 	requireTableExists(t, dsn, "batch_files")
@@ -296,7 +296,7 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 	res, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err)
 	require.Equal(t, int64(jointScenario.headVersion), res.Version)
-	requireBookkeeping(t, ctx, pool, jointScenario.headVersion, false)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 	requireRowCount(t, ctx, pool, "guard_pack_state", 0,
 		"the re-created structure starts empty: deleted data is not restored")
 	requireRowCount(t, ctx, pool, "organizations", 1,
