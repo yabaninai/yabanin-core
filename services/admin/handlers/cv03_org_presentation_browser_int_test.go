@@ -907,11 +907,17 @@ func TestCV03OrgPresentationBrowserAcceptance(t *testing.T) {
 
 	// Green named specs are NOT sufficient: the Playwright COMMAND must
 	// have exited zero (exit code, JSON parse) and its GLOBAL state must
-	// be clean — no unexpected/skipped specs, no top-level errors array
-	// (teardown/global failures). These are hard requirements after the
-	// receipt, so a failing run still leaves its evidence behind.
+	// be clean — exactly the frozen case count expected (a shrunk or
+	// grown suite is not this acceptance), zero flaky (a retried spec is
+	// not a clean pass), no unexpected/skipped specs, no top-level
+	// errors array (teardown/global failures). These are hard
+	// requirements after the receipt, so a failing run still leaves its
+	// evidence behind.
 	require.NoError(t, pwErr,
 		"cv03: the playwright command itself must succeed (exit status/JSON — details in %s/playwright.out)", artifacts)
+	require.Equal(t, len(cv03RequiredCases), report.Stats.Expected,
+		"cv03: playwright expected exactly %d specs (got %d) — suite drift", len(cv03RequiredCases), report.Stats.Expected)
+	require.Zero(t, report.Stats.Flaky, "cv03: playwright reported %d flaky specs — a retried pass is not a clean pass", report.Stats.Flaky)
 	require.Zero(t, report.Stats.Unexpected, "cv03: playwright reported %d unexpected results", report.Stats.Unexpected)
 	require.Zero(t, report.Stats.Skipped, "cv03: playwright reported %d skipped specs", report.Stats.Skipped)
 	require.Empty(t, report.Errors,

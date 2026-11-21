@@ -15,8 +15,10 @@
 #      for this invocation;
 #   3. the receipt is mode == "acceptance" — a CONTROL-mode receipt can
 #      never satisfy this gate;
-#   4. clean global state: zero global/teardown errors, zero unexpected
-#      and zero skipped specs;
+#   4. clean global state: zero global/teardown errors, stats exactly as
+#      the frozen suite requires — expected == 3 (suite drift rejected),
+#      zero unexpected, zero skipped, zero flaky (a retried pass is not
+#      a clean pass);
 #   5. the frozen case registry, pinned here as a set: exactly
 #      AC-OP-MEMBER, AC-OP-SHARE, AC-OP-READER — no missing, unknown or
 #      duplicate case ids — each at the Go stand's verdict "passed".
@@ -68,9 +70,12 @@ if os.stat(receipt).st_mtime < start - 1:
 if doc.get("mode") != "acceptance":
     bad(f"receipt {receipt} mode={doc.get('mode')!r}: a control-mode receipt can never satisfy the acceptance gate")
 stats = doc.get("stats") or {}
-for field in ("unexpected", "skipped"):
+frozen_n = 3  # len of the frozen registry below
+if stats.get("expected", -1) != frozen_n:
+    bad(f"receipt {receipt}: stats.expected={stats.get('expected')!r} (require exactly {frozen_n} — suite drift)")
+for field in ("unexpected", "skipped", "flaky"):
     if stats.get(field, -1) != 0:
-        bad(f"receipt {receipt}: stats.{field}={stats.get(field)!r} (require 0)")
+        bad(f"receipt {receipt}: stats.{field}={stats.get(field)!r} (require 0; a flaky retry is not a clean pass)")
 if doc.get("global_errors", -1) != 0:
     bad(f"receipt {receipt}: global_errors={doc.get('global_errors')!r} (require 0; teardown/global Playwright errors)")
 required = doc.get("required_cases") or []
@@ -134,7 +139,7 @@ gate_selftest() {
 JSON
 	)
 	local case
-	for case in good control stale global unexpected registry-shrink registry-dup registry-unknown case-failed; do
+	for case in good control stale global unexpected expected flaky registry-shrink registry-dup registry-unknown case-failed; do
 		printf '%s\n' "$good" >"$tmp/r-$case.json"
 	done
 	touch -d "@$start" "$tmp"/r-*.json
@@ -142,6 +147,8 @@ JSON
 	touch -d "@$((start - 3600))" "$tmp/r-stale.json"
 	sed -i 's/"global_errors": 0/"global_errors": 2/' "$tmp/r-global.json"
 	sed -i 's/"unexpected": 0/"unexpected": 1/' "$tmp/r-unexpected.json"
+	sed -i 's/"expected": 3/"expected": 2/' "$tmp/r-expected.json"
+	sed -i 's/"flaky": 0/"flaky": 1/' "$tmp/r-flaky.json"
 	sed -i 's/"required_cases": \["AC-OP-MEMBER", "AC-OP-SHARE", "AC-OP-READER"\]/"required_cases": ["AC-OP-MEMBER"]/' "$tmp/r-registry-shrink.json"
 	sed -i 's/{"id": "AC-OP-READER", "title": "reader", "status": "passed"}/{"id": "AC-OP-MEMBER", "title": "dup", "status": "passed"}/' "$tmp/r-registry-dup.json"
 	sed -i 's/{"id": "AC-OP-READER", "title": "reader", "status": "passed"}/{"id": "AC-OP-EXTRA", "title": "extra", "status": "passed"}/' "$tmp/r-registry-unknown.json"
@@ -154,6 +161,8 @@ JSON
 stale:not fresh
 global:global_errors
 unexpected:stats.unexpected
+expected:stats.expected
+flaky:stats.flaky
 registry-shrink:frozen registry
 registry-dup:duplicate case ids
 registry-unknown:frozen registry
@@ -169,7 +178,7 @@ case-failed:status'
 			|| die "selftest: $name rejection must name its reason '$fragment' (got: $(cat "$tmp/e-$name"))"
 	done
 
-	echo "orgpresentation gate: selftest OK (4 log cases + 8 isolated receipt negatives + 1 positive)"
+	echo "orgpresentation gate: selftest OK (4 log cases + 10 isolated receipt negatives + 1 positive)"
 }
 
 # --- main gate --------------------------------------------------------------
