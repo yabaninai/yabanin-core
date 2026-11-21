@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/reireirei/yabanin/pkg/budget"
 	"github.com/reireirei/yabanin/pkg/config"
@@ -25,10 +26,14 @@ import (
 // path: normal generated text is JSON-marshaled as the "input" string, forwarded
 // to the local mock upstream, and forwarded content, response body and usage
 // accounting are verified deterministically for every input. The input-
-// independent contracts the pipeline cannot reach from this request shape —
-// session-affinity recording, the finishRequest hook order, the
-// completionTermination classification — are pinned once by the named tests
-// below instead of inside every fuzz iteration.
+// independent contracts the pipeline cannot reach from this request shape are
+// pinned by frozen seed cases inside this driver (critical-go wave 2: seed
+// coverage counts only work executed on the fuzz path), with the named tests
+// below kept as behavior documentation:
+//
+//	pick 3 — accountUsage's session-affinity recording arm,
+//	pick 4 — finishCompletion over a canceled request context (§5.3
+//	         client-cancel termination) with the hook order.
 func FuzzEmbeddingsHappyPathForwarding(f *testing.F) {
 	const upstreamBody = `{"object":"list","data":[],"usage":{"prompt_tokens":3,"total_tokens":3}}`
 
@@ -36,11 +41,27 @@ func FuzzEmbeddingsHappyPathForwarding(f *testing.F) {
 	// plus a long base64-run body (critical-go: the reservation input
 	// profile's base64-strip accounting loop, exercised through the real
 	// embeddings request path).
-	f.Add("hello")
-	f.Add("fuzz seed two")
-	f.Add(strings.Repeat("QUJD", 100))
+	f.Add(uint8(0), "hello")
+	f.Add(uint8(1), "fuzz seed two")
+	f.Add(uint8(2), strings.Repeat("QUJD", 100))
+	// Critical-go wave-2 frozen pins (input-independent contracts).
+	f.Add(uint8(3), "")
+	f.Add(uint8(4), "")
 
-	f.Fuzz(func(t *testing.T, in string) {
+	f.Fuzz(func(t *testing.T, pick uint8, in string) {
+		switch pick {
+		case 3:
+			fuzzAffinityAccounted(t)
+			return
+		case 4:
+			fuzzFinishCompletionTerminated(t)
+			return
+		case 0, 1, 2:
+			// the regular happy-path body below
+		default:
+			// unknown pins (only reachable under -fuzz) run the regular body
+		}
+
 		text := "embedding: " + strings.ToValidUTF8(in, "�")
 		body, err := json.Marshal(struct {
 			Model string `json:"model"`
@@ -167,6 +188,74 @@ func TestCompletionTerminationClassification(t *testing.T) {
 				t.Fatalf("completionTermination = %v, want %v", got, tt.want)
 			}
 		})
+	}
+}
+
+// fuzzAffinityAccounted executes the session-affinity recording arm of
+// accountUsage on the fuzz path (critical-go wave 2: seed coverage counts
+// only work executed inside fuzz iterations). The embeddings pipeline never
+// sets affinityModel on its usageRecord, so the arm only fires for a
+// non-empty model; the probe lowers the min-token gate to 1 so its cache-
+// read count sticks the model as the session preference.
+func fuzzAffinityAccounted(t *testing.T) {
+	t.Helper()
+
+	gw := &gateway{log: fuzzDiscardLogger(), sessionAffinity: fallbackrouter.NewSessionAffinity(0, 1, 0)}
+	ctx := context.Background()
+	gw.accountUsage(ctx, httptest.NewRecorder(), usageRecord{
+		orgID:         "org-fz-affinity",
+		sessionID:     "sess-fz-affinity",
+		affinityModel: "embed-pin",
+		usage:         provider.Usage{PromptTokens: 1, CompletionTokens: 2, CacheReadTokens: 7},
+	})
+	if got := gw.sessionAffinity.Preferred(ctx, "org-fz-affinity", "sess-fz-affinity"); got != "embed-pin" {
+		t.Fatalf("session affinity not recorded: preferred %q", got)
+	}
+}
+
+// fuzzFinishCompletionTerminated executes finishCompletion over a canceled
+// request context on the fuzz path (critical-go wave 2): §5.3 Finalize must
+// classify the dead context as a client cancel, the provider-reported usage
+// reaches the finisher event, and the hook order stays eventNote → publish.
+// The reservation gate is nil on this bare gateway, so finalize is the
+// attach-only no-op (the wired settle path is integration-pinned) and the
+// termination stamp never reaches the event.
+func fuzzFinishCompletionTerminated(t *testing.T) {
+	t.Helper()
+
+	canceled, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got := completionTermination(canceled); got != budget.TerminationClientCancel {
+		t.Fatalf("completionTermination(canceled) = %v, want %v", got, budget.TerminationClientCancel)
+	}
+
+	gw := &gateway{log: fuzzDiscardLogger()}
+	var (
+		order []string
+		note  *eventpub.Event
+	)
+	restore := observeEvent(func(*eventpub.Event) { order = append(order, "publish") })
+	defer restore()
+	gw.eventNote = func(e *eventpub.Event) { order = append(order, "event_note"); note = e }
+
+	gw.finishCompletion(httptest.NewRecorder(), canceled, admitted{
+		Info:           resolver.ModelInfo{ModelName: "m", Provider: "openai", Enabled: true},
+		RequestedModel: "m",
+		OrgID:          "org-fzc",
+		TeamID:         "team-fzc",
+		APIKeyID:       "key-fzc",
+		SessionID:      "sess-fzc",
+		RequestID:      "req-fzc",
+	}, provider.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8, Source: provider.UsageSourceProvider},
+		"openai", "http://upstream-fzc.invalid", http.StatusOK, time.Now(), nil)
+
+	if want := []string{"event_note", "publish"}; !slices.Equal(order, want) {
+		t.Fatalf("finishCompletion hook order = %v, want %v", order, want)
+	}
+	if note == nil || note.EventType != "request.completed" || note.Endpoint != "completions" ||
+		note.TokensIn != 3 || note.TokensOut != 5 || note.UsageSource != "provider" ||
+		note.StatusCode != http.StatusOK {
+		t.Fatalf("finishCompletion event = %+v", note)
 	}
 }
 

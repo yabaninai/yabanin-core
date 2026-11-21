@@ -95,11 +95,71 @@ func FuzzTraceEventDelivery(f *testing.F) {
 	for i := range traceDeliveryCases {
 		f.Add(uint8(i), uint32(23+i), i%2 == 0)
 	}
+	// Critical-go wave-2 frozen pins: the guard arms the request-scoped
+	// scenarios cannot reach — empty-id / invalid-reason no-ops (200) and
+	// the cyclic registry eviction at the bound (201).
+	f.Add(uint8(200), uint32(1), false)
+	f.Add(uint8(201), uint32(1), false)
 	f.Fuzz(func(t *testing.T, index uint8, request uint32, before bool) {
+		if index >= 200 {
+			traceStampGuardCase(t, int(index))
+			return
+		}
 		s := traceDeliveryCases[int(index)%len(traceDeliveryCases)].scaled(int(request % 31))
 		id := traceStampTestID(t, fmt.Sprintf("delivery-%08x", request))
 		traceDeliveryEvent(t, id, fmt.Sprintf("team-%x", request), s, before)
 	})
+}
+
+// traceStampGuardCase pins the trace-stamp guard arms (critical-go wave 2):
+// empty request ids and reasons outside the closed enum are honest no-ops,
+// a context without a request id never marks policy truncation, and the
+// bounded registry evicts its oldest slot cyclically when the 4097th
+// request registers.
+func traceStampGuardCase(t *testing.T, index int) {
+	t.Helper()
+	switch index {
+	case 200:
+		require.Nil(t, traceStampClaim(""))
+		traceStampObservePublished("")
+		traceStampObserveDrop("", "drop:event_publish:publish_failed")
+		traceStampMarkTruncated("", "truncated:policy_steps")
+		traceStampMarkTruncated("guard-200", "not-a-reason")
+		traceStampDeclare("", 3)
+		traceStampDeclare("guard-200", -1)
+		traceStampPolicyTruncation(context.Background(), true, true)
+		ev := &eventpub.Event{RequestID: "guard-200"}
+		traceStampEvent(ev)
+		require.JSONEq(t, `{"v":1,"c":"unknown"}`, ev.Labels["trace_completeness"])
+	case 201:
+		// Fill the registry to its bound, then force one cyclic eviction:
+		// the slot about to be overwritten is freed and a claim for it
+		// reports absence instead of resurrecting stale evidence.
+		var fill []string
+		defer func() {
+			for _, id := range fill {
+				traceStampClaim(id)
+			}
+		}()
+		registrySize := func() int {
+			traceStampMu.Lock()
+			defer traceStampMu.Unlock()
+			return len(traceStampRegistry)
+		}
+		for registrySize() < traceStampRegistryMax {
+			id := fmt.Sprintf("evict-%d", len(fill))
+			traceStampStateFor(id)
+			fill = append(fill, id)
+		}
+		traceStampMu.Lock()
+		victim := traceStampRing[traceStampRingNext]
+		traceStampMu.Unlock()
+		traceStampStateFor("evict-newest")
+		require.Nil(t, traceStampClaim(victim))
+		require.NotNil(t, traceStampClaim("evict-newest"))
+	default:
+		t.Fatalf("unknown trace guard case %d", index)
+	}
 }
 
 func TestTraceDeliveryRedisStream(t *testing.T) {

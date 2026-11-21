@@ -32,7 +32,7 @@ func (r *fuzzFlushRecorder) Flush() {
 }
 
 func FuzzSSEToolGate(f *testing.F) {
-	for id := 1; id <= 18; id++ {
+	for id := 1; id <= 24; id++ {
 		f.Add([]byte{byte(id)}) // frozen regression corpus
 	}
 	// Generated-stream seeds: active gate with denied fragment mid-hold, and
@@ -56,8 +56,13 @@ func FuzzSSEToolGate(f *testing.F) {
 	f.Add([]byte{133, 0, 0, 0})                                      // nameless call with arguments → release guard
 	f.Add([]byte{137, 0, 0, 0})                                      // object arguments → identity refused
 	f.Add([]byte{193, 0, 0, 0x0C, 193, 0, 0, 0x40})                  // inactive: scalar then invalid-first-token payloads
+	// Critical-go wave-2 frozen pins (SSE-19..SSE-24): the passthrough tail
+	// tracker, the stream identity shim, the SSE error frame, held-frame
+	// passthrough for unparseable payloads, and the streaming-policy state /
+	// writer delegation cluster. These are direct unit pins — no SSE frames
+	// are driven.
 	f.Fuzz(func(t *testing.T, data []byte) {
-		if len(data) > 0 && data[0] >= 1 && data[0] <= 18 {
+		if len(data) > 0 && data[0] >= 1 && data[0] <= 24 {
 			fuzzSSECases[int(data[0])](t)
 			return
 		}
@@ -294,6 +299,12 @@ var fuzzSSECases = map[int]func(*testing.T){
 	16: fuzzSSE16,
 	17: fuzzSSE17,
 	18: fuzzSSE18,
+	19: fuzzSSE19,
+	20: fuzzSSE20,
+	21: fuzzSSE21,
+	22: fuzzSSE22,
+	23: fuzzSSE23,
+	24: fuzzSSE24,
 }
 
 // // SSE-01 inactive writer passes frames through untouched
@@ -688,5 +699,152 @@ func fuzzSSE18(t *testing.T) {
 	body := w.Body.String()
 	if !strings.Contains(body, "safe_tool") || !strings.Contains(body, `"finish_reason":"tool_calls"`) {
 		t.Fatalf("SSE-18: engine-less release must pass frames through: %q", body)
+	}
+}
+
+// // SSE-19 passthrough tail tracker: header/status delegation, byte-exact
+// write passthrough, and the torn-tail predicate in both polarities
+// (critical-go wave 2: stream.go ssePassthroughTail.Header, WriteHeader,
+// torn).
+func fuzzSSE19(t *testing.T) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	tail := &ssePassthroughTail{w: rec}
+	tail.Header().Set("X-Tail-Probe", "1")
+	if got := rec.Header().Get("X-Tail-Probe"); got != "1" {
+		t.Fatalf("SSE-19: Header must delegate to the wrapped writer, got %q", got)
+	}
+	tail.WriteHeader(http.StatusTeapot)
+	if rec.Code != http.StatusTeapot {
+		t.Fatalf("SSE-19: WriteHeader must delegate, got %d", rec.Code)
+	}
+	if tail.torn() {
+		t.Fatal("SSE-19: nothing written must not be torn")
+	}
+	if n, err := tail.Write([]byte("data: x\n")); err != nil || n != 8 {
+		t.Fatalf("SSE-19: data write: n=%d err=%v", n, err)
+	}
+	if !tail.torn() {
+		t.Fatal("SSE-19: a written data line without its blank separator must be torn")
+	}
+	if n, err := tail.Write([]byte("\n")); err != nil || n != 1 {
+		t.Fatalf("SSE-19: separator write: n=%d err=%v", n, err)
+	}
+	if tail.torn() {
+		t.Fatal("SSE-19: a completed frame must not be torn")
+	}
+	if got := rec.Body.String(); got != "data: x\n\n" {
+		t.Fatalf("SSE-19: passthrough must stay byte-identical, got %q", got)
+	}
+}
+
+// // SSE-20 stream identity shim: the stream stage stamps the same resolved
+// team and key identities the middleware would set on the JSON path
+// (critical-go wave 2: stream.go streamIdentityRequest).
+func fuzzSSE20(t *testing.T) {
+	t.Helper()
+
+	ctx := withPrincipal(context.Background(), principal{APIKeyID: "key-fz20"})
+	req := streamIdentityRequest(&streamRun{teamID: "team-fz20", ctx: ctx})
+	if got := req.Header.Get("X-Team-Id"); got != "team-fz20" {
+		t.Fatalf("SSE-20: X-Team-Id = %q, want team-fz20", got)
+	}
+	if got := req.Header.Get("X-API-Key-Id"); got != "key-fz20" {
+		t.Fatalf("SSE-20: X-API-Key-Id = %q, want key-fz20", got)
+	}
+}
+
+// // SSE-21 code-less SSE error frame: type and message render, the [DONE]
+// terminator follows, the flush reaches the client, and a failing writer
+// must not panic (critical-go wave 2: stream.go writeSSEError).
+func fuzzSSE21(t *testing.T) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	writeSSEError(rec, "upstream_error", "boom")
+	body := rec.Body.String()
+	if !strings.Contains(body, `"type":"upstream_error"`) || !strings.Contains(body, "boom") {
+		t.Fatalf("SSE-21: error frame missing type/message: %q", body)
+	}
+	if !strings.HasSuffix(body, "data: [DONE]\n\n") {
+		t.Fatalf("SSE-21: frame must end with the [DONE] terminator: %q", body)
+	}
+	if !rec.Flushed {
+		t.Fatal("SSE-21: the error frame must flush")
+	}
+	dead := &fuzzRecorder{ResponseRecorder: httptest.NewRecorder(), failWrite: true}
+	writeSSEError(dead, "upstream_error", "client gone") // must not panic
+}
+
+// // SSE-22 held-frame passthrough and payload stripping: a held frame whose
+// payload no longer parses passes byte-identically (never fail the stream
+// over a filter bug), and a non-data frame strips to its trimmed line
+// (critical-go wave 2: toolgate.go writeHeld, framePayload).
+func fuzzSSE22(t *testing.T) {
+	t.Helper()
+
+	if got := string(framePayload([]byte("  : keepalive\t"))); got != ": keepalive" {
+		t.Fatalf("SSE-22: non-data payload must trim to the raw line, got %q", got)
+	}
+	rec := httptest.NewRecorder()
+	g := &sseToolGateWriter{w: rec}
+	frame := []byte(": keepalive\n\n")
+	g.writeHeld(heldFrame{frame: frame}, map[callKey]bool{}, map[int]bool{})
+	if rec.Body.String() != string(frame) {
+		t.Fatalf("SSE-22: unparseable held frame must pass byte-identically, got %q", rec.Body.String())
+	}
+}
+
+// // SSE-23 streaming-policy state: markAborted records the terminal denial,
+// aborted and payloadJSON expose it, and an empty state reports nothing
+// (critical-go wave 2: stream_policy.go streamPolicyState).
+func fuzzSSE23(t *testing.T) {
+	t.Helper()
+
+	st := &streamPolicyState{}
+	if aborted, msg := st.aborted(); aborted || msg != "" {
+		t.Fatalf("SSE-23: fresh state must not be aborted, got (%v,%q)", aborted, msg)
+	}
+	if got := st.payloadJSON(); got != "" {
+		t.Fatalf("SSE-23: empty state must render an empty policy payload, got %q", got)
+	}
+	st.markAborted("blocked by stream policy")
+	aborted, msg := st.aborted()
+	if !aborted || msg != "blocked by stream policy" {
+		t.Fatalf("SSE-23: markAborted must record the denial, got (%v,%q)", aborted, msg)
+	}
+}
+
+// // SSE-24 policy-seam writer delegation: header/status passthrough, the
+// [DONE] terminator predicate, and the abort accessors riding the shared
+// state (critical-go wave 2: stream_policy.go sseStreamPolicyWriter).
+func fuzzSSE24(t *testing.T) {
+	t.Helper()
+
+	rec := httptest.NewRecorder()
+	pw := &sseStreamPolicyWriter{w: rec, state: &streamPolicyState{}}
+	pw.Header().Set("X-Policy-Probe", "1")
+	if got := rec.Header().Get("X-Policy-Probe"); got != "1" {
+		t.Fatalf("SSE-24: Header must delegate to the wrapped writer, got %q", got)
+	}
+	pw.WriteHeader(http.StatusInsufficientStorage)
+	if rec.Code != http.StatusInsufficientStorage {
+		t.Fatalf("SSE-24: WriteHeader must delegate, got %d", rec.Code)
+	}
+	if !pw.isDone([]byte("data: [DONE]\n")) || pw.isDone([]byte("data: x\n")) {
+		t.Fatal("SSE-24: isDone must accept only the trimmed [DONE] terminator")
+	}
+	if pw.policyAborted() || pw.abortMessage() != "" {
+		t.Fatalf("SSE-24: fresh writer must not be aborted, got (%v,%q)",
+			pw.policyAborted(), pw.abortMessage())
+	}
+	pw.state.markAborted("prefix deny")
+	if !pw.policyAborted() || pw.abortMessage() != "prefix deny" {
+		t.Fatalf("SSE-24: writer must surface the state denial, got (%v,%q)",
+			pw.policyAborted(), pw.abortMessage())
+	}
+	if got := pw.payloadJSON(); got != "" {
+		t.Fatalf("SSE-24: writer payload must render the empty state, got %q", got)
 	}
 }

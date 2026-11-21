@@ -32,6 +32,7 @@ import (
 	"net/http/httptest"
 	"sort"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -226,7 +227,18 @@ func FuzzDrainChunkSplits(f *testing.F) {
 	// The [DONE] tail sits beyond one byte's range, so the fuzz corpus
 	// cannot target it directly; the exhaustive single-cut subtest above
 	// covers every offset of both fixtures, including the terminator.
+	// Critical-go wave-2 frozen pins: the 0xff prefix dispatches to the
+	// stream idle-watchdog cases the split compositions cannot reach
+	// (0xff 00 flowing, 0xff 01 stalled, other 0xff-led input the drain
+	// wiring itself).
+	f.Add([]byte{0xff, 0x00})
+	f.Add([]byte{0xff, 0x01})
+	f.Add([]byte{0xff, 0x02})
 	f.Fuzz(func(t *testing.T, rawCuts []byte) {
+		if len(rawCuts) > 0 && rawCuts[0] == 0xff {
+			fuzzIdleWatchdogCase(t, rawCuts)
+			return
+		}
 		if len(rawCuts) > 64 {
 			rawCuts = rawCuts[:64] // bound the composition size
 		}
@@ -267,4 +279,104 @@ func fuzzCutPositions(raw []byte, dataLen int) []int {
 	}
 	sort.Ints(cuts)
 	return cuts
+}
+
+// fuzzStalledReader is an upstream body that never delivers a byte.
+type fuzzStalledReader struct{}
+
+func (fuzzStalledReader) Read([]byte) (int, error) { return 0, nil }
+
+// fuzzIdleWatchdogCase pins the stream idle-watchdog cluster the split
+// compositions cannot reach (critical-go wave 2):
+//
+//	0 — a flowing body keeps the watchdog quiet while delivering its bytes,
+//	1 — a stalled body fires the deadline exactly once (the CAS arm),
+//	2 — drain arms the watchdog when the gateway sets a deadline, and a
+//	    flowing fixture still drains byte-identically.
+func fuzzIdleWatchdogCase(t *testing.T, raw []byte) {
+	t.Helper()
+	switch {
+	case len(raw) > 1 && raw[1] == 0x00:
+		fuzzIdleFlowing(t)
+	case len(raw) > 1 && raw[1] == 0x01:
+		fuzzIdleFired(t)
+	default:
+		fuzzDrainIdleWatchdog(t)
+	}
+}
+
+// fuzzIdleFlowing: every read that delivers bytes pushes the deadline back,
+// so the reader stays silent (Fired false) across reads, Stop, and a grace
+// period well beyond the deadline.
+func fuzzIdleFlowing(t *testing.T) {
+	t.Helper()
+
+	payload := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"flow\"}}]}\n\n")
+	r := newIdleReader(strings.NewReader(string(payload)), 200*time.Millisecond, func() {})
+	buf := make([]byte, len(payload))
+	n, err := io.ReadFull(r, buf)
+	require.NoError(t, err)
+	require.Equal(t, payload, buf[:n], "the watchdog must deliver the wrapped bytes unchanged")
+	r.Stop()
+	time.Sleep(250 * time.Millisecond) // > deadline: silent without a stall
+	require.False(t, r.Fired(), "a flowing body must never fire the watchdog")
+}
+
+// fuzzIdleFired: a body that never delivers a byte must fire its deadline
+// and the onIdle callback must run exactly once — the CAS makes concurrent
+// (or repeated) timer runs single-shot.
+func fuzzIdleFired(t *testing.T) {
+	t.Helper()
+
+	var cancels atomic.Int32
+	r := newIdleReader(fuzzStalledReader{}, time.Millisecond, func() { cancels.Add(1) })
+	deadline := time.Now().Add(250 * time.Millisecond)
+	for !r.Fired() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	require.True(t, r.Fired(), "a stalled body must fire its deadline")
+	require.Equal(t, int32(1), cancels.Load(), "onIdle must run exactly once")
+	time.Sleep(5 * time.Millisecond)
+	require.Equal(t, int32(1), cancels.Load(), "the deadline must stay single-shot after firing")
+	r.Stop()
+}
+
+// fuzzDrainIdleWatchdog: drain arms the watchdog exactly when the gateway
+// sets a deadline, and a flowing fixture drains byte-identically to the
+// unwatched reference with the watchdog silent.
+func fuzzDrainIdleWatchdog(t *testing.T) {
+	t.Helper()
+
+	gw := streamTestGateway("http://idle-unused.invalid")
+	gw.streamIdleTimeout = 5 * time.Second // fixture drains in milliseconds: never fires
+	fixture := openAISplitFixture()
+	rec := httptest.NewRecorder()
+	r := &streamRun{
+		gw:        gw,
+		w:         rec,
+		ctx:       context.Background(),
+		streamCtx: context.Background(),
+		l:         testLogger(),
+		body:      []byte(`{"model":"gpt-4","messages":[{"role":"user","content":"hi"}]}`),
+		sessionID: "sess",
+		orgID:     "org",
+		taskID:    "task",
+		reqID:     "req",
+		start:     time.Now(),
+		streamResp: &http.Response{
+			StatusCode: http.StatusOK,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(strings.NewReader(string(fixture))),
+		},
+		finalInfo:        resolver.ModelInfo{ModelName: "gpt-4", Enabled: true},
+		clientWantsUsage: true,
+	}
+	reference, _ := drainSplit(t, fixture, "", "gpt-4", nil)
+	_, err := r.drain(rec)
+	require.NoError(t, err, "a flowing fixture must drain under the watchdog")
+	require.True(t, r.clientSawDone, "the [DONE] terminator must reach the client")
+	require.Equal(t, reference, rec.Body.String(), "the watchdog must not alter delivered bytes")
+	require.NoError(t, apiformat.ValidateChatStream(strings.Split(rec.Body.String(), "\n")))
+	require.NotNil(t, r.streamIdle, "drain must arm the watchdog when a deadline is set")
+	require.False(t, r.streamIdle.Fired(), "the armed watchdog must stay silent on a flowing stream")
 }

@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"context"
 	"encoding/json"
 	"fmt"
 	"math"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/reireirei/yabanin/pkg/budget"
+	"github.com/reireirei/yabanin/pkg/labels"
 	"github.com/reireirei/yabanin/pkg/pricing"
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/stretchr/testify/require"
@@ -37,7 +39,31 @@ func FuzzUsageSettlementFacts(f *testing.F) {
 		checkDurationFact(t, mode, size)
 		checkCatalogFact(t, mode, count)
 		checkUsageClassification(t, mode)
+		checkLabelContextFacts(t, mode)
 	})
+}
+
+// checkLabelContextFacts pins the request-label context accessors
+// (critical-go wave 2: labels_ctx.go): nil contexts degrade to zero values
+// instead of panicking, and the principal-source round trip stores exactly
+// what withPrincipalLabelSources put in.
+func checkLabelContextFacts(t *testing.T, mode uint8) {
+	t.Helper()
+	var nilCtx context.Context // nil on purpose: the degradation IS the pinned contract
+	p, ok := principalFrom(nilCtx)
+	require.False(t, ok)
+	require.Empty(t, p.APIKeyID)
+	require.Empty(t, labelsFrom(nilCtx))
+	require.Nil(t, principalLabelSources(nilCtx))
+	var sources []labels.Source
+	if mode%2 == 0 {
+		sources = []labels.Source{
+			{Name: "request", Labels: labels.Set{"workload": "fuzz"}},
+			{Name: "api_key", Labels: labels.Set{"team": "t1"}, Locked: true},
+		}
+	}
+	ctx := withPrincipalLabelSources(context.Background(), sources)
+	require.Equal(t, sources, principalLabelSources(ctx))
 }
 
 func checkDurationFact(t *testing.T, mode uint8, size uint32) {
@@ -135,6 +161,10 @@ func FuzzResponseHistoryDelivery(f *testing.F) {
 		f.Add(mode, uint16(mode*3), "result ☕\nwith quotes \"")
 	}
 	f.Add(uint8(255), uint16(27), "end of long result")
+	// Critical-go wave-2 frozen pin: two delta fragments sharing tool-call
+	// index 0 must merge into one recorded call (the accumulator's map-hit
+	// arm the single-fragment seeds never take).
+	f.Add(uint8(9), uint16(0), "tool call delivered in two delta fragments")
 	f.Fuzz(func(t *testing.T, mode uint8, split uint16, text string) {
 		// Vary both the content and the SSE transport boundary independently.
 		text = strings.ToValidUTF8(text[:min(len(text), 384)], "�")
@@ -142,6 +172,10 @@ func FuzzResponseHistoryDelivery(f *testing.F) {
 		require.Nil(t, envelopeFromCompletionDoc([]byte(`{"object":"error"}`), "local-model"))
 		if mode == 255 {
 			checkLongHistory(t, text)
+		}
+		if mode == 9 {
+			checkRepeatedToolDelta(t, text)
+			return
 		}
 		msg, expected := historyExample(t, mode, text)
 		choice := map[string]any{"index": 0, "message": msg, "finish_reason": "stop"}
@@ -233,4 +267,48 @@ func checkLongHistory(t *testing.T, suffix string) {
 	require.Equal(t, longFrame+frame, out.Body.String())
 	expect := map[string]any{"v": 1, "kind": "model_response", "status": "partial", "content": "tail:" + suffix, "reason": "capture_limit", "truncated": true}
 	checkHistoryWire(t, expect, capture.finishEnvelope("complete", "").marshal())
+}
+
+// checkRepeatedToolDelta pins the stream accumulator's map-hit arm
+// (critical-go wave 2: stream.go streamChoiceAcc.toolCall): two delta
+// fragments sharing tool-call index 0 merge into ONE recorded call whose
+// arguments are the byte-exact concatenation, with the id and name taken
+// from the first fragment.
+func checkRepeatedToolDelta(t *testing.T, text string) {
+	t.Helper()
+	// Keep every fragment a valid JSON string literal: strip the bytes that
+	// could put an escape sequence across the split point.
+	text = strings.Map(func(r rune) rune {
+		if r == '"' || r == '\\' || r < 0x20 || r == 0x7f {
+			return -1
+		}
+		return r
+	}, text)
+	args := historyJSON(t, map[string]string{"note": text})
+	if len(args) < 4 {
+		args = `{"note":"fz"}`
+	}
+	frame := func(fragment string) string {
+		doc := map[string]any{"choices": []any{map[string]any{"index": 0, "delta": map[string]any{
+			"tool_calls": []any{map[string]any{"index": 0, "id": "call_fz9", "type": "function",
+				"function": map[string]any{"name": "demo", "arguments": fragment}}},
+		}}}}
+		return "data: " + historyJSON(t, doc) + "\n\n"
+	}
+	out := httptest.NewRecorder()
+	capture := newResponseHistoryCapture(out)
+	cut := max(1, len(args)/2)
+	for _, fragment := range []string{args[:cut], args[cut:]} {
+		_, err := capture.Write([]byte(frame(fragment)))
+		require.NoError(t, err)
+	}
+	_, err := capture.Write([]byte("data: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.True(t, capture.sawDone)
+	env := capture.finishEnvelope("complete", "")
+	require.NotNil(t, env)
+	require.Len(t, env.ToolCalls, 1)
+	require.Equal(t, "call_fz9", env.ToolCalls[0].ID)
+	require.Equal(t, "demo", env.ToolCalls[0].Name)
+	require.Equal(t, args, env.ToolCalls[0].Arguments)
 }
