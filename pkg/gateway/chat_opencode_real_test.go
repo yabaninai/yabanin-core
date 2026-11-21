@@ -89,6 +89,10 @@ func TestChatCompletions_OpenCodeCLI_RealE2E(t *testing.T) {
 	defer upstream.Close()
 
 	gw := responsesTestGateway(t, upstream.URL)
+	// The real CLI cannot send identity headers; resolve its bearer key to
+	// a test org exactly like production org-key auth so Preview2 durable
+	// accounting admits the turn.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("opencode-e2e", nil))
 	gw.res = stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: upstream.URL, Enabled: true}}
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "m", DisplayName: "m", Provider: "openai", CreatedAt: time.Now().UTC(),

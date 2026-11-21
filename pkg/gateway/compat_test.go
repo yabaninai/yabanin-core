@@ -282,6 +282,10 @@ func serveGateway(t *testing.T, gw *gateway, method, path string, body []byte, a
 func compatGateway(t *testing.T, upstreamURL, provider string) *gateway {
 	t.Helper()
 	gw := responsesTestGateway(t, upstreamURL)
+	// Preview2: these turns ride the real routes with a bearer key, so the
+	// durable terminal facts need the principal resolved exactly like
+	// production org-key auth.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("compat-org", nil))
 	base := resolver.ModelInfo{ModelName: "m", Provider: provider, UpstreamURL: upstreamURL, UpstreamAPIKey: "upstream-key", Enabled: true}
 	codex := base
 	codex.ModelName = "gpt-5-codex"
