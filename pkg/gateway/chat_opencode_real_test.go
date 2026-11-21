@@ -93,6 +93,10 @@ func TestChatCompletions_OpenCodeCLI_RealE2E(t *testing.T) {
 	gw.models = staticModelLister{entry: modelEntry{
 		ID: "m", DisplayName: "m", Provider: "openai", CreatedAt: time.Now().UTC(),
 	}}
+	// Strict auth strips client identity headers, so the tenant must come
+	// from key resolution — exactly like the production edge. Durable
+	// accounting binds org_id NOT NULL and refuses unattributed dispatches.
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-opencode-e2e", nil))
 
 	var sawChat atomic.Bool
 	restore := observeEvent(func(e *eventpub.Event) {

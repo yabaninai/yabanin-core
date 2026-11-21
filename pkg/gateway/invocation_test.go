@@ -11,6 +11,7 @@ import (
 	"context"
 	"errors"
 	"maps"
+	"sync"
 	"testing"
 
 	"github.com/stretchr/testify/require"
@@ -19,8 +20,11 @@ import (
 )
 
 // fakeInvocationStore scripts the durable seam for isolated tests and
-// emulates the production store's equality contract on recommit.
+// emulates the production store's equality contract on recommit. It is
+// safe for concurrent requests (fair-admission tests drive parallel
+// tenants through one gateway).
 type fakeInvocationStore struct {
+	mu         sync.Mutex
 	admitErr   error
 	voidErr    error
 	factsErr   error
@@ -32,6 +36,8 @@ type fakeInvocationStore struct {
 }
 
 func (f *fakeInvocationStore) AdmitInvocation(_ context.Context, rec admissionRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.admitErr != nil {
 		return f.admitErr
 	}
@@ -40,6 +46,8 @@ func (f *fakeInvocationStore) AdmitInvocation(_ context.Context, rec admissionRe
 }
 
 func (f *fakeInvocationStore) VoidInvocation(_ context.Context, id string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	if f.voidErr != nil {
 		return f.voidErr
 	}
@@ -48,6 +56,8 @@ func (f *fakeInvocationStore) VoidInvocation(_ context.Context, id string) error
 }
 
 func (f *fakeInvocationStore) RecordTerminalFacts(_ context.Context, rec terminalFactsRecord) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
 	f.factsCalls++
 	if len(f.factsErrs) > 0 {
 		err := f.factsErrs[0]

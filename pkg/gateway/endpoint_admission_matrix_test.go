@@ -41,11 +41,12 @@ func newAdmissionMatrixGateway(t *testing.T) (*gateway, *atomic.Int64, *atomic.I
 	t.Cleanup(server.Close)
 
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key"},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-		pool: upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key"},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+		pool:        upstream.NewPool(upstream.Options{}),
 	}
 	gw.eventNote = func(*eventpub.Event) { events.Add(1) }
 	return gw, &hits, &events
@@ -152,6 +153,9 @@ func TestEndpointAdmission_ControlWithoutTaskHeader(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			gw, hits, _ := newAdmissionMatrixGateway(t)
+			// This control must reach the wire, so give it a resolved
+			// tenant: durable accounting refuses org-less paid dispatch.
+			gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-test", nil))
 			rec := postMatrixRequest(t, gw, tc.path, "application/json", tc.body, nil)
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.Equal(t, int64(1), hits.Load())

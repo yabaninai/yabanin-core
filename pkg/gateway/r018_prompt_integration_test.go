@@ -69,7 +69,9 @@ func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
 	cfg.UnknownModelPolicy = "reject"
 
 	gw := &gateway{
-		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}, cfg: cfg, log: slog.New(slog.DiscardHandler)},
 		gatewayEgress: gatewayEgress{
 			pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL}),
 		},

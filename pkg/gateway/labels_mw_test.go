@@ -192,6 +192,10 @@ func TestLabelsReachChatStreamResponsesAndMessages(t *testing.T) {
 			gotMu.Unlock()
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, strings.NewReader(tc.body))
 			req.Header.Set("Content-Type", "application/json")
+			// Handlers are invoked directly (no auth chain), so the trusted
+			// tenant header must be stamped by hand: durable accounting
+			// binds org_id NOT NULL and refuses unattributed dispatches.
+			req.Header.Set("X-Org-Id", "org-test")
 			req.Header.Set("X-Yabanin-Labels", "issue=PAY-1,ci.pipeline=42")
 			rec := httptest.NewRecorder()
 			gw.labelsMiddleware(tc.handler).ServeHTTP(rec, req)

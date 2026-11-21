@@ -89,6 +89,7 @@ func evalgateTestGateway(t *testing.T, primaryURL, judgeURL string, store verdic
 		EvalgateSampleRate: 1.0,
 	}
 	gw := &gateway{
+		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
 		cfg:         cfg,
 		pool:        upstream.NewPool(upstream.Options{BaseURL: primaryURL}),
 		fallback:    fallbackrouter.NewFallbackExecutor(nil, 3, nil),

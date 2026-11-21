@@ -106,7 +106,10 @@ func n03p6t09PostChat(t *testing.T, gw *gateway, body, orgID string) *httptest.R
 	ctx := withReservationGate(req.Context(), &reservationGate{
 		plan: &budget.Plan{Mode: budget.ModeOff},
 		rsv: &budget.Reservation{OrgID: testOrg, Scopes: []budget.ScopeReserve{
-			{Scope: budget.ScopeWallet, Key: testOrg, Bound: 1_000_000},
+			// AllowanceID mirrors a real grant: the terminal projection
+			// rejects tuples without one (an un-granted reserve cannot be
+			// a durable fact).
+			{Scope: budget.ScopeWallet, Key: testOrg, AllowanceID: 1, Bound: 1_000_000},
 		}},
 	})
 	rec := httptest.NewRecorder()

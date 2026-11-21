@@ -63,6 +63,7 @@ func n07rlPostChatWithDeadline(t *testing.T, gw *gateway, body string, deadline 
 	ctx, cancel := context.WithTimeout(t.Context(), deadline)
 	t.Cleanup(cancel)
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

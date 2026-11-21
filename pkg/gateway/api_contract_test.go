@@ -39,6 +39,7 @@ func TestContract_ErrorEnvelopeShape(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 			r.Header.Set("Content-Type", "application/json")
 			rec := httptest.NewRecorder()
 			gw.chatCompletions(rec, r)
@@ -67,6 +68,7 @@ func TestContract_SuccessBodyShape(t *testing.T) {
 
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
@@ -106,6 +108,7 @@ func TestContract_SSEStreamShapes(t *testing.T) {
 	gw := decisionTestGateway(sse.URL)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	gw.serveStream(rec, r.Context(), rt06TestResolve(gw, "gpt-4o-mini"),

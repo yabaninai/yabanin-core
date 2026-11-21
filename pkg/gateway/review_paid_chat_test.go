@@ -44,6 +44,12 @@ func TestReviewPaidChatHTTP(t *testing.T) {
 			}))
 			defer server.Close()
 			gw := goldenChatGateway(t, server.URL)
+			// The trusted fixture wires a default in-memory store; the
+			// no-store case must reset the field to a true nil interface
+			// (a typed nil *fakeInvocationStore would pass the production
+			// != nil guard and crash) to keep proving the fail-closed
+			// refusal.
+			gw.invocations = nil
 			if tc.store != nil {
 				gw.invocations = tc.store
 			}
