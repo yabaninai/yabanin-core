@@ -251,16 +251,12 @@ func TestImagesGenerations_ClientCancelMidResponse(t *testing.T) {
 	var ev *eventpub.Event
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
 
-	ctx, cancel := context.WithCancel(context.Background())
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	// Safety net: never let a plumbing regression hang the suite.
-	timer := time.AfterFunc(10*time.Second, cancel)
-	defer timer.Stop()
 
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/images/generations", strings.NewReader(`{"model":"m","prompt":"x"}`))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
-	goldenIdentity(req)
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -271,10 +267,20 @@ func TestImagesGenerations_ClientCancelMidResponse(t *testing.T) {
 		r.ServeHTTP(rec, req)
 	}()
 
-	<-upstreamWrote
+	select {
+	case <-upstreamWrote:
+	case <-done:
+		t.Fatalf("gateway returned before contacting provider: %d %s", rec.Code, rec.Body.String())
+	case <-ctx.Done():
+		t.Fatal("provider did not start the response before the deadline")
+	}
 	time.Sleep(50 * time.Millisecond) // let the gateway block reading the body
 	cancel()
-	<-done
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("gateway did not finish after client cancellation")
+	}
 
 	if rec.Code != http.StatusBadGateway {
 		t.Fatalf("status %d, want 502: %s", rec.Code, rec.Body.String())

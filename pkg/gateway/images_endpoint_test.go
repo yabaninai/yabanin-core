@@ -43,7 +43,7 @@ func imagesTestGateway(t *testing.T, info resolver.ModelInfo, upstreamURL string
 	return &gateway{
 		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: upstreamURL},
 		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-images", nil)),
 		res:  stubModelResolver{"m": info},
 		pool: upstream.NewPool(upstream.Options{}),
 		// Preview2 durable accounting: isolated tests wire an explicit

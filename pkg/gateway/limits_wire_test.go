@@ -83,11 +83,9 @@ func wireImagesGateway(t *testing.T, calls *atomic.Int64) *gateway {
 		_, _ = w.Write([]byte(`{"created":1,"data":[{"b64_json":"aGk="}]}`))
 	}))
 	t.Cleanup(up.Close)
-	gw := imagesTestGateway(t, resolver.ModelInfo{
+	return imagesTestGateway(t, resolver.ModelInfo{
 		ModelName: "gpt-image-1-canon", Provider: "openai", UpstreamURL: up.URL, Enabled: true,
 	}, up.URL)
-	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-wire", nil))
-	return gw
 }
 
 // T05: chunked framing cannot hide the body size. The header carries no
