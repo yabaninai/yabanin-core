@@ -801,13 +801,14 @@ func (r *streamRun) wrapWriters() http.Flusher {
 	return flusher
 }
 
-// ssePassthroughTail observes the client-facing tail of the passthrough
+// ssePassthroughTail observes the client-facing tail of a passthrough
 // relay: whether the bytes written so far end inside an SSE event (a data
 // line was written but its blank frame separator has not). Writes pass
-// through unchanged — the passthrough relay stays bit-for-bit; only
-// completePassthroughTail ever appends, exactly one LF, at drain-failure
-// composition time. Single-goroutine by construction: drain and the
-// end-of-stream composition run on the serveStream goroutine.
+// through unchanged — the passthrough relays stay bit-for-bit; only
+// complete ever appends, and only at terminal-frame composition time
+// (drain failure or stream-interruption synthesis). Single-goroutine by
+// construction: drain and the end-of-stream composition run on the serve
+// goroutine of the owning endpoint.
 type ssePassthroughTail struct {
 	w     http.ResponseWriter
 	total int64 // bytes passed through (0 = nothing streamed: nothing torn)
@@ -824,16 +825,13 @@ func (t *ssePassthroughTail) Flush() {
 
 func (t *ssePassthroughTail) Write(p []byte) (int, error) {
 	t.total += int64(len(p))
-	if n := len(p); n > 0 {
-		// Trailing LF run of the cumulative stream. A write that is
-		// entirely LFs extends the previous run — the passthrough handler
-		// writes a line and its terminator as separate calls, so the
-		// "\n\n" separator can split across writes.
-		run := 0
-		for i := n - 1; i >= 0 && p[i] == '\n'; i-- {
-			run++
-		}
-		if run == n {
+	if len(p) > 0 {
+		// Trailing line-terminator run of the cumulative stream. A write
+		// consisting only of terminators extends the previous run — relays
+		// may write a line and its terminator (or a lone separator) as a
+		// separate call, so the "\n\n" separator can split across writes.
+		run, all := trailingTerminatorRun(p)
+		if all {
 			t.lfRun = min(t.lfRun+run, 2)
 		} else {
 			t.lfRun = min(run, 2)
@@ -842,27 +840,71 @@ func (t *ssePassthroughTail) Write(p []byte) (int, error) {
 	return t.w.Write(p)
 }
 
+// trailingTerminatorRun counts the line terminators at the end of p — a
+// '\n', or a '\r\n' pair as ONE terminator, so CRLF streams reach a frame
+// boundary after "\r\n\r\n" instead of reading as forever-torn — capped
+// at 2, and reports whether the terminators cover all of p (such a write
+// only extends the cumulative run). A trailing lone '\r' is a cut before
+// its LF: it terminates nothing.
+func trailingTerminatorRun(p []byte) (run int, all bool) {
+	i := len(p)
+	for run < 2 && i > 0 {
+		switch {
+		case p[i-1] == '\n':
+			run++
+			i--
+			if i > 0 && p[i-1] == '\r' {
+				i--
+			}
+		case p[i-1] == '\r' && i == len(p):
+			return run, false
+		default:
+			return run, false
+		}
+	}
+	return run, i == 0
+}
+
 // torn reports a streamed tail that ends mid-event: at least one byte was
-// written and the trailing LF run is shorter than the "\n\n" frame
-// separator.
+// written and the trailing line-terminator run is shorter than the two
+// terminators of a frame separator.
 func (t *ssePassthroughTail) torn() bool {
 	return t.total > 0 && t.lfRun < 2
 }
 
-// completePassthroughTail closes a torn SSE event on the passthrough relay
-// right before the drain-failure notification composes its error frame: one
-// LF turns a dangling "data: …\n" tail into its whole event, byte-exact
-// against the upstream stream, so the error frame starts at an event
-// boundary instead of gluing into a half-written event (the line-buffered
-// relay contract). Never reached on the policy-seam path: there the
-// assembly buffer drops the never-processed partial instead
-// (sseStreamPolicyWriter.finishStream) — completing it would emit raw,
-// unmutated upstream content that passed no policy stage.
-func (r *streamRun) completePassthroughTail() {
-	if r.streamPolicy != nil || r.sseTail == nil || !r.sseTail.torn() {
+// complete closes a torn SSE event by appending exactly the missing bytes
+// of the frame separator. A dangling data line with its terminator
+// (lfRun 1) takes one LF — byte-exact against an LF upstream, and for a
+// CRLF tail a grammar-legal mixed-terminator separator (the CRLF corpus
+// pins that relay behavior); a cut mid-line (lfRun 0) takes two, ending
+// the partial line and dispatching it verbatim. Nil and untorn tails are
+// no-ops, so terminal-frame composers can call it unconditionally.
+// Writing through the tracker marks the tail complete, making repeated
+// calls no-ops too.
+func (t *ssePassthroughTail) complete() {
+	if t == nil || !t.torn() {
 		return
 	}
-	_, _ = io.WriteString(r.sseTail, "\n")
+	if t.lfRun == 0 {
+		_, _ = io.WriteString(t, "\n\n")
+		return
+	}
+	_, _ = io.WriteString(t, "\n")
+}
+
+// completePassthroughTail closes a torn SSE event on the passthrough relay
+// right before the drain-failure notification composes its error frame, so
+// the error frame starts at an event boundary instead of gluing into a
+// half-written event (the line-buffered relay contract). Never reached on
+// the policy-seam path: there the assembly buffer drops the
+// never-processed partial instead (sseStreamPolicyWriter.finishStream) —
+// completing it would emit raw, unmutated upstream content that passed no
+// policy stage.
+func (r *streamRun) completePassthroughTail() {
+	if r.streamPolicy != nil {
+		return
+	}
+	r.sseTail.complete()
 }
 
 // streamIdentityRequest carries the stream stage's trusted identity headers

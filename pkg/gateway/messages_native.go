@@ -4,7 +4,6 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -191,48 +190,11 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 	gw.finishNativeMessages(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", "")
 }
 
-// messagesStreamLineLimit bounds the per-line buffering of the native SSE
-// relay. Upstreams are trusted for correctness, not for size discipline: a
-// pathological or hostile provider can send a single multi-megabyte SSE
-// line, and an unbounded ReadBytes would buffer it (and every such line)
-// in gateway memory. 8 MiB is far above any legitimate frame (values ride
-// JSON events, not bulk payloads) and far below any real request budget.
-const messagesStreamLineLimit = 8 << 20
-
-// errAnthropicLineLimit marks a line that exceeded messagesStreamLineLimit.
-// It is never shown to clients: the relay drops the line and the T03
-// synthesis closes the client stream instead.
-var errAnthropicLineLimit = errors.New("anthropic: upstream SSE line exceeds the line limit")
-
-// readAnthropicLine reads one upstream line, byte-identical including the
-// terminating '\n' when present. When the line grows past limit the rest of
-// the line is drained and errAnthropicLineLimit is returned (the partial
-// bytes are dropped with it).
-func readAnthropicLine(r *bufio.Reader, limit int) ([]byte, error) {
-	var line []byte
-	for {
-		frag, err := r.ReadSlice('\n')
-		line = append(line, frag...)
-		if err == bufio.ErrBufferFull {
-			if len(line) > limit {
-				for {
-					// Discard the remainder of the oversized line; only the
-					// loop exit condition matters here.
-					_, err = r.ReadSlice('\n')
-					if err != bufio.ErrBufferFull {
-						break
-					}
-				}
-				return nil, errAnthropicLineLimit
-			}
-			continue
-		}
-		return line, err
-	}
-}
-
 // relayAnthropicSSE forwards the upstream Anthropic SSE stream to the client
-// byte-identically while accounting usage. It also tracks stream lifecycle:
+// byte-identically while accounting usage. Only complete upstream lines are
+// forwarded: a line cut before its terminator is withheld — a delimiter
+// cannot make truncated JSON decodable for event-by-event SDK consumers —
+// so the client never receives a partial event. It also tracks stream lifecycle:
 // when the upstream ends without a terminal event — transport cut,
 // ErrAbortHandler, or the idle watchdog canceling the read — the still-open
 // content blocks are closed (ascending index order) and one terminal error
@@ -242,6 +204,10 @@ func readAnthropicLine(r *bufio.Reader, limit int) ([]byte, error) {
 // never duplicated, and the finish classification is untouched (D1: native
 // stays request.completed with the partial usage).
 func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
+	// The relay writes through the tail tracker so a torn last event is
+	// closed before the synthesized terminal frames compose (chat F2 canon).
+	tail := &ssePassthroughTail{w: w}
+	w = tail
 	reader := bufio.NewReader(body)
 	var parser apiformat.SSEParser
 	var acc anthStreamUsage
@@ -276,34 +242,65 @@ func relayAnthropicSSE(w http.ResponseWriter, body io.Reader) provider.Usage {
 			sawError = true
 		}
 	}
-	for {
-		line, err := readAnthropicLine(reader, messagesStreamLineLimit)
-		if err == errAnthropicLineLimit {
-			// Oversized upstream line: drop it whole, stop relaying. The
-			// synthesis below closes the client stream (no stop was seen);
-			// the caller's deferred upstream body close aborts the provider
-			// connection, so the tail is never produced.
-			slog.Debug("native relay dropped oversized upstream line", "limit_bytes", messagesStreamLineLimit)
-			break
+	// Frames are dispatched whole: an event is only decodable once its
+	// blank separator has arrived, so lines of an unterminated frame are
+	// held back and only a decodable event missing just the separator is
+	// salvaged on a break (apiformat.SSEFrameBuffer).
+	var frames apiformat.SSEFrameBuffer
+	writeFrame := func(blob []byte) {
+		if len(blob) == 0 {
+			return
 		}
-		if len(line) > 0 {
-			_, _ = w.Write(line)
-			if flusher != nil {
-				flusher.Flush()
-			}
-			for _, ev := range parser.Feed(line) {
-				acc.note(ev)
-				track(ev)
-			}
+		_, _ = w.Write(blob)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		for _, ev := range parser.Feed(blob) {
+			acc.note(ev)
+			track(ev)
+		}
+	}
+	for {
+		line, err := apiformat.ReadSSELine(reader, apiformat.SSEStreamLineLimit)
+		if err == apiformat.ErrSSELineLimit {
+			// Oversized upstream line: drop it and the held frame, stop
+			// relaying. The synthesis below closes the client stream (no
+			// stop was seen); the caller's deferred upstream body close
+			// aborts the provider connection, so the tail is never
+			// produced.
+			slog.Debug("native relay dropped oversized upstream line", "limit_bytes", apiformat.SSEStreamLineLimit)
+			break
 		}
 		if err != nil {
+			// Upstream ended mid-line (transport cut, or EOF without the
+			// terminator): the unterminated partial is withheld, and the
+			// held frame is dispatched only when it is a decodable event
+			// missing just its separator — otherwise it is dropped so the
+			// synthesis below composes at an event boundary.
+			if frames.Salvageable() {
+				writeFrame(frames.Take())
+			}
 			break
+		}
+		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
+		if overflow {
+			slog.Debug("native relay dropped oversized upstream frame", "limit_bytes", apiformat.SSEStreamLineLimit)
+			break
+		}
+		if blank {
+			// Blank separator: the frame is complete — dispatch it whole,
+			// verbatim, separator included.
+			writeFrame(append(frames.Take(), line...))
+			continue
 		}
 	}
 	for _, ev := range parser.Flush() {
 		acc.note(ev)
 		track(ev)
 	}
+	// Close a torn tail (dangling line or cut mid-line) before the
+	// synthesized stop/error frames glue into it; no-op on whole-frame tails.
+	tail.complete()
 	if !sawStop && !sawError {
 		closeOpenAnthropicBlocks(w, flusher, open)
 	}

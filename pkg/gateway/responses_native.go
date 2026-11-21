@@ -202,7 +202,10 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 		defer idle.Stop()
 		body = idle
 	}
-	usage, relayErr := relayResponsesSSE(w, body)
+	// The relay writes through the tail tracker so a torn last event is
+	// closed before the response.failed frame composes (chat F2 canon).
+	tail := &ssePassthroughTail{w: w}
+	usage, relayErr := relayResponsesSSE(tail, body)
 	// N03-P06-T02: SSE headers are already committed; the provider
 	// prompt-cache outcome rides the HTTP trailer. Covers both ends: the
 	// completed branch and the failure branch (the partial usage parsed
@@ -225,6 +228,7 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 			sessionID: admitted.SessionID,
 			usage:     usage,
 		})
+		tail.complete()
 		writeResponsesStreamFailed(w, detail)
 		gw.finishResponsesNative(w, r.Context(), admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.failed", detail, term)
 		return
@@ -260,9 +264,17 @@ func writeResponsesStreamFailed(w http.ResponseWriter, message string) {
 
 // relayResponsesSSE pipes the upstream Responses SSE stream to the client
 // verbatim and returns the usage parsed off the terminal events plus the
-// read error that ended the drain, if any. Clean EOF ends the drain without
-// an error (the chat canon: EOF is not a drain failure); every other read
-// error is reported so the caller can classify the break.
+// read error that ended the drain, if any. Frames are dispatched whole: a
+// consumer decodes an event only once its blank separator has arrived
+// (the payload is the data lines joined with LF), so lines of an
+// unterminated frame are held back with bounded memory. On an upstream
+// break the held frame is dispatched only when it is a decodable event
+// missing just its separator; otherwise it is dropped so the caller's
+// failure frame composes at an event boundary. On clean EOF the held
+// bytes are flushed verbatim — the chat canon: EOF is not a drain
+// failure. An oversized line or frame ends the drain as an upstream
+// error; every other read error is reported so the caller can classify
+// the break.
 func relayResponsesSSE(w http.ResponseWriter, body io.Reader) (provider.Usage, error) {
 	reader := bufio.NewReader(body)
 	var parser apiformat.SSEParser
@@ -282,22 +294,57 @@ func relayResponsesSSE(w http.ResponseWriter, body io.Reader) (provider.Usage, e
 			}
 		}
 	}
-	for {
-		line, err := reader.ReadBytes('\n')
-		if len(line) > 0 {
-			_, _ = w.Write(line)
-			if flusher != nil {
-				flusher.Flush()
-			}
-			for _, ev := range parser.Feed(line) {
-				note(ev)
-			}
+	var frames apiformat.SSEFrameBuffer
+	writeFrame := func(blob []byte) {
+		if len(blob) == 0 {
+			return
 		}
-		if err != nil {
-			if errors.Is(err, io.EOF) {
-				break
+		_, _ = w.Write(blob)
+		if flusher != nil {
+			flusher.Flush()
+		}
+		for _, ev := range parser.Feed(blob) {
+			note(ev)
+		}
+	}
+	for {
+		line, err := apiformat.ReadSSELine(reader, apiformat.SSEStreamLineLimit)
+		if err == apiformat.ErrSSELineLimit {
+			// Oversized upstream line: drop it and the held frame, end the
+			// drain as an upstream error; the caller's response.failed
+			// frame closes the client stream.
+			return usage, apiformat.ErrSSELineLimit
+		}
+		if err != nil && !errors.Is(err, io.EOF) {
+			// Broken upstream (cut mid-line): the unterminated partial is
+			// withheld, and the held frame goes out only when it is a
+			// decodable event missing just its separator — the failure
+			// frame the caller writes composes at an event boundary
+			// instead of gluing into a truncated event.
+			if frames.Salvageable() {
+				writeFrame(frames.Take())
 			}
 			return usage, err
+		}
+		if err != nil {
+			// io.EOF — clean end. The held frame goes out only when it is
+			// a decodable event missing just its separator; an
+			// unterminated trailing partial can never become an event and
+			// is withheld.
+			if frames.Salvageable() {
+				writeFrame(frames.Take())
+			}
+			break
+		}
+		blank, overflow := frames.Add(line, apiformat.SSEStreamLineLimit)
+		if overflow {
+			return usage, apiformat.ErrSSELineLimit
+		}
+		if blank {
+			// Blank separator: the frame is complete — dispatch it whole,
+			// verbatim, separator included.
+			writeFrame(append(frames.Take(), line...))
+			continue
 		}
 	}
 	for _, ev := range parser.Flush() {

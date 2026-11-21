@@ -225,8 +225,11 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 		RequestBytes:           len(upstreamBody),
 	})
 	// N03-P01: watch the terminal — a late failure after the client already
-	// saw the [DONE] terminator must not emit a second terminal event.
-	watch := newSSETerminalWatch(w)
+	// saw the [DONE] terminator must not emit a second terminal event. The
+	// tail tracker sits under the watch so a torn last event is closed
+	// before the drain-failure error frame composes (chat F2 canon).
+	tail := &ssePassthroughTail{w: w}
+	watch := newSSETerminalWatch(tail)
 	usage, drainErr := handler.HandleStream(streamCtx, watch, flusher, resp)
 	if drainErr != nil {
 		// NEXT-18c: no analytics event on this path — settle the escrow with
@@ -237,6 +240,7 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 		}
 		gate.finalizeNoEvent(term)
 		if !watch.sawDone() {
+			tail.complete()
 			writeSSEError(w, apierrors.ErrorCodeAPI, "stream drain failed")
 		}
 		return
