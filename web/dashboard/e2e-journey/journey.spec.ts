@@ -407,7 +407,13 @@ test('AC-ZERO recorded zero counters render as explicit zeros', async ({ page })
 })
 
 // ---------------------------------------------------------------------------
-// AC-STALE — switching tenant clears the previous tenant's facts
+// AC-STALE — switching tenant clears the previous tenant's facts.
+// Negative scope: after the switch to org B, no PREVIOUS-tenant (org A)
+// marker (ORG_A_MARKERS) may render anywhere — the drawer must show the
+// refused deep link ("Request not found in the log") and zero org-A facts.
+// B's own row legitimately renders in B's scope (the switch itself is proven
+// by B's row at :431), so TENANT_B_MARKERS must NOT be banned here: that ban
+// is only valid in AC-IDOR, whose a_only user cannot access org B at all.
 // ---------------------------------------------------------------------------
 
 test('AC-STALE tenant switch clears the previous tenant journey from the drawer', async ({ page }) => {
@@ -438,7 +444,10 @@ test('AC-STALE tenant switch clears the previous tenant journey from the drawer'
   await expect(p.getByRole('heading', { name: COPY.journeyHeading, exact: true })).toHaveCount(0)
   await expect(p.locator('body')).not.toContainText(`Fallback attempts: ${served.oracle.attempt_count}`)
   await expect(p.locator('body')).not.toContainText(`${served.oracle.duration_ms} ms`)
-  for (const marker of TENANT_B_MARKERS) {
+  // After the switch, no previous-tenant (org A) fact may render anywhere.
+  // B's own row legitimately renders in B's scope (loaded at :431, again
+  // after the reload) — mirroring AC-RACE's negative scope.
+  for (const marker of ORG_A_MARKERS) {
     await expect(p.locator('body')).not.toContainText(marker)
   }
   await shot(p, 'ac-stale-after-switch')
