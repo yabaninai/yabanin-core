@@ -50,6 +50,40 @@ export function auditReasonOpts(reason: string): { headers?: Record<string, stri
   return trimmed ? { headers: { 'X-Audit-Reason': trimmed } } : {}
 }
 
+/** Confirm-enablement is pure: every required field must be filled and,
+ *  for typed-entity confirmation, match the exact entity string. */
+function confirmEnabled(args: {
+  busy: boolean
+  hasInput: boolean
+  inputValue: string
+  nameRequired: boolean
+  nameValue: string
+  reasonRequired: boolean | undefined
+  reasonValue: string
+  entity: string | undefined
+}): boolean {
+  if (args.busy) return false
+  if (args.hasInput && args.inputValue.trim().length === 0) return false
+  if (args.nameRequired && args.nameValue.trim() !== (args.entity ?? '').trim()) return false
+  if (args.reasonRequired && args.reasonValue.trim().length === 0) return false
+  return true
+}
+
+/** Separate amount and typed-entity states for two-field actions; when
+ *  no separate name state is provided the name field stays bound to the
+ *  single shared value (entity-only consumers, unchanged semantics). */
+function nameFieldBinding(args: {
+  nameValue?: string
+  onNameChange?: (value: string) => void
+  inputValue: string
+  onValueChange: (value: string) => void
+}): { value: string; onChange: (value: string) => void } {
+  if (args.nameValue !== undefined && args.onNameChange) {
+    return { value: args.nameValue, onChange: args.onNameChange }
+  }
+  return { value: args.inputValue, onChange: args.onValueChange }
+}
+
 const UNDO_MS = 10_000
 
 function messageOf(err: unknown): string {
@@ -73,10 +107,12 @@ export function ActionDialog({
   pending,
   entity,
   inputValue,
+  nameValue,
   reasonValue,
   busy,
   error,
   onValueChange,
+  onNameChange,
   onReasonChange,
   onConfirm,
   onCancel,
@@ -84,10 +120,16 @@ export function ActionDialog({
   pending: PendingAction
   entity?: string
   inputValue: string
+  /** Two-field actions (input + typed-entity confirmation) pass the typed
+   *  name separately; single-field and entity-only consumers omit it and
+   *  keep the historical shared binding (execute receives what the
+   *  operator typed into the only field). */
+  nameValue?: string
   reasonValue: string
   busy: boolean
   error: string
   onValueChange: (value: string) => void
+  onNameChange?: (value: string) => void
   onReasonChange: (value: string) => void
   onConfirm: () => void
   onCancel: () => void
@@ -95,10 +137,17 @@ export function ActionDialog({
   const { t } = useTranslation()
   const panelRef = useRef<HTMLDivElement | null>(null)
   const { opts, impact, nameRequired } = pending
-  const valueFilled = !opts.input || inputValue.trim().length > 0
-  const nameFilled = !nameRequired || inputValue.trim() === (entity ?? '').trim()
-  const reasonFilled = !opts.reason?.required || reasonValue.trim().length > 0
-  const canConfirm = !busy && valueFilled && nameFilled && reasonFilled
+  const nameBind = nameFieldBinding({ nameValue, onNameChange, inputValue, onValueChange })
+  const canConfirm = confirmEnabled({
+    busy,
+    hasInput: opts.input != null,
+    inputValue,
+    nameRequired,
+    nameValue: nameBind.value,
+    reasonRequired: opts.reason?.required,
+    reasonValue,
+    entity,
+  })
 
   // trap Tab inside the panel, close on Escape and restore focus on unmount.
   // Runs once per dialog; onCancel is stable (setPending) so the closure
@@ -146,8 +195,8 @@ export function ActionDialog({
             <input
               id="action-dialog-name"
               className="control w-full"
-              value={inputValue}
-              onChange={(event) => onValueChange(event.target.value)}
+              value={nameBind.value}
+              onChange={(event) => nameBind.onChange(event.target.value)}
               autoComplete="off"
             />
           </div>
@@ -211,6 +260,9 @@ export function useAction(descriptor: ActionDescriptor) {
   const [busy, setBusy] = useState(false)
   const [dialogError, setDialogError] = useState('')
   const [value, setValue] = useState('')
+  // Typed-entity confirmation for two-field actions; entity-only actions
+  // keep using `value` for it exactly as before.
+  const [name, setName] = useState('')
   const [reason, setReason] = useState('')
   const [toast, setToast] = useState<ToastState | null>(null)
   const toastTimer = useRef<ReturnType<typeof setTimeout> | null>(null)
@@ -252,6 +304,7 @@ export function useAction(descriptor: ActionDescriptor) {
       }
       setDialogError('')
       setValue(opts.input?.initial ?? '')
+      setName('')
       setPending({
         opts,
         impact: opts.impact ?? descriptor.impact,
@@ -266,7 +319,10 @@ export function useAction(descriptor: ActionDescriptor) {
   const confirm = useCallback(async () => {
     if (!pending || busy) return
     const { opts, nameRequired } = pending
-    if (nameRequired && value.trim() !== (opts.entity ?? '').trim()) return
+    // Two-field actions confirm against the typed-name state; entity-only
+    // actions confirm against the shared value (historical semantics).
+    const typedName = opts.input ? name : value
+    if (nameRequired && typedName.trim() !== (opts.entity ?? '').trim()) return
     if (opts.reason?.required && !reason.trim()) return
     setBusy(true)
     setDialogError('')
@@ -279,7 +335,7 @@ export function useAction(descriptor: ActionDescriptor) {
     } finally {
       setBusy(false)
     }
-  }, [busy, pending, value, reason])
+  }, [busy, pending, value, name, reason])
 
   const undoToast = useCallback(async () => {
     if (!toast) return
@@ -299,6 +355,8 @@ export function useAction(descriptor: ActionDescriptor) {
           pending={pending}
           entity={pending.opts.entity}
           inputValue={value}
+          nameValue={pending.opts.input && pending.nameRequired ? name : undefined}
+          onNameChange={pending.opts.input && pending.nameRequired ? setName : undefined}
           reasonValue={reason}
           busy={busy}
           error={dialogError}

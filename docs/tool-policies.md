@@ -19,7 +19,7 @@ changes when an operator defines rules.
 |---|---|
 | MCP invokes (`/api/mcp/invoke`) | the raw tool name is checked **before** the proxy egresses; deny → `403 policy_denied` |
 | A2A sends (`/api/a2a/send`) | the tool name `a2a:<agent>` is checked the same way |
-| Built-in executors (`yabanin:web_fetch`, …) | checked as `yabanin:<tool>` before execution |
+| Built-in executors (`yabanin:web_fetch`, …) | checked under **both** addresses — the bare tool name (`web_fetch`) and the qualified name (`yabanin:web_fetch`) — on every surface: the invoke pre-check, the executor itself (which the chat/agent loop also uses) and the built-in catalog. A deny row in **either** form refuses the call and hides the tool; an allow row in one form never un-denies the other. Within one form the ranking below applies unchanged |
 | Model responses (`/v1/chat/completions`, JSON and SSE) | `tool_calls` the model **declares** are checked before the client sees them: denied calls are stripped, and a choice whose every call was denied finishes with `stop` instead of `tool_calls` — the client-side executor never receives them |
 
 Denied calls are counted per org and tool in the

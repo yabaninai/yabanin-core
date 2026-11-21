@@ -166,8 +166,12 @@ func TestGrantMatrix_ReadRespondAdmin(t *testing.T) {
 				require.NoError(t, err)
 				assert.Equal(t, Server, res.Server)
 				hops, _ := rec.snapshot()
-				require.Len(t, hops, len(hopsBefore)+1, "the allowed cell executes exactly one guarded hop")
-				assert.Equal(t, "org-caller", hops[len(hops)-1].org, "the hop is attributed to the caller org")
+				// Two guarded hops per allowed execution: the dual policy
+				// addresses (bare effective name + yabanin:<name>).
+				require.Len(t, hops, len(hopsBefore)+2, "the allowed cell executes exactly two guarded hops (both policy addresses)")
+				for _, h := range hops[len(hopsBefore):] {
+					assert.Equal(t, "org-caller", h.org, "every hop is attributed to the caller org")
+				}
 				return
 			}
 			require.ErrorIs(t, err, tc.wantErr)
@@ -201,11 +205,13 @@ func TestConfusedDeputy_CallerOrgAttributionOnEveryHop(t *testing.T) {
 		_, err := reg.Execute(ctx, deputyConfig("yabanin:time_now"), deputyCall("time_now"))
 		require.NoError(t, err)
 		hops, _ := rec.snapshot()
-		require.Len(t, hops, 1)
+		// One execution = two hops: the bare address and yabanin:<name>.
+		require.Len(t, hops, 2)
 		assert.Equal(t, "org-caller", hops[0].org, "attribution is the CALLER's org")
 		assert.Equal(t, "sub-caller", hops[0].subject, "the subject rides the hop verbatim")
 		assert.Equal(t, Server, hops[0].server)
 		assert.Equal(t, "time_now", hops[0].tool)
+		assert.Equal(t, "yabanin:time_now", hops[1].tool, "the second hop is the qualified policy address")
 		for _, h := range hops {
 			assert.NotEqual(t, "org-deputy", h.org, "the deputy's own org must never appear in attribution")
 		}
@@ -242,7 +248,9 @@ func TestConfusedDeputy_CallerOrgAttributionOnEveryHop(t *testing.T) {
 			require.NoError(t, err, "identical allowed call %d", i+1)
 		}
 		hops, _ := rec.snapshot()
-		require.Len(t, hops, 3, "two more caller-org hops (1 from the first subtest)")
+		// 2 hops from the first subtest + 2 per allowed call (dual policy
+		// addresses).
+		require.Len(t, hops, 6, "two more caller-org hop pairs (one pair from the first subtest)")
 		assert.Equal(t, "org-caller", hops[2].org)
 
 		// The revocation analogue at this seam: the route allow-list is

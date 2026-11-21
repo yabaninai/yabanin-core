@@ -10,6 +10,8 @@
 // stream of 5xx is not onboarding progress). Unknown (null) never counts as
 // done: partial data must not produce "all set" (OnboardingCard precedent).
 
+import { relatedListHref } from './inspectUrl.ts'
+
 export type StepState = boolean | null // null = not yet determined / failed
 
 export interface OnboardingSignals {
@@ -34,6 +36,24 @@ export function providerKeysLink(orgId: string): string {
 
 export function gatewayKeysLink(orgId: string): string {
   return `#keys?org=${encodeURIComponent(orgId)}`
+}
+
+// CUI-02 first-run defect (2026-11-20): step 3 also deep-links the budgets
+// screen — the first request needs a team budget or the gateway rejects it
+// with budget_not_configured (see pages/budgets/FirstTeamBudget.tsx).
+export function budgetsLink(orgId: string): string {
+  return `#budgets?org=${encodeURIComponent(orgId)}`
+}
+// UI-contract (CUI-02, owner correction 2026-11-20): the evidence identity is
+// the KNOWN setup request id — the X-Request-ID the operator's client sent
+// through the gateway, carried on the onboarding URL as an explicit `request`
+// param. It is never derived from list position or timestamps. The link uses
+// the canonical typed drawer form (`inspect=request:<id>`); an empty id
+// degrades to the plain explorer list (relatedListHref drops empty params).
+export function firstRequestLink(orgId: string, requestId: string): string {
+  return relatedListHref('requests-explorer', `org=${encodeURIComponent(orgId)}`, {
+    inspect: requestId ? `request:${requestId}` : '',
+  })
 }
 
 export function allStepsDone(s: OnboardingSignals): boolean {

@@ -58,6 +58,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/pricing"
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/regionrouter"
+	"github.com/reireirei/yabanin/pkg/requestid"
 	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/retry"
 	"github.com/reireirei/yabanin/pkg/router"
@@ -107,6 +108,43 @@ func RunGatewayServerWithJWT(cfg config.Gateway, rdb *redis.Client, pool *pgxpoo
 		return fmt.Errorf("invalid gateway config: %w", err)
 	}
 
+	httpRouter, streamIdleTimeout, streamUsageProviders := newGatewayHTTPRouter(cfg, l)
+
+	gw, err := buildGateway(cfg, rdb, pool, l, ctx, jwtw, circuits, policy...)
+	if err != nil {
+		return err
+	}
+	gw.streamIdleTimeout = streamIdleTimeout
+	gw.streamUsageProviders = streamUsageProviders
+
+	// P6: DB-backed base costs for cost analytics. The process-global default
+	// pricer is installed exactly once, at server boot and before any request
+	// can be served — never in the buildGateway composition root, which tests
+	// execute without a server lifetime (w21-06 order-independence pin).
+	if gw.dbPricer != nil {
+		pricing.SetDefaultPricer(gw.dbPricer)
+	}
+
+	healthHandler(gw, httpRouter, l)
+	gw.routes(httpRouter)
+
+	return startGatewayServers(gw, httpRouter, cfg, l, ctx)
+}
+
+// newGatewayHTTPRouter builds the production gateway middleware chain on
+// a fresh chi router, in mount order: CORS (when configured) → metrics →
+// request-id → per-prefix timeouts → ingress body caps → per-IP rate
+// limit → security headers → request logger → recoverer → tracing. This
+// is the one place the chain is declared: RunGatewayServerWithJWT stamps
+// health and routes on the returned router, and tests mount it to
+// exercise the real production middleware (a test-local re-declaration of
+// the chain is exactly how a missing mount stays invisible).
+//
+// It also returns the parsed stream_idle_timeout and the resolved
+// stream-usage provider set — boot-time values the caller stamps onto the
+// gateway after buildGateway (they configure stream handlers, not the
+// middleware chain).
+func newGatewayHTTPRouter(cfg config.Gateway, l *slog.Logger) (*chi.Mux, time.Duration, map[string]bool) {
 	httpRouter := chi.NewRouter()
 
 	// Wire CORS if configured
@@ -120,26 +158,17 @@ func RunGatewayServerWithJWT(cfg config.Gateway, rdb *redis.Client, pool *pgxpoo
 		}))
 	}
 
-	// Initialize metrics subsystem (no-op if disabled).
-	if cfg.MetricsEnabled {
-		metrics.Init()
-		// V9: shadow-mode collectors are promauto-registered at package load
-		// (pkg/shadow); re-register them through the same idempotent path so
-		// the /metrics exposition is complete when shadow is enabled.
-		if cfg.Shadow.Enabled {
-			for _, c := range shadow.Collectors() {
-				if err := prometheus.Register(c); err != nil {
-					if !strings.Contains(err.Error(), "duplicate metrics") {
-						l.Warn("shadow metric registration failed", "error", err)
-					}
-				}
-			}
-		}
-		httpRouter.Use(metrics.PrometheusMiddleware())
-		l.Info("metrics enabled")
-	}
+	mountGatewayMetrics(httpRouter, cfg, l)
 
-	httpRouter.Use(middleware.RequestID)
+	// Request-ID contract (pkg/requestid): the client's X-Request-ID is
+	// echoed verbatim on the response, carried in the request context for
+	// upstream propagation (pkg/upstream) and event persistence
+	// (request_logs via the completion event), and generated (req_<hex>)
+	// only when absent. requestid.Inject replaces chi's
+	// middleware.RequestID as the single mount — no parallel ID mechanism;
+	// requestid.FromContext still falls back to chi's context key, so every
+	// existing GetReqID reader keeps working.
+	httpRouter.Use(requestid.Inject)
 	// Per-request timeout for LLM proxying. Reasoning models can legitimately
 	// exceed 60s (stand eval uses 300s); default preserves prior behavior.
 	requestTimeout, err := time.ParseDuration(cfg.RequestTimeout)
@@ -192,26 +221,28 @@ func RunGatewayServerWithJWT(cfg config.Gateway, rdb *redis.Client, pool *pgxpoo
 		httpRouter.Use(tracing.HTTPMiddleware())
 		l.Info("tracing enabled")
 	}
+	return httpRouter, streamIdleTimeout, streamUsageProviders
+}
 
-	gw, err := buildGateway(cfg, rdb, pool, l, ctx, jwtw, circuits, policy...)
-	if err != nil {
-		return err
+func mountGatewayMetrics(httpRouter *chi.Mux, cfg config.Gateway, l *slog.Logger) {
+	if !cfg.MetricsEnabled {
+		return
 	}
-	gw.streamIdleTimeout = streamIdleTimeout
-	gw.streamUsageProviders = streamUsageProviders
-
-	// P6: DB-backed base costs for cost analytics. The process-global default
-	// pricer is installed exactly once, at server boot and before any request
-	// can be served — never in the buildGateway composition root, which tests
-	// execute without a server lifetime (w21-06 order-independence pin).
-	if gw.dbPricer != nil {
-		pricing.SetDefaultPricer(gw.dbPricer)
+	metrics.Init()
+	// V9: shadow-mode collectors are promauto-registered at package load
+	// (pkg/shadow); re-register them through the same idempotent path so
+	// the /metrics exposition is complete when shadow is enabled.
+	if cfg.Shadow.Enabled {
+		for _, c := range shadow.Collectors() {
+			if err := prometheus.Register(c); err != nil {
+				if !strings.Contains(err.Error(), "duplicate metrics") {
+					l.Warn("shadow metric registration failed", "error", err)
+				}
+			}
+		}
 	}
-
-	healthHandler(gw, httpRouter, l)
-	gw.routes(httpRouter)
-
-	return startGatewayServers(gw, httpRouter, cfg, l, ctx)
+	httpRouter.Use(metrics.PrometheusMiddleware())
+	l.Info("metrics enabled")
 }
 
 // buildGateway is the gateway composition root (AF-17): every dependency the
@@ -1724,7 +1755,7 @@ type gatewayEgress struct {
 	mcpCredsSrc *mcpCredsSource
 	// A2A-01: external A2A agent proxy (nil when YABANIN_A2A_GATEWAY is not
 	// set or no DB pool — the /api/a2a/send route group is then not mounted).
-	a2aProxy *a2aagg.Proxy
+	a2aProxy a2aProxy
 	// TOOL-01/03: tool policy engine (nil without a DB pool; zero policies
 	// = allow-all, no behavior change) and the built-in server-side tool
 	// executor (web_fetch et al; nil without a DB pool).
@@ -1871,6 +1902,16 @@ type gatewayObservability struct {
 	driftDetector *classifier.DriftDetector
 	// V9: shadow-mode dispatcher (nil when shadow is disabled).
 	shadow *shadow.Dispatcher
+}
+
+// a2aProxy is the Send boundary the a2aSend handler codes against; the
+// production wiring is *a2aagg.Proxy. The seam exists because the handler's
+// InvokeError mapping is defensive: the real proxy answers agent-only only
+// for an empty agent identity, which the handler's own agent-principal
+// check rejects before the proxy is called, so the mapping arms must stay
+// verifiable at the dependency boundary instead of only on the wire path.
+type a2aProxy interface {
+	Send(ctx context.Context, orgID string, id a2aagg.Identity, req a2aagg.SendRequest) (json.RawMessage, error)
 }
 
 // gateway is the request-path service. Its dependencies are grouped into the

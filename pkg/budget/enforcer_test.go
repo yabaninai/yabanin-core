@@ -5,12 +5,13 @@ import (
 	"errors"
 	"log/slog"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
 	pgconn "github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgtype"
+	pgtype "github.com/jackc/pgx/v5/pgtype"
 	"github.com/reireirei/yabanin/pkg/money"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -106,38 +107,84 @@ func (r *mockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *mockRows) Conn() *pgx.Conn                              { return nil }
 func (r *mockRows) RawValues() [][]byte                          { return nil }
 func (r *mockRows) Values() ([]any, error)                       { return nil, nil }
-func (r *mockRows) Scan(dest ...interface{}) error               { return errors.New("scan not supported") }
+func (r *mockRows) Scan(dest ...any) error                       { return errors.New("scan not supported") }
 
-// newSmartMockPool creates a pool that routes budget vs spend queries correctly.
-// budgetQueryFn is called for the team_budgets SELECT; spendQueryFn for the
-func newSmartMockPool(budgetQueryFn, spendQueryFn func() pgx.Row) *mockPool {
-	return &mockPool{
-		queryRowFn: func(ctx context.Context, query string, args ...interface{}) pgx.Row {
-			if strings.Contains(query, "team_budgets") {
-				f := budgetQueryFn
-				if f == nil {
-					f = func() pgx.Row { return &mockRow{err: pgx.ErrNoRows} }
-				}
-				return f()
-			}
-			f := spendQueryFn
-			if f == nil {
-				f = func() pgx.Row { return &mockRow{err: pgx.ErrNoRows} }
-			}
-			return f()
-		},
-		execFn: func(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error) {
-			return pgconn.NewCommandTag("OK"), nil
-		},
+// fakeBudgetDB models the committed team_budgets / team_spend_monthly rows
+// behind the enforcer's ONE snapshot query: rows maps team → {limit, hard}
+// (absent key = no budget row), spend maps team → exact micro-USD. Tests
+// flip state BETWEEN calls to model committed admin writes; snapshot reads
+// are counted so controls can pin that a check actually re-read the
+// authoritative row instead of serving something remembered.
+type fakeBudgetDB struct {
+	mu    sync.Mutex
+	rows  map[string][]interface{}
+	spend map[string]int64
+	// outage, when set, fails every snapshot read (store-down control).
+	outage error
+	reads  int
+}
+
+func newFakeBudgetDB() *fakeBudgetDB {
+	return &fakeBudgetDB{rows: map[string][]interface{}{}, spend: map[string]int64{}}
+}
+
+// setBudget models the committed PUT /api/teams/{id}/budget row.
+func (f *fakeBudgetDB) setBudget(teamID string, monthlyLimitUSD float64, hard bool) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.rows[teamID] = []interface{}{monthlyLimitUSD, hard}
+}
+
+// deleteBudget models the committed DELETE /api/teams/{id}/budget.
+func (f *fakeBudgetDB) deleteBudget(teamID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.rows, teamID)
+}
+
+// setSpend models the month's exact micro-USD accumulator.
+func (f *fakeBudgetDB) setSpend(teamID string, micro int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.spend[teamID] = micro
+}
+
+// setOutage models a budget-store outage (every read fails).
+func (f *fakeBudgetDB) setOutage(err error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.outage = err
+}
+
+func (f *fakeBudgetDB) snapshotReads() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+func (f *fakeBudgetDB) QueryRow(_ context.Context, _ string, args ...interface{}) pgx.Row {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.reads++
+	if f.outage != nil {
+		return &mockRow{err: f.outage}
 	}
+	teamID, _ := args[0].(string)
+	row, ok := f.rows[teamID]
+	if !ok {
+		return &mockRow{err: pgx.ErrNoRows}
+	}
+	return &mockRow{data: [][]interface{}{append(append([]interface{}{}, row...), f.spend[teamID])}}
+}
+
+func (f *fakeBudgetDB) Exec(_ context.Context, _ string, _ ...interface{}) (pgconn.CommandTag, error) {
+	return pgconn.NewCommandTag("OK"), nil
 }
 
 func TestNewEnforcer(t *testing.T) {
-	log := newBudgetTestLogger()
-	e := NewEnforcer(nil, log)
+	e := NewEnforcer(newFakeBudgetDB(), newBudgetTestLogger())
 	require.NotNil(t, e)
-	assert.NotNil(t, e.cache)
-	assert.Equal(t, 1*time.Minute, e.ttl)
+	require.NotNil(t, e.db)
 }
 
 func TestCheckBudget_EmptyTeamID(t *testing.T) {
@@ -153,18 +200,18 @@ func TestCheckBudget_NilDB(t *testing.T) {
 }
 
 func TestCheckBudget_NoBudgetConfigured(t *testing.T) {
-	e := NewEnforcer(newSmartMockPool(nil, nil), newBudgetTestLogger())
+	db := newFakeBudgetDB()
+	e := NewEnforcer(db, newBudgetTestLogger())
 	err := e.CheckBudget(context.Background(), "team-1")
-	assert.ErrorIs(t, err, ErrNoBudget) // deny by default — no budget row configured
+	require.ErrorIs(t, err, ErrNoBudget) // deny by default — no budget row configured
+	assert.Equal(t, 1, db.snapshotReads(), "the denial comes from an authoritative read")
 }
 
 func TestCheckBudget_HardLimitExceeded(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(150_000_000)}}} }, // $150 exact
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
+	db := newFakeBudgetDB()
+	db.setBudget("team-1", 100.0, true)
+	db.setSpend("team-1", 150_000_000) // $150 exact
+	e := NewEnforcer(db, newBudgetTestLogger())
 
 	err := e.CheckBudget(context.Background(), "team-1")
 	require.Error(t, err)
@@ -172,67 +219,326 @@ func TestCheckBudget_HardLimitExceeded(t *testing.T) {
 }
 
 func TestCheckBudget_SoftLimitExceeded(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, false}}} }, // soft limit
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(150_000_000)}}} },
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
+	db := newFakeBudgetDB()
+	db.setBudget("team-2", 100.0, false) // soft limit
+	db.setSpend("team-2", 150_000_000)
+	e := NewEnforcer(db, newBudgetTestLogger())
 
 	err := e.CheckBudget(context.Background(), "team-2")
 	require.NoError(t, err) // soft limit → warn but allow
 }
 
 func TestCheckBudget_WithinHardLimit(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(50_000_000)}}} }, // $50 exact
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
+	db := newFakeBudgetDB()
+	db.setBudget("team-3", 100.0, true)
+	db.setSpend("team-3", 50_000_000) // $50 exact
+	e := NewEnforcer(db, newBudgetTestLogger())
 
 	err := e.CheckBudget(context.Background(), "team-3")
 	require.NoError(t, err)
 }
 
-func TestCheckBudget_CacheHit(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{err: pgx.ErrNoRows} }, // no budget
-		nil,
-	)
+// TestFirstBudgetWriteVisibleToNextCheck is the frozen original-sequence
+// control: a team is denied while unconfigured, an authorized budget write
+// commits, and the IMMEDIATELY following check on the same team evaluates
+// the persisted budget (no TTL wait, no cache of the absence). The read
+// count pins that the second check re-read the authoritative row — the
+// pre-fix 1-minute negative cache fails this test by serving the remembered
+// absence (ErrNoBudget, one snapshot read total).
+func TestFirstBudgetWriteVisibleToNextCheck(t *testing.T) {
+	db := newFakeBudgetDB()
+	e := NewEnforcer(db, newBudgetTestLogger())
 
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	// First call — misses cache, fetches from DB (no budget → ErrNoBudget cached)
+	// Original immediate denial: no budget row configured.
 	err := e.CheckBudget(context.Background(), "team-4")
 	require.ErrorIs(t, err, ErrNoBudget)
+	require.Equal(t, 1, db.snapshotReads())
 
-	// Second call — should hit negative cache, no DB query, same denial
+	// The authorized write commits (PUT /api/teams/team-4/budget: $100 hard).
+	db.setBudget("team-4", 100.0, true)
+	db.setSpend("team-4", 50_000_000)
+
+	// The very next check evaluates the persisted budget.
 	err = e.CheckBudget(context.Background(), "team-4")
-	require.ErrorIs(t, err, ErrNoBudget)
+	require.NoError(t, err, "a committed first budget must be visible to the immediately following request")
+	require.Equal(t, 2, db.snapshotReads(), "the allowance comes from a fresh authoritative read")
 }
 
-func TestCheckBudget_DBErrorFailClosed(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{err: errors.New("connection refused")} },
-		nil,
-	)
+// TestChangedLimitEnforcedByNextCheck is the frozen stale-limit control: a
+// lowered limit takes effect on the next check — the previous state (an
+// allowed request under $100) must never keep authorizing spend above the
+// new $0.50 cap.
+func TestChangedLimitEnforcedByNextCheck(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-5", 100.0, true)
+	db.setSpend("team-5", 50_000_000) // $50 of spend
+	e := NewEnforcer(db, newBudgetTestLogger())
 
-	e := NewEnforcer(pool, newBudgetTestLogger())
+	require.NoError(t, e.CheckBudget(context.Background(), "team-5"))
+
+	// The operator lowers the cap below the already-recorded spend.
+	db.setBudget("team-5", 0.50, true)
 
 	err := e.CheckBudget(context.Background(), "team-5")
+	require.ErrorIs(t, err, ErrBudgetExceeded,
+		"the lowered limit binds the next request; a remembered higher limit is never served")
+}
+
+// TestDeletedBudgetDeniesNextCheck is the delete half of the stale control:
+// removing the row restores the fail-closed denial immediately — the
+// previously allowed team must not keep a phantom cap.
+func TestDeletedBudgetDeniesNextCheck(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-6", 100.0, true)
+	db.setSpend("team-6", 50_000_000)
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	require.NoError(t, e.CheckBudget(context.Background(), "team-6"))
+
+	db.deleteBudget("team-6") // DELETE /api/teams/team-6/budget commits
+
+	err := e.CheckBudget(context.Background(), "team-6")
+	require.ErrorIs(t, err, ErrNoBudget, "no stale allow after a committed delete")
+}
+
+// TestBudgetStoreOutage_DeniesNeverServesLastKnownLimit is the frozen outage
+// control: when freshness cannot be established the enforcer denies — the
+// last-known $100 limit is never served as proof of the current cap.
+func TestBudgetStoreOutage_DeniesNeverServesLastKnownLimit(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-7", 100.0, true)
+	db.setSpend("team-7", 50_000_000)
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	require.NoError(t, e.CheckBudget(context.Background(), "team-7"), "preconditions: allowed under the live limit")
+
+	db.setOutage(errors.New("connection refused"))
+
+	err := e.CheckBudget(context.Background(), "team-7")
+	assert.ErrorIs(t, err, ErrBudgetUnavailable, "an unreadable store is a denial, not a last-known allowance")
+}
+
+// TestCheckBudget_DBErrorOnUnbudgetedTeam pins the same fail-closed posture
+// for the first read of an unconfigured team.
+func TestCheckBudget_DBErrorOnUnbudgetedTeam(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setOutage(errors.New("connection refused"))
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	err := e.CheckBudget(context.Background(), "team-8")
 	assert.ErrorIs(t, err, ErrBudgetUnavailable) // fail-closed on DB error
 }
 
-func TestCheckBudget_SpendFetchErrorFailClosed(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		func() pgx.Row { return &mockRow{err: errors.New("spend DB error")} },
-	)
+// TestTwoTeamIsolation_BudgetWriteScopedPerTeam: a budget configured for
+// team B never authorizes team A, and A's later configuration changes
+// nothing for B — each team's denial/allowance rides its own row.
+func TestTwoTeamIsolation_BudgetWriteScopedPerTeam(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-b", 100.0, true)
+	db.setSpend("team-b", 10_000_000)
+	e := NewEnforcer(db, newBudgetTestLogger())
 
-	e := NewEnforcer(pool, newBudgetTestLogger())
-	err := e.CheckBudget(context.Background(), "team-6")
-	assert.ErrorIs(t, err, ErrBudgetUnavailable) // fail-closed on spend fetch error
+	// B configured, A not: B allowed, A denied.
+	require.NoError(t, e.CheckBudget(context.Background(), "team-b"))
+	require.ErrorIs(t, e.CheckBudget(context.Background(), "team-a"), ErrNoBudget)
+
+	// The write that fixes A (PUT /api/teams/team-a/budget) — B untouched.
+	db.setBudget("team-a", 25.0, true)
+	require.NoError(t, e.CheckBudget(context.Background(), "team-a"),
+		"team A's own write is visible to A immediately")
+	require.NoError(t, e.CheckBudget(context.Background(), "team-b"), "team B stays within its own limit")
+
+	// Deleting B's budget denies B while A keeps its allowance.
+	db.deleteBudget("team-b")
+	require.ErrorIs(t, e.CheckBudget(context.Background(), "team-b"), ErrNoBudget)
+	require.NoError(t, e.CheckBudget(context.Background(), "team-a"))
+}
+
+func TestCheckBudget_BudgetAtExactLimit(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-14", 100.0, true)
+	db.setSpend("team-14", 100_000_000)
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	err := e.CheckBudget(context.Background(), "team-14")
+	require.Error(t, err) // spend (100_000_000µ) >= limit ($100) → hard limit blocks
+	assert.ErrorIs(t, err, ErrBudgetExceeded)
+}
+
+func TestCheckBudget_BudgetJustBelowLimit(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-15", 100.0, true)
+	db.setSpend("team-15", 100_000_000-1)
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	err := e.CheckBudget(context.Background(), "team-15")
+	require.NoError(t, err) // 1µ below the limit → allowed
+}
+
+// TestCheckBudget_SubCentExactPrecision: the comparison runs on the exact
+// micro-USD accumulator, not a cent-rounded projection. A cent-rounded
+// projection would lose the last 4000µ.
+func TestCheckBudget_SubCentExactPrecision(t *testing.T) {
+	under := newFakeBudgetDB()
+	under.setBudget("team-19", 0.01, true) // $0.01 = 10_000µ
+	under.setSpend("team-19", 9_999)
+	require.NoError(t, NewEnforcer(under, newBudgetTestLogger()).CheckBudget(context.Background(), "team-19"))
+
+	at := newFakeBudgetDB()
+	at.setBudget("team-20", 0.01, true)
+	at.setSpend("team-20", 10_000)
+	require.ErrorIs(t,
+		NewEnforcer(at, newBudgetTestLogger()).CheckBudget(context.Background(), "team-20"),
+		ErrBudgetExceeded)
+}
+
+func TestCheckBudget_NegativeSpendAllowed(t *testing.T) {
+	db := newFakeBudgetDB()
+	db.setBudget("team-16", 100.0, true) // no spend entry → COALESCE 0
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	err := e.CheckBudget(context.Background(), "team-16")
+	require.NoError(t, err) // no spend record → 0 < 100
+}
+
+// TestConcurrentChecksDuringBudgetWrite: checks racing a committed write see
+// either the old or the new committed state — never an error, never a torn
+// row. Barrier-synchronized phases, no sleeps.
+func TestConcurrentChecksDuringBudgetWrite(t *testing.T) {
+	db := newFakeBudgetDB()
+	e := NewEnforcer(db, newBudgetTestLogger())
+	const workers = 8
+
+	runPhase := func(begin chan struct{}) []error {
+		out := make(chan error, workers)
+		var wg sync.WaitGroup
+		for i := 0; i < workers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-begin
+				out <- e.CheckBudget(context.Background(), "team-race")
+			}()
+		}
+		close(begin)
+		wg.Wait()
+		close(out)
+		errs := make([]error, 0, workers)
+		for err := range out {
+			errs = append(errs, err)
+		}
+		return errs
+	}
+
+	// Phase 1: every concurrent check denies (no row).
+	for _, err := range runPhase(make(chan struct{})) {
+		require.ErrorIs(t, err, ErrNoBudget, "pre-write concurrent phase: uniform denial")
+	}
+
+	// The write commits.
+	db.setBudget("team-race", 100.0, true)
+
+	// Phase 2: every concurrent check allows.
+	for _, err := range runPhase(make(chan struct{})) {
+		require.NoError(t, err, "post-write concurrent phase: uniform allowance")
+	}
+}
+
+// TestConcurrentChecksWhileBudgetToggles: barrier-separated rounds of
+// concurrent checks around committed flips — absent, present, absent, ... —
+// pin that every round's concurrent checks agree with the COMMITTED state
+// (uniform denial / uniform allowance, never a torn row or an error). The
+// write happens strictly between rounds, so the polarity assertions are
+// deterministic; the checks within a round still execute concurrently.
+func TestConcurrentChecksWhileBudgetToggles(t *testing.T) {
+	db := newFakeBudgetDB()
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	const readers = 8
+	const rounds = 10
+	for round := 0; round < rounds; round++ {
+		present := round%2 == 1 // round 0 reads the absent state; flips alternate
+
+		begin := make(chan struct{})
+		done := make(chan error, readers)
+		var wg sync.WaitGroup
+		for i := 0; i < readers; i++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				<-begin
+				done <- e.CheckBudget(context.Background(), "team-toggle")
+			}()
+		}
+		close(begin)
+		wg.Wait()
+		close(done)
+
+		for err := range done {
+			if present {
+				require.NoError(t, err, "round %d: committed budget present — allowance expected", round)
+			} else {
+				require.ErrorIs(t, err, ErrNoBudget, "round %d: no committed row — denial expected", round)
+			}
+		}
+
+		// The committed write lands strictly between rounds (no reader in flight).
+		if present {
+			db.deleteBudget("team-toggle")
+		} else {
+			db.setBudget("team-toggle", 100.0, true)
+		}
+	}
+
+	db.setBudget("team-toggle", 100.0, true)
+	require.NoError(t, e.CheckBudget(context.Background(), "team-toggle"), "final committed state: allowed")
+}
+
+// TestConcurrentChecksRacingWriter_NeverOutsideCommittedStates: readers spin
+// freely while a writer flips the row continuously — each outcome must be a
+// committed state (denial or allowance), never ErrBudgetUnavailable or a
+// torn row. Polarity counts are scheduler-dependent and deliberately NOT
+// asserted here (the deterministic rounds above pin the polarity contract).
+func TestConcurrentChecksRacingWriter_NeverOutsideCommittedStates(t *testing.T) {
+	db := newFakeBudgetDB()
+	e := NewEnforcer(db, newBudgetTestLogger())
+
+	const readers = 4
+	const iterations = 200
+	begin := make(chan struct{})
+	outcomes := make(chan error, readers*iterations)
+	var wg sync.WaitGroup
+	for i := 0; i < readers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-begin
+			for j := 0; j < iterations; j++ {
+				outcomes <- e.CheckBudget(context.Background(), "team-race-writer")
+			}
+		}()
+	}
+	writerDone := make(chan struct{})
+	go func() {
+		defer close(writerDone)
+		<-begin
+		for j := 0; j < 25; j++ {
+			db.setBudget("team-race-writer", 100.0, true)
+			db.deleteBudget("team-race-writer")
+		}
+		db.setBudget("team-race-writer", 100.0, true)
+	}()
+	close(begin)
+	wg.Wait()
+	<-writerDone
+	close(outcomes)
+
+	for err := range outcomes {
+		if err != nil && !errors.Is(err, ErrNoBudget) {
+			t.Fatalf("outcome outside the committed-state set: %v", err)
+		}
+	}
+	require.NoError(t, e.CheckBudget(context.Background(), "team-race-writer"), "final committed state: allowed")
 }
 
 // recordExactSpendArgs captures one RecordTeamSpendExact upsert.
@@ -315,105 +621,9 @@ func (m *mockSpendExecutor) Exec(ctx context.Context, query string, args ...any)
 	return m.execFn(ctx, query, args...)
 }
 
-func TestGetSpendThisMonth_NoRows(t *testing.T) {
-	pool := newSmartMockPool(nil, func() pgx.Row { return &mockRow{err: pgx.ErrNoRows} })
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	spend, err := e.getSpendThisMonthMicro(context.Background(), "team-10")
-	require.NoError(t, err)
-	assert.Equal(t, int64(0), spend)
-}
-
-func TestGetSpendThisMonth_WithSpend(t *testing.T) {
-	pool := newSmartMockPool(nil, func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(75_250_000)}}} })
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	spend, err := e.getSpendThisMonthMicro(context.Background(), "team-11")
-	require.NoError(t, err)
-	assert.Equal(t, int64(75_250_000), spend, "the exact accumulator is read, not the projection")
-}
-
-func TestGetSpendThisMonth_DBError(t *testing.T) {
-	pool := newSmartMockPool(nil, func() pgx.Row { return &mockRow{err: errors.New("connection lost")} })
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	spend, err := e.getSpendThisMonthMicro(context.Background(), "team-12")
-	require.Error(t, err)
-	assert.Equal(t, int64(0), spend)
-}
-
-func TestClearCache(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{err: pgx.ErrNoRows} },
-		nil,
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	err := e.CheckBudget(context.Background(), "team-13")
-	require.ErrorIs(t, err, ErrNoBudget) // no budget row → deny (and cache the absence)
-	require.Len(t, e.cache, 1)
-
-	e.ClearCache("team-13")
-	assert.Empty(t, e.cache)
-}
-
-func TestCheckBudget_BudgetAtExactLimit(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(100_000_000)}}} },
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	err := e.CheckBudget(context.Background(), "team-14")
-	require.Error(t, err) // spend (100_000_000µ) >= limit ($100) → hard limit blocks
-	assert.ErrorIs(t, err, ErrBudgetExceeded)
-}
-
-func TestCheckBudget_BudgetJustBelowLimit(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(100_000_000 - 1)}}} },
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	err := e.CheckBudget(context.Background(), "team-15")
-	require.NoError(t, err) // 1µ below the limit → allowed
-}
-
-// outcome. A cent-rounded projection would lose the last 4000µ.
-func TestCheckBudget_SubCentExactPrecision(t *testing.T) {
-	under := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{0.01, true}}} }, // $0.01 = 10_000µ
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(9_999)}}} },
-	)
-	require.NoError(t, NewEnforcer(under, newBudgetTestLogger()).CheckBudget(context.Background(), "team-19"))
-
-	at := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{0.01, true}}} },
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{int64(10_000)}}} },
-	)
-	require.ErrorIs(t,
-		NewEnforcer(at, newBudgetTestLogger()).CheckBudget(context.Background(), "team-20"),
-		ErrBudgetExceeded)
-}
-
-func TestCheckBudget_NegativeSpendAllowed(t *testing.T) {
-	pool := newSmartMockPool(
-		func() pgx.Row { return &mockRow{data: [][]interface{}{{100.0, true}}} },
-		nil,
-	)
-
-	e := NewEnforcer(pool, newBudgetTestLogger())
-
-	err := e.CheckBudget(context.Background(), "team-16")
-	require.NoError(t, err) // no spend record → 0 < 100
-}
-
 // blockingRow blocks its Scan until the test releases it — it models a slow
-// team_budgets read for one team while another team's check must proceed.
+// snapshot read for one team while another team's check must proceed. It
+// fills the snapshot dests: $100 hard limit, $0.10 exact spend.
 type blockingRow struct {
 	started chan struct{}
 	release chan struct{}
@@ -435,10 +645,10 @@ func (r *blockingRow) Scan(dest ...interface{}) error {
 	return nil
 }
 
-// TestCheckBudget_ConcurrentTeamsDoNotSerialize (W-MONEY): the budget read
-// runs OUTSIDE the cache lock, so a slow DB read for one team cannot block
-// another team's check — the old write-lock-across-the-query serialized
-// every tenant behind the slowest budget read.
+// TestCheckBudget_ConcurrentTeamsDoNotSerialize (W-MONEY): the snapshot read
+// carries no enforcer-level lock, so a slow DB read for one team cannot
+// block another team's check — the old write-lock-across-the-query
+// serialized every tenant behind the slowest budget read.
 func TestCheckBudget_ConcurrentTeamsDoNotSerialize(t *testing.T) {
 	started := make(chan struct{})
 	release := make(chan struct{})
@@ -449,15 +659,15 @@ func TestCheckBudget_ConcurrentTeamsDoNotSerialize(t *testing.T) {
 				if teamID == "team-slow" {
 					return &blockingRow{started: started, release: release}
 				}
-				return &mockRow{data: [][]interface{}{{100.0, true}}}
+				return &mockRow{data: [][]interface{}{{100.0, true, int64(0)}}}
 			}
-			return &mockRow{err: pgx.ErrNoRows} // spend: zero for both teams
+			return &mockRow{err: pgx.ErrNoRows}
 		},
 	}, newBudgetTestLogger())
 
 	slowDone := make(chan error, 1)
 	go func() { slowDone <- e.CheckBudget(context.Background(), "team-slow") }()
-	<-started // the slow team's budget read is in flight, cache unlocked
+	<-started // the slow team's snapshot read is in flight
 
 	fastDone := make(chan error, 1)
 	go func() { fastDone <- e.CheckBudget(context.Background(), "team-fast") }()

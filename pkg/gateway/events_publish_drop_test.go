@@ -5,9 +5,13 @@ package cli
 // answers both drop classes with a silent-failure count — backlog_full when
 // the in-process publish semaphore is saturated, publish_failed when the
 // bounded retries against the stream are exhausted — so a queue/Redis
-// outage is observable on /metrics instead of debug-log-only.
+// outage is observable on /metrics and in Warn-level logs instead of a
+// silent drop.
 
 import (
+	"bytes"
+	"fmt"
+	"log/slog"
 	"testing"
 	"time"
 
@@ -71,7 +75,8 @@ func requirePublishQuiescence(t *testing.T) {
 
 // TestPublishEventBacklogFullCounted pins the synchronous drop path: a
 // saturated in-process backlog skips the publish and increments
-// event_publish{reason="backlog_full"} before publishEvent returns.
+// event_publish{reason="backlog_full"} before publishEvent returns. The
+// drop is fail-visible, not silent: it logs at Warn with backlog context.
 func TestPublishEventBacklogFullCounted(t *testing.T) {
 	// Saturate the shared semaphore and HOLD the tokens for the whole test:
 	// publishEvent must hit the full backlog, not a free slot. Fail cleanly
@@ -94,11 +99,86 @@ func TestPublishEventBacklogFullCounted(t *testing.T) {
 		}
 	}()
 
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
 	before := silentFailureValue(t, "event_publish", "backlog_full")
-	publishEvent(deadRedisPublisher(), testLogger(), publishDropEvent())
+	publishEvent(deadRedisPublisher(), logger, publishDropEvent())
 	require.InDelta(t, before+1, silentFailureValue(t, "event_publish", "backlog_full"),
 		1e-9,
 		"a backlog-full drop must be counted synchronously")
+	require.Contains(t, logs.String(), "level=WARN",
+		"a saturated-backlog drop must be visible at Warn, not Debug")
+	require.Contains(t, logs.String(), `msg="event publish skipped, backlog full"`,
+		"the drop log must keep the skip message")
+	require.Contains(t, logs.String(),
+		fmt.Sprintf("queue_len=%d", cap(eventPublishSem)),
+		"the Warn must carry the saturated queue length as backlog context")
+}
+
+// TestPublishEventBacklogFreeStillPublishes pins the complement: with one
+// free slot the event takes the publish path — the slot is acquired (the
+// acquire is synchronous in publishEvent, so it is held when publishEvent
+// returns), no backlog_full drop is counted and no backlog Warn is logged.
+// Guards the backlog-size change against turning the acquire path into a
+// drop path.
+func TestPublishEventBacklogFreeStillPublishes(t *testing.T) {
+	requirePublishQuiescence(t) // exact delta: no foreign publish may hold slots
+	// Hold every slot but one; the next publishEvent must take the last one.
+	for i := 0; i < cap(eventPublishSem)-1; i++ {
+		eventPublishSem <- struct{}{}
+	}
+	defer func() {
+		for i := 0; i < cap(eventPublishSem)-1; i++ {
+			select {
+			case <-eventPublishSem:
+			case <-time.After(10 * time.Second):
+				t.Fatalf("publish semaphore did not drain at slot %d", i)
+			}
+		}
+	}()
+
+	var logs bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&logs, nil))
+
+	before := silentFailureValue(t, "event_publish", "backlog_full")
+	publishEvent(deadRedisPublisher(), logger, publishDropEvent())
+	require.Len(t, eventPublishSem, cap(eventPublishSem),
+		"the only free slot must be acquired by the publish handoff")
+	require.InDelta(t, before, silentFailureValue(t, "event_publish", "backlog_full"),
+		1e-9,
+		"a publish that acquired a slot must not count a backlog-full drop")
+	// The publish handoff detached a publisher goroutine that keeps the
+	// acquired slot until after publishAttempt — including its terminal
+	// Warn write into this test's log buffer — has returned (the same
+	// hold-until-after-the-write invariant requirePublishQuiescence
+	// relies on). Wait for that release before reading the buffer:
+	// reading `logs` while the detached goroutine may still be logging
+	// raced its Write under -race (write: events.go publishAttempt Warn,
+	// read: the NotContains below). The wait must be a REAL channel
+	// operation: the kth receive on a buffered channel happens-before
+	// the (k+C)th send completes, so a send into the slot the goroutine
+	// just released happens-after its release, which is program-ordered
+	// after the Warn write — everything after that send in the test is
+	// race-free to read the buffer. (Polling len(eventPublishSem) has
+	// no such happens-before edge: the 100x -race gate flagged the same
+	// read/write pair even when the release had long been observed.)
+	// The probe token is handed straight back so the test's own cap-1
+	// slot ledger stays exact for the deferred drain. Same expectation,
+	// synchronized observation; the bounded deadline catches a hung
+	// publish ladder.
+	require.Eventually(t, func() bool {
+		select {
+		case eventPublishSem <- struct{}{}:
+			<-eventPublishSem
+			return true
+		default:
+			return false
+		}
+	}, 5*time.Second, 10*time.Millisecond,
+		"the detached publisher must release its slot once its retry ladder exhausts")
+	require.NotContains(t, logs.String(), "backlog full",
+		"a published event must not log the backlog warning")
 }
 
 // TestPublishEventTerminalFailureCounted pins the exhausted-retries path:

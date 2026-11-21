@@ -205,6 +205,21 @@ function subscribe(listener: () => void): () => void {
   return () => { listeners.delete(listener) }
 }
 
+/**
+ * Narrow subscription for hash-keyed consumers OUTSIDE the store's React
+ * bindings (useHashParam): the scope's own commits rewrite the hash with
+ * replaceState, which fires no hashchange, so those consumers would miss
+ * toolbar period/org switches entirely. commit() runs writeGlobalScope
+ * BEFORE setState→emit, so by the time a listener runs the URL already
+ * carries the new value — listeners re-read the hash and never receive
+ * payloads, keeping arriving URLs authoritative. Same mechanism, same
+ * single listener set as the store's own bindings; no competing store, no
+ * history writes, no event loop (adoption never writes back).
+ */
+export function subscribeGlobalScope(listener: () => void): () => void {
+  return subscribe(listener)
+}
+
 export interface GlobalScopeApi extends GlobalScopeState {
   setOrg: (org: string) => void
   setPeriod: (period: Exclude<PeriodPreset, 'custom'>, now?: Date) => void

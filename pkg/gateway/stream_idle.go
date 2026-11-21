@@ -18,10 +18,17 @@ type idleReader struct {
 }
 
 // newIdleReader arms the watchdog immediately; Stop disarms it at drain end.
+// The callback is exactly-once: Timer.Reset on an already-expired AfterFunc
+// timer re-arms the callback (Go timer contract), so without the CAS guard a
+// reader that keeps flowing after one legitimate fire can trigger a second
+// onIdle run — the CI run 44814334185 double-close panic came from exactly
+// that second run (close of the same "fired" channel twice).
 func newIdleReader(r io.Reader, d time.Duration, onIdle func()) *idleReader {
 	ir := &idleReader{r: r, d: d}
 	ir.timer = time.AfterFunc(d, func() {
-		ir.fired.Store(true)
+		if !ir.fired.CompareAndSwap(false, true) {
+			return
+		}
 		if onIdle != nil {
 			onIdle()
 		}
@@ -31,7 +38,9 @@ func newIdleReader(r io.Reader, d time.Duration, onIdle func()) *idleReader {
 
 func (ir *idleReader) Read(p []byte) (int, error) {
 	n, err := ir.r.Read(p)
-	if n > 0 {
+	// Once fired, stop re-arming: Reset would schedule a fresh callback run
+	// for a watchdog that already did its job (see newIdleReader).
+	if n > 0 && !ir.fired.Load() {
 		ir.timer.Reset(ir.d)
 	}
 	return n, err

@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
-	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -35,38 +34,48 @@ type dbConn interface {
 	Exec(ctx context.Context, query string, args ...interface{}) (pgconn.CommandTag, error)
 }
 
-// Enforcer checks team budget limits in real-time.
-// Uses DB for persistence and an in-memory cache for fast lookups.
+// Enforcer checks team budget limits in real-time against the AUTHORITATIVE
+// database state: one snapshot query per check returns the team's current
+// finite limit together with the current month's exact spend, so a committed
+// budget write (PUT/DELETE /api/teams/{id}/budget) is visible to the very
+// next request.
+//
+// There is deliberately NO in-memory limit/absence cache. The previous
+// 1-minute TTL cache served a stale cached absence after a first budget was
+// configured (the immediate 403 after an authorized PUT) and, symmetrically,
+// could serve a stale limit after a change/delete; a cached row is not proof
+// of the current cap. Caching the limit also saved no round trips: the exact
+// monthly spend — same team, same request — was already read from
+// team_spend_monthly on EVERY permitted request. Folding both into one
+// snapshot keeps the per-check round-trip count at exactly one, needs no
+// cross-process invalidation channel between the admin API and the gateway
+// (separate processes in production), and degrades fail-closed: any read
+// failure denies (ErrBudgetUnavailable) instead of serving a last-known
+// limit.
 type Enforcer struct {
-	db    dbConn
-	log   *slog.Logger
-	cache map[string]*teamBudget
-	mu    sync.RWMutex
-	ttl   time.Duration
+	db  dbConn
+	log *slog.Logger
 }
 
-type teamBudget struct {
+// teamBudgetSnapshot is ONE authoritative read of a team's budget state.
+type teamBudgetSnapshot struct {
 	monthlyLimitUSD float64
-	// monthlyLimitMicroUSD is the limit converted to exact micro-USD once at
-	// load time (ADR-0001 §13): the spend comparison runs on the exact
+	// monthlyLimitMicroUSD is the limit converted to exact micro-USD once
+	// per snapshot (ADR-0001 §13): the spend comparison runs on the exact
 	// bigint accumulator, never on floats.
 	monthlyLimitMicroUSD int64
 	hardLimit            bool
-	// absent marks a cached negative lookup (no budget row). It preserves the
-	// ErrNoBudget signal across cache hits so a $0 zero-value entry is never
-	// mistaken for a real budget.
-	absent   bool
-	cachedAt time.Time
+	// spendMicroUSD is the month's exact micro-USD accumulator; a missing
+	// team_spend_monthly row reads as zero spend.
+	spendMicroUSD int64
 }
 
 // NewEnforcer creates a budget enforcer backed by the database.
 // Accepts any type implementing dbConn (e.g., *pgxpool.Pool).
 func NewEnforcer(db dbConn, log *slog.Logger) *Enforcer {
 	return &Enforcer{
-		db:    db,
-		log:   log.With("component", "budget-enforcer"),
-		cache: make(map[string]*teamBudget),
-		ttl:   1 * time.Minute,
+		db:  db,
+		log: log.With("component", "budget-enforcer"),
 	}
 }
 
@@ -87,32 +96,26 @@ func (e *Enforcer) CheckBudget(ctx context.Context, teamID string) error {
 		return nil
 	}
 
-	budget, err := e.getBudget(ctx, teamID)
+	snap, err := e.getBudgetSnapshot(ctx, teamID)
 	if err != nil {
 		if errors.Is(err, ErrNoBudget) {
 			return ErrNoBudget
 		}
 		e.log.Warn("budget lookup unavailable, denying request", "team_id", teamID, "error", err)
-		return fmt.Errorf("%w: %v", ErrBudgetUnavailable, err)
+		return fmt.Errorf("%w: %w", ErrBudgetUnavailable, err)
 	}
 
-	spendMicro, err := e.getSpendThisMonthMicro(ctx, teamID)
-	if err != nil {
-		e.log.Warn("budget spend lookup unavailable, denying request", "team_id", teamID, "error", err)
-		return fmt.Errorf("%w: %v", ErrBudgetUnavailable, err)
-	}
-
-	if spendMicro >= budget.monthlyLimitMicroUSD {
-		if budget.hardLimit {
+	if snap.spendMicroUSD >= snap.monthlyLimitMicroUSD {
+		if snap.hardLimit {
 			return fmt.Errorf("%w: spent $%.2f of $%.2f limit",
 				ErrBudgetExceeded,
-				float64(spendMicro)/float64(money.MicroPerUSD),
-				budget.monthlyLimitUSD)
+				float64(snap.spendMicroUSD)/float64(money.MicroPerUSD),
+				snap.monthlyLimitUSD)
 		}
 		e.log.Warn("team budget soft limit exceeded",
 			"team_id", teamID,
-			"spend_micro_usd", spendMicro,
-			"limit", budget.monthlyLimitUSD,
+			"spend_micro_usd", snap.spendMicroUSD,
+			"limit", snap.monthlyLimitUSD,
 		)
 	}
 
@@ -156,84 +159,49 @@ func RecordTeamSpendExact(ctx context.Context, db SpendExecutor, teamID, period 
 	return nil
 }
 
-func (e *Enforcer) getBudget(ctx context.Context, teamID string) (*teamBudget, error) {
-	// Fast path: a fresh entry answers under the read lock, so concurrent
-	// checks of DIFFERENT teams never contend on the writer.
-	e.mu.RLock()
-	if b, ok := e.cache[teamID]; ok && time.Since(b.cachedAt) < e.ttl {
-		e.mu.RUnlock()
-		return e.budgetFromCache(b)
-	}
-	e.mu.RUnlock()
+// getBudgetSnapshot reads the team's current finite limit and the current
+// month's exact spend in ONE round trip (both sides are primary-key probes:
+// team_budgets by team_id, team_spend_monthly by (team_id, period)).
+//
+//   - no team_budgets row → pgx.ErrNoRows → ErrNoBudget (fail-closed denial,
+//     the same signal the gateway maps to 403 budget_not_configured);
+//   - no team_spend_monthly row → COALESCE reads as zero spend;
+//   - any read failure → returned verbatim and mapped by CheckBudget to
+//     ErrBudgetUnavailable: a freshness failure is a denial, never a
+//     last-known cached limit.
+func (e *Enforcer) getBudgetSnapshot(ctx context.Context, teamID string) (*teamBudgetSnapshot, error) {
+	period := time.Now().UTC().Format("2006-01")
 
-	// Miss: the DB query runs OUTSIDE every lock (pattern: credits.Store.
-	// GetBalance) — the write lock below guards only the cache write, so a
-	// slow budget read for one team never serializes every other tenant.
-	// Concurrent misses for the same team may each query; the row is
-	// identical, so the last write wins without any caller observing a
-	// torn entry.
 	var monthlyLimit float64
 	var hardLimit bool
+	var spendMicro int64
 	err := e.db.QueryRow(ctx,
-		`SELECT monthly_limit_usd, hard_limit FROM team_budgets WHERE team_id = $1`,
-		teamID,
-	).Scan(&monthlyLimit, &hardLimit)
-
-	b := &teamBudget{cachedAt: time.Now()}
+		`SELECT b.monthly_limit_usd,
+		        b.hard_limit,
+		        COALESCE(s.spend_micro_usd, 0)
+		   FROM team_budgets b
+		   LEFT JOIN team_spend_monthly s
+		          ON s.team_id = b.team_id
+		         AND s.period  = $2
+		  WHERE b.team_id = $1`,
+		teamID, period,
+	).Scan(&monthlyLimit, &hardLimit, &spendMicro)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, ErrNoBudget
+	}
 	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			// Cache the absence — no budget configured for this team.
-			b.absent = true
-			e.mu.Lock()
-			e.cache[teamID] = b
-			e.mu.Unlock()
-			return nil, ErrNoBudget
-		}
 		return nil, err
 	}
 
-	b.monthlyLimitUSD = monthlyLimit
-	b.monthlyLimitMicroUSD = int64(math.Round(monthlyLimit * float64(money.MicroPerUSD)))
-	b.hardLimit = hardLimit
-	e.mu.Lock()
-	e.cache[teamID] = b
-	e.mu.Unlock()
-	return b, nil
+	return &teamBudgetSnapshot{
+		monthlyLimitUSD:      monthlyLimit,
+		monthlyLimitMicroUSD: int64(math.Round(monthlyLimit * float64(money.MicroPerUSD))),
+		hardLimit:            hardLimit,
+		spendMicroUSD:        spendMicro,
+	}, nil
 }
 
-// budgetFromCache unwraps a cached entry. A cached negative lookup (absent) is
-// reported as ErrNoBudget so the caller keeps denying until the cache expires;
-// a real entry is returned as a usable budget.
-func (e *Enforcer) budgetFromCache(b *teamBudget) (*teamBudget, error) {
-	if b.absent {
-		return nil, ErrNoBudget
-	}
-	return b, nil
-}
-
-// getSpendThisMonthMicro reads the exact micro-USD accumulator for the
-// column written by the settlement worker, never on the spend_usd
-// compatibility projection. No row → zero spend for the period.
-func (e *Enforcer) getSpendThisMonthMicro(ctx context.Context, teamID string) (int64, error) {
-	period := time.Now().UTC().Format("2006-01")
-
-	var spend int64
-	err := e.db.QueryRow(ctx,
-		`SELECT COALESCE(spend_micro_usd, 0) FROM team_spend_monthly WHERE team_id = $1 AND period = $2`,
-		teamID, period,
-	).Scan(&spend)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return 0, nil
-		}
-		return 0, err
-	}
-	return spend, nil
-}
-
-// ClearCache invalidates cached budget for a team (called after budget updates).
-func (e *Enforcer) ClearCache(teamID string) {
-	e.mu.Lock()
-	defer e.mu.Unlock()
-	delete(e.cache, teamID)
-}
+// ClearCache is retained for Go source compatibility with existing callers.
+// It is a deliberate no-op: every CheckBudget reads the authoritative
+// limit+spend snapshot, so there is no cached state left to invalidate.
+func (e *Enforcer) ClearCache(teamID string) {}

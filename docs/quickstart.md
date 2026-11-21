@@ -27,7 +27,7 @@ WSL2 with Docker integration. The commands below run from the repository
 root. You need:
 
 - Git, Docker Engine or Docker Desktop, and Docker Compose v2 with `--wait`.
-- Bash, `make`, OpenSSL, `curl`, and Python 3 (used by the smoke check).
+- Bash, `make`, OpenSSL, `curl`, and Python 3.9+ (used by the one-command setup and smoke check).
 - Internet access for container base images and Go modules during the first
   build. Go itself is installed inside the build image; host Go is optional.
 - Enough Docker memory and disk space to compile the gateway and run
@@ -78,19 +78,33 @@ prebuilt Yabanin release. Third-party Compose images are pinned by digest.
 
 ## One-command demo
 
-From a verified checkout, one script runs steps 2 to 4 (configuration,
-build and start, and seed) and prints where the API key and admin
-password appear:
+From the root of the checked-out Core revision run:
 
 ```bash
 bash scripts/quickstart/demo.sh
 ```
 
-Rerunning it is safe: the running stack and existing credentials are
-reused, and the summary notes that the password was issued on the first
-run. `--fresh` wipes the disposable demo database and keys and issues new
-ones (destructive). The numbered steps below are the manual path; each one
-explains what the script chains.
+The command builds this checkout, starts the gateway and dashboard, creates
+the Seed organization and sends four requests through the mock model. Open
+the printed Requests link and sign in with the displayed login. The private
+state directory printed on completion holds `admin-password` and `gateway-key`.
+The four entries show code review, support, documentation and tool planning,
+with their actual request IDs, status and token usage.
+
+To include multiple OpenAI-compatible models at installation, pass the provider
+manifest in the same command. Each entry has a distinct model ID, HTTPS base
+URL and private key file. Registration alone makes no external inference calls.
+Use `--probe-providers` to send one potentially billable chat per model.
+See [the two-provider example](demo.md#optional-provider-endpoints-at-installation).
+
+```bash
+bash scripts/quickstart/demo.sh --providers /path/to/providers.json
+```
+
+Rerun with the same inputs to resume. Keep the private state, Compose volume
+and `deploy/quickstart/.env` together. The explicit `--fresh` option wipes
+the disposable database, sample history and credentials and provisions new ones.
+The numbered steps below describe manual installation.
 
 ## 2. Generate local configuration
 
@@ -203,6 +217,28 @@ bash scripts/quickstart/smoke.sh "$YABANIN_API_KEY"
 ```
 
 `make quickstart-smoke KEY="$YABANIN_API_KEY"` runs the same check.
+
+### Optional: local load smoke check
+
+With [k6](https://grafana.com/docs/k6/latest/set-up/install-k6/) installed
+separately — it is not part of this quickstart's tooling — you can exercise
+the load scripts against the quickstart mock with a tiny labeled smoke
+profile:
+
+```bash
+export TOKENROUTER_API_KEY="$YABANIN_API_KEY"
+make load-test-chat MODEL=mock-model SMOKE=1
+```
+
+The target refuses to start unless `TOKENROUTER_API_KEY` is already exported;
+it never places the key on a command line. The request goes to the local
+gateway on `127.0.0.1:8082` using the seeded `mock-model`, and the run is
+reported as a `smoke` profile. It checks load-script wiring and the exact
+model identity in responses only; it is not a load measurement of the
+gateway. The full profile (ramping to 1,000 virtual users) targets a
+separately prepared deployment and is unrelated to quickstart sizing.
+Unset the key when finished, as shown in [Stop, restart, and
+reset](#stop-restart-and-reset).
 
 Expected final line: `smoke ok (N request log rows)`, where `N` is at least 1.
 The check waits for the log consumer, so it takes several seconds. On a fresh

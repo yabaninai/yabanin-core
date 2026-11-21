@@ -174,6 +174,81 @@ EOF
     fi
 }
 
+# `go version -m` echoes its argument path as the manifest header line; invoke
+# it with the bare binary name from inside the release dir so the fallback
+# .buildinfo bytes are identical across RELEASE_DIR locations (C-3).
+write_buildinfo() { # write_buildinfo <binary>: go version -m -> <binary>.buildinfo
+    local name
+    name=$(basename "$1")
+    (cd "$(dirname "$1")" && go version -m "$name") > "$1.buildinfo"
+}
+
+# sbom_spdx_is_valid <file>: the SPDX document exists, parses as JSON, carries
+# the required SPDX document fields and a nonempty packages array. A scanner
+# exiting zero while emitting nothing (or truncated/malformed output) must not
+# be claimable as a valid SBOM; a missing python3 also fails closed here.
+sbom_spdx_is_valid() { # sbom_spdx_is_valid <file> -> 0 iff populated SPDX JSON
+    python3 - "$1" <<'PY'
+import json
+import sys
+
+try:
+    with open(sys.argv[1], encoding="utf-8") as handle:
+        doc = json.load(handle)
+except (OSError, ValueError):
+    sys.exit(1)
+
+required = ("spdxVersion", "SPDXID", "name", "dataLicense", "creationInfo")
+missing = [field for field in required if not doc.get(field)]
+packages = doc.get("packages")
+if missing or not isinstance(packages, list) or not packages:
+    sys.exit(1)
+PY
+}
+
+# sbom_spdx_deterministic <raw-spdx> <out-spdx> <source-name> <source-version> <epoch> <scan-root>:
+# Bind the only two fields syft 1.x still varies across scans of identical
+# input (independently verified with the pinned scanner: with
+# --source-name/--source-version every package/file/relationship field comes
+# out identical across absolute directories; /creationInfo/created stays
+# time.Now()-derived and /documentNamespace stays a fresh UUID, including on
+# repeat scans). created is bound to SOURCE_DATE_EPOCH; documentNamespace is
+# bound to the source revision plus a content hash of the rest of the
+# document. No package/file/relationship/license fact is touched. Fails
+# nonzero on unreadable input, a non-integer epoch, or any remaining absolute
+# scan-root path in the delivered bytes. Normalization happens ONLY here, at
+# emit time; downstream verification stays a strict full-byte comparison.
+sbom_spdx_deterministic() {
+    python3 - "$1" "$2" "$3" "$4" "$5" "$6" <<'PY'
+import hashlib
+import json
+import re
+import sys
+from datetime import datetime, timezone
+
+raw_path, out_path, source_name, source_version, epoch, scan_root = sys.argv[1:7]
+with open(raw_path, encoding="utf-8") as handle:
+    doc = json.load(handle)
+try:
+    created = datetime.fromtimestamp(int(epoch), tz=timezone.utc)
+except (ValueError, OverflowError, OSError):
+    sys.exit(1)
+info = doc.get("creationInfo") or {}
+info["created"] = created.strftime("%Y-%m-%dT%H:%M:%SZ")
+doc["creationInfo"] = info
+doc.pop("documentNamespace", None)
+canonical = json.dumps(doc, sort_keys=True, separators=(",", ":"))
+slug = re.sub(r"[^A-Za-z0-9.-]+", "-", "%s-%s" % (source_name, source_version)).strip("-") or "source"
+doc["documentNamespace"] = "https://spdx.org/spdxdocs/%s-%s" % (
+    slug, hashlib.sha256(canonical.encode("utf-8")).hexdigest()[:16])
+serialized = json.dumps(doc, sort_keys=True, indent=2, ensure_ascii=False) + "\n"
+if scan_root and scan_root in serialized:
+    sys.exit(1)
+with open(out_path, "w", encoding="utf-8", newline="\n") as handle:
+    handle.write(serialized)
+PY
+}
+
 VERSION=$(git describe --tags --always --dirty 2>/dev/null || echo dev)
 COMMIT=$(git rev-parse --short HEAD 2>/dev/null || echo unknown)
 
@@ -221,7 +296,8 @@ fi
 
 mkdir -p "$RELEASE_DIR"
 rm -f "$RELEASE_DIR"/yabanin "$RELEASE_DIR"/yabanin-* "$RELEASE_DIR"/SHA256SUMS "$RELEASE_DIR"/SHA256SUMS.sig \
-    "$RELEASE_DIR"/SHA256SUMS.sig.bundle "$RELEASE_DIR"/sbom-* "$RELEASE_DIR"/*.buildinfo "$RELEASE_DIR"/sbom.source \
+    "$RELEASE_DIR"/SHA256SUMS.sig.bundle "$RELEASE_DIR"/sbom-* "$RELEASE_DIR"/sbom.spdx.json \
+    "$RELEASE_DIR"/*.buildinfo "$RELEASE_DIR"/sbom.source \
     "$RELEASE_DIR"/THIRD-PARTY-NOTICES.md "$RELEASE_DIR"/NOTICE "$RELEASE_DIR"/NOTICE-litellm.txt \
     "$RELEASE_DIR"/yabanin-release.pub "$RELEASE_DIR"/UNSIGNED-RELEASE-DISCLOSURE.md \
     "$RELEASE_DIR"/recipe.json
@@ -244,7 +320,69 @@ echo "computing SHA256SUMS"
 (cd "$RELEASE_DIR" && shasum -a 256 yabanin yabanin-* > SHA256SUMS && cat SHA256SUMS)
 echo "generating SBOM"
 if command -v syft > /dev/null 2>&1; then
-    syft dir:"$RELEASE_DIR" -o spdx-json > "$RELEASE_DIR/sbom.spdx.json" && echo "syft SPDX SBOM written"
+    # Fail closed: the previous `syft ... && echo` form left the failing
+    # scanner left of `&&` (exempt from set -e), so a nonzero syft exit still
+    # reached the unconditional sbom.source claim with a truncated/empty
+    # sbom.spdx.json in place. Capture the real status, discard the unusable
+    # SPDX, and propagate the failure; a failed scan never falls back to the
+    # go version -m manifests (the missing-tool fallback below is separate).
+    # A zero exit is not proof either: the emitted document must be populated,
+    # well-formed SPDX before any success claim is written.
+    # Determinism is handled at EMIT time: the scanner runs with the native
+    # --source-name/--source-version binding (root IDs/names and every
+    # package/relationship field then come out identical across absolute
+    # directories) and the only two fields syft still varies, /creationInfo/
+    # created and /documentNamespace, are bound by sbom_spdx_deterministic to
+    # SOURCE_DATE_EPOCH and the source revision. Raw scanner bytes are kept
+    # as hash-bound evidence OUTSIDE the compared release set; the delivered
+    # sbom.spdx.json stays strictly full-byte compared downstream. Verification
+    # never normalizes.
+    RELEASE_SBOM_RAW_DIR="${RELEASE_SBOM_RAW_DIR:-${RELEASE_DIR%/}-sbom-raw}"
+    case "$RELEASE_SBOM_RAW_DIR" in
+        "$RELEASE_DIR"|"$RELEASE_DIR"/*)
+            echo "FAIL: RELEASE_SBOM_RAW_DIR must stay outside RELEASE_DIR (a raw file inside it would be scanned and break determinism)" >&2
+            exit 1
+            ;;
+    esac
+    mkdir -p "$RELEASE_SBOM_RAW_DIR"
+    raw_spdx="$RELEASE_SBOM_RAW_DIR/sbom.spdx.raw.json"
+    SBOM_SOURCE_NAME="${SBOM_SOURCE_NAME:-yabanin-core}"
+    SBOM_SOURCE_VERSION="${SBOM_SOURCE_VERSION:-$(git rev-parse HEAD 2>/dev/null || echo unknown)}"
+    syft_status=0
+    syft dir:"$RELEASE_DIR" --source-name "$SBOM_SOURCE_NAME" --source-version "$SBOM_SOURCE_VERSION" -o spdx-json > "$raw_spdx" || syft_status=$?
+    if [ "$syft_status" -ne 0 ]; then
+        rm -f "$RELEASE_DIR/sbom.spdx.json"
+        echo "FAIL: syft SPDX SBOM generation exited $syft_status — sbom.spdx.json discarded, no SBOM claimed (raw attempt kept at $raw_spdx)" >&2
+        exit "$syft_status"
+    fi
+    if ! sbom_spdx_is_valid "$raw_spdx"; then
+        rm -f "$RELEASE_DIR/sbom.spdx.json"
+        echo "FAIL: raw syft output is not a populated SPDX document (missing/empty/malformed) — no SBOM claimed" >&2
+        exit 1
+    fi
+    if ! sbom_spdx_deterministic "$raw_spdx" "$RELEASE_DIR/sbom.spdx.json" "$SBOM_SOURCE_NAME" "$SBOM_SOURCE_VERSION" "$SOURCE_DATE_EPOCH" "$RELEASE_DIR"; then
+        rm -f "$RELEASE_DIR/sbom.spdx.json"
+        echo "FAIL: deterministic SPDX emission failed — no SBOM claimed" >&2
+        exit 1
+    fi
+    if ! sbom_spdx_is_valid "$RELEASE_DIR/sbom.spdx.json"; then
+        rm -f "$RELEASE_DIR/sbom.spdx.json"
+        echo "FAIL: delivered sbom.spdx.json is not a populated SPDX document — no SBOM claimed" >&2
+        exit 1
+    fi
+    echo "syft SPDX SBOM written"
+    syft_ver=$(syft version 2>/dev/null | awk -F': *' '/^Version:/ {print $2; exit}'); syft_ver=${syft_ver:-unknown}
+    syft_commit=$(syft version 2>/dev/null | awk -F': *' '/^GitCommit:/ {print $2; exit}'); syft_commit=${syft_commit:-unknown}
+    {
+        echo "syft-version: $syft_ver"
+        echo "syft-commit: $syft_commit"
+        echo "source-name: $SBOM_SOURCE_NAME"
+        echo "source-version: $SBOM_SOURCE_VERSION"
+        echo "source-date-epoch: $SOURCE_DATE_EPOCH"
+        echo "raw-sha256: $(shasum -a 256 "$raw_spdx" | awk '{print $1}')"
+        echo "delivered-sha256: $(shasum -a 256 "$RELEASE_DIR/sbom.spdx.json" | awk '{print $1}')"
+    } > "$RELEASE_SBOM_RAW_DIR/sbom-evidence.txt"
+    echo "raw scanner evidence (outside the compared release set): $RELEASE_SBOM_RAW_DIR/sbom-evidence.txt"
     echo "syft spdx-json" > "$RELEASE_DIR/sbom.source"
 else
     if strict; then
@@ -253,7 +391,7 @@ else
     fi
     echo "syft not installed — writing go version -m build manifests instead"
     for bin in "$RELEASE_DIR/yabanin" "$RELEASE_DIR"/yabanin-*; do
-        go version -m "$bin" > "$bin.buildinfo" || exit 1
+        write_buildinfo "$bin" || exit 1
     done
     echo "go-version-m buildinfo fallback (syft not installed; NOT a full SPDX SBOM)" > "$RELEASE_DIR/sbom.source"
 fi

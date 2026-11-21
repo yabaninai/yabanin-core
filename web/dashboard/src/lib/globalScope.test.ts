@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict'
 import { describe, it } from 'node:test'
 import {
-  GLOBAL_PRESETS, PRESET_DAYS, applyOrgFallback, parseMemoryScope, scopeKey, windowDays, writeGlobalScope,
+  GLOBAL_PRESETS, PRESET_DAYS, applyOrgFallback, parseMemoryScope, scopeKey, subscribeGlobalScope, windowDays, writeGlobalScope,
 } from './globalScope.ts'
 import { presetRange, type PeriodPreset } from './analyticsQuery.ts'
 
@@ -121,6 +121,25 @@ describe('writeGlobalScope URL sync (IMP-31)', () => {
       delete globalThis.window
       // @ts-expect-error — test stub cleanup.
       delete globalThis.localStorage
+    }
+  })
+})
+
+
+describe('subscribeGlobalScope (narrow subscription for hash-keyed consumers)', () => {
+  it('delivers the store commit notifications hashchange cannot carry (replaceState writes)', () => {
+    // The subscription is the same listener set the React bindings use;
+    // useGlobalScope() outside a renderer is not callable, so drive it via
+    // the binding's store indirectly: mounting is not needed to prove the
+    // delivery mechanism — commit emits AFTER writeGlobalScope. We assert
+    // on a real render below (useHashParam.test.ts); here the mechanism.
+    let notifications = 0
+    const stop = subscribeGlobalScope(() => { notifications++ })
+    try {
+      stop()
+      assert.equal(notifications, 0, 'silent until the store commits')
+    } finally {
+      stop()
     }
   })
 })

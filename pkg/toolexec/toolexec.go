@@ -124,13 +124,14 @@ func (e *ExecError) Error() string { return e.Code + ": " + e.Message }
 
 // Error codes (the gateway maps them to HTTP statuses).
 const (
-	ErrCodeNotFound    = "not_found"    // unknown builtin tool → 404
-	ErrCodeDenied      = "denied"       // guard hook deny → 409
-	ErrCodeSSRF        = "ssrf_blocked" // target failed the guard → 400
-	ErrCodeUpstream    = "upstream"     // fetch failed / bad status → 502
-	ErrCodeTimeout     = "timeout"      // 504
-	ErrCodeBadReq      = "bad_request"  // malformed params → 400
-	ErrCodeToolBlocked = "tool_blocked" // OP-6 toolpolicy guard deny → 400
+	ErrCodeNotFound          = "not_found"          // unknown builtin tool → 404
+	ErrCodeDenied            = "denied"             // guard hook deny → 409
+	ErrCodeSSRF              = "ssrf_blocked"       // target failed the guard → 400
+	ErrCodeUpstream          = "upstream"           // fetch failed / bad status → 502
+	ErrCodeTimeout           = "timeout"            // 504
+	ErrCodeBadReq            = "bad_request"        // malformed params → 400
+	ErrCodeToolBlocked       = "tool_blocked"       // OP-6 toolpolicy guard deny → 400
+	ErrCodePolicyUnavailable = "policy_unavailable" // indeterminate policy verdict before dispatch → 503
 )
 
 // Result is the successful execution outcome returned to the caller.
@@ -159,13 +160,20 @@ func (x *Executor) Execute(ctx context.Context, tool string, params json.RawMess
 // ExecuteGuarded runs one built-in tool call under the attached OP-6
 // the EFFECTIVE tool name (http_request composes http_<method>), so a deny
 // decision or an args rule (schema / max_bytes / deny_regex) blocks the call
-// with tool_blocked and it never reaches the tool — and the post-egress
-// GuardResult folds over the serialized body (mask rewrites it, deny drops
+// with tool_blocked and it never reaches the tool; an indeterminate
+// (degraded) args verdict refuses the same way as policy_unavailable,
+// because an unresolved permit never dispatches a server-side network
+// tool (TOOL-DEGRADED-01). The post-egress GuardResult folds over the
+// serialized body (mask rewrites it, deny drops
 // the result; the call itself already ran, the mcpagg parity). Decision
 // outcomes are counted on the shared toolpolicy decision counter
 // (server = "yabanin", tool = the effective name). The identity comes from
 // the caller (the gateway's verified principal); the raw Execute stays the
 // unguarded dispatch for callers that enforce policy upstream.
+//
+// Policy addresses: the guard is consulted under EVERY address returned by
+// PolicyKeys for the effective name — rows keyed by the bare built-in name
+// and rows keyed "yabanin:<name>" both hold (see PolicyKeys).
 func (x *Executor) ExecuteGuarded(ctx context.Context, orgID, subject, tool string, params json.RawMessage) (*Result, error) {
 	if len(params) == 0 {
 		params = json.RawMessage(`{}`)
@@ -174,36 +182,137 @@ func (x *Executor) ExecuteGuarded(ctx context.Context, orgID, subject, tool stri
 	if x.guard == nil {
 		return x.Execute(ctx, tool, params)
 	}
-	rep := x.guard.GuardArgs(ctx, orgID, subject, BuiltinServerName, effective, params)
-	switch {
-	case rep.Degraded:
-		metricToolPolicy(orgID, effective, "error")
-	case rep.Denied:
-		metricToolPolicy(orgID, effective, "deny")
-		return nil, &ExecError{Code: ErrCodeToolBlocked, Message: rep.Reason}
-	default:
-		metricToolPolicy(orgID, effective, "allow")
+	rep := x.guardArgsFor(ctx, orgID, subject, effective, params)
+	if err := x.argsRefusal(orgID, effective, rep); err != nil {
+		return nil, err
 	}
 	res, err := x.Execute(ctx, tool, params)
 	if err != nil {
 		return nil, err
 	}
-	resRep := x.guard.GuardResult(ctx, orgID, subject, BuiltinServerName, effective, res.Body)
-	switch resRep.Action {
+	resRep := x.guardResultFor(ctx, orgID, subject, effective, res.Body)
+	if err := x.applyResultGuard(orgID, effective, resRep, res); err != nil {
+		return nil, err
+	}
+	return res, nil
+}
+
+// argsRefusal counts the merged args verdict on the shared decision counter
+// (the outcome rides the refusal: deny, error, allow) and returns the
+// pre-egress refusal, if any: a determinate deny refuses as tool_blocked,
+// and a degraded verdict — an indeterminate loader outage — fails CLOSED
+// with the typed policy-unavailable refusal, because an unresolved permit
+// never dispatches a server-side network tool (TOOL-DEGRADED-01).
+func (x *Executor) argsRefusal(orgID, effective string, rep toolpolicy.ArgsReport) *ExecError {
+	switch {
+	case rep.Denied:
+		metricToolPolicy(orgID, effective, "deny")
+		return &ExecError{Code: ErrCodeToolBlocked, Message: rep.Reason}
+	case rep.Degraded:
+		metricToolPolicy(orgID, effective, "error")
+		return &ExecError{Code: ErrCodePolicyUnavailable, Message: rep.Reason}
+	default:
+		metricToolPolicy(orgID, effective, "allow")
+		return nil
+	}
+}
+
+// applyResultGuard counts the merged result verdict and applies it to res:
+// mask rewrites the body, deny drops the result (the call already ran — the
+// mcpagg parity); a degraded clean verdict counts as an error.
+func (x *Executor) applyResultGuard(orgID, effective string, rep toolpolicy.ResultReport, res *Result) error {
+	switch rep.Action {
 	case toolpolicy.ResultDeny:
 		metricToolPolicy(orgID, effective, "deny")
-		return nil, &ExecError{Code: ErrCodeToolBlocked, Message: resRep.Reason}
+		return &ExecError{Code: ErrCodeToolBlocked, Message: rep.Reason}
 	case toolpolicy.ResultMask:
 		metricToolPolicy(orgID, effective, "mask")
-		res.Body = json.RawMessage(resRep.Masked)
+		res.Body = json.RawMessage(rep.Masked)
 	case toolpolicy.ResultFlag:
 		metricToolPolicy(orgID, effective, "flag")
 	default:
-		if resRep.Degraded {
+		if rep.Degraded {
 			metricToolPolicy(orgID, effective, "error")
 		}
 	}
-	return res, nil
+	return nil
+}
+
+// PolicyKey composes the documented qualified policy address for a built-in
+// tool ("yabanin:<name>" — docs/tool-policies.md).
+func PolicyKey(effectiveTool string) string {
+	return BuiltinServerName + ":" + effectiveTool
+}
+
+// PolicyKeys returns every policy tool address a built-in call is checked
+// under, in evaluation order: the bare effective name (the long-standing
+// rows) and the documented "yabanin:<name>" key. Compatibility invariant:
+// a deny under EITHER address refuses the call and hides it from the
+// catalog; an allow row of one form never un-denies the other. Within one
+// address the engine's specificity/priority ranking applies unchanged.
+func PolicyKeys(effectiveTool string) []string {
+	return []string{effectiveTool, PolicyKey(effectiveTool)}
+}
+
+// guardArgsFor evaluates the args guard under every PolicyKeys address and
+// composes the verdict: a denied report denies the call (stable
+// attribution: the first denying address wins), otherwise Degraded is
+// sticky across forms. Every address is evaluated — the merged verdict is
+// deny-preserving, so the composition is order-independent.
+func (x *Executor) guardArgsFor(ctx context.Context, orgID, subject, effective string, params json.RawMessage) toolpolicy.ArgsReport {
+	var rep toolpolicy.ArgsReport
+	for i, key := range PolicyKeys(effective) {
+		next := x.guard.GuardArgs(ctx, orgID, subject, BuiltinServerName, key, params)
+		if i == 0 {
+			rep = next
+			continue
+		}
+		rep = mergeArgsReports(rep, next)
+	}
+	return rep
+}
+
+// guardResultFor evaluates the result guard under every PolicyKeys address
+// and composes the verdict most-restrictively (engine cross-policy
+// composition parity; a deny is maximal, so the composition is
+// order-independent).
+func (x *Executor) guardResultFor(ctx context.Context, orgID, subject, effective string, body json.RawMessage) toolpolicy.ResultReport {
+	var rep toolpolicy.ResultReport
+	for i, key := range PolicyKeys(effective) {
+		next := x.guard.GuardResult(ctx, orgID, subject, BuiltinServerName, key, body)
+		if i == 0 {
+			rep = next
+			continue
+		}
+		rep = mergeResultReports(rep, next)
+	}
+	return rep
+}
+
+// mergeArgsReports composes two address-form args verdicts: a deny under
+// either form denies; otherwise Degraded is sticky (one degraded form
+// keeps the call counted as an error, never as a clean allow).
+func mergeArgsReports(a, b toolpolicy.ArgsReport) toolpolicy.ArgsReport {
+	switch {
+	case a.Denied:
+		return a
+	case b.Denied:
+		return b
+	}
+	a.Degraded = a.Degraded || b.Degraded
+	return a
+}
+
+// mergeResultReports composes two address-form result verdicts: the most
+// restrictive action wins (deny > mask > flag — ResultAction.Rank, the
+// engine's own cross-policy rule) with its reason/masked payload; Degraded
+// is sticky.
+func mergeResultReports(a, b toolpolicy.ResultReport) toolpolicy.ResultReport {
+	if b.Action.Rank() > a.Action.Rank() {
+		a, b = b, a
+	}
+	a.Degraded = a.Degraded || b.Degraded
+	return a
 }
 
 // metricToolPolicy counts one guard decision (the mcpagg invoke-path label

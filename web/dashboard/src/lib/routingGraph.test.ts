@@ -5,6 +5,7 @@
 // view renders; the pure model keeps them testable without a browser.
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
+import { visibleEdge } from './routingEdgeWindow.ts'
 import {
   buildRoutingGraph, focusSubgraph, layoutRoutingGraph, edgeEndpoints, isBackEdge,
   nearestNode, NODE_H, NODE_W,
@@ -216,4 +217,24 @@ test('nearestNode: arrow moves pick the nearest advancing node, never backwards'
   assert.equal(nearestNode(boxes, 'a', 'left'), null)
   assert.equal(nearestNode(boxes, 'a', 'up'), null)
   assert.equal(nearestNode(boxes, 'missing', 'right'), null)
+})
+
+const start = { x: 0, y: 0 }
+const end = { x: 300, y: 400 }
+
+test('clipped line follows the original slope and dash phase without a false arrow', () => {
+  assert.deepEqual(visibleEdge(start, end, { left: 60, right: 180 }), { d: 'M 60 80 L 180 240', offset: 100, target: false })
+  assert.deepEqual(visibleEdge(end, start, { left: 60, right: 180 }), { d: 'M 180 240 L 60 80', offset: 200, target: false })
+})
+
+test('only the original endpoint carries the arrow when partially clipped', () => {
+  assert.deepEqual(visibleEdge(start, end, { left: 60, right: 400 }), { d: 'M 60 80 L 300 400', offset: 100, target: true })
+  assert.deepEqual(visibleEdge(start, end, { left: -50, right: 60 }), { d: 'M 0 0 L 60 80', offset: 0, target: false })
+})
+
+test('offscreen paths have no stroke and vertical paths keep finite coordinates', () => {
+  const vertical = { x: 0, y: 99 }
+  assert.deepEqual(visibleEdge(start, vertical, { left: 0, right: 1 }), { d: 'M 0 0 L 0 99', offset: 0, target: true })
+  assert.deepEqual(visibleEdge(start, vertical, { left: 1, right: 2 }), { d: '', offset: 0, target: false })
+  assert.deepEqual(visibleEdge(start, end, null), { d: 'M 0 0 L 300 400', offset: 0, target: true })
 })

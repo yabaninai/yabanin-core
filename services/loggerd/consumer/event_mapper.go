@@ -3,6 +3,7 @@ package consumer
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -586,9 +587,22 @@ func fullRequestLogRow(ev requestEvent, sessionID, errorValue any, statusCode in
 	r.set("task_id", ev.g2.taskIDStr)
 	r.set("agent_id", ev.g2.agentIDStr)
 	r.set("routing_decision", ev.g2.routingDecision)
+	// CV-02 recorded-zero split (attribution contract): the publisher
+	// emits attempt_count / retry_count on EVERY request.completed, but
+	// uninstrumented producers (embeddings, images, audio transcriptions)
+	// leave the Go zero values — so key-present 0/0 is an UNINSTRUMENTED
+	// request, not a measurement. attempt_count>0 (valid positive integer)
+	// is the attribution signal: only then does the attempt family bind,
+	// with retry_count>=0 preserving a real single-attempt zero (retry=0
+	// is measured fact, not unknown). Everything else — absent (legacy
+	// pre-field events), zero/negative/fractional/NaN/Inf/out-of-range
+	// values — binds NULL: never an invented counter, never an erased one.
+	// first_token_ms keeps its own zero-means-unknown contract: a present 0
+	// means "not measured" (non-streaming request, stream that died before
+	// the first token) — there is no real 0 ms first token.
 	r.set("first_token_ms", nullableInt64(ev.raw, "first_token_ms"))
-	r.set("attempt_count", nullableInt64(ev.raw, "attempt_count"))
-	r.set("retry_count", nullableInt64(ev.raw, "retry_count"))
+	r.set("attempt_count", attributedAttemptCount(ev.raw))
+	r.set("retry_count", attributedRetryCount(ev.raw))
 	r.set("endpoint", ev.acct.endpoint)
 	r.set("usage_source", ev.acct.usageSource)
 	r.set("cost_status", ev.acct.costStatus)
@@ -748,10 +762,13 @@ func parseBool(fields map[string]interface{}, key string) bool {
 }
 
 // nullableInt64 returns nil when the stream field is absent or zero, else
-// the value. Used for observability columns where 0 was never a meaningful
-// measurement (first_token_ms: non-streaming requests; attempt_count:
-// legacy events predating the field), so those rows read as "unknown"
-// rather than a fake zero in AVG/percentile aggregates.
+// the value. Used for observability columns where a present 0 was never a
+// meaningful measurement (first_token_ms: non-streaming requests or a
+// stream that died before the first token; cache_read_tokens /
+// cache_creation_tokens: the provider did not report them), so those rows
+// read as "unknown" rather than a fake zero in AVG/percentile aggregates.
+// Recorded counters (attempt_count / retry_count) MUST NOT use this — see
+// attributedAttemptCount / attributedRetryCount (CV-02).
 func nullableInt64(fields map[string]interface{}, key string) interface{} {
 	if _, ok := fields[key]; !ok {
 		return nil
@@ -761,6 +778,77 @@ func nullableInt64(fields map[string]interface{}, key string) interface{} {
 		return nil
 	}
 	return v
+}
+
+// parseCountField parses one recorded counter field exactly. It returns
+// (value, true) only for a finite integral value within int64 range —
+// strings must parse as exact base-10 integers; float64s must be finite,
+// integral and inside the representable edges. Everything else (absent,
+// nil, fraction, NaN/Inf, out of range, wrong type) returns (0, false): a
+// corrupt field never becomes a counter via truncation.
+func parseCountField(fields map[string]interface{}, key string) (int64, bool) {
+	switch val := fields[key].(type) {
+	case int64:
+		return val, true
+	case float64:
+		// 2^63 boundaries: float64 cannot represent every int64, and a
+		// runtime out-of-range float→int conversion is
+		// implementation-dependent, so reject at the exact representable
+		// edges instead of truncating a counter into existence. These
+		// comparisons alone reject non-finite values BEFORE any
+		// conversion: NaN != Trunc(NaN), and ±Inf already sit beyond
+		// the bounds.
+		const maxInt64Plus1 = 9223372036854775808.0    // 2^63
+		const minInt64AsFloat = -9223372036854775808.0 // -2^63, exact
+		if val != math.Trunc(val) || val >= maxInt64Plus1 || val < minInt64AsFloat {
+			return 0, false
+		}
+		return int64(val), true
+	case string:
+		// Exact integer parsing: "1.5", "0x1", "1e3" and friends fail
+		// rather than parse partially.
+		parsed, err := strconv.ParseInt(val, 10, 64)
+		if err != nil {
+			return 0, false
+		}
+		return parsed, true
+	default:
+		return 0, false
+	}
+}
+
+// attributedAttemptCount binds attempt_count only as a valid POSITIVE
+// integer. The publisher always emits the key, and uninstrumented producers
+// (embeddings_endpoint, images_endpoint, audio_transcriptions) leave the Go
+// zero value — a present 0 is an uninstrumented request, not a real "zeroth
+// attempt" (every attributed request is attempt >= 1). Absent (legacy),
+// zero, negative and corrupt values all bind NULL: unknown.
+func attributedAttemptCount(fields map[string]interface{}) interface{} {
+	attempts, ok := parseCountField(fields, "attempt_count")
+	if !ok || attempts <= 0 {
+		return nil
+	}
+	return attempts
+}
+
+// attributedRetryCount binds retry_count only when the attempt family is
+// attributed — attempt_count parsed to a valid positive integer — and the
+// retry value itself is a valid non-negative integer. With attribution,
+// retry_count=0 is the measured single-attempt outcome (CV-02) and must
+// bind 0, not NULL; positive retries bind as recorded. Without attribution
+// (uninstrumented 0/0 producers, legacy absent events) or with an invalid
+// retry value (absent, negative, fractional, NaN/Inf, out of range), NULL —
+// never a fabricated number.
+func attributedRetryCount(fields map[string]interface{}) interface{} {
+	attempts, ok := parseCountField(fields, "attempt_count")
+	if !ok || attempts <= 0 {
+		return nil
+	}
+	retries, ok := parseCountField(fields, "retry_count")
+	if !ok || retries < 0 {
+		return nil
+	}
+	return retries
 }
 
 func fieldStringDefault(fields map[string]interface{}, key, fallback string) string {

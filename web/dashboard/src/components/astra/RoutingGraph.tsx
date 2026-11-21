@@ -25,15 +25,18 @@
 //  * Plain SVG, astra tokens only, no chart library, no animation beyond the
 //    140ms opacity/stroke transition on selection (none under
 //    prefers-reduced-motion).
-import { useMemo, useRef, useState, type KeyboardEvent } from 'react'
+import { useCallback, useMemo, useRef, useState, type KeyboardEvent } from 'react'
 import { useTranslation } from 'react-i18next'
 import type { RoutingMap } from '../../api/routing'
 import { currentHashQuery, relatedListHref } from '../../lib/inspectUrl'
 import { edgeEndpoints, isBackEdge, nearestNode, type NavDir, type NodeBox } from '../../lib/routingGraph'
 import {
-  buildTopology, focusTopology, layoutTopology, selectionPath,
+  buildTopology, focusTopology, layoutTopology, selectionPath, mountTopology,
   type TopoEdge, type TopoNode, type TopoNodeKind, type TopoBand, type TopologyView, type SelectionPath,
+  type GroupSummary,
 } from '../../lib/routingTopology'
+import { visibleEdge, type EdgeWindow } from '../../lib/routingEdgeWindow'
+import { useRoutingEdgeWindow } from '../../hooks/useRoutingEdgeWindow'
 import { StateNotice } from './StateNotice'
 
 type T = ReturnType<typeof useTranslation>['t']
@@ -64,6 +67,7 @@ const NODE_KIND_KEY: Record<TopoNodeKind, string> = {
   rule: 'routingMap.scopeRule',
   missing: 'routingMap.graphMissing',
   provider: 'routingMap.colProvider',
+  group: 'tasks.colGroup',
 }
 /** Stable warning code → localized label; unknown codes stay raw. */
 const WARN_KEY: Record<string, string> = {
@@ -75,7 +79,7 @@ const WARN_KEY: Record<string, string> = {
   alias_target_disabled: 'routingMap.warnTargetDisabled',
   rule_target_disabled: 'routingMap.warnTargetDisabled',
 }
-const NODE_GLYPH: Record<TopoNodeKind, string> = { model: 'M', alias: 'A', rule: 'R', missing: '?', provider: 'P' }
+const NODE_GLYPH: Record<TopoNodeKind, string> = { model: 'M', alias: 'A', rule: 'R', missing: '?', provider: 'P', group: '+' }
 const BAND_KEY: Record<TopoBand, string> = {
   alias: 'routingMap.laneAliases',
   rule: 'routingMap.laneRules',
@@ -130,6 +134,11 @@ function edgeTitle(edge: TopoEdge, labelOf: (id: string) => string, t: T): strin
 
 /** Second line under the label: status, alias target, or the phantom mark. */
 function nodeStatus(node: TopoNode, t: T): string {
+  if (node.kind === 'group') {
+    // A group is a summary of REAL configured entries: its status line and
+    // accessible name carry the exact hidden member and edge counts.
+    return `+ ${t('routingMap.graphCount', { nodes: node.group?.memberIds.length ?? 0, edges: node.group?.hiddenEdgeCount ?? 0 })}`
+  }
   if (node.kind === 'missing') return t('routingMap.graphMissing')
   if (node.kind === 'alias') return node.sublabel
   if (node.kind === 'provider') return ''
@@ -172,19 +181,32 @@ function flowDetail(edge: TopoEdge, t: T): string {
 export function RoutingGraphSection({ map }: { map: RoutingMap }) {
   const { t } = useTranslation()
   const view = useMemo(() => buildTopology(map), [map])
-  const layout = useMemo(() => layoutTopology(view), [view])
-  const byId = useMemo(() => new Map(view.nodes.map(n => [n.id, n])), [view])
+  const [query, setQuery] = useState('')
+  const [selectedId, setSelectedId] = useState<string | null>(null)
+  // The expanded band group (`group:<band>`): selecting a group mounts its
+  // named hidden members under the same bounded budgets.
+  const [expandedGroupId, setExpandedGroupId] = useState<string | null>(null)
+  const focus = useMemo(() => focusTopology(view, query), [view, query])
+  const queryActive = query.trim() !== ''
+  // THE bounded mount, derived before any render: everything still exists in
+  // `view` (exact totals); only what fits MOUNT_LIMITS renders — the rest
+  // becomes named per-band group summaries with exact hidden counts.
+  const mount = useMemo(
+    () => mountTopology(view, { focusIds: focus.focusIds, queryActive, selectedId, expandedGroupId }),
+    [view, focus, queryActive, selectedId, expandedGroupId],
+  )
+  const layout = useMemo(() => layoutTopology(mount.view), [mount.view])
+  const byId = useMemo(() => new Map(mount.view.nodes.map(n => [n.id, n])), [mount.view])
   // Deterministic DOM ids for roving focus (index-based: unique by construction).
   const domId = useMemo(() => {
     const idx = new Map<string, string>()
-    view.nodes.forEach((n, i) => idx.set(n.id, `rg-node-${i}`))
+    mount.view.nodes.forEach((n, i) => idx.set(n.id, `rg-node-${i}`))
     return idx
-  }, [view])
-
-  const [query, setQuery] = useState('')
-  const [selectedId, setSelectedId] = useState<string | null>(null)
-  const focus = useMemo(() => focusTopology(view, query), [view, query])
+  }, [mount.view])
+  // The selected path runs over the FULL view: selection highlights the real
+  // configuration path, not just the mounted slice of it.
   const path = useMemo(() => selectionPath(view, selectedId), [view, selectedId])
+  const labelOf = useCallback((id: string) => byId.get(id)?.label ?? id, [byId])
   const searchRef = useRef<HTMLInputElement>(null)
 
   if (view.nodes.length === 0) {
@@ -197,9 +219,13 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
   }
 
   const selected = selectedId !== null ? byId.get(selectedId) ?? null : null
+  // A selected GROUP drives no path highlight (it is a summary, not an
+  // endpoint) — everything stays fully visible while it is expanded.
+  const hasSelection = selectedId !== null && selected?.kind !== 'group'
   // Selected stays fully visible even when dimmed by the search focus.
-  const visible = (id: string) => focus.focusIds.has(id) || id === selectedId
-  const labelOf = (id: string) => byId.get(id)?.label ?? id
+  // Group summaries are always visible: they do not exist in the FULL view
+  // the focus runs over, and they are the mount's own navigation surface.
+  const visible = (id: string) => id.startsWith('group:') || focus.focusIds.has(id) || id === selectedId
 
   const moveFocus = (from: string, dir: NavDir) => {
     // Arrow keys walk the VISIBLE subgraph only — navigating into a dimmed
@@ -211,10 +237,20 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
     el?.focus()
   }
 
+  // One toggle gesture for every node: select/deselect — and for a group,
+  // expand/collapse its named hidden members (selection follows, so the
+  // inspector shows the summary while it is expanded).
+  const toggleNode = (id: string) => {
+    if (byId.get(id)?.kind === 'group') {
+      setExpandedGroupId(prev => (prev === id ? null : id))
+    }
+    setSelectedId(prev => (prev === id ? null : id))
+  }
+
   const onNodeKeyDown = (event: KeyboardEvent, id: string) => {
     if (event.key === 'Enter' || event.key === ' ') {
       event.preventDefault()
-      setSelectedId(prev => (prev === id ? null : id))
+      toggleNode(id)
       return
     }
     const dir = NAV[event.key]
@@ -248,7 +284,7 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
         </label>
         <button
           type="button"
-          onClick={() => { setQuery(''); setSelectedId(null); searchRef.current?.focus() }}
+          onClick={() => { setQuery(''); setSelectedId(null); setExpandedGroupId(null); searchRef.current?.focus() }}
           data-testid="routing-graph-reset"
           className="min-h-[36px] rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule-strong)] px-3 text-sm hover:bg-[color:var(--astra-surface-muted)]"
         >
@@ -257,19 +293,20 @@ export function RoutingGraphSection({ map }: { map: RoutingMap }) {
         <MatchCount view={view} query={query} matched={focus.matchedIds.size} noMatches={focus.noMatches} />
       </div>
 
-      <div className="flex flex-wrap items-start gap-4">
+      <div className="flex flex-col items-stretch gap-4 md:flex-row md:flex-wrap md:items-start">
         <div className="max-w-full min-w-0 flex-1 overflow-auto rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule)] p-1">
           <TopologyCanvas
-            view={view}
+            view={mount.view}
+            totals={mount.totals}
             layout={layout}
             visible={visible}
             path={path}
-            hasSelection={selectedId !== null}
+            hasSelection={hasSelection}
             selectedId={selectedId}
             matchedIds={focus.matchedIds}
             domId={domId}
             labelOf={labelOf}
-            onSelect={id => setSelectedId(prev => (prev === id ? null : id))}
+            onSelect={toggleNode}
             onNodeKeyDown={onNodeKeyDown}
           />
         </div>
@@ -351,8 +388,10 @@ function MatchCount({ view, query, matched, noMatches }: {
 }
 
 /** The SVG canvas: band headers, then edges, then nodes (nodes paint last). */
-function TopologyCanvas({ view, layout, visible, path, hasSelection, selectedId, matchedIds, domId, labelOf, onSelect, onNodeKeyDown }: {
+function TopologyCanvas({ view, totals, layout, visible, path, hasSelection, selectedId, matchedIds, domId, labelOf, onSelect, onNodeKeyDown }: {
   view: TopologyView
+  /** Exact FULL totals — the accessible canvas name reports what EXISTS. */
+  totals: { nodes: number; edges: number }
   layout: ReturnType<typeof layoutTopology>
   visible: (id: string) => boolean
   path: SelectionPath
@@ -365,11 +404,12 @@ function TopologyCanvas({ view, layout, visible, path, hasSelection, selectedId,
   onNodeKeyDown: (event: KeyboardEvent, id: string) => void
 }) {
   const { t } = useTranslation()
+  const { canvas, window } = useRoutingEdgeWindow()
   return (
-    <svg
+    <svg ref={canvas}
       role="group"
       className="routing-topo"
-      aria-label={t('routingMap.graphAria', { nodes: view.nodes.length, edges: view.edges.length })}
+      aria-label={t('routingMap.graphAria', { nodes: totals.nodes, edges: totals.edges })}
       width={layout.width}
       height={layout.height}
       data-testid="routing-graph-canvas"
@@ -406,6 +446,7 @@ function TopologyCanvas({ view, layout, visible, path, hasSelection, selectedId,
           <TopoEdgeView
             key={edge.id}
             edge={edge}
+            window={window}
             from={from}
             to={to}
             focusDim={!(visible(edge.from) && visible(edge.to))}
@@ -440,8 +481,9 @@ function TopologyCanvas({ view, layout, visible, path, hasSelection, selectedId,
 }
 
 /** One directed config edge: uniform width, dash by kind, olive on the path. */
-function TopoEdgeView({ edge, from, to, focusDim, onPath, hasSelection, labelOf }: {
+function TopoEdgeView({ edge, window, from, to, focusDim, onPath, hasSelection, labelOf }: {
   edge: TopoEdge
+  window: EdgeWindow | null
   from: NodeBox
   to: NodeBox
   focusDim: boolean
@@ -450,23 +492,26 @@ function TopoEdgeView({ edge, from, to, focusDim, onPath, hasSelection, labelOf 
   labelOf: (id: string) => string
 }) {
   const { t } = useTranslation()
+  const title = useMemo(() => edgeTitle(edge, labelOf, t), [edge, labelOf, t])
   const { a, b } = edgeEndpoints(from, to)
   const self = edge.from === edge.to
   const back = !self && isBackEdge(from, to)
+  const line = self || back ? { d: edgeD(a, b, self, back), target: true, offset: 0 } : visibleEdge(a, b, window)
   const { stroke, markerId } = edgePaint(edge, onPath)
   const opacity = edgeOpacity(focusDim, onPath, hasSelection)
   const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 - (self ? 30 : 0) }
   return (
     <g className="topo-edge" data-testid="routing-graph-edge" opacity={opacity}>
       <path
-        d={edgeD(a, b, self, back)}
+        d={line.d}
         fill="none"
         stroke={stroke}
         strokeWidth={EDGE_W}
         strokeDasharray={EDGE_DASH[edge.kind] || undefined}
-        markerEnd={`url(#${markerId})`}
+        strokeDashoffset={line.offset || undefined}
+        markerEnd={line.target ? `url(#${markerId})` : undefined}
       >
-        <title>{edgeTitle(edge, labelOf, t)}</title>
+        <title>{title}</title>
       </path>
       {edge.label !== '' && !focusDim && (
         <text x={mid.x} y={mid.y} textAnchor="middle" dominantBaseline="middle"
@@ -499,8 +544,8 @@ function TopoNodeView({ node, box, dim, onPath, hasSelection, isMatch, isSelecte
   onNodeKeyDown: (event: KeyboardEvent, id: string) => void
 }) {
   const { t } = useTranslation()
-  const aria = nodeAria(node, t)
-  const status = nodeStatus(node, t)
+  const aria = useMemo(() => nodeAria(node, t), [node, t])
+  const status = useMemo(() => nodeStatus(node, t), [node, t])
   const opacity = nodeOpacity(dim, onPath, hasSelection)
   return (
     <g
@@ -619,6 +664,28 @@ function Flows({ node, view, labelOf }: {
   )
 }
 
+/** The group stand-in's exact summary: named members and hidden edges. */
+function GroupCounts({ group, t }: { group: GroupSummary; t: T }) {
+  return (
+    <p className="mt-2 text-sm"><span className="text-[color:var(--astra-text-muted)]">{t('tasks.colGroup')}: </span>
+      <span>{t('routingMap.graphCount', { nodes: group.memberIds.length, edges: group.hiddenEdgeCount })}</span></p>
+  )
+}
+
+/** The requests-explorer deep link for a real entry (a group has no single model to list). */
+function OpenRequestsLink({ node, t }: { node: TopoNode; t: T }) {
+  return (
+    <p className="mt-3">
+      <a className="underline decoration-dotted underline-offset-2" data-testid={`routing-graph-requests-${safeId(node.id)}`}
+        href={relatedListHref('requests-explorer', currentHashQuery(), {
+          model: node.model?.model_name ?? node.alias?.target_model ?? node.rule?.target_model ?? node.label,
+        })}>
+        {t('routingMap.openRequests')}
+      </a>
+    </p>
+  )
+}
+
 /** The selected node's facts: kind, identity, target, warnings, flows, drill-down. */
 function NodeInspector({ map, view, node, labelOf, onClear }: {
   map: RoutingMap
@@ -652,18 +719,13 @@ function NodeInspector({ map, view, node, labelOf, onClear }: {
         <p className="mt-1 text-sm"><span className="text-[color:var(--astra-text-muted)]">{t('routingMap.colPriority')}: </span>{node.rule.priority}</p>
       )}
 
+      {node.group && <GroupCounts group={node.group} t={t} />}
+
       <NodeWarnings map={map} node={node} />
 
       <Flows node={node} view={view} labelOf={labelOf} />
 
-      <p className="mt-3">
-        <a className="underline decoration-dotted underline-offset-2" data-testid={`routing-graph-requests-${safeId(node.id)}`}
-          href={relatedListHref('requests-explorer', currentHashQuery(), {
-            model: node.model?.model_name ?? node.alias?.target_model ?? node.rule?.target_model ?? node.label,
-          })}>
-          {t('routingMap.openRequests')}
-        </a>
-      </p>
+      {node.kind !== 'group' && <OpenRequestsLink node={node} t={t} />}
     </aside>
   )
 }

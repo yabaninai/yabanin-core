@@ -2,8 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useHashParam } from '../hooks/useHashParam'
 import { useInspectParam } from '../hooks/useInspectParam'
+import { useRequestLabelKeys } from '../hooks/useRequestLabelKeys'
 import {
-  fetchLabelKeys, getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
+  getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
 import { currentHashQuery, relatedListHref } from '../lib/inspectUrl'
@@ -26,6 +27,7 @@ import { FilterBar, type FilterBarHandle } from '../components/astra/FilterBar'
 import { GlobalScopeBar } from '../components/GlobalScopeBar'
 import { Pagination } from '../components/Pagination'
 import { useGlobalScope } from '../lib/globalScope'
+import { resolveRequestFilters } from './requestExplorerWindow'
 import { useAutoRefresh, useAutoRefreshInterval, useDocumentHidden } from '../lib/freshness'
 import { FreshnessControl } from '../components/astra/FreshnessControl'
 import { useTablePrefs } from '../hooks/useTablePrefs'
@@ -619,6 +621,133 @@ async function copyText(value: string): Promise<void> {
   } catch { /* denied — the ID stays visible for manual selection */ }
 }
 
+function explorerTableSort(yqlParse: ReturnType<typeof parseYQL>): SortState | null {
+  return yqlParse.ok && yqlParse.order && SORT_COLUMN_KEY[yqlParse.order.field]
+    ? { key: SORT_COLUMN_KEY[yqlParse.order.field], dir: yqlParse.order.desc ? 'desc' : 'asc' }
+    : null
+}
+
+type DecisionLoad = 'idle' | 'loading' | 'ready' | 'failed'
+
+function renderInspectorDecisions(t: ExplorerTranslate, inspectDecisionsState: DecisionLoad,
+  inspectDecisions: PolicyDecision[] | null, loadInspectDecisions: () => void, decisionsLink: string) {
+  return (
+    <section aria-label={t('explorer.policyDecisionsHeading')} className="flex flex-col gap-2" data-testid="inspector-policy-decisions">
+      <h4 className="text-xs font-medium uppercase tracking-wide text-[color:var(--astra-text-muted)]">{t('explorer.policyDecisionsHeading')}</h4>
+      {inspectDecisionsState === 'loading' && (
+        <p className="text-sm text-[color:var(--astra-text-muted)]" data-testid="inspector-decisions-loading">{t('states.loading')}</p>
+      )}
+      {inspectDecisionsState === 'failed' && (
+        <div className="flex flex-wrap items-center gap-2" data-testid="inspector-decisions-failed">
+          <p className="text-sm text-[color:var(--astra-warning)]">{t('explorer.decisionsLoadFailed')}</p>
+          <button type="button" onClick={loadInspectDecisions}
+            className="text-sm text-[color:var(--astra-accent)] underline underline-offset-2">
+            {t('common.retry')}
+          </button>
+        </div>
+      )}
+      {inspectDecisionsState === 'ready' && (inspectDecisions !== null && inspectDecisions.length > 0 ? (
+        <>
+          <ul className="flex flex-col gap-2 text-sm">
+            {inspectDecisions.slice(0, 5).map(d => (
+              <li key={d.id}
+                className="flex flex-col gap-1 rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule)] px-3 py-2"
+                data-testid="inspector-decision-row">
+                <div className="flex flex-wrap items-center gap-2">
+                  <span className="text-[color:var(--astra-ink)]" style={{ fontFamily: 'var(--astra-font-code)' }}>
+                    {d.policy_id}{d.policy_version > 0 ? ` @v${d.policy_version}` : ''}
+                  </span>
+                  <span className="rounded-full border border-[color:var(--astra-rule-strong)] px-2 text-xs uppercase tracking-wide text-[color:var(--astra-text-muted)]">{d.mode}</span>
+                  <span className="text-xs text-[color:var(--astra-text-muted)]">{d.created_at}</span>
+                </div>
+                <p className="text-[color:var(--astra-ink)]" data-testid="inspector-decision-verdict">
+                  {d.mode === 'enforce'
+                    ? t('explorer.decisionActual', { verdict: d.verdict })
+                    : t('explorer.decisionShadow', { verdict: d.verdict })}
+                </p>
+                {!d.findings_valid && (
+                  <p className="text-xs text-[color:var(--astra-warning)]">{t('explorer.decisionsFindingsInvalid')}</p>
+                )}
+                {d.findings.length > 0 && (
+                  <ul className="flex flex-col gap-0.5 text-xs text-[color:var(--astra-text-muted)]">
+                    {d.findings.map((f, i) => (
+                      <li key={`${d.id}-${i}`}>{f.step ? `${f.step}: ${f.category}` : f.category}</li>
+                    ))}
+                  </ul>
+                )}
+              </li>
+            ))}
+          </ul>
+          {inspectDecisions.length > 5 && (
+            <p className="text-xs text-[color:var(--astra-text-muted)]">{t('explorer.decisionsMore')}</p>
+          )}
+          <a className="w-fit text-sm text-[color:var(--astra-accent)] underline underline-offset-2"
+            href={decisionsLink} data-testid="inspector-decisions-open-log">
+            {t('explorer.decisionsOpenLog')}
+          </a>
+        </>
+      ) : (
+        <p className="text-sm text-[color:var(--astra-text-muted)]" data-testid="inspector-decisions-empty">{t('explorer.decisionsEmpty')}</p>
+      ))}
+    </section>
+  )
+}
+
+type ExplorerTranslate = (key: string, options?: Record<string, unknown>) => string
+
+function lineageEvidence(t: ExplorerTranslate, record: LineageAttestation | null) {
+  if (!record) return undefined
+  const value = typeof record.region_evidence === 'string' ? record.region_evidence : ''
+  return { tier: value || 'provider_declared', explanation: t(EXPLORER_EVIDENCE_KEYS[value] || 'explorer.noLineageRecord') }
+}
+
+function storedString(lineage: unknown, fallback?: string) {
+  return typeof lineage === 'string' ? lineage : fallback || undefined
+}
+
+function inspectorRecord(t: ExplorerTranslate, id: string, loading: boolean, lineage: LineageAttestation | null,
+  detail: RequestDetail | null, privacy: boolean) {
+  if (loading || !id) return null
+  return {
+    id,
+    model: storedString(lineage?.model_used, detail?.model_used),
+    regionClaim: storedString(lineage?.inference_region, detail?.home_region),
+    // Requests predating lineage tracing still have a timestamp in the request log.
+    timing: storedString(lineage?.timestamp || undefined, detail?.created_at),
+    evidence: lineageEvidence(t, lineage),
+    raw: privacy ? undefined : lineage ?? detail ?? undefined,
+  }
+}
+
+function inspectorTimeline(t: ExplorerTranslate, inspectorLoading: boolean, inspectDetail: RequestDetail | null,
+  inspectorDecisionsNode: React.ReactNode) {
+  return (
+    <>
+      {!inspectorLoading && !inspectDetail && (
+        <StateNotice state="warning" title={t('explorer.detailRequestUnknownTitle')}
+          message={t('explorer.detailRequestUnknown')} />
+      )}
+      {inspectorDecisionsNode}
+      {inspectDetail ? routeTimelineNode(t, inspectDetail) : null}
+    </>
+  )
+}
+
+function RequestListStatus({ error, loaded, loading, onRetry }: {
+  error: string; loaded: boolean; loading: boolean; onRetry: () => void
+}) {
+  const { t } = useTranslation()
+  return (
+    <>
+      {error && <StateNotice state="error" message={error} action={{ label: t('common.retry'), onClick: onRetry }} />}
+      {!loaded && !loading && (
+        <StateNotice state="not-loaded"
+          message={t('explorer.notLoaded')} />
+      )}
+    </>
+  )
+}
+
 export function RequestExplorerPage() {
   const { t, i18n } = useTranslation()
   // The org scope is the shared GlobalScope (hash ?org=, remembered
@@ -654,9 +783,7 @@ export function RequestExplorerPage() {
   // query; orderings without a table column (e.g. latency) show as the YQL
   // chip only. Rewriting the committed value re-syncs the FilterBar draft
   // (controlled `applied`) and the URL hash.
-  const serverSort: SortState | null = yqlParse.ok && yqlParse.order && SORT_COLUMN_KEY[yqlParse.order.field]
-    ? { key: SORT_COLUMN_KEY[yqlParse.order.field], dir: yqlParse.order.desc ? 'desc' : 'asc' }
-    : null
+  const serverSort = explorerTableSort(yqlParse)
   const applyHeaderSort = (next: SortState | null) => {
     // An invalid committed query cannot be rewritten reliably — the bar's
     // inline parse error explains; fix the query first.
@@ -711,7 +838,7 @@ export function RequestExplorerPage() {
   const [autoRefreshMs, setAutoRefreshMs] = useAutoRefreshInterval()
   const tabHidden = useDocumentHidden()
   const [topModels, setTopModels] = useState<Array<{ model: string; actual_cost_usd: number }>>([])
-  const [labelKeys, setLabelKeys] = useState<string[]>([])
+  const { labelKeys, refreshLabels } = useRequestLabelKeys(org)
   const [inspectParam, setInspectParam] = useInspectParam()
   const inspectId = inspectParam.startsWith('request:') ? inspectParam.slice('request:'.length) : inspectParam
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
@@ -724,7 +851,7 @@ export function RequestExplorerPage() {
   // broken; keyed to [inspectId, org] with a cancelled guard like the other
   // drawer fetches, so a stale response can never land in a reopened drawer.
   const [inspectDecisions, setInspectDecisions] = useState<PolicyDecision[] | null>(null)
-  const [inspectDecisionsState, setInspectDecisionsState] = useState<'idle' | 'loading' | 'ready' | 'failed'>('idle')
+  const [inspectDecisionsState, setInspectDecisionsState] = useState<DecisionLoad>('idle')
   const gen = useRef(0)
   // Per-table column visibility + density (compact is the
   // default; seeded once for operators without stored prefs).
@@ -764,11 +891,7 @@ export function RequestExplorerPage() {
   // exactly the same applied scope (they are fetched together, generation-
   // guarded by `gen`). The quick fields and the errors-only toggle live
   // inside the committed query — there are no parallel filter params.
-  const buildFilterParams = () => ({
-    orgId: org,
-    from: toRFC3339(fromLocal) || undefined, to: toRFC3339(toLocal) || undefined,
-    query: yqlCommitted || undefined,
-  })
+  const buildFilterParams = () => resolveRequestFilters(gs, yqlCommitted, refreshLabels)
 
   const load = async (p = 1) => {
     if (!org) return
@@ -859,17 +982,6 @@ export function RequestExplorerPage() {
       .catch(() => setTopModels([]))
   }, [org])
 
-  // Label keys for the FilterBar field registry (best-effort; a failure just
-  // leaves the builder without label.<key> options).
-  useEffect(() => {
-    if (!org) { setLabelKeys([]); return }
-    const ctrl = new AbortController()
-    fetchLabelKeys(org, toRFC3339(fromLocal), toRFC3339(toLocal), { signal: ctrl.signal })
-      .then(rows => setLabelKeys(rows.map(r => r.key)))
-      .catch(() => setLabelKeys([]))
-    return () => ctrl.abort()
-  }, [org, fromLocal, toLocal])
-
   // Value suggestions from existing endpoints: models come from the savings
   // report already fetched for the hints.
   const queryValueHints = (field: string): string[] => {
@@ -896,7 +1008,7 @@ export function RequestExplorerPage() {
     const timer = setTimeout(() => { void load(1) }, 400)
     return () => clearTimeout(timer)
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [org, fromLocal, toLocal, yqlCommitted])
+  }, [org, gs, yqlCommitted])
 
   // Auto-refresh — the operator's interval (localStorage); paused
   // while the tab is hidden OR the request inspector (drawer) is open; ticks
@@ -1168,66 +1280,7 @@ export function RequestExplorerPage() {
   // enforce row names the applied action, a shadow row names what WOULD
   // have happened and never reads as an applied verdict.
   const decisionsLink = relatedListHref('policy-decisions', currentHashQuery(), { org, request: inspectId })
-  const inspectorDecisionsNode: React.ReactNode = (
-    <section aria-label={t('explorer.policyDecisionsHeading')} className="flex flex-col gap-2" data-testid="inspector-policy-decisions">
-      <h4 className="text-xs font-medium uppercase tracking-wide text-[color:var(--astra-text-muted)]">{t('explorer.policyDecisionsHeading')}</h4>
-      {inspectDecisionsState === 'loading' && (
-        <p className="text-sm text-[color:var(--astra-text-muted)]" data-testid="inspector-decisions-loading">{t('states.loading')}</p>
-      )}
-      {inspectDecisionsState === 'failed' && (
-        <div className="flex flex-wrap items-center gap-2" data-testid="inspector-decisions-failed">
-          <p className="text-sm text-[color:var(--astra-warning)]">{t('explorer.decisionsLoadFailed')}</p>
-          <button type="button" onClick={loadInspectDecisions}
-            className="text-sm text-[color:var(--astra-accent)] underline underline-offset-2">
-            {t('common.retry')}
-          </button>
-        </div>
-      )}
-      {inspectDecisionsState === 'ready' && (inspectDecisions !== null && inspectDecisions.length > 0 ? (
-        <>
-          <ul className="flex flex-col gap-2 text-sm">
-            {inspectDecisions.slice(0, 5).map(d => (
-              <li key={d.id}
-                className="flex flex-col gap-1 rounded-[length:var(--astra-radius-control)] border border-[color:var(--astra-rule)] px-3 py-2"
-                data-testid="inspector-decision-row">
-                <div className="flex flex-wrap items-center gap-2">
-                  <span className="text-[color:var(--astra-ink)]" style={{ fontFamily: 'var(--astra-font-code)' }}>
-                    {d.policy_id}{d.policy_version > 0 ? ` @v${d.policy_version}` : ''}
-                  </span>
-                  <span className="rounded-full border border-[color:var(--astra-rule-strong)] px-2 text-xs uppercase tracking-wide text-[color:var(--astra-text-muted)]">{d.mode}</span>
-                  <span className="text-xs text-[color:var(--astra-text-muted)]">{d.created_at}</span>
-                </div>
-                <p className="text-[color:var(--astra-ink)]" data-testid="inspector-decision-verdict">
-                  {d.mode === 'enforce'
-                    ? t('explorer.decisionActual', { verdict: d.verdict })
-                    : t('explorer.decisionShadow', { verdict: d.verdict })}
-                </p>
-                {!d.findings_valid && (
-                  <p className="text-xs text-[color:var(--astra-warning)]">{t('explorer.decisionsFindingsInvalid')}</p>
-                )}
-                {d.findings.length > 0 && (
-                  <ul className="flex flex-col gap-0.5 text-xs text-[color:var(--astra-text-muted)]">
-                    {d.findings.map((f, i) => (
-                      <li key={`${d.id}-${i}`}>{f.step ? `${f.step}: ${f.category}` : f.category}</li>
-                    ))}
-                  </ul>
-                )}
-              </li>
-            ))}
-          </ul>
-          {inspectDecisions.length > 5 && (
-            <p className="text-xs text-[color:var(--astra-text-muted)]">{t('explorer.decisionsMore')}</p>
-          )}
-          <a className="w-fit text-sm text-[color:var(--astra-accent)] underline underline-offset-2"
-            href={decisionsLink} data-testid="inspector-decisions-open-log">
-            {t('explorer.decisionsOpenLog')}
-          </a>
-        </>
-      ) : (
-        <p className="text-sm text-[color:var(--astra-text-muted)]" data-testid="inspector-decisions-empty">{t('explorer.decisionsEmpty')}</p>
-      ))}
-    </section>
-  )
+  const inspectorDecisionsNode = renderInspectorDecisions(t, inspectDecisionsState, inspectDecisions, loadInspectDecisions, decisionsLink)
 
   return (
     // Density budget: ≥15 rows at 1440×900. One compact band carries the
@@ -1318,11 +1371,7 @@ export function RequestExplorerPage() {
         valueHints={queryValueHints}
       />
 
-      {loadError && <StateNotice state="error" message={loadError} action={{ label: t('common.retry'), onClick: () => void load(1) }} />}
-      {!loaded && !loading && (
-        <StateNotice state="not-loaded"
-          message={t('explorer.notLoaded')} />
-      )}
+      <RequestListStatus error={loadError} loaded={loaded} loading={loading} onRetry={() => void load(1)} />
 
       {loaded && (
         <section aria-label={t('explorer.requestsHeading')} className="flex flex-col gap-2">
@@ -1378,48 +1427,10 @@ export function RequestExplorerPage() {
         <RequestInspector
           variant="drawer"
           loading={inspectorLoading}
-          record={!inspectorLoading && inspectId ? {
-            id: inspectId,
-            model: typeof inspectRecord?.model_used === 'string'
-              ? inspectRecord.model_used
-              : inspectDetail?.model_used || undefined,
-            regionClaim: typeof inspectRecord?.inference_region === 'string'
-              ? inspectRecord.inference_region
-              : inspectDetail?.home_region || undefined,
-            // Timing falls back to the request_logs timestamp: lineage rows
-            // exist only for post-enablement traffic, but every logged request
-            // has a created_at (user finding 2026-09-15: "Not recorded").
-            timing: typeof inspectRecord?.timestamp === 'string' && inspectRecord.timestamp
-              ? inspectRecord.timestamp
-              : (inspectDetail?.created_at || undefined),
-              evidence: inspectRecord ? {
-              tier: typeof inspectRecord.region_evidence === 'string' && inspectRecord.region_evidence ? inspectRecord.region_evidence : 'provider_declared',
-              explanation: EXPLORER_EVIDENCE_KEYS[typeof inspectRecord.region_evidence === 'string' ? inspectRecord.region_evidence : '']
-                ? t(EXPLORER_EVIDENCE_KEYS[typeof inspectRecord.region_evidence === 'string' ? inspectRecord.region_evidence : ''])
-                : t('explorer.noLineageRecord'),
-            } : undefined,
-          // Requests without a lineage record fall back to the full request-log
-          // detail — the snapshot fields already render above, this is the
-          // complete record.
-          raw: privacy ? undefined : (inspectRecord ?? inspectDetail ?? undefined),
-          } : null}
+          record={inspectorRecord(t, inspectId, inspectorLoading, inspectRecord, inspectDetail, privacy)}
           fields={buildDetailFields(t, inspectDetail, privacy, (key, value) => addLabelClause(key, value))}
           costProvenance={costProvenanceNode(t, inspectDetail)}
-          routeTimeline={(
-            // The timeline slot carries three layers so the
-            // drawer stays informative even when the request-log row is
-            // gone: the explicit unknown-request diagnosis (never a bare
-            // empty shell), the policy decisions for this request, and —
-            // only when the detail row exists — the routing timeline.
-            <>
-              {!inspectorLoading && !inspectDetail && (
-                <StateNotice state="warning" title={t('explorer.detailRequestUnknownTitle')}
-                  message={t('explorer.detailRequestUnknown')} />
-              )}
-              {inspectorDecisionsNode}
-              {inspectDetail ? routeTimelineNode(t, inspectDetail) : null}
-            </>
-          )}
+          routeTimeline={inspectorTimeline(t, inspectorLoading, inspectDetail, inspectorDecisionsNode)}
           links={[
             { label: t('explorer.viewLineage'), href: `#lineage?req=${encodeURIComponent(inspectId)}` },
             { label: t('explorer.decisionsOpenLog'), href: decisionsLink },

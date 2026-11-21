@@ -18,7 +18,17 @@ import (
 	"github.com/reireirei/yabanin/pkg/resolver"
 )
 
-var eventPublishSem = make(chan struct{}, 50)
+// eventPublishBacklog sizes the publishEvent semaphore. WHY: transient
+// downstream stalls (e.g. a fork-based snapshot stalling the event stream)
+// must not drop accounting events for already-succeeded requests — the
+// 2026-11-20 qualification run (500→1000 VU ramp) lost 21 request rows to
+// a 50-slot backlog during a sub-second stall at ~800 events/s publish
+// rates, while clients already held their 200s. 512 absorbs such stalls;
+// overflow stays fail-visible (Warn + event_publish{reason="backlog_full"}),
+// never silent, and acquire never blocks the request path.
+const eventPublishBacklog = 512
+
+var eventPublishSem = make(chan struct{}, eventPublishBacklog)
 
 // eventObserver, when set, sees every analytics event before publish.
 // Production leaves it nil. Tests must restore it through observeEvent.
@@ -118,52 +128,66 @@ func publishEvent(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Ev
 	case eventPublishSem <- struct{}{}:
 		go func() {
 			defer func() { <-eventPublishSem }()
-
-			const (
-				maxRetries = 3
-				baseDelay  = 50 * time.Millisecond
-				maxDelay   = 300 * time.Millisecond
-			)
-			var err error
-			for attempt := 0; attempt <= maxRetries; attempt++ {
-				if attempt > 0 {
-					delay := baseDelay << uint(attempt-1) // safe: attempt is bounded by maxRetries (3)
-					if delay > maxDelay {
-						delay = maxDelay
-					}
-					time.Sleep(delay)
-				}
-				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-				err = p.Publish(ctx, event)
-				cancel()
-				if err == nil {
-					traceStampObservePublished(event.RequestID)
-					return
-				}
-				l.Debug("event publish attempt failed",
-					slog.Int("attempt", attempt+1),
-					slog.String("event_type", event.EventType),
-					slog.String("error", err.Error()),
-				)
-			}
-			l.Warn("event publish permanently failed after retries",
-				slog.String("event_type", event.EventType),
-				slog.String("error", err.Error()),
-			)
-			// A producer-side drop is the start of a history gap (N12-P02,
-			// I40): make it visible beyond the log line — queue/Redis
-			// outages must be observable on /metrics.
-			metrics.SilentFailure("event_publish", "publish_failed")
-			// G4: the same fact must cite the request-row stamp — the
-			// sibling cohort is not provably complete (owner arm 1).
-			traceStampObserveDrop(event.RequestID, traceStampDropPublishFailed)
+			publishAttempt(p, l, event)
 		}()
 	default:
-		l.Debug("event publish skipped, backlog full")
+		l.Warn("event publish skipped, backlog full",
+			slog.String("place", "event_publish"),
+			slog.String("reason", "backlog_full"),
+			slog.String("event_type", event.EventType),
+			slog.Int("queue_len", len(eventPublishSem)),
+			slog.Int("queue_cap", cap(eventPublishSem)),
+		)
 		metrics.SilentFailure("event_publish", "backlog_full")
 		// G4: sibling drop on the request-row stamp (owner arm 1).
 		traceStampObserveDrop(event.RequestID, traceStampDropBacklogFull)
 	}
+}
+
+// publishAttempt runs one event's bounded retry ladder on the publish
+// goroutine: up to maxRetries attempts with exponential backoff, each
+// against its own 2s timeout, then the fail-visible terminal accounting
+// (Warn + counter + request-row stamp). It detaches from the caller
+// context on purpose — see publishEvent.
+func publishAttempt(p *eventpub.RedisPublisher, l *slog.Logger, event *eventpub.Event) {
+	const (
+		maxRetries = 3
+		baseDelay  = 50 * time.Millisecond
+		maxDelay   = 300 * time.Millisecond
+	)
+	var err error
+	for attempt := 0; attempt <= maxRetries; attempt++ {
+		if attempt > 0 {
+			delay := baseDelay << uint(attempt-1) // safe: attempt is bounded by maxRetries (3)
+			if delay > maxDelay {
+				delay = maxDelay
+			}
+			time.Sleep(delay)
+		}
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		err = p.Publish(ctx, event)
+		cancel()
+		if err == nil {
+			traceStampObservePublished(event.RequestID)
+			return
+		}
+		l.Debug("event publish attempt failed",
+			slog.Int("attempt", attempt+1),
+			slog.String("event_type", event.EventType),
+			slog.String("error", err.Error()),
+		)
+	}
+	l.Warn("event publish permanently failed after retries",
+		slog.String("event_type", event.EventType),
+		slog.String("error", err.Error()),
+	)
+	// A producer-side drop is the start of a history gap (N12-P02,
+	// I40): make it visible beyond the log line — queue/Redis
+	// outages must be observable on /metrics.
+	metrics.SilentFailure("event_publish", "publish_failed")
+	// G4: the same fact must cite the request-row stamp — the
+	// sibling cohort is not provably complete (owner arm 1).
+	traceStampObserveDrop(event.RequestID, traceStampDropPublishFailed)
 }
 
 // eventBase is the single builder input for the gateway's analytics events

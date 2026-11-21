@@ -148,11 +148,19 @@ container images; you do not need Go or Node.js installed on your computer
 
 ### One command
 
-`bash scripts/quickstart/demo.sh` runs the steps below for you: configure,
-build, start, seed, then a summary pointing at the dashboard and where the
-API key and admin password were printed. Rerunning it is safe; `--fresh`
-wipes the demo database and issues new credentials (destructive). The
-numbered steps are the manual path that explains each command.
+Run from the root of the Core checkout:
+
+```bash
+bash scripts/quickstart/demo.sh
+```
+
+The command builds this revision, starts the gateway and dashboard, creates
+credentials, then verifies four labeled requests in the Seed organization.
+Open the printed Requests link and sign in using the password in the printed
+private directory. Run the same command again to resume. To connect several
+OpenAI-compatible models during setup, pass `--providers /path/to/providers.json`.
+See [provider setup and demo scenarios](docs/demo.md). The steps below describe
+manual installation.
 
 ### 1. Download, configure, and start
 

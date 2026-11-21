@@ -232,6 +232,9 @@ quality-fast quality-static quality-security quality-security-code quality-secur
 _quality-self:
 	bash -n scripts/quality/run.sh scripts/quality/changed.sh scripts/ci/run-with-report.sh scripts/security/govulncheck-classify.sh
 	python3 -m unittest discover -s scripts/quality/tests -p 'test_*.py'
+	node --test scripts/release/test_dashboard_notices.mjs
+	python3 -m unittest discover -s deploy/mock-provider -p 'test_*.py'
+	python3 scripts/release/test_release_evidence.py
 
 _quality-fast:
 	$(GO_SCOPE) go build
@@ -494,10 +497,13 @@ measure-savings: ## P5 kill criterion: savings measurement
 train-classifier: ## P5.8: train the ML classifier (requires internal datasets; not in public export)
 	@echo "train-classifier: ML training datasets are not part of the public export"; exit 77
 
-load-test-chat: ## k6 load test: chat completions
+load-test-chat: ## k6 load test: chat completions (export TOKENROUTER_API_KEY first; usage: make load-test-chat MODEL=<model> [BASE_URL=..] [SMOKE=1])
 	@echo "=== k6 Chat Completions Load Test ==="
-	k6 run --env TOKENROUTER_BASE_URL=$(or $(TOKENROUTER_BASE_URL),http://localhost:8082) \
-	   --env TOKENROUTER_API_KEY=$(or $(TOKENROUTER_API_KEY),yabanin-dev-key) \
+	@if [ -z "$${TOKENROUTER_API_KEY:-}" ]; then echo "usage: export TOKENROUTER_API_KEY=<gateway key>; make load-test-chat MODEL=<configured model> [BASE_URL=http://127.0.0.1:8082] [SMOKE=1]"; exit 2; fi
+	@if [ -z "$(strip $(MODEL)$(TOKENROUTER_MODEL))" ]; then echo "load-test-chat: MODEL (or TOKENROUTER_MODEL) is required; no implicit model or registry assumption"; exit 2; fi
+	k6 run --env TOKENROUTER_MODEL='$(or $(TOKENROUTER_MODEL),$(MODEL))' \
+	   --env TOKENROUTER_BASE_URL='$(or $(TOKENROUTER_BASE_URL),http://127.0.0.1:8082)' \
+	   $(if $(filter 1,$(SMOKE)),--env TOKENROUTER_SMOKE=1,) \
 	   tests/load/k6_chat.js
 
 load-test-cache: ## k6 load test: cache hit rate
@@ -506,10 +512,13 @@ load-test-cache: ## k6 load test: cache hit rate
 	   --env TOKENROUTER_API_KEY=$(or $(TOKENROUTER_API_KEY),yabanin-dev-key) \
 	   tests/load/k6_cache_hit.js
 
-load-test-mixed: ## k6 load test: mixed models
+load-test-mixed: ## k6 load test: mixed models (export TOKENROUTER_API_KEY first; usage: make load-test-mixed MODELS=<m1,m2,..> [BASE_URL=..] [SMOKE=1])
 	@echo "=== k6 Mixed Models Load Test ==="
-	k6 run --env TOKENROUTER_BASE_URL=$(or $(TOKENROUTER_BASE_URL),http://localhost:8082) \
-	   --env TOKENROUTER_API_KEY=$(or $(TOKENROUTER_API_KEY),yabanin-dev-key) \
+	@if [ -z "$${TOKENROUTER_API_KEY:-}" ]; then echo "usage: export TOKENROUTER_API_KEY=<gateway key>; make load-test-mixed MODELS=<model-a,model-b,...> [BASE_URL=http://127.0.0.1:8082] [SMOKE=1]"; exit 2; fi
+	@if [ -z "$(strip $(MODELS)$(TOKENROUTER_MODELS))" ]; then echo "load-test-mixed: MODELS (or TOKENROUTER_MODELS) is required; pass at least two distinct registered models"; exit 2; fi
+	k6 run --env TOKENROUTER_MODELS='$(or $(TOKENROUTER_MODELS),$(MODELS))' \
+	   --env TOKENROUTER_BASE_URL='$(or $(TOKENROUTER_BASE_URL),http://127.0.0.1:8082)' \
+	   $(if $(filter 1,$(SMOKE)),--env TOKENROUTER_SMOKE=1,) \
 	   tests/load/k6_mixed_models.js
 
 bench-stand: ## OP-23: run the internal benchmark stand (not in public export)

@@ -63,6 +63,25 @@ func TestInjectReasoningEffort_BrokenJSON_Unchanged(t *testing.T) {
 	}
 }
 
+// Non-object JSON passes through byte-for-byte, including null which decodes to a nil map.
+func TestInjectReasoningEffort_NullAndNonObjectBodies_Unchanged(t *testing.T) {
+	cases := []struct{ name, body string }{
+		{"json_null", `null`},
+		{"json_array", `[]`},
+		{"json_string", `"a string"`},
+		{"json_number", `42`},
+		{"json_boolean", `true`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			out := injectReasoningEffort([]byte(tc.body), "high")
+			if string(out) != tc.body {
+				t.Fatalf("non-object body must stay byte-identical: in=%s out=%s", tc.body, out)
+			}
+		})
+	}
+}
+
 func TestMaybeInjectEffort_EnabledMatchInjects(t *testing.T) {
 	gw := newEffortTestGateway(t, true, "o3,o4-mini,gpt-5", []string{"o3", "o4-mini", "gpt-5"})
 	body := []byte(`{"model":"gpt-5.2","messages":[]}`)

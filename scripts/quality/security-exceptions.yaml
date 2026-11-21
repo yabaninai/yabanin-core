@@ -38,3 +38,57 @@ exceptions:
     owner: yabanin
     expires: 2027-03-28
     scanner: license_check
+  - id: picomatch-single-branch-extglob-redos
+    path: node_modules/picomatch
+    vulnerability_id: CVE-2026-112366
+    package: picomatch
+    version: 2.3.2
+    scope: web/site/package-lock.json
+    reason: build-only; static Docusaurus glob patterns, no external pattern input; owner-approved limited exposure 2026-11-18 (question-1l2lyd23); no upstream fix available
+    owner: yabanin
+    expires: "2026-11-30"
+    scanner: dep_audit
+  - id: dashboard-picomatch-v2-extglob-redos
+    path: node_modules/picomatch
+    vulnerability_id: CVE-2026-112366
+    package: picomatch
+    version: 2.3.2
+    scope: web/dashboard/package-lock.json
+    reason: build/lint-only static operator globs via the legacy micromatch/anymatch/readdirp chains; no runtime or user-supplied patterns; no upstream fix for CVE-2026-112366 (affects <=4.0.7); owner decision question-qwc5b2rs (2026-11-18); no general or runtime-input ReDoS waiver; remove on upstream fix or reachability change
+    owner: yabanin
+    expires: "2026-11-30"
+    scanner: dep_audit
+    development: true
+  - id: dashboard-picomatch-v4-extglob-redos
+    path: node_modules/tinyglobby/node_modules/picomatch
+    vulnerability_id: CVE-2026-112366
+    package: picomatch
+    version: 4.0.5
+    scope: web/dashboard/package-lock.json
+    reason: tinyglobby-nested picomatch 4.0.5 (^4.0.4 via vite/sucrase/@typescript-eslint/typescript-estree build and lint chains); static operator globs only, no runtime or user-supplied patterns; no upstream fix for CVE-2026-112366 (affects <=4.0.7); owner decision question-qwc5b2rs (2026-11-18); no general or runtime-input ReDoS waiver; remove on upstream fix or reachability change
+    owner: yabanin
+    expires: "2026-11-30"
+    scanner: dep_audit
+    development: true
+  - id: dashboard-picomatch-v4-vite-extglob-redos
+    path: node_modules/vite/node_modules/picomatch
+    vulnerability_id: CVE-2026-112366
+    package: picomatch
+    version: 4.0.5
+    scope: web/dashboard/package-lock.json
+    reason: vite-nested picomatch 4.0.5 (^4.0.2, build-tool glob matching inside vite); static operator globs only, no runtime or user-supplied patterns; no upstream fix for CVE-2026-112366 (affects <=4.0.7); owner decision question-qwc5b2rs (2026-11-18); no general or runtime-input ReDoS waiver; remove on upstream fix or reachability change
+    owner: yabanin
+    expires: "2026-11-30"
+    scanner: dep_audit
+    development: true
+  - id: sdk-picomatch-v4-extglob-redos
+    path: node_modules/picomatch
+    vulnerability_id: CVE-2026-112366
+    package: picomatch
+    version: 4.0.7
+    scope: sdks/node/package-lock.json
+    reason: owner option B with independently confirmed build/test-only reachability (2026-11-18); test discovery feeds picomatch only static operator-owned patterns (vitest default include/exclude globs; no vitest/vite config file or CLI glob arguments); tsc builds from static tsconfig src/**/* includes and does not use picomatch; no runtime or user-controlled glob path; published SDK package ships no dev tool code; no upstream fix for CVE-2026-112366 (affects <=4.0.7); no general or runtime-input ReDoS waiver; remove on upstream fix or reachability change
+    owner: yabanin
+    expires: "2026-11-30"
+    scanner: dep_audit
+    development: true

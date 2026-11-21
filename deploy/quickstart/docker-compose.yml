@@ -32,7 +32,7 @@ services:
       retries: 30
 
   redis:
-    image: redis:7-alpine@sha256:7b1753b4c5ad8458906c272a8132b8c15f5557b000379eb115fb239706a384b7  # pinned 2026-11-10 (was: redis:7-alpine)
+    image: redis:7.2-alpine@sha256:2f66de68111e64c3927859f158f8e666066dae2b97d9f82770a6f37a5aa1c335  # Redis 7.2.17 (BSD-3-Clause)
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]

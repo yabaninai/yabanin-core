@@ -28,7 +28,7 @@ func injectReasoningEffort(body []byte, effort string) []byte {
 		return body
 	}
 	var root map[string]json.RawMessage
-	if err := json.Unmarshal(body, &root); err != nil {
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
 		return body
 	}
 	enc, err := json.Marshal(effort)

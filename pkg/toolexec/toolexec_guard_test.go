@@ -31,11 +31,13 @@ type fakeToolGuard struct {
 	gotServer   string
 	gotTool     string
 	gotArgs     string
+	argsSeq     [][2]string // every (server, tool) the args phase consulted
 }
 
 func (g *fakeToolGuard) GuardArgs(_ context.Context, _, _, server, tool string, args json.RawMessage) toolpolicy.ArgsReport {
 	g.argsCalls++
 	g.gotServer, g.gotTool, g.gotArgs = server, tool, string(args)
+	g.argsSeq = append(g.argsSeq, [2]string{server, tool})
 	return g.args
 }
 
@@ -106,9 +108,19 @@ func TestExecuteGuarded_ArgsDeny_BlockedBeforeUpstream(t *testing.T) {
 	if up.calls.Load() != 0 {
 		t.Fatalf("denied call must not reach the tool, got %d requests", up.calls.Load())
 	}
-	if g.argsCalls != 1 || g.gotServer != BuiltinServerName || g.gotTool != ToolWebFetch ||
-		!strings.Contains(g.gotArgs, up.URL) {
-		t.Fatalf("guard must see (yabanin, web_fetch, args) once: %+v", g)
+	// Dual-form contract pin: the deny may fire on either address, and the
+	// guard is consulted for BOTH (bare + qualified) with the args intact.
+	want := [][2]string{{BuiltinServerName, ToolWebFetch}, {BuiltinServerName, PolicyKey(ToolWebFetch)}}
+	if g.argsCalls != len(want) {
+		t.Fatalf("guard must be consulted under both policy addresses, got %d calls: %v", g.argsCalls, g.argsSeq)
+	}
+	for i := range want {
+		if g.argsSeq[i] != want[i] {
+			t.Fatalf("guard address order = %v, want %v", g.argsSeq, want)
+		}
+	}
+	if !strings.Contains(g.gotArgs, up.URL) {
+		t.Fatalf("guard must see the args: %s", g.gotArgs)
 	}
 }
 
@@ -124,8 +136,9 @@ func TestExecuteGuarded_EffectiveNameGuarded(t *testing.T) {
 	if !errors.As(err, &eErr) || eErr.Code != ErrCodeToolBlocked {
 		t.Fatalf("want tool_blocked, got %v", err)
 	}
-	if g.gotTool != "http_post" {
-		t.Fatalf("guard must see the effective name http_post, got %q", g.gotTool)
+	want := [][2]string{{BuiltinServerName, "http_post"}, {BuiltinServerName, PolicyKey("http_post")}}
+	if len(g.argsSeq) != len(want) || g.argsSeq[0] != want[0] || g.argsSeq[1] != want[1] {
+		t.Fatalf("guard must see the effective name under both addresses, got %v", g.argsSeq)
 	}
 }
 
@@ -163,15 +176,22 @@ func TestExecuteGuarded_ResultMask(t *testing.T) {
 	}
 }
 
-// TestExecuteGuarded_DegradedCountsError: a fail-open org outage proceeds
-// unguarded but counts as an error decision, never an allow.
-func TestExecuteGuarded_DegradedCountsError(t *testing.T) {
+// TestExecuteGuarded_DegradedRefusesTyped: an indeterminate (degraded)
+// org outage is not a permit — the call is refused with the typed
+// policy-unavailable error and never egresses, while the decision counter
+// still records exactly one error decision, never an allow.
+func TestExecuteGuarded_DegradedRefusesTyped(t *testing.T) {
 	up := newGuardUpstream(t)
 	g := &fakeToolGuard{args: toolpolicy.ArgsReport{Degraded: true}}
 	x := NewExecutor(NewDefaultConfig(), nil, nil).WithToolGuard(g)
-	if _, err := x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
-		json.RawMessage(`{"url":"`+up.URL+`"}`)); err != nil {
-		t.Fatalf("degraded must proceed: %v", err)
+	_, err := x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
+		json.RawMessage(`{"url":"`+up.URL+`"}`))
+	var eErr *ExecError
+	if !errors.As(err, &eErr) || eErr.Code != ErrCodePolicyUnavailable {
+		t.Fatalf("degraded must refuse as policy_unavailable, got %v", err)
+	}
+	if n := up.calls.Load(); n != 0 {
+		t.Fatalf("degraded refusal must never egress, got %d", n)
 	}
 	if d := decisionDelta(t, "org-1", ToolWebFetch, "error", func() {
 		_, _ = x.ExecuteGuarded(context.Background(), "org-1", "ag-1", ToolWebFetch,
