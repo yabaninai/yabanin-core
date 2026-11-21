@@ -652,10 +652,10 @@ type mockStore struct {
 	// grant tests: physical rows carry their own key, owner and agent
 	// attribution. When nil, ListRequests keeps its historical single-row
 	// behavior so established non-grant tests are untouched.
-	requestRows []mockRequestRow
-	experiments map[string]*cache.Experiment
-	analytics          *adminstore.AnalyticsResult
-	pricingImport      func(catalog pricing.PriceFile, mappings []adminstore.CatalogPriceMap, onlyMapped, apply bool, updatedBy string) (adminstore.CatalogImportResult, error)
+	requestRows   []mockRequestRow
+	experiments   map[string]*cache.Experiment
+	analytics     *adminstore.AnalyticsResult
+	pricingImport func(catalog pricing.PriceFile, mappings []adminstore.CatalogPriceMap, onlyMapped, apply bool, updatedBy string) (adminstore.CatalogImportResult, error)
 }
 
 func newMockStore() *mockStore {
@@ -1693,6 +1693,7 @@ func (m *mockStore) GetGlobalCostStats(_ context.Context, _ time.Time, _ time.Ti
 		AvgCostPerRequest:  0.01,
 	}, nil
 }
+
 // mockRequestRow models one physical request_logs row for the row-key
 // fixture: RowKey is the immutable physical identity (0031), OwnerUserID and
 // AgentID carry the attribution the list predicate scopes on.
@@ -1754,6 +1755,7 @@ func (m *mockStore) listFixtureRows(f adminstore.RequestListFilters) ([]adminsto
 	}
 	return rows, len(rows), nil
 }
+
 // GetRequestDetailRow serves the row-key pinned detail read (0031): the
 // fixture's bound row is (org-1, key 1); every other key does not exist. The
 // access-context contract of GetRequestDetail still applies via delegation.
