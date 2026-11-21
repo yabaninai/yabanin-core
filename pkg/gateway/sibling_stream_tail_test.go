@@ -1034,7 +1034,7 @@ func TestRealtime_OversizedLineAbortsBounded(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	gw := &gateway{}
-	usage, _, term, drainErr := gw.realtimeRelay(context.Background(), rec, rec, strings.NewReader(realtimeWhole+big+"\n\nmore\n"), nil)
+	usage, _, term, drainErr, _ := gw.realtimeRelay(context.Background(), rec, rec, strings.NewReader(realtimeWhole+big+"\n\nmore\n"), nil)
 	raw := rec.Body.String()
 	var tooLarge errRealtimeLineTooLarge
 	if !errors.As(drainErr, &tooLarge) {

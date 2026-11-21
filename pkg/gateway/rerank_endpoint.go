@@ -86,7 +86,10 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 	// NEXT-18c (ADR-0001 §5.1) + ratified D3: reservation rides the
 	// embeddings-style input pre-estimate (no generated output tokens,
 	// out_cap = 0); the wallet settles on the actual provider usage below.
-	rctx := r.Context()
+	// The minted invocation identity rides the same context so the
+	// confirmed start and the terminal facts bind to this request's
+	// admission row.
+	rctx := withInvocationIdentity(r.Context(), admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "rerank",
 		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 			admitted.Info, admitted.Body, nil, true))
@@ -122,6 +125,19 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap), so a local failure never
+	// strands a durable admission for a request that never dispatched. Fail
+	// closed: an unwritten start (write error, timeout or lost ACK — outcome
+	// unknown) refuses the request with ZERO provider arrivals under the
+	// history_unavailable envelope, and the escrow is released.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 	resp, err := client.Do(ctx, "/v1/rerank", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -163,7 +179,7 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	_, _ = gw.finishRequest(rctx, requestFinish{
+	_, ferr := gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,
@@ -203,6 +219,14 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 		termination: completionTermination(rctx),
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
 
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)

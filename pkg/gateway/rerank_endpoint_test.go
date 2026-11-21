@@ -28,11 +28,12 @@ import (
 func r105TestGateway(t *testing.T, info resolver.ModelInfo) *gateway {
 	t.Helper()
 	return &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: info.UpstreamURL},
-		log:  slog.New(slog.DiscardHandler),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info, info.ModelName: info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: info.UpstreamURL},
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": info, info.ModelName: info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 }
 

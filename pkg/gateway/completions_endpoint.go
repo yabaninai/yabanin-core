@@ -91,8 +91,11 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 	// NEXT-18c (ADR-0001 §5.1): pre-check, then reserve — this pipeline has
 	// no cache branch, so both stages run back-to-back before the upstream
 	// call. The gate rides the request-derived context for the finalize
-	// stages below.
+	// stages below. The minted invocation identity rides the same context
+	// so the confirmed start and the terminal facts bind to this request's
+	// admission row on BOTH transports below.
 	rctx := withPolicyEvent(r.Context(), policyEvent)
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	gate, ok := gw.reservationPlan(w, r, "completions",
 		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 			admitted.Info, admitted.Body, reservationMaxTokens(req.MaxTokens), false))
@@ -117,11 +120,39 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	// Stream capability precedes the durable start on every branch: a
+	// writer that cannot flush would otherwise commit an admission for a
+	// request that can never dispatch (chat streamRun.admit canon — fail
+	// before anything durable, with zero provider arrivals).
+	if req.Stream {
+		if _, ok := w.(http.Flusher); !ok {
+			gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+			apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
+			return
+		}
+	}
+	// Preview2 durable accounting: the confirmed start commits immediately
+	// BEFORE the first paid provider dispatch — after every fallible local
+	// setup step above (pool wiring, model remap, stream capability), so a
+	// local failure never strands a durable admission for a request that
+	// never dispatched. One admission per request; the JSON and stream
+	// branches below share it and the kind binds to the transport actually
+	// dispatched. Fail closed: an unwritten start (write error, timeout or
+	// lost ACK — outcome unknown) refuses the request with ZERO provider
+	// arrivals under the history_unavailable envelope, and the escrow is
+	// released. The structured 503 precedes the stream branch, so it can
+	// never land after client success headers.
+	if err := gw.confirmPaidInvocation(rctx, invocationKindForChat(req.Stream)); err != nil {
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(w, err)
+		return
+	}
 
 	if req.Stream {
 		// W-TIMEOUT: streams carry no whole-request deadline; the transport's
 		// ResponseHeaderTimeout plus the idle watchdog below bound them.
-		gw.completionsStream(w, r, gate, admitted, client, upstreamBody, apiKey, providerName, upstreamURL, started, l)
+		gw.completionsStream(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, providerName, upstreamURL, started, l)
 		return
 	}
 
@@ -161,14 +192,26 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 			rctx = withPolicyEvent(rctx, appendPolicyEvents(policyEventFrom(rctx), postEvent))
 		}
 		if denied {
-			gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusBadRequest, started, resp)
+			if ferr := gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusBadRequest, started, resp); ferr != nil {
+				// The client envelope is already the policy denial; the
+				// withheld event is logged loudly (finishRequestLogged
+				// canon).
+				l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+			}
 			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"response blocked by organization policy", policyDenyErrorCode)
 			return
 		}
 		limited = masked
 	}
-	gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp)
+	if ferr := gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp); ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
 	// N03-P06-T02: provider prompt-cache transparency on the legacy
 	// completions JSON path (absent for estimated usage — never fabricated).
 	setPromptCacheHeader(w, usage)
@@ -177,7 +220,7 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write(limited)
 }
 
-func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, providerName, upstreamURL string, started time.Time, l *slog.Logger) {
+func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, providerName, upstreamURL string, started time.Time, l *slog.Logger) {
 	upstreamBody, clientWantsUsage := ensureStreamUsage(upstreamBody, providerName, gw.streamUsageProviders)
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -186,13 +229,15 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Proxy-Cache", "bypass")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
-		return
-	}
+	// The caller checked the stream capability BEFORE the durable start,
+	// so the writer is a Flusher by construction (a non-flusher writer
+	// never reaches this function — it answered 501 with no admission).
+	flusher, _ := w.(http.Flusher)
 
-	streamCtx, cancelStream := context.WithCancel(r.Context())
+	// The stream context derives from the request-derived rctx (identity,
+	// gate, policy record ride it into the finisher) — client
+	// cancellation still propagates from the parent request context.
+	streamCtx, cancelStream := context.WithCancel(rctx)
 	defer cancelStream()
 
 	resp, err := client.Do(streamCtx, "/v1/completions", upstreamBody, apiKey, true, nil)
@@ -237,12 +282,24 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	// before the drain-failure error frame composes (chat F2 canon).
 	tail := &ssePassthroughTail{w: w}
 	watch := newSSETerminalWatch(tail)
+	// Central binding (Preview2 durable accounting, chat drain canon): an
+	// admitted invocation holds the client-facing [DONE] until its terminal
+	// facts commit — release happens exactly once after the durable write;
+	// a failed write drops the terminator and surfaces the typed accounting
+	// error frame instead.
+	if h := invocationIdentityFrom(rctx); h != nil && h.Admitted() && gw.invocations != nil {
+		watch.armDoneHold()
+	}
 	usage, drainErr := handler.HandleStream(streamCtx, watch, flusher, resp)
 	if drainErr != nil {
 		// NEXT-18c: no analytics event on this path — settle the escrow with
-		// zero spend; the idle return sweeps it.
+		// zero spend; the idle return sweeps it. The reconciler's grace
+		// sweep owns the admitted-without-facts row. The client must NOT
+		// observe a held success terminator for the failed stream: drop it
+		// (chat drain canon) before the error frame.
+		watch.failDoneHold()
 		term := budget.TerminationUpstreamErr
-		if r.Context().Err() != nil {
+		if rctx.Err() != nil {
 			term = budget.TerminationClientCancel
 		}
 		gate.finalizeNoEvent(term)
@@ -255,7 +312,19 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	// N03-P06-T02: stream headers committed long ago; outcome rides the
 	// trailer once HandleStream returns final usage.
 	setPromptCacheTrailer(w, usage)
-	gw.finishCompletion(w, r.Context(), admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp)
+	if ferr := gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp); ferr != nil {
+		// Central binding: the held terminator is dropped and replaced by
+		// the accounting error frame — deliberately NO safe-retry language:
+		// the work already ran under this invocation identity (chat stream
+		// canon).
+		watch.failDoneHold()
+		writeSSEErrorWithCode(w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(rctx), "error", ferr)
+		return
+	}
+	watch.releaseDoneHold()
 }
 
 func closeUpstream(l *slog.Logger, resp *http.Response) {
@@ -286,7 +355,12 @@ func completionsUsage(body, request []byte, adapter provider.Provider) provider.
 	return provider.Usage{PromptTokens: n, TotalTokens: n, Source: provider.UsageSourceEstimated}
 }
 
-func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, providerName, upstreamURL string, status int, started time.Time, resp *http.Response) {
+// finishCompletion settles the legacy completions response durably — the
+// usage record, terminal facts and the reservation — and returns the
+// terminal-facts commit error so each transport can apply its canon:
+// buffered callers withhold the upstream body, the stream caller drops
+// the held [DONE] and closes with the accounting error frame.
+func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, providerName, upstreamURL string, status int, started time.Time, resp *http.Response) error {
 	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
 	gw.accountUsage(ctx, w, usageRecord{
 		orgID:      admitted.OrgID,
@@ -296,7 +370,7 @@ func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, 
 		costUSD:    ext.EstimatedCostUSD,
 		priceKnown: ext.PriceKnown,
 	})
-	_, _ = gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:      "request.completed",
 			RequestID:      admitted.RequestID,
@@ -340,10 +414,11 @@ func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, 
 		termination: completionTermination(ctx),
 		// NEXT-18c: settle the reservation and stamp tuples + termination
 		// (§5.3 Finalize). Resale is not computed on this pipeline; the
-		// wallet actual falls back to the base quote — the consumer's own
-		// rule.
+		// wallet actual falls back to the base quote — the consumer's
+		// own rule.
 		eventNote: true,
 	}, nil)
+	return ferr
 }
 
 // completionTermination classifies a finished completion for the Finalize
