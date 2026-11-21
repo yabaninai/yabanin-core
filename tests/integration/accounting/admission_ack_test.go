@@ -51,27 +51,19 @@ func (r *ackRelay) take(pid uint32) *ackCut {
 func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.Reader) error {
 	var pid uint32
 	var command string
-	var header [5]byte
 	for {
-		if _, err := io.ReadFull(backend, header[:]); err != nil {
+		frame, err := readAckFrame(backend)
+		if err != nil {
 			return err
 		}
-		size := int(binary.BigEndian.Uint32(header[1:])) - 4
-		if size < 0 || size > 64<<20 {
-			return errors.New("invalid stand PostgreSQL reply length")
-		}
-		frame := make([]byte, 5+size)
-		copy(frame, header[:])
-		if _, err := io.ReadFull(backend, frame[5:]); err != nil {
-			return err
-		}
-		if header[0] == 'K' && size == 8 {
+		size := len(frame) - 5
+		if frame[0] == 'K' && size == 8 {
 			pid = binary.BigEndian.Uint32(frame[5:9])
 		}
-		if header[0] == 'C' {
+		if frame[0] == 'C' {
 			command = strings.TrimSuffix(string(frame[5:]), "\x00")
 		}
-		if header[0] == 'Z' && size == 1 && frame[5] == 'I' {
+		if frame[0] == 'Z' && size == 1 && frame[5] == 'I' {
 			if cut := r.take(pid); cut != nil {
 				if err := cut.deliver(ctx, client, command); err != nil {
 					return err
@@ -86,6 +78,21 @@ func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.
 		}
 	}
 }
+func readAckFrame(src io.Reader) ([]byte, error) {
+	var header [5]byte
+	if _, err := io.ReadFull(src, header[:]); err != nil {
+		return nil, err
+	}
+	size := int(binary.BigEndian.Uint32(header[1:])) - 4
+	if size < 0 || size > 64<<20 {
+		return nil, errors.New("invalid stand PostgreSQL reply length")
+	}
+	frame := make([]byte, len(header)+size)
+	copy(frame, header[:])
+	_, err := io.ReadFull(src, frame[len(header):])
+	return frame, err
+}
+
 func (c *ackCut) deliver(ctx context.Context, client net.Conn, command string) error {
 	c.held <- command
 	select {
@@ -176,7 +183,13 @@ type ackResponse struct {
 
 func (s *stand) ackRequest(ctx context.Context, rid string) ackResponse {
 	var out ackResponse
-	trace := httptrace.ClientTrace{GotFirstResponseByte: func() { out.at = time.Now() }}
+	first := make(chan time.Time, 1)
+	trace := httptrace.ClientTrace{GotFirstResponseByte: func() {
+		select {
+		case first <- time.Now():
+		default:
+		}
+	}}
 	payload := fmt.Sprintf(`{"model":%q,"messages":[{"role":"user","content":%q}]}`, s.model, rid)
 	req, err := http.NewRequestWithContext(httptrace.WithClientTrace(ctx, &trace), http.MethodPost, s.gatewayURL+"/v1/chat/completions", strings.NewReader(payload))
 	if err != nil {
@@ -193,6 +206,10 @@ func (s *stand) ackRequest(ctx context.Context, rid string) ackResponse {
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	select {
+	case out.at = <-first:
+	default:
+	}
 	out.status, out.body, out.err = resp.StatusCode, string(body), err
 	return out
 }
@@ -353,10 +370,18 @@ func TestAccountingAckRelayControl(t *testing.T) {
 	}
 	for _, forward := range []bool{true, false} {
 		cut := relay.arm(17)
-		_, err := target.Write(ready)
+		command := []byte{'C', 0, 0, 0, 11, 'C', 'O', 'M', 'M', 'I', 'T', 0}
+		_, err := target.Write(command)
+		require.NoError(t, err)
+		buf := make([]byte, len(command))
+		_, err = io.ReadFull(client, buf)
+		require.NoError(t, err)
+		require.Equal(t, command, buf)
+		_, err = target.Write(ready)
 		require.NoError(t, err)
 		select {
-		case <-cut.held:
+		case tag := <-cut.held:
+			require.Equal(t, "COMMIT", tag)
 		case <-time.After(time.Second):
 			t.Fatal("target reply not held")
 		}
