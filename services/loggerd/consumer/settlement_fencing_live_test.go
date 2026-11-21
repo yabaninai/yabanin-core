@@ -107,8 +107,6 @@ func fencingWallet(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org st
 // rows or money — may change; the rightful worker then settles exactly
 // once.
 func TestSettlementWorkerCompetingClaims(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
 
 	const org = "77777777-7777-4777-8777-7777777777f1"
@@ -220,8 +218,6 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 // predicate from the fencing SELECT to prove this control bites: without
 // it, the read locks and passes the recovered rows.
 func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
 
 	const org = "99999999-9999-4999-8999-9999999999f2"
@@ -321,6 +317,7 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	}
 	bal, rem, rows, micro = fencingWallet(ctx, t, pool, org)
 	assert.EqualValues(t, 9_700, bal, "two independent 150c charges, exactly once")
+	assert.EqualValues(t, 0, rem, "whole-cent charges carry no micro rests — the seeded zero remainder stays")
 	assert.EqualValues(t, 2, rows)
 	assert.EqualValues(t, -3_000_000, micro)
 }
