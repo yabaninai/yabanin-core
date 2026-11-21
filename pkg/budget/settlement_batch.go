@@ -11,10 +11,16 @@
 //   - a job whose sequential application would cross the grace floor becomes
 //     requires_attention WITHOUT touching the wallet, exactly like the
 //     per-job path, and later jobs still apply;
-//   - usage ledger rows rely on the production partial unique index
-//     (ON CONFLICT DO NOTHING): a conflict for the same org is an
-//     idempotent no-op settle for that job, a conflict under a DIFFERENT
-//     org is the request-identity conflict (never charged here);
+//   - usage ledger rows rely on the production partial unique indexes
+//     (ON CONFLICT DO NOTHING), one domain per entry identity (0028/0029):
+//     an invocation-bearing entry dedupes on the minted uuid
+//     (uniq_credit_transactions_invocation) while a legacy entry keeps the
+//     global-on-request_id domain over NULL-invocation rows
+//     (uniq_credit_transactions_usage_legacy). A conflict for the same org
+//     is an idempotent no-op settle for that job, a conflict under a
+//     DIFFERENT org is the request-identity conflict (never charged here),
+//     and two invocations sharing one client request id are two
+//     independent charges — within one org or across orgs;
 //   - the wallet row is updated once with the sum of applied jobs;
 //   - reserved_micro_usd of every scope row drops by the sum of
 //     min(actual, bound) of APPLIED jobs whose allocation is not released
@@ -126,6 +132,14 @@ type SettleEntry struct {
 	// settlement workers must pass the claimed value.
 	FencingToken int32
 	RequestID    string
+	// InvocationID is the billed invocation identity (0028+ schemas):
+	// non-empty keys the wallet idempotency read and the usage-ledger
+	// dedupe on the minted uuid instead of the shared client request id,
+	// so two invocations sharing one request id settle as two independent
+	// charges. Empty is the legacy global-on-request_id domain. The
+	// worker's claim projects it from settlement_jobs.invocation_id
+	// (NULL there = legacy row); pre-0028 claims never produce it.
+	InvocationID string
 	Kind         string
 	Amount       money.MicroUSD
 	Payload      []byte
@@ -229,11 +243,22 @@ func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCen
 		return nil, err
 	}
 
+	// Resolve the wallet/ledger schema ONCE per batch, before any
+	// domain-dependent statement: a statement that misses a column aborts
+	// the whole transaction (SQLSTATE 25P02 blocks every later statement),
+	// so an in-flight fallback could never run. The catalog probe is valid
+	// on every schema version and bounded to one read per batch — never
+	// per row.
+	schema, err := probeBatchSchema(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
+
 	dispositions := make(map[int64]BatchDisposition, len(entries))
 
 	// Wallet first (canonical lock order §5.3), then the spend areas in
 	// team_month → agent_day → session order.
-	if err := settleWalletEntries(ctx, tx, orgID, graceFloorCents, entries, dispositions); err != nil {
+	if err := settleWalletEntries(ctx, tx, orgID, graceFloorCents, entries, dispositions, schema); err != nil {
 		return nil, err
 	}
 	if err := settleSpendEntries(ctx, tx, entries, spenders, dispositions); err != nil {
@@ -250,9 +275,14 @@ func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCen
 }
 
 // verifySettlementFencing locks claimed jobs and ensures each non-zero claim
-// token still matches settlement_jobs.attempts. A retry/claim increments
-// attempts, so a paused worker cannot settle after a newer worker acquired
-// the same job. Rows are locked in id order to preserve a stable lock order.
+// token still matches settlement_jobs.attempts ON a row that is still
+// 'processing'. A retry/claim increments attempts, so a paused worker cannot
+// settle after a newer worker acquired the same job; the status filter
+// additionally excludes the recovered-but-not-yet-reclaimed window —
+// recoverExpiredLeases moves an expired lease to 'retry' WITHOUT
+// incrementing attempts, and a stale worker must not settle, retry-mark or
+// otherwise overwrite that requeued state even though the token still
+// matches. Rows are locked in id order to preserve a stable lock order.
 func verifySettlementFencing(ctx context.Context, tx pgx.Tx, entries []SettleEntry) error {
 	ids := make([]int64, 0, len(entries))
 	expected := make(map[int64]int32, len(entries))
@@ -273,7 +303,7 @@ func verifySettlementFencing(ctx context.Context, tx pgx.Tx, entries []SettleEnt
 	}
 	rows, err := tx.Query(ctx, `
 		SELECT id, attempts FROM settlement_jobs
-		WHERE id = ANY($1::bigint[])
+		WHERE id = ANY($1::bigint[]) AND status = 'processing'
 		ORDER BY id
 		FOR UPDATE`, ids)
 	if err != nil {
@@ -296,15 +326,49 @@ func verifySettlementFencing(ctx context.Context, tx pgx.Tx, entries []SettleEnt
 		return fmt.Errorf("settlement batch fencing rows: %w", err)
 	}
 	if seen != len(ids) {
-		return fmt.Errorf("%w: one or more claimed jobs no longer exist", ErrStaleSettlementToken)
+		return fmt.Errorf("%w: one or more claimed jobs are no longer 'processing' under this token (lease recovered or re-claimed)", ErrStaleSettlementToken)
 	}
 	return nil
+}
+
+// batchSchema records the schema features the batch's domain-dependent
+// statements need, resolved by one catalog probe per batch (see
+// probeBatchSchema). Never guessed statement-by-statement: PostgreSQL
+// aborts the transaction after a failed statement, so a reactive fallback
+// inside the batch can never succeed.
+type batchSchema struct {
+	// hasGraceColumn: org_credits.grace_floor_cents (NEXT-18a). False
+	// selects the two-column wallet read and the global grace floor.
+	hasGraceColumn bool
+	// hasInvocationColumn: credit_transactions.invocation_id (0028).
+	// False is the pre-0028 ledger: the original global usage index and
+	// arbiter rule, and an invocation-bearing entry is refused — never
+	// downgraded to the legacy domain (the per-job path's loud failure).
+	hasInvocationColumn bool
+}
+
+// probeBatchSchema resolves the batch's schema features in ONE catalog
+// read, valid on every schema version (information_schema reflects
+// whatever is live). It mirrors the consumer's settlement probe shape so
+// both surfaces agree on the live schema within one process.
+func probeBatchSchema(ctx context.Context, tx pgx.Tx) (batchSchema, error) {
+	var grace, invocation int
+	if err := tx.QueryRow(ctx, `
+		SELECT
+			(SELECT count(*) FROM information_schema.columns
+			 WHERE table_schema = current_schema() AND table_name = 'org_credits' AND column_name = 'grace_floor_cents'),
+			(SELECT count(*) FROM information_schema.columns
+			 WHERE table_schema = current_schema() AND table_name = 'credit_transactions' AND column_name = 'invocation_id')`).
+		Scan(&grace, &invocation); err != nil {
+		return batchSchema{}, fmt.Errorf("settlement batch schema probe: %w", err)
+	}
+	return batchSchema{hasGraceColumn: grace > 0, hasInvocationColumn: invocation > 0}, nil
 }
 
 // settleWalletEntries applies the resale_deduction entries against one
 // wallet read: sequential carry in id order, floor-blocked jobs parked
 // without touching the running state, one wallet UPDATE for the applied sum.
-func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloorCents int64, entries []SettleEntry, out map[int64]BatchDisposition) error {
+func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloorCents int64, entries []SettleEntry, out map[int64]BatchDisposition, schema batchSchema) error {
 	wallet := make([]SettleEntry, 0, len(entries))
 	for _, e := range entries {
 		if e.Kind == SettleKindResale {
@@ -317,9 +381,22 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 
 	var balance, remainder int64
 	var floor *int64
-	err := tx.QueryRow(ctx, `
-		SELECT balance_cents, remainder_micro_usd, grace_floor_cents
-		FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder, &floor)
+	var err error
+	if schema.hasGraceColumn {
+		// The reservation-schema wallet read includes the org's explicit
+		// grace floor (ADR §8), which wins over the global fallback.
+		err = tx.QueryRow(ctx, `
+			SELECT balance_cents, remainder_micro_usd, grace_floor_cents
+			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder, &floor)
+	} else {
+		// Pre-reservation schema: read the row without the column and use
+		// the global grace floor — the exact per-job semantics until the
+		// reservation schema exists. Selected up front: an undefined-column
+		// failure would abort the transaction (25P02).
+		err = tx.QueryRow(ctx, `
+			SELECT balance_cents, remainder_micro_usd
+			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		// No wallet: every resale entry is durable debt, exactly like the
 		// per-job path's no_wallet disposition. The wallet UPDATE below is
@@ -328,15 +405,6 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 			out[e.JobID] = BatchDisposition{Reason: ReasonNoWallet}
 		}
 		return nil
-	}
-	if isUndefinedColumn(err) {
-		// Pre-reservation schema (grace_floor_cents lands with NEXT-18a's
-		// migration): read the row without the column and fall back to the
-		// global grace floor — the exact per-job semantics until the
-		// reservation schema exists.
-		err = tx.QueryRow(ctx, `
-			SELECT balance_cents, remainder_micro_usd
-			FROM org_credits WHERE org_id = $1 FOR UPDATE`, orgID).Scan(&balance, &remainder)
 	}
 	if err != nil {
 		return fmt.Errorf("settlement batch wallet read: %w", err)
@@ -356,13 +424,22 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 		// idempotency read → floor math). A replayed job whose charge
 		// already committed settles as a no-op regardless of the wallet's
 		// current depth under the floor; the §5.5 equivalence is defined on
-		// that order.
-		existingOrg, exists, err := existingUsageOrg(ctx, tx, e.RequestID)
+		// that order. The lookup domain follows the entry identity, the
+		// same key split as the per-job DeductMicroInvocation check.
+		existingOrg, storedMicro, exists, err := existingUsageOrg(ctx, tx, e.RequestID, e.InvocationID, schema)
 		if err != nil {
 			return err
 		}
 		if exists {
 			if existingOrg != orgID {
+				out[e.JobID] = BatchDisposition{Reason: ReasonIdentityConflict}
+				continue
+			}
+			if e.InvocationID != "" && storedMicro != -int64(e.Amount) {
+				// The minted identity already charged a DIFFERENT amount —
+				// the per-job path's ErrChargeIdentityConflict check: a
+				// replay must never silently settle a changed amount, and
+				// the earlier charge must never be silently re-based.
 				out[e.JobID] = BatchDisposition{Reason: ReasonIdentityConflict}
 				continue
 			}
@@ -377,7 +454,7 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 			out[e.JobID] = BatchDisposition{Reason: ReasonInsufficientCredits}
 			continue
 		}
-		if err := insertWalletLedgerRow(ctx, tx, orgID, e, newBalance, chargeCents); err != nil {
+		if err := insertWalletLedgerRow(ctx, tx, orgID, e, newBalance, chargeCents, schema); err != nil {
 			return err
 		}
 		balance, remainder = newBalance, newRemainder
@@ -396,29 +473,61 @@ func settleWalletEntries(ctx context.Context, tx pgx.Tx, orgID string, graceFloo
 }
 
 // existingUsageOrg reads the idempotency state of one usage identity: the
-// owning org when the ledger already has the row. The per-org advisory lock
-// makes the read stable against concurrent writers, exactly like the
-// per-job path's idempotency SELECT.
-func existingUsageOrg(ctx context.Context, tx pgx.Tx, requestID string) (org string, exists bool, err error) {
-	err = tx.QueryRow(ctx, `
-		SELECT org_id FROM credit_transactions
-		WHERE request_id = $1 AND type = 'usage'`, requestID).Scan(&org)
+// owning org (and the stored signed µUSD amount for the invocation domain)
+// when the ledger already has the row. An invocation-bearing entry looks
+// up its minted uuid (globally unique; the charged org and the exact
+// signed amount are re-verified, mirroring the per-job
+// DeductMicroInvocation check — a foreign org or a changed amount is an
+// identity conflict, never a charge and never a silent re-settle). A
+// legacy entry keeps the global-on-request_id lookup over the
+// NULL-invocation domain: the exact pre-0029 cross-tenant conflict
+// semantics, with invocation rows that merely share the request id text
+// excluded. The per-org advisory lock makes the read stable against
+// concurrent writers, exactly like the per-job path's idempotency SELECT.
+// The statement is selected by the batch's one-time schema probe — an
+// invocation-bearing entry on a pre-0028 ledger is refused loudly instead
+// of being downgraded to the legacy domain.
+func existingUsageOrg(ctx context.Context, tx pgx.Tx, requestID, invocationID string, schema batchSchema) (org string, storedMicro int64, exists bool, err error) {
+	if invocationID != "" {
+		if !schema.hasInvocationColumn {
+			return "", 0, false, fmt.Errorf(
+				"settlement batch: invocation usage identity %q on a ledger without the invocation column — refusing the legacy domain", invocationID)
+		}
+		err = tx.QueryRow(ctx, `
+			SELECT org_id, amount_micro_usd FROM credit_transactions
+			WHERE invocation_id = $1 AND type = 'usage'`, invocationID).Scan(&org, &storedMicro)
+	} else if schema.hasInvocationColumn {
+		err = tx.QueryRow(ctx, `
+			SELECT org_id FROM credit_transactions
+			WHERE request_id = $1 AND invocation_id IS NULL AND type = 'usage'`, requestID).Scan(&org)
+	} else {
+		// Pre-0028 ledger: the original global usage lookup.
+		err = tx.QueryRow(ctx, `
+			SELECT org_id FROM credit_transactions
+			WHERE request_id = $1 AND type = 'usage'`, requestID).Scan(&org)
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
-		return "", false, nil
+		return "", 0, false, nil
 	}
 	if err != nil {
-		return "", false, fmt.Errorf("settlement batch idempotency read: %w", err)
+		return "", 0, false, fmt.Errorf("settlement batch idempotency read: %w", err)
 	}
-	return org, true, nil
+	return org, storedMicro, true, nil
 }
 
-// insertWalletLedgerRow writes one usage row. The production partial unique
-// index backs the idempotency read above (§5.5 ON CONFLICT DO NOTHING): the
+// insertWalletLedgerRow writes one usage row. The statement follows the
+// entry's identity domain, selected by the batch's one-time schema probe:
+// on the 0028+ ledger an invocation-bearing entry inserts the minted uuid
+// and dedupes on uniq_credit_transactions_invocation while a legacy entry
+// inserts NULL and keeps the global-on-request_id arbiter of
+// uniq_credit_transactions_usage_legacy; on a pre-0028 ledger only the
+// legacy domain exists (original statement and original global arbiter)
+// and an invocation-bearing entry is refused — never downgraded. The
 // advisory lock makes a race impossible, the arbiter keeps the insert safe
-// even if a foreign writer ever bypassed the lock, and a swallowed conflict
-// would under-charge — so a zero-row insert is an explicit error, never a
-// silent no-op.
-func insertWalletLedgerRow(ctx context.Context, tx pgx.Tx, orgID string, e SettleEntry, balanceAfter, chargeCents int64) error {
+// even if a foreign writer ever bypassed the lock, and a swallowed
+// conflict would under-charge — so a zero-row insert is an explicit error,
+// never a silent no-op.
+func insertWalletLedgerRow(ctx context.Context, tx pgx.Tx, orgID string, e SettleEntry, balanceAfter, chargeCents int64, schema batchSchema) error {
 	var rp struct {
 		Model     string `json:"model"`
 		TokensIn  int64  `json:"tokens_in"`
@@ -431,11 +540,38 @@ func insertWalletLedgerRow(ctx context.Context, tx pgx.Tx, orgID string, e Settl
 		"amount_micro_usd": int64(e.Amount),
 	})
 
-	tag, err := tx.Exec(ctx, `
-		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd)
-		VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6)
-		ON CONFLICT (request_id) WHERE request_id IS NOT NULL AND type = 'usage' DO NOTHING`,
-		orgID, -chargeCents, balanceAfter, e.RequestID, string(meta), -int64(e.Amount))
+	var tag pgconn.CommandTag
+	var err error
+	switch {
+	case e.InvocationID != "" && schema.hasInvocationColumn:
+		tag, err = tx.Exec(ctx, `
+			INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, invocation_id, metadata, amount_micro_usd)
+			VALUES ($1, $2, $3, 'usage', $4, $5, $6::jsonb, $7)
+			ON CONFLICT (invocation_id) WHERE invocation_id IS NOT NULL AND type = 'usage' DO NOTHING`,
+			orgID, -chargeCents, balanceAfter, e.RequestID, e.InvocationID, string(meta), -int64(e.Amount))
+	case e.InvocationID == "" && schema.hasInvocationColumn:
+		tag, err = tx.Exec(ctx, `
+			INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, invocation_id, metadata, amount_micro_usd)
+			VALUES ($1, $2, $3, 'usage', $4, NULL, $5::jsonb, $6)
+			ON CONFLICT (request_id) WHERE request_id IS NOT NULL AND invocation_id IS NULL AND type = 'usage' DO NOTHING`,
+			orgID, -chargeCents, balanceAfter, e.RequestID, string(meta), -int64(e.Amount))
+	case e.InvocationID == "" && !schema.hasInvocationColumn:
+		// Pre-0028 ledger: the original single-domain statement with its
+		// original global arbiter — the index 0029 contracts away still
+		// exists there, and no invocation rows can be produced on that
+		// schema.
+		tag, err = tx.Exec(ctx, `
+			INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd)
+			VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6)
+			ON CONFLICT (request_id) WHERE request_id IS NOT NULL AND type = 'usage' DO NOTHING`,
+			orgID, -chargeCents, balanceAfter, e.RequestID, string(meta), -int64(e.Amount))
+	default:
+		// Unreachable (the idempotency read refuses this state first) —
+		// kept as a loud guard so no future call path can silently bill
+		// an invocation under the shared legacy identity.
+		return fmt.Errorf(
+			"settlement batch ledger insert: invocation usage identity %q on a ledger without the invocation column — refusing the legacy domain", e.InvocationID)
+	}
 	if err != nil {
 		return fmt.Errorf("settlement batch ledger insert: %w", err)
 	}
@@ -796,11 +932,4 @@ func carryWalletCharge(balanceCents, remainderMicro, amountMicro, floorCents int
 		return balanceCents, remainderMicro, chargeCents, false
 	}
 	return newBalance, newRemainder, chargeCents, true
-}
-
-// isUndefinedColumn reports PostgreSQL SQLSTATE 42703 — the batch's only
-// schema-version fallback (org grace column pre-reservation-schema).
-func isUndefinedColumn(err error) bool {
-	var pgErr *pgconn.PgError
-	return errors.As(err, &pgErr) && pgErr.Code == "42703"
 }

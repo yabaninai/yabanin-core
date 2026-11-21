@@ -81,7 +81,8 @@ func TestExecuteJob_RefundShapedResaleJobIsPoisonNotRetry(t *testing.T) {
 
 			parked := db.execsBySubstring("status = 'requires_attention'")
 			require.Len(t, parked, 1, "a contract-violating wallet job parks as durable debt on the first attempt")
-			require.Len(t, parked[0].args, 2)
+			// (job id, truncated error, fencing token) — the fenced mark.
+			require.Len(t, parked[0].args, 3)
 			lastErr, ok := parked[0].args[1].(string)
 			require.True(t, ok)
 			require.Contains(t, lastErr, "invalid resale deduction charge",
