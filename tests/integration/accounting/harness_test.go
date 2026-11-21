@@ -494,9 +494,14 @@ func (s *stand) startLoggerd() {
 	}
 	s.procSeq++
 	logFile := filepath.Join(s.tempDir, fmt.Sprintf("loggerd-%d.log", s.procSeq))
-	s.loggerdCmd = s.spawn("loggerd", s.loggerdEnv, logFile)
+	cmd := s.spawn("loggerd", s.loggerdEnv, logFile)
+	s.loggerdCmd = cmd
 	t := s.t
-	t.Cleanup(func() { s.stopProc("loggerd", s.loggerdCmd) })
+	// Capture the cmd value, never the mutable field: after stop/restart
+	// the field points at a different process, and a field-reading
+	// closure would stop the replacement twice while its own registration
+	// did nothing.
+	t.Cleanup(func() { s.stopProc("loggerd", cmd) })
 }
 
 // stopLoggerd terminates the consumer process, leaving PostgreSQL, Redis,
@@ -531,9 +536,13 @@ func (s *stand) startGateway() {
 	}
 	s.procSeq++
 	logFile := filepath.Join(s.tempDir, fmt.Sprintf("gateway-%d.log", s.procSeq))
-	s.gatewayCmd = s.spawn("gateway", s.gatewayEnv, logFile)
+	cmd := s.spawn("gateway", s.gatewayEnv, logFile)
+	s.gatewayCmd = cmd
 	t := s.t
-	t.Cleanup(func() { s.stopProc("gateway", s.gatewayCmd) })
+	// Capture the cmd value, never the mutable field: killGatewaySIGKILL
+	// already reaps the killed process exactly once, and a field-reading
+	// closure would otherwise target the restart replacement twice.
+	t.Cleanup(func() { s.stopProc("gateway", cmd) })
 	s.waitHealthz(s.gatewayCmd, logFile)
 }
 
@@ -558,9 +567,16 @@ func (s *stand) spawn(sub string, env []string, logFile string) *exec.Cmd {
 }
 
 // stopProc terminates one product child process nil-safely, escalating to
-// SIGKILL after a grace period.
+// SIGKILL after a grace period. A process that was already reaped by an
+// explicit kill/wait (ProcessState set) is skipped: every process is
+// waited exactly once, by whichever path reaped it.
 func (s *stand) stopProc(sub string, cmd *exec.Cmd) {
 	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	if cmd.ProcessState != nil {
+		// Already terminated and waited (e.g. killGatewaySIGKILL or a
+		// prior stopProc); a second Wait would target a stale handle.
 		return
 	}
 	_ = cmd.Process.Signal(syscall.SIGTERM)
