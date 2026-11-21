@@ -3,6 +3,7 @@
 package accounting
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"os"
@@ -158,4 +159,39 @@ func TestFixtureSelfCheck(t *testing.T) {
 		t.Fatalf("fixture self-check: temp dir %s unexpectedly resolves as a Git worktree", dir)
 	}
 	t.Logf("fixture self-check passed (ledgers at %s)", dir)
+}
+
+func TestFixtureHeldPeerDisconnect(t *testing.T) {
+	f := startFixture(t, t.TempDir(), "unit-token")
+	t.Cleanup(f.stop)
+	const rid = "held-cancelled"
+	disconnected := f.Hold(rid)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, f.baseURL()+"/v1/chat/completions", strings.NewReader(`{"model":"m"}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Authorization", "Bearer unit-token")
+	req.Header.Set("X-Request-ID", rid)
+	done := make(chan error, 1)
+	go func() {
+		resp, err := http.DefaultClient.Do(req)
+		if resp != nil {
+			resp.Body.Close()
+		}
+		done <- err
+	}()
+	if !f.WaitForDispatch(rid, 5*time.Second) {
+		t.Fatal("request never reached the held provider")
+	}
+	cancel()
+	f.releaseAfterDisconnect(disconnected)
+	if err := <-done; err == nil {
+		t.Fatal("held request received a response after cancellation")
+	}
+	if a, d, r := f.Counts(rid); a != 1 || d != 1 || r != 0 {
+		t.Fatalf("cancelled request arrivals/dispatches/receipts = %d/%d/%d, want 1/1/0", a, d, r)
+	}
+	f.VerifyEvidence()
 }

@@ -158,8 +158,8 @@ func (f *fixture) serveTranscriptionRequest(w http.ResponseWriter, r *http.Reque
 	}
 
 	f.append("dispatches", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: true})
-	if ch := f.holdChan(rid); ch != nil {
-		<-ch
+	if !f.waitForResponseRelease(r, rid) {
+		return
 	}
 	reply := fixtureTranscribeReply()
 	if strings.Contains(filename, fixtureTranscribeBadUsageMark) {

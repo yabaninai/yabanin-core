@@ -91,7 +91,7 @@ type fixture struct {
 	arrivals   []fixtureRecord
 	dispatches []fixtureRecord
 	receipts   []fixtureRecord
-	hold       map[string]chan struct{}
+	hold       map[string]*responseHold
 	postTerm   map[string]chan struct{}
 	writeErr   error
 
@@ -107,7 +107,7 @@ func startFixture(t *testing.T, runDir string, token string) *fixture {
 		t:         t,
 		token:     token,
 		ledgerDir: filepath.Join(runDir, "fixture-ledgers"),
-		hold:      map[string]chan struct{}{},
+		hold:      map[string]*responseHold{},
 		postTerm:  map[string]chan struct{}{},
 	}
 	if err := os.MkdirAll(f.ledgerDir, 0o750); err != nil {
@@ -209,8 +209,8 @@ func (f *fixture) serve(w http.ResponseWriter, r *http.Request) {
 
 	// Hold barrier: place this request durably past dispatch with the
 	// response withheld until release.
-	if ch := f.holdChan(rid); ch != nil {
-		<-ch
+	if !f.waitForResponseRelease(r, rid) {
+		return
 	}
 
 	f.serveAccepted(w, r.URL.Path, rid, body)
@@ -705,23 +705,47 @@ func streamFrame(payload any) string {
 	return "data: " + string(data) + "\n\n"
 }
 
-// holdChan returns the release channel when the request is held.
-func (f *fixture) holdChan(rid string) <-chan struct{} {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	if ch, ok := f.hold[rid]; ok {
-		return ch
-	}
-	return nil
+type responseHold struct {
+	release      chan struct{}
+	disconnected chan struct{}
+	once         sync.Once
 }
 
-// Hold arms the hold barrier for rid. The provider will accept and record
-// the dispatch, then withhold the response until ReleaseAll.
-func (f *fixture) Hold(rid string) {
+// waitForResponseRelease returns false when the caller disconnects while its
+// response is held. No response bytes have been written at this point.
+func (f *fixture) waitForResponseRelease(r *http.Request, rid string) bool {
+	f.mu.Lock()
+	hold := f.hold[rid]
+	f.mu.Unlock()
+	if hold == nil {
+		return true
+	}
+	select {
+	case <-r.Context().Done():
+		hold.once.Do(func() { close(hold.disconnected) })
+		return false
+	case <-hold.release:
+		return true
+	}
+}
+
+// Hold arms the response barrier and returns the peer-disconnect observation.
+func (f *fixture) Hold(rid string) <-chan struct{} {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	if _, ok := f.hold[rid]; !ok {
-		f.hold[rid] = make(chan struct{})
+	if f.hold[rid] == nil {
+		f.hold[rid] = &responseHold{release: make(chan struct{}), disconnected: make(chan struct{})}
+	}
+	return f.hold[rid].disconnected
+}
+
+func (f *fixture) releaseAfterDisconnect(disconnected <-chan struct{}) {
+	f.t.Helper()
+	select {
+	case <-disconnected:
+		f.ReleaseAll()
+	case <-time.After(10 * time.Second):
+		f.t.Fatal("fixture: provider did not observe peer disconnect while response was held")
 	}
 }
 
@@ -729,8 +753,8 @@ func (f *fixture) Hold(rid string) {
 func (f *fixture) ReleaseAll() {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	for rid, ch := range f.hold {
-		close(ch)
+	for rid, hold := range f.hold {
+		close(hold.release)
 		delete(f.hold, rid)
 	}
 }
