@@ -851,13 +851,13 @@ func TestMessagesNative_KeepaliveForwardedWhileUpstreamOpen(t *testing.T) {
 	defer resp.Body.Close()
 
 	lines := make(chan string, 16)
-	go func() {
-		sc := bufio.NewScanner(resp.Body)
+	go func(reader io.Reader) {
+		sc := bufio.NewScanner(reader)
 		for sc.Scan() {
 			lines <- sc.Text()
 		}
 		close(lines)
-	}()
+	}(resp.Body)
 
 	select {
 	case first, ok := <-lines:
@@ -1036,7 +1036,7 @@ func TestRealtime_OversizedLineAbortsBounded(t *testing.T) {
 	rec := httptest.NewRecorder()
 
 	gw := &gateway{}
-	usage, _, term, drainErr, _ := gw.realtimeRelay(context.Background(), rec, rec, strings.NewReader(realtimeWhole+big+"\n\nmore\n"), nil)
+	usage, _, term, _, drainErr := gw.realtimeRelay(context.Background(), rec, rec, strings.NewReader(realtimeWhole+big+"\n\nmore\n"), nil)
 	raw := rec.Body.String()
 	var tooLarge errRealtimeLineTooLarge
 	if !errors.As(drainErr, &tooLarge) {

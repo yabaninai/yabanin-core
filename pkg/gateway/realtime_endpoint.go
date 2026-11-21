@@ -200,7 +200,7 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	// successful terminal (response.done status completed) until the
 	// terminal facts commit below — the chat [DONE] hold canon.
 	tail := &ssePassthroughTail{w: w}
-	usage, tee, term, drainErr, hold := gw.realtimeRelay(rctx, tail, tail, resp.Body, cancelStream)
+	usage, tee, term, hold, drainErr := gw.realtimeRelay(rctx, tail, tail, resp.Body, cancelStream)
 	// Cancellation cleanup: the spill file is removed on every exit —
 	// release/drop are idempotent and cleanup is safe to call again.
 	defer hold.cleanup()
@@ -389,7 +389,7 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 // way. Returns the parsed usage, the tee, the hold, the drain error (nil on
 // clean EOF; a write failure settles as a client cancel) and its Finalize
 // termination class (§5.3).
-func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, flusher http.Flusher, body io.Reader, cancelStream context.CancelFunc) (usage provider.Usage, tee *boundedBuffer, term budget.Termination, drainErr error, hold *realtimeTerminalHold) {
+func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, flusher http.Flusher, body io.Reader, cancelStream context.CancelFunc) (usage provider.Usage, tee *boundedBuffer, term budget.Termination, hold *realtimeTerminalHold, drainErr error) {
 	var capture boundedBuffer
 	tee = &capture
 	var parser apiformat.SSEParser
@@ -451,19 +451,19 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 	// line/frame is an upstream abort; any other error is a failed client
 	// write — the client walked away mid-session, and the consumed
 	// prefix is billed by the caller (G3 cancel-settle parity).
-	lineAbort := func(lerr error) (provider.Usage, *boundedBuffer, budget.Termination, error, *realtimeTerminalHold) {
+	lineAbort := func(lerr error) (provider.Usage, *boundedBuffer, budget.Termination, *realtimeTerminalHold, error) {
 		var tooLarge errRealtimeLineTooLarge
 		if errors.As(lerr, &tooLarge) {
-			return usage, tee, budget.TerminationUpstreamErr, lerr, hold
+			return usage, tee, budget.TerminationUpstreamErr, hold, lerr
 		}
 		var holdIO errRealtimeHoldIO
 		if errors.As(lerr, &holdIO) {
 			// Clean exhaustion: the spool failed BEFORE any suffix byte was
 			// delivered — no successful terminal was seen, so the drain
 			// error path stays terminal-safe.
-			return usage, tee, budget.TerminationUpstreamErr, lerr, hold
+			return usage, tee, budget.TerminationUpstreamErr, hold, lerr
 		}
-		return usage, tee, budget.TerminationClientCancel, lerr, hold
+		return usage, tee, budget.TerminationClientCancel, hold, lerr
 	}
 	// settleTail ends the framing at a stream break or clean EOF: the
 	// splitter's trailing lone CR resolves into a complete line (the CR
@@ -503,7 +503,7 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			if relayed > realtimeStreamLimit {
 				// Never truncate an SSE stream mid-event: the relay aborts
 				// as an upstream error at the cap.
-				return usage, tee, budget.TerminationUpstreamErr, errRealtimeStreamTooLarge{}, hold
+				return usage, tee, budget.TerminationUpstreamErr, hold, errRealtimeStreamTooLarge{}
 			}
 			_, _ = capture.Write(chunk)
 			for _, ev := range parser.Feed(chunk) {
@@ -522,7 +522,7 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			if lines.Pending() > apiformat.SSEStreamLineLimit {
 				// An unterminated line grew past the buffering limit: the
 				// relay aborts as an upstream error (bounded memory).
-				return usage, tee, budget.TerminationUpstreamErr, errRealtimeLineTooLarge{}, hold
+				return usage, tee, budget.TerminationUpstreamErr, hold, errRealtimeLineTooLarge{}
 			}
 		}
 		if werr != nil {
@@ -531,7 +531,7 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			// paid work for a client that is gone. The usage parser was
 			// fed above from every byte this chunk carried, so the usage
 			// already covers what was paid for.
-			return usage, tee, budget.TerminationClientCancel, werr, hold
+			return usage, tee, budget.TerminationClientCancel, hold, werr
 		}
 		if rerr == io.EOF {
 			// Clean end: EOF is not a drain failure; the tail settles with
@@ -542,9 +542,9 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 				return lineAbort(lerr)
 			}
 			if werr != nil {
-				return usage, tee, budget.TerminationClientCancel, werr, hold
+				return usage, tee, budget.TerminationClientCancel, hold, werr
 			}
-			return usage, tee, budget.TerminationCompleted, nil, hold
+			return usage, tee, budget.TerminationCompleted, hold, nil
 		}
 		if rerr != nil {
 			// Broken upstream: same boundary-aligned salvage as EOF — the
@@ -555,7 +555,7 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 				return lineAbort(lerr)
 			}
 			if werr != nil {
-				return usage, tee, budget.TerminationClientCancel, werr, hold
+				return usage, tee, budget.TerminationClientCancel, hold, werr
 			}
 			switch {
 			case idle != nil && idle.Fired():
@@ -563,7 +563,7 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			case rctx.Err() != nil:
 				term = budget.TerminationClientCancel
 			}
-			return usage, tee, term, rerr, hold
+			return usage, tee, term, hold, rerr
 		}
 	}
 }

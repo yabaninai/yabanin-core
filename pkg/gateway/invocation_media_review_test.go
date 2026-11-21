@@ -102,7 +102,9 @@ func TestReviewMediaKnownUsageAfterDisconnect(t *testing.T) {
 				if timing == "after_read" {
 					require.Empty(t, rec.Body.String())
 				} else {
-					require.Equal(t, []byte(reviewMediaResult), rec.Body.Bytes())
+					if !bytes.Equal([]byte(reviewMediaResult), rec.Body.Bytes()) {
+						t.Fatalf("media response changed on the wire: %q", rec.Body.Bytes())
+					}
 				}
 			})
 		}
