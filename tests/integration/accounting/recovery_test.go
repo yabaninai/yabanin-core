@@ -168,25 +168,7 @@ func (s *stand) requireDurableStartAtBarrier(t *testing.T, rid string) durableSt
 func (s *stand) requireInFlightIdentityBeforeGrace(t *testing.T, rid string, start durableStart) {
 	t.Helper()
 	if start.invocationUUID != "" {
-		rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-		switch {
-		case len(rows) == 0:
-			t.Fatalf("product: recovery case: the admitted request %s vanished from request_admissions after the restart — silently dropped, not recoverable", rid)
-		case len(rows) > 1:
-			t.Fatalf("product: recovery case: %d admission rows for %s after the restart (%s), want exactly the barrier row — duplicate accounting", len(rows), rid, fmtAdmissions(rows))
-		}
-		a := rows[0]
-		requireAdmissionVocabulary(t, a)
-		if a.InvocationID != start.invocationUUID {
-			t.Fatalf("product: recovery case: in-flight identity changed across the restart: barrier invocation %s, now %s — the admitted request was replaced, not recovered", start.invocationUUID, a.InvocationID)
-		}
-		if a.State != "admitted" {
-			t.Fatalf("product: recovery case: admission %s is %q before the grace window has elapsed (%s), want 'admitted' — premature unresolved, or a void/reconcile fabricated without evidence", a.InvocationID, a.State, fmtAdmissions(rows))
-		}
-		if a.ResolvedAt.Valid {
-			t.Fatalf("product: recovery case: admission %s carries resolved_at=%s while still admitted pre-grace — contradictory resolution record", a.InvocationID, a.ResolvedAt.Time.Format(time.RFC3339))
-		}
-		t.Logf("product: recovery case: in-flight identity preserved across restart (invocation=%s state=%q)", a.InvocationID, a.State)
+		s.requireAdmissionIdentityBeforeGrace(t, rid, start)
 	}
 
 	// No fabricated terminal evidence: the provider response was never
@@ -202,14 +184,7 @@ func (s *stand) requireInFlightIdentityBeforeGrace(t *testing.T, rid string, sta
 	// rows is acceptable on an admissions build.
 	logRows := s.oracleRequestLogRows(t, rid, s.oracleDB.orgID)
 	requireNoFabricatedRequestLogRows(t, rid, s.oracleDB.orgID, logRows, "product: recovery case: after restart")
-	switch {
-	case start.invocationUUID == "" && len(logRows) == 0 && start.hadRequestLog:
-		t.Fatalf("product: recovery case: the request_logs start row for %s did not survive the gateway restart — the attempt became undiscoverable", rid)
-	case start.invocationUUID == "" && len(logRows) == 0:
-		t.Fatalf("product: recovery case: crashed request %s is discoverable nowhere after restart (request_logs=0, request_admissions table absent)", rid)
-	case start.invocationUUID != "" && len(logRows) == 0:
-		t.Logf("product: recovery case: no request_logs row for %s (acceptable pre-grace: the admission row is the durable record; legacy materialization is not waited for)", rid)
-	}
+	requireCrashedRequestDiscoverable(t, rid, start, logRows)
 
 	// No charge without evidence: zero terminal facts must mean zero
 	// usage transactions and zero settlement jobs for this request.
@@ -220,6 +195,49 @@ func (s *stand) requireInFlightIdentityBeforeGrace(t *testing.T, rid string, sta
 	}
 	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs != 0 {
 		t.Fatalf("product: recovery case: %d settlement job(s) for %s although zero terminal facts exist — settlement without evidence", jobs, rid)
+	}
+}
+
+// requireAdmissionIdentityBeforeGrace asserts the admission row itself
+// survived the restart unchanged: exactly one row under the barrier
+// invocation UUID, still 'admitted', nothing resolved.
+func (s *stand) requireAdmissionIdentityBeforeGrace(t *testing.T, rid string, start durableStart) {
+	t.Helper()
+	rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
+	switch {
+	case len(rows) == 0:
+		t.Fatalf("product: recovery case: the admitted request %s vanished from request_admissions after the restart — silently dropped, not recoverable", rid)
+	case len(rows) > 1:
+		t.Fatalf("product: recovery case: %d admission rows for %s after the restart (%s), want exactly the barrier row — duplicate accounting", len(rows), rid, fmtAdmissions(rows))
+	}
+	a := rows[0]
+	requireAdmissionVocabulary(t, a)
+	if a.InvocationID != start.invocationUUID {
+		t.Fatalf("product: recovery case: in-flight identity changed across the restart: barrier invocation %s, now %s — the admitted request was replaced, not recovered", start.invocationUUID, a.InvocationID)
+	}
+	if a.State != "admitted" {
+		t.Fatalf("product: recovery case: admission %s is %q before the grace window has elapsed (%s), want 'admitted' — premature unresolved, or a void/reconcile fabricated without evidence", a.InvocationID, a.State, fmtAdmissions(rows))
+	}
+	if a.ResolvedAt.Valid {
+		t.Fatalf("product: recovery case: admission %s carries resolved_at=%s while still admitted pre-grace — contradictory resolution record", a.InvocationID, a.ResolvedAt.Time.Format(time.RFC3339))
+	}
+	t.Logf("product: recovery case: in-flight identity preserved across restart (invocation=%s state=%q)", a.InvocationID, a.State)
+}
+
+// requireCrashedRequestDiscoverable asserts the crashed request is still
+// discoverable somewhere after the restart: with an admission row, zero
+// request_logs rows are acceptable pre-grace (the admission row is the
+// durable record); without one, the request_logs start row itself must
+// have survived.
+func requireCrashedRequestDiscoverable(t *testing.T, rid string, start durableStart, logRows []requestRow) {
+	t.Helper()
+	switch {
+	case start.invocationUUID == "" && len(logRows) == 0 && start.hadRequestLog:
+		t.Fatalf("product: recovery case: the request_logs start row for %s did not survive the gateway restart — the attempt became undiscoverable", rid)
+	case start.invocationUUID == "" && len(logRows) == 0:
+		t.Fatalf("product: recovery case: crashed request %s is discoverable nowhere after restart (request_logs=0, request_admissions table absent)", rid)
+	case start.invocationUUID != "" && len(logRows) == 0:
+		t.Logf("product: recovery case: no request_logs row for %s (acceptable pre-grace: the admission row is the durable record; legacy materialization is not waited for)", rid)
 	}
 }
 

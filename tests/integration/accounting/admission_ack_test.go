@@ -48,26 +48,52 @@ func (r *ackRelay) take(pid uint32) *ackCut {
 	delete(r.cuts, pid)
 	return cut
 }
+
+// ackFrameState tracks the backend identity the reply stream has
+// announced so far: the K-frame backend pid and the C-frame command tag
+// of the transaction whose completion is still pending.
+type ackFrameState struct {
+	pid     uint32
+	command string
+}
+
+// observe folds one PostgreSQL reply frame into the tracked state.
+func (st *ackFrameState) observe(frame []byte) {
+	size := len(frame) - 5
+	if frame[0] == 'K' && size == 8 {
+		st.pid = binary.BigEndian.Uint32(frame[5:9])
+	}
+	if frame[0] == 'C' {
+		st.command = strings.TrimSuffix(string(frame[5:]), "\x00")
+	}
+}
+
+// isIdleSync reports whether the frame is the backend's ReadyForQuery
+// with the idle transaction status ('Z' + "I").
+func isIdleSync(frame []byte) bool {
+	return len(frame) == 6 && frame[0] == 'Z' && frame[5] == 'I'
+}
+
+// deliverHeldCommit runs the armed cut for a backend, if one is parked on
+// it, at the moment its transaction-ready reply must be withheld.
+func (r *ackRelay) deliverHeldCommit(ctx context.Context, client net.Conn, st ackFrameState) error {
+	if cut := r.take(st.pid); cut != nil {
+		return cut.deliver(ctx, client, st.command)
+	}
+	return nil
+}
+
 func (r *ackRelay) copyReplies(ctx context.Context, client net.Conn, backend io.Reader) error {
-	var pid uint32
-	var command string
+	var st ackFrameState
 	for {
 		frame, err := readAckFrame(backend)
 		if err != nil {
 			return err
 		}
-		size := len(frame) - 5
-		if frame[0] == 'K' && size == 8 {
-			pid = binary.BigEndian.Uint32(frame[5:9])
-		}
-		if frame[0] == 'C' {
-			command = strings.TrimSuffix(string(frame[5:]), "\x00")
-		}
-		if frame[0] == 'Z' && size == 1 && frame[5] == 'I' {
-			if cut := r.take(pid); cut != nil {
-				if err := cut.deliver(ctx, client, command); err != nil {
-					return err
-				}
+		st.observe(frame)
+		if isIdleSync(frame) {
+			if err := r.deliverHeldCommit(ctx, client, st); err != nil {
+				return err
 			}
 		}
 		if err := client.SetWriteDeadline(time.Now().Add(5 * time.Second)); err != nil {
@@ -214,6 +240,53 @@ func (s *stand) ackRequest(ctx context.Context, rid string) ackResponse {
 	return out
 }
 
+// awaitGatewayAdmissionLock polls the catalog until the gateway's
+// backend is visibly blocked on the admission advisory lock and returns
+// that backend's pid.
+func awaitGatewayAdmissionLock(ctx context.Context, t *testing.T, db *sql.DB) uint32 {
+	t.Helper()
+	var pid uint32
+	require.Eventually(t, func() bool {
+		err := db.QueryRowContext(ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING(pid)
+   WHERE a.application_name='acceptance_ack_gateway' AND l.locktype='advisory'
+   AND l.classid=1921 AND l.objid=112 AND NOT l.granted`).Scan(&pid)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false
+		}
+		return err == nil && pid > 0
+	}, 8*time.Second, 10*time.Millisecond, "gateway did not reach the admission trigger")
+	return pid
+}
+
+// awaitHeldCommitReply waits until the withheld transaction-ready reply
+// is observed; the client returning before that reply is a failure.
+func awaitHeldCommitReply(ctx context.Context, t *testing.T, cut *ackCut, result chan ackResponse) {
+	t.Helper()
+	select {
+	case command := <-cut.held:
+		require.Contains(t, []string{"INSERT 0 1", "COMMIT"}, command, "expected the completion exchange for this admission")
+		t.Logf("gateway backend completed %s and its transaction-ready reply is held", command)
+	case r := <-result:
+		t.Fatalf("client returned before commit reply: %d %v", r.status, r.err)
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
+// requireDiscardedAckResponse asserts the discard path's client-visible
+// outcome: the HTTP response began only after the selected connection
+// was closed.
+func requireDiscardedAckResponse(ctx context.Context, t *testing.T, cut *ackCut, resp ackResponse) {
+	t.Helper()
+	select {
+	case at := <-cut.discarded:
+		require.False(t, resp.at.IsZero(), "missing HTTP first-byte observation")
+		require.False(t, resp.at.Before(at), "HTTP response began before the selected connection was closed")
+	case <-ctx.Done():
+		t.Fatal(ctx.Err())
+	}
+}
+
 func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn, rid string, forward bool) string {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
@@ -231,28 +304,11 @@ func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn,
 		result <- s.ackRequest(ctx, rid)
 	}()
 	defer func() { cancel(); <-done }()
-	var pid uint32
-	require.Eventually(t, func() bool {
-		err := db.QueryRowContext(ctx, `SELECT l.pid FROM pg_locks l JOIN pg_stat_activity a USING(pid)
-   WHERE a.application_name='acceptance_ack_gateway' AND l.locktype='advisory'
-   AND l.classid=1921 AND l.objid=112 AND NOT l.granted`).Scan(&pid)
-		if errors.Is(err, sql.ErrNoRows) {
-			return false
-		}
-		return err == nil && pid > 0
-	}, 8*time.Second, 10*time.Millisecond, "gateway did not reach the admission trigger")
+	pid := awaitGatewayAdmissionLock(ctx, t, db)
 	t.Logf("holding transaction-ready acknowledgement for request %s backend %d", rid, pid)
 	cut := relay.arm(pid)
 	require.NoError(t, lock.Commit())
-	select {
-	case command := <-cut.held:
-		require.Contains(t, []string{"INSERT 0 1", "COMMIT"}, command, "expected the completion exchange for this admission")
-		t.Logf("gateway backend %d completed %s and its transaction-ready reply is held", pid, command)
-	case r := <-result:
-		t.Fatalf("client returned before commit reply: %d %v", r.status, r.err)
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
+	awaitHeldCommitReply(ctx, t, cut, result)
 	var id string
 	require.NoError(t, db.QueryRowContext(ctx, `SELECT invocation_id::text FROM request_admissions WHERE client_request_id=$1 AND org_id=$2`, rid, s.oracleDB.orgID).Scan(&id))
 	t.Logf("independent database observation confirmed invocation %s for request %s", id, rid)
@@ -276,13 +332,7 @@ func (s *stand) exerciseStartAck(t *testing.T, relay *ackRelay, other *sql.Conn,
 		require.Contains(t, resp.body, fixtureAssistantContent)
 		return id
 	}
-	select {
-	case at := <-cut.discarded:
-		require.False(t, resp.at.IsZero(), "missing HTTP first-byte observation")
-		require.False(t, resp.at.Before(at), "HTTP response began before the selected connection was closed")
-	case <-ctx.Done():
-		t.Fatal(ctx.Err())
-	}
+	requireDiscardedAckResponse(ctx, t, cut, resp)
 	code, ok := decodeErrorCode(resp.body)
 	require.Equal(t, 503, resp.status, resp.body)
 	require.True(t, ok)
