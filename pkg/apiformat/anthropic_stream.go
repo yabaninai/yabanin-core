@@ -542,6 +542,7 @@ func (s *AnthropicStreamWriter) writeFinalLocked(code int, extra http.Header, bo
 			dst.Add(key, value)
 		}
 	}
+	preserveRetryRefusal(dst, s.header)
 	dst.Set("Content-Type", "application/json")
 	s.dst.WriteHeader(code)
 	_, _ = s.dst.Write(body)

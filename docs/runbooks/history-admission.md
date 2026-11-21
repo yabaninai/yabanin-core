@@ -107,7 +107,7 @@ same value and incur a separate charge.
 | Client observation | What happened | Client or operator action |
 | --- | --- | --- |
 | HTTP 503, `history_unavailable`, with a message that the paid call was not sent | The gateway could not confirm the durable start for that call. This applies even when the optional history probe is disabled or uses `allow_loss`. | Restore gateway write access to PostgreSQL. For a single refused call, retry after recovery. |
-| `accounting_commit_failed` after provider dispatch | The gateway could not confirm the terminal usage record. A streaming client can receive this error after HTTP 200 and some content. The provider may already have charged for the work. | Stop automatic retries. Retain the organization ID, request ID and time of the failure. Check the invocation before issuing any new request. |
+| `accounting_commit_failed` after provider dispatch | The gateway could not confirm the terminal usage record. Buffered errors include `X-Should-Retry: false` for clients that honor the hint. A streaming client can receive the error after HTTP 200 and some content. The provider may already have charged for the work. | Stop automatic retries. Retain the organization ID, request ID and time of the failure. Check the invocation before issuing any new request. |
 | Connection lost with no final response | The client has no reliable evidence of how far the request progressed. | Use the same lookup before deciding whether to retry. |
 
 An operator with authorized database access can inspect the attempt with

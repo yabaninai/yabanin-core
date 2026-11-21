@@ -509,6 +509,7 @@ func (s *ResponsesStreamWriter) finishErrorLocked() {
 	}
 	s.finished = true
 	body := normalizeResponsesError(s.buf.Bytes())
+	preserveRetryRefusal(s.dst.Header(), s.header)
 	s.dst.Header().Set("Content-Type", "application/json")
 	code := s.status
 	if code == 0 {
