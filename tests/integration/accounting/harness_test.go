@@ -97,6 +97,10 @@ type stand struct {
 	ownerSeedEnv []string
 	// upstreamKeyFile is the fixture bearer token file passed to seed.
 	upstreamKeyFile string
+	// encKey is the stand's YABANIN_ENCRYPTION_KEY, retained so late
+	// owner-side provisioning can encrypt additional upstream credentials
+	// exactly like the seed path does.
+	encKey string
 
 	// procSeq disambiguates process log files across restarts.
 	procSeq int
@@ -301,6 +305,7 @@ func startStandWithGatewayEnv(t *testing.T, extraGatewayEnv ...string) *stand {
 		t.Fatalf("harness: encryption key entropy: %v", err)
 	}
 	encKey := hex.EncodeToString(keyRaw)
+	s.encKey = encKey
 
 	// Owner login env: used by migrate and seed exactly like the
 	// quickstart's one-shot services (the controlled-elevation path).
