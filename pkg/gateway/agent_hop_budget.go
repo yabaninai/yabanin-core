@@ -183,42 +183,10 @@ func (c *budgetedJudgeClient) JudgeChat(ctx context.Context, req llmjudge.ChatRe
 	}
 	start := c.now()
 
-	// 1. Loop bound: one external request cannot spin internal model hops
-	// unboundedly. Fail-closed — over the cap, the hop does not run.
-	if err := c.loop.Admit(agentHopEpisode(ctx)); err != nil {
-		return llmjudge.ChatResponse{}, fmt.Errorf("judge loop budget: %w", err)
-	}
-
-	// 2. Agent budget (G2): the same fail-closed check admissionCore runs
-	// for interactive traffic, over the parent request's agent identity.
-	if p, ok := principalFrom(ctx); ok && c.agentEnforcer != nil && p.AgentID != "" {
-		if err := c.agentEnforcer.CheckAgentBudget(ctx, p.AgentID); err != nil {
-			return llmjudge.ChatResponse{}, fmt.Errorf("judge agent budget: %w", err)
-		}
-	}
-
-	// 2b. Workload cap (N06-P07-T04): the hop rides the parent request's
-	// workload identity (the label admissionCore stamped on the context)
-	// under the same opt-in per-replica cap, namespaced by the parent's org
-	// (req.Meta.Org — the same identity channel hopBudgetRequest uses) so
-	// identical workload names across orgs never share a window.
-	// Fail-closed — over cap, the hop does not run and the policy's
-	// on_error mode governs the outcome.
-	if err := sharedWorkloadLedger().Admit(req.Meta.Org, hopWorkloadScope(ctx), 0); err != nil {
-		return llmjudge.ChatResponse{}, fmt.Errorf("judge workload budget: %w", err)
-	}
-
-	// 3. Model resolution: "$(indirection)" refs resolve through the
-	// gateway's registry path; bare refs are served literally.
-	target, err := c.resolveTarget(ctx, req.ModelRef)
-	if err != nil {
-		return llmjudge.ChatResponse{}, err
-	}
-
-	// 4. §5 admission: estimate + reserve the hop against the SAME scopes
-	// the parent request was admitted under. An enforce-mode denial is
-	// terminal for the hop; shadow records would-deny and proceeds.
-	rsv, _, err := c.admitHop(ctx, req, target) // admitted=false always carries err != nil
+	// Steps 1–4 — loop bound, agent budget, workload cap, model resolution
+	// and §5 admission — run in admitJudgeHop, which preserves this
+	// sequence verbatim.
+	target, rsv, err := c.admitJudgeHop(ctx, req)
 	if err != nil {
 		return llmjudge.ChatResponse{}, err
 	}
@@ -241,14 +209,7 @@ func (c *budgetedJudgeClient) JudgeChat(ctx context.Context, req llmjudge.ChatRe
 		// Never-dispatched local failure: release the reserved escrow at
 		// zero spend and publish nothing — no terminal billed for a hop
 		// the provider never saw.
-		if rsv != nil {
-			walletActual, budgetActual := reservationActuals(0, 0)
-			c.admission.Finalize(rsv, walletActual, budgetActual)
-		}
-		if callErr != nil {
-			return llmjudge.ChatResponse{}, callErr
-		}
-		return llmjudge.ChatResponse{}, errors.New("judge hop never dispatched")
+		return llmjudge.ChatResponse{}, c.releaseUndispatched(rsv, callErr)
 	}
 
 	// 6. Settlement: exactly one request.completed per hop, on success AND
@@ -268,6 +229,70 @@ func (c *budgetedJudgeClient) JudgeChat(ctx context.Context, req llmjudge.ChatRe
 		return llmjudge.ChatResponse{}, err
 	}
 	return llmjudge.ChatResponse{Content: content, Model: target.Model}, nil
+}
+
+// admitJudgeHop runs the hop's pre-dispatch admission sequence (JudgeChat
+// steps 1–4), in order: loop bound, agent budget (G2), workload cap,
+// model resolution and §5 Plan/Reserve. Every check is fail-closed — over
+// any cap or on any denial the hop does not run and the policy's on_error
+// mode governs the outcome. It returns the resolved target and the §5
+// reservation (nil when the deploy admits without reservations — the same
+// shape the interactive reservationPlan uses); an error is terminal for
+// the hop.
+func (c *budgetedJudgeClient) admitJudgeHop(ctx context.Context, req llmjudge.ChatRequest) (llmjudge.Target, *budget.Reservation, error) {
+	// 1. Loop bound: one external request cannot spin internal model hops
+	// unboundedly.
+	if err := c.loop.Admit(agentHopEpisode(ctx)); err != nil {
+		return llmjudge.Target{}, nil, fmt.Errorf("judge loop budget: %w", err)
+	}
+
+	// 2. Agent budget (G2): the same fail-closed check admissionCore runs
+	// for interactive traffic, over the parent request's agent identity.
+	if p, ok := principalFrom(ctx); ok && c.agentEnforcer != nil && p.AgentID != "" {
+		if err := c.agentEnforcer.CheckAgentBudget(ctx, p.AgentID); err != nil {
+			return llmjudge.Target{}, nil, fmt.Errorf("judge agent budget: %w", err)
+		}
+	}
+
+	// 2b. Workload cap (N06-P07-T04): the hop rides the parent request's
+	// workload identity (the label admissionCore stamped on the context)
+	// under the same opt-in per-replica cap, namespaced by the parent's org
+	// (req.Meta.Org — the same identity channel hopBudgetRequest uses) so
+	// that identical workload names across orgs never share a window.
+	if err := sharedWorkloadLedger().Admit(req.Meta.Org, hopWorkloadScope(ctx), 0); err != nil {
+		return llmjudge.Target{}, nil, fmt.Errorf("judge workload budget: %w", err)
+	}
+
+	// 3. Model resolution: "$(indirection)" refs resolve through the
+	// gateway's registry path; bare refs are served literally.
+	target, err := c.resolveTarget(ctx, req.ModelRef)
+	if err != nil {
+		return llmjudge.Target{}, nil, err
+	}
+
+	// 4. §5 admission: estimate + reserve the hop against the SAME scopes
+	// the parent request was admitted under. An enforce-mode denial is
+	// terminal for the hop; shadow records would-deny and proceeds.
+	rsv, _, err := c.admitHop(ctx, req, target) // admitted=false always carries err != nil
+	if err != nil {
+		return llmjudge.Target{}, nil, err
+	}
+	return target, rsv, nil
+}
+
+// releaseUndispatched closes a hop whose confirmed start never committed:
+// it releases the reserved escrow at zero spend (no Finalize tuples are
+// published — nothing was billed) and surfaces the local failure, or a
+// sentinel when the transport reported success without dispatching.
+func (c *budgetedJudgeClient) releaseUndispatched(rsv *budget.Reservation, callErr error) error {
+	if rsv != nil {
+		walletActual, budgetActual := reservationActuals(0, 0)
+		c.admission.Finalize(rsv, walletActual, budgetActual)
+	}
+	if callErr != nil {
+		return callErr
+	}
+	return errors.New("judge hop never dispatched")
 }
 
 // agentHopEpisode keys the loop budget by the parent request's request id;
@@ -293,11 +318,8 @@ func (c *budgetedJudgeClient) resolveTarget(ctx context.Context, ref string) (ll
 // admitHop runs the §5 sections for one internal hop: Plan (estimate the
 // per-scope bounds from the judge payload + max tokens) then Reserve (the
 // hop is never cached, so there is no cache branch). Shadow would-deny
-// refusals land on the same metrics reservationPlan uses; enforce refusals
-// fail the hop.
-// admitHop runs the §5 sections for one internal hop: Plan (estimate the
-// per-scope bounds from the judge payload + max tokens) then Reserve (the
-// hop is never cached, so there is no cache branch). It reports
+// refusals land on the same metrics reservationPlan uses; enforce
+// refusals fail the hop. It reports
 // (reservation, admitted, err): admitted=false with err!=nil is a terminal
 // denial; admitted=true with a nil reservation is the unreserved proceed
 // (off mode / no controller / shadow refusal) — the same shape the
@@ -407,6 +429,38 @@ func buildJudgeHopBody(req llmjudge.ChatRequest, model string) judgeHopBody {
 	return b
 }
 
+// prepareJudgeHop runs every fallible local step of the wire round trip
+// (key lookup, client setup, request encoding, translation) BEFORE any
+// paid dispatch: a failure here means the hop never reached the provider,
+// so the caller releases the reservation at zero spend and settles
+// nothing. It mirrors the packaged judge client's setup sequence.
+func (c *budgetedJudgeClient) prepareJudgeHop(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target) (*upstream.Client, provider.Provider, []byte, string, error) {
+	key := ""
+	if c.keys != nil {
+		var err error
+		key, err = c.keys.ResolveJudgeKey(ctx, req.Meta.Org, target)
+		if err != nil {
+			return nil, nil, nil, "", fmt.Errorf("judge key resolve: %w", err)
+		}
+	}
+
+	cl, err := c.pool.Get(target.UpstreamURL, target.Provider)
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("judge upstream client: %w", err)
+	}
+	prov := cl.Adapter()
+
+	body, err := json.Marshal(buildJudgeHopBody(req, target.Model))
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("judge request encode: %w", err)
+	}
+	native, err := prov.TranslateRequest(body)
+	if err != nil {
+		return nil, nil, nil, "", fmt.Errorf("judge request translate: %w", err)
+	}
+	return cl, prov, native, key, nil
+}
+
 // call performs one translated chat.completions round trip against the
 // pooled upstream client for target, mirroring the packaged judge client
 // and returning the raw response body plus its EXACT parsed usage (the
@@ -418,30 +472,12 @@ func buildJudgeHopBody(req llmjudge.ChatRequest, model string) judgeHopBody {
 // commit itself): those hops never reached the provider, so the caller
 // releases the reservation and settles nothing. Once the start commits,
 // dispatched stays true through any later wire failure — the hop is
-// durably admitted and settles exactly once.
+// durably admitted and settles exactly once. There is no redispatch: the
+// confirmed start commits immediately before the single upstream Do.
 func (c *budgetedJudgeClient) call(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target, holder *invocationIdentity) (dispatched bool, respBody []byte, usage provider.Usage, statusCode int, callErr error) {
-	key := ""
-	if c.keys != nil {
-		var err error
-		key, err = c.keys.ResolveJudgeKey(ctx, req.Meta.Org, target)
-		if err != nil {
-			return false, nil, provider.Usage{}, 0, fmt.Errorf("judge key resolve: %w", err)
-		}
-	}
-
-	cl, err := c.pool.Get(target.UpstreamURL, target.Provider)
+	cl, prov, native, key, err := c.prepareJudgeHop(ctx, req, target)
 	if err != nil {
-		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge upstream client: %w", err)
-	}
-	prov := cl.Adapter()
-
-	body, err := json.Marshal(buildJudgeHopBody(req, target.Model))
-	if err != nil {
-		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge request encode: %w", err)
-	}
-	native, err := prov.TranslateRequest(body)
-	if err != nil {
-		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge request translate: %w", err)
+		return false, nil, provider.Usage{}, 0, err
 	}
 
 	extra := http.Header{}
@@ -456,12 +492,13 @@ func (c *budgetedJudgeClient) call(ctx context.Context, req llmjudge.ChatRequest
 
 	// Preview2 durable accounting: the confirmed start commits immediately
 	// BEFORE the actual paid dispatch — every fallible local step (key
-	// lookup, client setup, translation, method/header prep) has run above,
-	// so a local failure never strands a durable admission for a hop that
-	// never dispatched. Fail closed: an unwritten start (write error,
-	// timeout or lost ACK — outcome unknown) fails the hop with ZERO
-	// provider arrivals; the caller releases the reserved escrow at zero
-	// spend and the hop identity never dispatches later under this id.
+	// lookup, client setup, translation, method/header prep) has run in
+	// prepareJudgeHop, so a local failure never strands a durable
+	// admission for a hop that never dispatched. Fail closed: an
+	// unwritten start (write error, timeout or lost ACK — outcome
+	// unknown) fails the hop with ZERO provider arrivals; the caller
+	// releases the reserved escrow at zero spend and the hop identity
+	// never dispatches later under this id.
 	if err := holder.beginPaidDispatch(ctx, c.invocations, invocationKindJudge); err != nil {
 		return false, nil, provider.Usage{}, 0, fmt.Errorf("judge hop durable start: %w", err)
 	}
@@ -528,6 +565,48 @@ func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatReque
 	}
 	ext := provider.ComputeCost(usage, providerName, target.Model)
 
+	ev := c.hopSettleEvent(ctx, req, target, start, usage, statusCode, callErr, ext)
+
+	// §5.3 Finalize: record the hop's actual spend in the local escrow and
+	// stamp the reserve tuples on the event before publish.
+	if rsv != nil {
+		walletActual, budgetActual := reservationActuals(0, ext.EstimatedCostUSD)
+		c.admission.Finalize(rsv, walletActual, budgetActual)
+		ev.Reservations = rsv.TuplesJSON()
+	}
+
+	chargeHopWorkload(ctx, req.Meta.Org, ext.EstimatedCostUSD)
+	ev.Termination = hopTermination(ctx, callErr)
+
+	c.log.Debug("judge hop settled",
+		slog.String("endpoint", agentHopEndpoint),
+		slog.String("model", target.Model),
+		slog.Int64("tokens_in", usage.PromptTokens),
+		slog.Int64("tokens_out", usage.CompletionTokens),
+	)
+
+	// Preview2 durable accounting: stamp the hop's identity and commit the
+	// terminal facts BEFORE the publish — the finishRequest funnel order.
+	// A commit failure withholds the event entirely (never a published
+	// completion without its facts row); the escrow above already settled,
+	// and the reconciler's grace sweep owns the admitted row.
+	if h := invocationIdentityFrom(ctx); h != nil {
+		ev.InvocationID = h.ID()
+		if h.Admitted() {
+			if err := c.commitHopTerminal(ctx, h, ev); err != nil {
+				return err
+			}
+		}
+	}
+	publishEvent(c.publisher, c.log, ev) //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+	return nil
+}
+
+// hopSettleEvent assembles the hop's request.completed event: the shared
+// analytics shape carrying the EXACT upstream usage, the computed cost
+// (ext — computed once by the caller) and the source flags, with a failed
+// hop's error stamped on the event.
+func (c *budgetedJudgeClient) hopSettleEvent(ctx context.Context, req llmjudge.ChatRequest, target llmjudge.Target, start time.Time, usage provider.Usage, statusCode int, callErr error, ext provider.ExtendedUsage) *eventpub.Event {
 	ev := eventBase{
 		EventType:        "request.completed",
 		RequestID:        logctx.RequestID(ctx),
@@ -554,55 +633,37 @@ func (c *budgetedJudgeClient) settle(ctx context.Context, req llmjudge.ChatReque
 	if callErr != nil {
 		ev.Error = callErr.Error()
 	}
+	return ev
+}
 
-	// §5.3 Finalize: record the hop's actual spend in the local escrow and
-	// stamp the reserve tuples on the event before publish.
-	if rsv != nil {
-		walletActual, budgetActual := reservationActuals(0, ext.EstimatedCostUSD)
-		c.admission.Finalize(rsv, walletActual, budgetActual)
-		ev.Reservations = rsv.TuplesJSON()
+// chargeHopWorkload applies the workload chargeback (N06-P07-T04): the
+// hop's settled actual counts against its workload's windowed cap,
+// namespaced by the parent's org (org) exactly like the Admit check in
+// admitJudgeHop. Same quote rule as the consumer: positive or
+// exactly-zero quotes charge; unknown quotes contribute nothing. The
+// settle event already carries the workload label, so the durable
+// attribution does not depend on this in-memory ledger.
+func chargeHopWorkload(ctx context.Context, org string, costUSD float64) {
+	workload := hopWorkloadScope(ctx)
+	if workload == "" {
+		return
 	}
+	if quote, state := money.QuoteFromUSD(costUSD, true); state == money.QuotePositive || state == money.QuoteZero {
+		sharedWorkloadLedger().Charge(org, workload, quote)
+	}
+}
 
-	// Workload chargeback (N06-P07-T04): the hop's settled actual counts
-	// against its workload's windowed cap, namespaced by the parent's org
-	// (req.Meta.Org) exactly like the Admit check above. Same quote rule as
-	// the consumer: positive or exactly-zero quotes charge; unknown quotes
-	// contribute nothing. The event above already carries the workload
-	// label, so the durable attribution does not depend on this in-memory
-	// ledger.
-	if workload := hopWorkloadScope(ctx); workload != "" {
-		if quote, state := money.QuoteFromUSD(ext.EstimatedCostUSD, true); state == money.QuotePositive || state == money.QuoteZero {
-			sharedWorkloadLedger().Charge(req.Meta.Org, workload, quote)
-		}
-	}
+// hopTermination resolves the hop's settle termination: an upstream error
+// wins (even when usage is known — the hop's terminal class is the wire
+// failure); otherwise the parent request's completion termination applies.
+func hopTermination(ctx context.Context, callErr error) string {
 	if callErr != nil && budget.ValidTermination(budget.TerminationUpstreamErr) {
-		ev.Termination = string(budget.TerminationUpstreamErr)
-	} else if budget.ValidTermination(completionTermination(ctx)) {
-		ev.Termination = string(completionTermination(ctx))
+		return string(budget.TerminationUpstreamErr)
 	}
-
-	c.log.Debug("judge hop settled",
-		slog.String("endpoint", agentHopEndpoint),
-		slog.String("model", target.Model),
-		slog.Int64("tokens_in", usage.PromptTokens),
-		slog.Int64("tokens_out", usage.CompletionTokens),
-	)
-
-	// Preview2 durable accounting: stamp the hop's identity and commit the
-	// terminal facts BEFORE the publish — the finishRequest funnel order.
-	// A commit failure withholds the event entirely (never a published
-	// completion without its facts row); the escrow above already settled,
-	// and the reconciler's grace sweep owns the admitted row.
-	if h := invocationIdentityFrom(ctx); h != nil {
-		ev.InvocationID = h.ID()
-		if h.Admitted() {
-			if err := c.commitHopTerminal(ctx, h, ev); err != nil {
-				return err
-			}
-		}
+	if term := completionTermination(ctx); budget.ValidTermination(term) {
+		return string(term)
 	}
-	publishEvent(c.publisher, c.log, ev) //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-	return nil
+	return ""
 }
 
 // commitHopTerminal is the judge-hop seam of the finishRequest funnel
