@@ -246,10 +246,11 @@ export function useOrgPresentation(orgId?: string): OrgPresentation {
   // the actual org record via the supported single-org GET instead of
   // defaulting. Members never fetch here (the detail route is root-only).
   useEffect(() => {
-    if (!orgId || !mayResolveDetail(meLoading, me)) return
-    if (findPoolOrg(orgs, orgId) || directoryExtraFor(me, orgId)) return
+    const root = mayResolveDetail(meLoading, me) ? me : null
+    if (!orgId || !root) return
+    if (findPoolOrg(orgs, orgId) || directoryExtraFor(root, orgId)) return
     let alive = true
-    void beginOrgDetail(me, orgId).then((org) => {
+    void beginOrgDetail(root, orgId).then((org) => {
       if (alive && org) setDetailsVersion((v) => v + 1)
     })
     return () => {
