@@ -223,6 +223,7 @@ func TestCompletions_StreamBreakTornTailCompletesBeforeError(t *testing.T) {
 		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: upstreamSrv.URL, Enabled: true}},
 		pool:                 upstreampkg.NewPool(upstreampkg.Options{}),
+		invocations:          &fakeInvocationStore{},
 		streamUsageProviders: map[string]bool{"openai": true},
 		streamIdleTimeout:    0,
 	}
@@ -262,6 +263,7 @@ func TestCompletions_StreamBreakMidLineWithholdsPartialLine(t *testing.T) {
 		auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
 		res:                  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: upstreamSrv.URL, Enabled: true}},
 		pool:                 upstreampkg.NewPool(upstreampkg.Options{}),
+		invocations:          &fakeInvocationStore{},
 		streamUsageProviders: map[string]bool{"openai": true},
 		streamIdleTimeout:    0,
 	}

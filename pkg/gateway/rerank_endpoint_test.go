@@ -45,6 +45,12 @@ func postR105(t *testing.T, gw *gateway, path, body string, headers map[string]s
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	// Preview2 paid dispatch is fail-closed without tenant attribution —
+	// default the org header the way the edge always sets it in production;
+	// per-test overrides (residency fixtures) win.
+	if req.Header.Get("X-Org-Id") == "" {
+		req.Header.Set("X-Org-Id", "org-test")
+	}
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)

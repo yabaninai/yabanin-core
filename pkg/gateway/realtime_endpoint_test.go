@@ -353,6 +353,7 @@ func TestRealtime_ClientCancelSettlesConsumedPrefix(t *testing.T) {
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/realtime", strings.NewReader(`{"model":"m"}`))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)

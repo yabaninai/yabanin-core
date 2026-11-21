@@ -23,6 +23,7 @@ func postEmbeddings(t *testing.T, gw *gateway, body string) *httptest.ResponseRe
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/embeddings", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)
@@ -47,11 +48,12 @@ func TestEmbeddings_HappyPathUsageAndEvent(t *testing.T) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	var ev *eventpub.Event
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
@@ -112,11 +114,12 @@ func TestEmbeddings_Upstream500(t *testing.T) {
 	}))
 	defer server.Close()
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	rec := postEmbeddings(t, gw, `{"model":"m","input":"hello"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -145,11 +148,12 @@ func TestEmbeddings_EstimatedUsage(t *testing.T) {
 	}))
 	defer server.Close()
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": {ModelName: "m", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	var ev *eventpub.Event
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
@@ -172,11 +176,12 @@ func TestEmbeddings_BodyTooLargeThroughMaxBody(t *testing.T) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	r := chi.NewRouter()
 	r.Use(httpmw.MaxBody(10 * 1024 * 1024))
@@ -184,6 +189,7 @@ func TestEmbeddings_BodyTooLargeThroughMaxBody(t *testing.T) {
 
 	big := `{"model":"m","input":"` + strings.Repeat("a", 10*1024*1024) + `"}`
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/embeddings", strings.NewReader(big))
+	req.Header.Set("X-Org-Id", "org-test") // Preview2: paid dispatch needs tenant attribution
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -206,11 +212,12 @@ func TestEmbeddings_OversizedResponse(t *testing.T) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	rec := postEmbeddings(t, gw, `{"model":"m","input":"hello"}`)
 	if rec.Code != http.StatusBadGateway {
@@ -233,11 +240,12 @@ func TestEmbeddings_AtCapResponsePasses(t *testing.T) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 	rec := postEmbeddings(t, gw, `{"model":"m","input":"hello"}`)
 	if rec.Code != http.StatusOK {
