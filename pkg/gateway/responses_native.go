@@ -388,7 +388,7 @@ func (gw *gateway) finishResponsesNative(w http.ResponseWriter, ctx context.Cont
 	case termHint != "":
 		term = termHint
 	}
-	gw.finishRequest(ctx, requestFinish{
+	_, _ = gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  eventType,
 			RequestID:                  admitted.RequestID,

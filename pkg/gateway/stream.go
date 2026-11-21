@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -193,6 +194,10 @@ type streamRun struct {
 	// event. Set by the terminal watch installed in drain and read by the
 	// finishers on the same goroutine.
 	clientSawDone bool
+	// doneWatch holds the drain's terminal watch when the DONE frame is
+	// being held for the facts commit (nil on free/unwatched streams;
+	// its methods are nil-receiver safe).
+	doneWatch *sseTerminalWatch
 
 	// connection-phase results (connect).
 	finalInfo        resolver.ModelInfo
@@ -680,7 +685,7 @@ func (r *streamRun) finishConnectFailure() {
 		"error", r.lastErr, "attempts", len(r.attempts))
 
 	// PB1: Lineage attestation for streaming error path.
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base: eventBase{
 			EventType:       "request.failed",
 			RequestID:       r.reqID,
@@ -717,6 +722,14 @@ func (r *streamRun) finishConnectFailure() {
 		// event (§5.3 Finalize); no usage accrued on the connection phase.
 		termination: budget.TerminationUpstreamErr,
 	}, nil)
+	// The client's stream already ended in an error envelope — its held
+	// [DONE] (if any) must never follow a failure; drop it and log the
+	// withheld event loudly.
+	r.doneWatch.failDoneHold()
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 
 	_, errType, _, errMsg := r.gw.mapProviderUpstream(r.finalInfo.Provider, r.lastCode, r.lastErr)
 	// RATELIMIT-FALLBACK P2: on a decision-bearing upstream rate limit,
@@ -1002,12 +1015,20 @@ func (r *streamRun) finishStreamPolicyDenied(usage provider.Usage, ttftMs int64,
 	if hasTTFT {
 		deniedBase.FirstTokenMs = ttftMs
 	}
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        deniedBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: budget.TerminationPolicyDenied,
 	}, nil)
+	// The client's stream already ended in an error envelope — its held
+	// [DONE] (if any) must never follow a failure; drop it and log the
+	// withheld event loudly.
+	r.doneWatch.failDoneHold()
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 }
 
 // drain pipes the committed upstream stream to the client through the
@@ -1039,6 +1060,12 @@ func (r *streamRun) drain(flusher http.Flusher) (usage provider.Usage, drainErr 
 	// The terminal watch rides the outermost writer so every producer's
 	// [DONE] (passthrough, translation, policy flush) marks the delivery.
 	watch := newSSETerminalWatch(r.w)
+	if h := invocationIdentityFrom(r.ctx); h != nil && h.Admitted() && r.gw.invocations != nil {
+		// Central binding: hold the client's terminal [DONE] until the
+		// invocation's facts commit in finishSuccess.
+		watch.armDoneHold()
+		r.doneWatch = watch
+	}
 	handler := provider.NewStreamHandlerWithOptions(r.finalInfo.Provider, r.finalInfo.ModelName,
 		provider.StreamOptions{SuppressUsageOnlyChunk: !r.clientWantsUsage, RequestBytes: len(r.body)})
 	usage, drainErr = handler.HandleStream(r.streamCtx, watch, flusher, r.streamResp)
@@ -1512,12 +1539,20 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 	case r.ctx.Err() != nil:
 		term = budget.TerminationClientCancel
 	}
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        drainBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: term,
 	}, nil)
+	// The client's stream already ended in an error envelope — its held
+	// [DONE] (if any) must never follow a failure; drop it and log the
+	// withheld event loudly.
+	r.doneWatch.failDoneHold()
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 }
 
 // finishSuccess finalizes a fully drained stream: breaker success, budget
@@ -1613,12 +1648,25 @@ func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsa
 	}
 	// NEXT-18c: settle the reservation with the actual spend (§5.3
 	// Finalize) and stamp the tuples + completed termination on the event.
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        successBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: budget.TerminationCompleted,
 	}, nil)
+	// Central binding: the held terminator is released only after the
+	// durable record committed. On failure it is dropped and replaced by
+	// the accounting error frame — deliberately NO safe-retry language:
+	// the work already ran under this invocation identity.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		writeSSEErrorWithCode(r.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		r.l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
 }
 
 // cachedCompletion is the minimal shape of a chat.completion document stored
@@ -1822,6 +1870,10 @@ type sseTerminalWatch struct {
 	http.ResponseWriter
 	flusher http.Flusher
 	seen    atomic.Bool
+
+	heldMu sync.Mutex
+	armed  bool
+	held   []byte
 }
 
 // newSSETerminalWatch wraps w; the watch itself stays a Flusher for
@@ -1834,11 +1886,84 @@ func newSSETerminalWatch(w http.ResponseWriter) *sseTerminalWatch {
 // sawDone reports whether the [DONE] terminator was written to the client.
 func (sw *sseTerminalWatch) sawDone() bool { return sw.seen.Load() }
 
+// armDoneHold makes the watch buffer the terminal [DONE] frame instead of
+// forwarding it: stream success is ordered after the terminal-facts
+// commit (central binding), so the client's terminator waits.
+func (sw *sseTerminalWatch) armDoneHold() {
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = true
+}
+
+// releaseDoneHold writes the held [DONE] frame after the facts committed.
+// Nil-receiver safe: unwatched/free streams never arm.
+func (sw *sseTerminalWatch) releaseDoneHold() {
+	if sw == nil {
+		return
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	if !sw.armed || sw.held == nil {
+		return
+	}
+	// Normalize a line-form hold ("data: [DONE]\n" without its blank
+	// line) to the full frame so the released terminator is well-formed.
+	if !bytes.HasSuffix(sw.held, []byte("\n\n")) {
+		sw.held = append(sw.held, '\n')
+	}
+	_, _ = sw.ResponseWriter.Write(sw.held)
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
+	sw.held = nil
+}
+
+// failDoneHold drops the held [DONE] frame: the client must NOT observe a
+// success terminator for an unaccounted stream. Nil-receiver safe.
+func (sw *sseTerminalWatch) failDoneHold() {
+	if sw == nil {
+		return
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = false
+	sw.held = nil
+}
+
 func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
 	if !sw.seen.Load() && isSSEDoneFrame(p) {
 		sw.seen.Store(true)
+		sw.heldMu.Lock()
+		if sw.armed {
+			sw.held = append(sw.held[:0], p...)
+			sw.heldMu.Unlock()
+			return len(p), nil
+		}
+		sw.heldMu.Unlock()
+	}
+	// While a DONE frame is held, absorb the terminator's trailing blank
+	// lines (the passthrough writes the line and its newline separately):
+	// releasing them early would reorder the client's terminator.
+	if len(p) > 0 && isAllNewlines(p) {
+		sw.heldMu.Lock()
+		if sw.armed && len(sw.held) > 0 {
+			sw.held = append(sw.held, p...)
+			sw.heldMu.Unlock()
+			return len(p), nil
+		}
+		sw.heldMu.Unlock()
 	}
 	return sw.ResponseWriter.Write(p)
+}
+
+// isAllNewlines reports a chunk consisting solely of line terminators.
+func isAllNewlines(p []byte) bool {
+	for _, b := range p {
+		if b != '\n' && b != '\r' {
+			return false
+		}
+	}
+	return true
 }
 
 // Flush forwards to the wrapped writer's flusher.

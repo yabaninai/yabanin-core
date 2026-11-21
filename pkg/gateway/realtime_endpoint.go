@@ -191,7 +191,7 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 			affinityModel: admitted.Info.ModelName,
 			usage:         usage,
 		})
-		gw.finishRequest(rctx, requestFinish{
+		_, _ = gw.finishRequest(rctx, requestFinish{
 			base: eventBase{
 				EventType:                  "request.failed",
 				RequestID:                  admitted.RequestID,
@@ -243,7 +243,7 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 		costUSD:       ext.EstimatedCostUSD,
 		priceKnown:    ext.PriceKnown,
 	})
-	gw.finishRequest(rctx, requestFinish{
+	_, _ = gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,

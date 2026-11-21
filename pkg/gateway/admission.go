@@ -114,6 +114,13 @@ type admissionCore struct {
 	UserID       string
 	TaskID       string
 	WorkloadID   string
+
+	// Invocation is the Preview2 durable-accounting holder minted here —
+	// the §5 choke point every paid pipeline crosses — and stashed on the
+	// request context for the first paid dispatch site and the
+	// finishRequest terminal funnel. Cache-hit paths mint too (identity on
+	// the wire without an admission row).
+	Invocation *invocationIdentity
 	// FairTicket is the release handle for the admitted fair-admission slot
 	// (nil when the feature is off or the request was shed). RATELIMIT-FALLBACK
 	// F1: the chat path releases it synchronously at request end — the
@@ -144,6 +151,14 @@ func (gw *gateway) admissionCore(w http.ResponseWriter, r *http.Request, l *slog
 		AgentID:      r.Header.Get("X-Agent-Id"),
 		UserID:       r.Header.Get("X-User-Id"),
 	}
+
+	// Preview2 durable accounting: mint the per-invocation identity (uuid)
+	// at the shared admission choke point, before any guard outcome can
+	// branch the pipeline. IO-free; the kind binds later at the first paid
+	// dispatch, so every pipeline sharing this core gets one holder.
+	out.Invocation = newInvocationIdentity(
+		out.OrgID, out.RequestID, out.SessionID,
+		out.APIKeyID, out.SessionKeyID, in.Model)
 
 	// U1: pre-egress guard hooks (deterministic PII/secrets/injection). Runs
 	// once per request, before routing/forwarding. deny → 400, no forward;
