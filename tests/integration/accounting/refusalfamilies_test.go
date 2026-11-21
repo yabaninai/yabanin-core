@@ -22,10 +22,11 @@ import (
 // and the independently defined protocol validity check for a healthy
 // reply. The fault windows reuse the whole-ledger and storage oracles.
 type refusalFamily struct {
-	name     string // case-log family name
-	request  func(t *testing.T, s *stand, rid string) (status int, body string, err error)
-	upstream string                                    // fixture arrival path a healthy control must use
-	validate func(t *testing.T, s *stand, body string) // protocol contract of the healthy reply
+	name         string // case-log family name
+	outputTokens int    // expected from the independent provider fixture
+	request      func(t *testing.T, s *stand, rid string) (status int, body string, err error)
+	upstream     string                                    // fixture arrival path a healthy control must use
+	validate     func(t *testing.T, s *stand, body string) // protocol contract of the healthy reply
 }
 
 // TestAccountingRefusalFamiliesBeforeDispatch extends the independent
@@ -152,16 +153,16 @@ func TestAccountingRefusalFamiliesBeforeDispatch(t *testing.T) {
 // helpers (maintainability: bounded function bodies, no mega-closure).
 func refusalFamilies() []refusalFamily {
 	return []refusalFamily{
-		{name: "chat buffered", request: requestChatBuffered, upstream: "/v1/chat/completions", validate: validateChatReply},
-		{name: "chat sse", request: requestChatSSE, upstream: "/v1/chat/completions", validate: validateChatSSE},
-		{name: "embeddings", request: requestEmbeddings, upstream: "/v1/embeddings", validate: validateEmbeddingsReply},
-		{name: "responses native buffered", request: requestResponsesBuffered, upstream: "/v1/responses", validate: validateResponsesReply},
-		{name: "responses native sse", request: requestResponsesSSE, upstream: "/v1/responses", validate: validateResponsesSSE},
-		{name: "completions legacy", request: requestCompletions, upstream: "/v1/completions", validate: validateCompletionsReply},
-		{name: "moderations", request: requestModerations, upstream: "/v1/moderations", validate: validateModerationsReply},
-		{name: "rerank", request: requestRerank, upstream: "/v1/rerank", validate: validateRerankReply},
-		{name: "images generation", request: requestImages, upstream: "/v1/images/generations", validate: validateImagesReply},
-		{name: "realtime sse", request: requestRealtime, upstream: "/v1/realtime", validate: validateRealtimeSSE},
+		{name: "chat buffered", outputTokens: fixtureCompletionTokens, request: requestChatBuffered, upstream: "/v1/chat/completions", validate: validateChatReply},
+		{name: "chat sse", outputTokens: fixtureCompletionTokens, request: requestChatSSE, upstream: "/v1/chat/completions", validate: validateChatSSE},
+		{name: "embeddings", outputTokens: 0, request: requestEmbeddings, upstream: "/v1/embeddings", validate: validateEmbeddingsReply},
+		{name: "responses native buffered", outputTokens: fixtureCompletionTokens, request: requestResponsesBuffered, upstream: "/v1/responses", validate: validateResponsesReply},
+		{name: "responses native sse", outputTokens: fixtureCompletionTokens, request: requestResponsesSSE, upstream: "/v1/responses", validate: validateResponsesSSE},
+		{name: "completions legacy", outputTokens: fixtureCompletionTokens, request: requestCompletions, upstream: "/v1/completions", validate: validateCompletionsReply},
+		{name: "moderations", outputTokens: 0, request: requestModerations, upstream: "/v1/moderations", validate: validateModerationsReply},
+		{name: "rerank", outputTokens: 0, request: requestRerank, upstream: "/v1/rerank", validate: validateRerankReply},
+		{name: "images generation", outputTokens: fixtureCompletionTokens, request: requestImages, upstream: "/v1/images/generations", validate: validateImagesReply},
+		{name: "realtime sse", outputTokens: fixtureCompletionTokens, request: requestRealtime, upstream: "/v1/realtime", validate: validateRealtimeSSE},
 	}
 }
 
@@ -858,7 +859,7 @@ func (s *stand) controlFamily(t *testing.T, fam refusalFamily, phase string) {
 	requireEventually(t, 60*time.Second, 500*time.Millisecond, func() bool {
 		return s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 1
 	}, "harness: %s control %s never became durable in request_logs", fam.name, phase)
-	s.requireDurableControlEvidence(t, fam.name, phase, rid)
+	s.requireDurableControlEvidence(t, fam.name, phase, rid, fam.outputTokens)
 	t.Logf("harness: %s control %s ok (request id %s)", fam.name, phase, rid)
 }
 
@@ -867,7 +868,7 @@ func (s *stand) controlFamily(t *testing.T, fam refusalFamily, phase string) {
 // confirmed state (admitted, or reconciled once the consumer settled
 // it — never voided or unresolved) and exactly one matching
 // request_terminal_facts row and log under that same invocation.
-func (s *stand) requireDurableControlEvidence(t *testing.T, family, phase, rid string) {
+func (s *stand) requireDurableControlEvidence(t *testing.T, family, phase, rid string, outputTokens int) {
 	t.Helper()
 	rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 	if len(rows) != 1 {
@@ -885,8 +886,10 @@ func (s *stand) requireDurableControlEvidence(t *testing.T, family, phase, rid s
 		JOIN request_logs l ON l.invocation_id = f.invocation_id AND l.org_id::text = f.org_id
 		WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3
 		AND l.request_id=$3 AND f.event->>'invocation_id'=f.invocation_id::text
-		AND f.event->>'org_id'=f.org_id AND f.event->>'request_id'=f.client_request_id`
-	if n := s.oracleCount(t, linked, a.InvocationID, s.oracleDB.orgID, rid); n != 1 {
-		t.Fatalf("product: %s control %s: expected one matching terminal fact and log under admission %s, got %d", family, phase, a.InvocationID, n)
+		AND f.event->>'org_id'=f.org_id AND f.event->>'request_id'=f.client_request_id
+		AND l.tokens_in=$4 AND l.tokens_out=$5
+		AND f.event->>'tokens_in'=l.tokens_in::text AND f.event->>'tokens_out'=l.tokens_out::text`
+	if n := s.oracleCount(t, linked, a.InvocationID, s.oracleDB.orgID, rid, fixturePromptTokens, outputTokens); n != 1 {
+		t.Fatalf("product: %s control %s: expected one matching terminal fact and log with %d/%d tokens under admission %s, got %d", family, phase, fixturePromptTokens, outputTokens, a.InvocationID, n)
 	}
 }
