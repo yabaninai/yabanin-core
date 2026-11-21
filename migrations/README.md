@@ -8,11 +8,11 @@ beside an existing binary does not change its embedded migration set.
 
 ## Current schema and numbering
 
-- Current embedded head: **0027** (`security_inbox`). A successful migration to
-  this release records `version = 27` and `dirty = false`.
-- Next available migration number: **0028**.
-- The shipped set contains **26 up/down pairs**: `0001` through `0022`, then
-  `0024` through `0027`. Version **0023 is permanently reserved and unused**;
+- Current embedded head: **0029** (`request_invocations_contract`). A successful
+  migration to this release records `version = 29` and `dirty = false`.
+- Next available migration number: **0030**.
+- The shipped set contains **28 up/down pairs**: `0001` through `0022`, then
+  `0024` through `0029`. Version **0023 is permanently reserved and unused**;
   do not create a replacement file for it or renumber later migrations.
 - Files use the format `NNNN_name.up.sql` and `NNNN_name.down.sql`, with a
   four-digit version and a lowercase descriptive name. Each version has exactly
@@ -42,6 +42,8 @@ The later additions include:
 | `0025` | Organization classification taxonomies |
 | `0026` | Row-level security for security-event documents |
 | `0027` | Security inbox incidents |
+| `0028` | Per-invocation accounting identity: request admissions, terminal facts, invocation-keyed settlement and credit dedupe (expand) |
+| `0029` | Removal of the superseded settlement charge key and global credit usage index (contract of `0028`) |
 
 A schema object's presence does not by itself establish that a feature is
 configured, enabled or exposed by a particular deployment. Consult the SQL

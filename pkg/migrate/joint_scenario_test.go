@@ -36,7 +36,7 @@ type jointScenarioWalk struct {
 }
 
 var jointScenario = jointScenarioWalk{
-	headVersion:      27, // 0027_security_inbox (E06-P01 W01-C02); 0023 is the reserved gap (0022 present via e02p01a, 0024 present via e03p01b, 0025 present via e04p01a)
+	headVersion:      29, // 0029_request_invocations_contract; 0023 is the reserved gap (0022 present via e02p01a, 0024 present via e03p01b, 0025 present via e04p01a)
 	cohortStamp:      1,
 	downTarget:       12,
 	belowTargetVer:   12,

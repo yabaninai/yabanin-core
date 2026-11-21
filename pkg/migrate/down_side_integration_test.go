@@ -20,7 +20,7 @@ import (
 // incremental migration disappears across down → re-up and comes back in no
 // form, while the structure does:
 //
-//  1. full upgrade to the embedded head (version 27, pinned like
+//  1. full upgrade to the embedded head (version 29, pinned like
 //     TestRun_CleanInstallSeedRegression);
 //  2. seed a probe row into guard_pack_state (introduced by 0013, a plain
 //     single-row table with no FK or RLS dimension);
@@ -66,7 +66,7 @@ func TestRun_DownLeavesDeletedDataDeleted(t *testing.T) {
 	// 1) Upgrade to the embedded head.
 	up1, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "initial upgrade should apply the full schema")
-	require.Equal(t, int64(27), up1.Version,
+	require.Equal(t, int64(29), up1.Version,
 		"embedded head moved: re-pin the probe versions (0013 table, down target 12) in the same change")
 
 	// 2) Seed the probe row the scenario will require to stay deleted.
