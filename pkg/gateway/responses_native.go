@@ -199,8 +199,8 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 }
 
 func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, started time.Time) {
-	l := logctx.From(r.Context(), gw.log)
-	streamCtx, cancelStream := context.WithCancel(r.Context())
+	l := logctx.From(rctx, gw.log)
+	streamCtx, cancelStream := context.WithCancel(rctx)
 	defer cancelStream()
 	resp, err := client.Do(streamCtx, "/v1/responses", upstreamBody, apiKey, true, nil)
 	if err != nil {
@@ -465,16 +465,8 @@ func (rl *responsesStreamRelay) writeFrame(blob []byte) {
 // authoritative delivered terminal. cleanEnd reports which end it was:
 // only a clean end settles the parser's pending event afterwards.
 func (rl *responsesStreamRelay) drain(lr *apiformat.SSELineReader) (stopErr error, cleanEnd bool) {
-	for {
-		if rl.werr != nil && !lr.Buffered() {
-			// The client write failed: stop pulling provider bytes — a
-			// streaming upstream on the live connection would keep doing
-			// paid work for a client that is gone. Frames already read
-			// still settle usage (writeFrame parsed them for exactly
-			// this); flushParser applies the same delivered rule. No
-			// buffered bytes means nothing already-paid remains.
-			break
-		}
+	// After a client write fails, finish accounting for buffered bytes only.
+	for rl.werr == nil || lr.Buffered() {
 		line, rerr := lr.ReadLine()
 		if rerr == apiformat.ErrSSELineLimit {
 			// Oversized upstream line: drop it and the held frame; the

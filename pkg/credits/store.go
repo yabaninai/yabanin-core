@@ -40,12 +40,12 @@ var (
 	ErrChargeIdentityConflict = errors.New("charge identity conflict")
 )
 
-// creditSchemaProbeQuery reports whether credit_transactions carries the
+// invocationColumnProbeQuery reports whether credit_transactions carries the
 // invocation_id column (migration 0028+). column_name is a bind parameter
 // so a probe against an unexpected surface cannot echo a row back as
 // truth. The probe runs on the pool before any transaction is held and
 // only a successful read is cached.
-const creditSchemaProbeQuery = `SELECT count(*) FROM information_schema.columns
+const invocationColumnProbeQuery = `SELECT count(*) FROM information_schema.columns
 	WHERE table_schema = current_schema() AND table_name = 'credit_transactions' AND column_name = $1`
 
 // creditInvocationColumn resolves (per store) whether the ledger carries
@@ -63,7 +63,7 @@ func (s *Store) creditInvocationColumn(ctx context.Context) (bool, error) {
 		return false, nil
 	}
 	var n int
-	if err := s.db.QueryRow(ctx, creditSchemaProbeQuery, "invocation_id").Scan(&n); err != nil {
+	if err := s.db.QueryRow(ctx, invocationColumnProbeQuery, "invocation_id").Scan(&n); err != nil {
 		return false, err
 	}
 	s.ledgerResolved, s.ledgerHasInvCol = true, n > 0

@@ -4,7 +4,6 @@ import (
 	"encoding/json"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -68,13 +67,13 @@ func TestTerminalSettlementQuoteRange(t *testing.T) {
 			require.NoError(t, err)
 			tc.set(&event, outside)
 			_, writeErr := event.TerminalAccountingFields()
-			assert.Error(t, writeErr)
+			require.Error(t, writeErr)
 
 			facts[tc.field] = "9223372036855"
 			raw, err := json.Marshal(facts)
 			require.NoError(t, err)
 			_, readErr := DecodeTerminalAccounting(raw, event.InvocationID, event.OrgID)
-			assert.Error(t, readErr)
+			require.Error(t, readErr)
 		})
 	}
 }

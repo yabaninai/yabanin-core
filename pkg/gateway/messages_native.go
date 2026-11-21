@@ -179,8 +179,8 @@ func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rc
 }
 
 func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, extra http.Header, started time.Time) {
-	l := logctx.From(r.Context(), gw.log)
-	streamCtx, cancelStream := context.WithCancel(r.Context())
+	l := logctx.From(rctx, gw.log)
+	streamCtx, cancelStream := context.WithCancel(rctx)
 	defer cancelStream()
 	resp, err := client.Do(streamCtx, "/v1/messages", upstreamBody, apiKey, true, extra)
 	if err != nil {
@@ -527,16 +527,8 @@ func (rl *anthStreamRelay) writeFrame(blob []byte) {
 // oversized line or frame, an upstream break, a clean EOF, or the
 // authoritative delivered terminal.
 func (rl *anthStreamRelay) drain(lr *apiformat.SSELineReader) {
-	for {
-		if rl.werr != nil && !lr.Buffered() {
-			// The client write failed: stop pulling provider bytes — a
-			// streaming upstream on the live connection would keep doing
-			// paid work for a client that is gone. Frames already read
-			// still settle usage; the settle flush below applies the
-			// same delivered rule to lifecycle tracking. No buffered
-			// bytes means nothing already-paid remains.
-			break
-		}
+	// After a client write fails, finish accounting for buffered bytes only.
+	for rl.werr == nil || lr.Buffered() {
 		line, err := lr.ReadLine()
 		if err == apiformat.ErrSSELineLimit {
 			// Oversized upstream line: drop it and the held frame, stop

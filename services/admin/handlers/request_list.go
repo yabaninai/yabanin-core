@@ -220,7 +220,7 @@ func (h *AdminHandlers) readRequestDetailRow(ctx context.Context, w http.Respons
 		writeJSON(w, http.StatusForbidden, apiError{Error: "request payload grant cannot be used"})
 		return nil, 0, false
 	}
-	rowKey, err := grantStore.PeekRequestPayloadGrantTarget(r.Context(), token, orgID, requestID, userID, time.Now().UTC())
+	rowKey, err := grantStore.PeekRequestPayloadGrantTarget(ctx, token, orgID, requestID, userID, time.Now().UTC())
 	if err != nil {
 		// Invalid, expired, revoked, replayed, wrong org/grantee/request,
 		// unbound legacy, or a grant-store failure: the same fail-closed

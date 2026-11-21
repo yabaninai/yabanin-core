@@ -1226,8 +1226,8 @@ func validateChatCacheReplay(l *slog.Logger, orgID string, hit *cache.CacheHit, 
 // possibly stale, pre-fix stream-cache entries; non-stream lookups are
 // unaffected).
 func (gw *gateway) chatCacheEligible(cc *chatContext) bool {
-	return !(gw.cache == nil || cc.orgID == "" || cc.cacheDisabled ||
-		(cc.req.Stream && !gw.cfg.CacheStreamEnabled))
+	return gw.cache != nil && cc.orgID != "" && !cc.cacheDisabled &&
+		(!cc.req.Stream || gw.cfg.CacheStreamEnabled)
 }
 
 // governChatCacheHit re-governs a cached document with the CURRENT

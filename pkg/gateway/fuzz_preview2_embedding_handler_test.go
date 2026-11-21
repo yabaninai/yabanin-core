@@ -249,7 +249,7 @@ func fuzzFinishCompletionTerminated(t *testing.T) {
 	defer restore()
 	gw.eventNote = func(e *eventpub.Event) { order = append(order, "event_note"); note = e }
 
-	gw.finishCompletion(httptest.NewRecorder(), canceled, admitted{
+	err := gw.finishCompletion(httptest.NewRecorder(), canceled, admitted{
 		Info:           resolver.ModelInfo{ModelName: "m", Provider: "openai", Enabled: true},
 		RequestedModel: "m",
 		OrgID:          "org-fzc",
@@ -259,6 +259,9 @@ func fuzzFinishCompletionTerminated(t *testing.T) {
 		RequestID:      "req-fzc",
 	}, provider.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8, Source: provider.UsageSourceProvider},
 		"openai", "http://upstream-fzc.invalid", http.StatusOK, time.Now(), nil)
+	if err != nil {
+		t.Fatalf("finishCompletion: %v", err)
+	}
 
 	if want := []string{"event_note", "publish"}; !slices.Equal(order, want) {
 		t.Fatalf("finishCompletion hook order = %v, want %v", order, want)
