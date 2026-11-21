@@ -18,6 +18,7 @@
 //   go test -tags integration -run TestCV03OrgPresentationBrowserAcceptance \
 //     ./services/admin/handlers/ -count=1 -timeout 20m
 import { defineConfig } from '@playwright/test'
+import { join } from 'node:path'
 
 const baseURL = process.env.CV03_BASE_URL
 const artifacts = process.env.CV03_ARTIFACTS
@@ -38,7 +39,8 @@ export default defineConfig({
   workers: 1,
   retries: 0,
   reporter: [['list']],
-  outputDir: artifacts,
+  // Playwright clears its output directory at startup. The stand owns the parent.
+  outputDir: join(artifacts, 'playwright'),
   use: {
     baseURL,
     trace: 'off',

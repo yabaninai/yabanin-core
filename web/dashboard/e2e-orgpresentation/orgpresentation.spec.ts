@@ -96,7 +96,7 @@ test('AC-OP-MEMBER member wallet renders own JPY/Tokyo presentation with zero di
   const page = await ctx.newPage()
   const dirCalls = tallyDirectory(page)
 
-  await page.goto('/#/credits')
+  await page.goto('/#credits')
   // autoSelect commits the member's single own org (from /api/me, not the
   // root-only directory); the USD ledger amount renders labeled by the
   // member's JPY preference, the stamp in Tokyo time.
@@ -111,7 +111,7 @@ test('AC-OP-MEMBER member wallet renders own JPY/Tokyo presentation with zero di
 test('AC-OP-SHARE remount shares the parked org GET and then renders CHF/Zurich', async ({ browser }) => {
   const ctx = await userContext(browser, fx.users.root.cookie)
   const page = await ctx.newPage()
-  await page.goto('/#/credits')
+  await page.goto('/#credits')
 
   // Browser-side tallies, live from before the first selection through
   // the FINAL render: the server barrier only counts GETs that arrive
@@ -145,8 +145,8 @@ test('AC-OP-SHARE remount shares the parked org GET and then renders CHF/Zurich'
   // Unmount (overview is root-readable), remount: autoSelect picks a
   // page-1 filler (the target is beyond page 1), then re-enter the target.
   const walletsBeforeRecommit = targetWalletGETs
-  await page.goto('/#/overview')
-  await page.goto('/#/credits')
+  await page.goto('/#overview')
+  await page.goto('/#credits')
   await page.getByLabel('Org ID').selectOption({ label: 'Enter ID manually…' })
   await page.getByLabel('org uuid').fill(fx.target.id)
 
@@ -185,7 +185,7 @@ test('AC-OP-READER analytics renders own EUR presentation with wallet still deni
   const dirCalls = tallyDirectory(page)
 
   const q = `m=${fx.analytics.metrics}&from=${encodeURIComponent(fx.analytics.from)}&to=${encodeURIComponent(fx.analytics.to)}`
-  await page.goto(`/#/analytics?${q}`)
+  await page.goto(`/#analytics?${q}`)
   // GlobalScopeBar autoSelects the reader's single own org; the query
   // runs org-scoped and the USD-denominated totals render labeled by the
   // reader's EUR preference.
