@@ -385,7 +385,10 @@ func logdStartElected(ctx context.Context, cfg config.All, rdb *redis.Client, rt
 func logdLeadWork(rt *logdRuntime, logger *slog.Logger) func(context.Context) error {
 	return func(leadCtx context.Context) error {
 		logger.Info("leader: starting stream consumer under elected leadership")
-		go rt.consumer.RunAdmissionRecovery(leadCtx, rt.db)
+		recoveryCtx, stopRecovery := context.WithCancel(leadCtx)
+		recoveryDone := make(chan struct{})
+		go func() { defer close(recoveryDone); rt.consumer.RunAdmissionRecovery(recoveryCtx, rt.db) }()
+		defer func() { stopRecovery(); <-recoveryDone }()
 		go func() {
 			if runErr := rt.settlement.Run(leadCtx); runErr != nil {
 				logger.Error("settlement worker failed", "error", runErr)

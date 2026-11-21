@@ -41,13 +41,13 @@ func validAccountingScalar(key, value string) bool {
 		return value == "" || value == "true"
 	case "ts":
 		n, err := strconv.ParseInt(value, 10, 64)
-		return err == nil && n > 0
+		return err == nil && n > 0 && strconv.FormatInt(n, 10) == value
 	case "estimated_cost_usd", "resale_cost_usd", "counterfactual_cost_usd":
 		n, err := strconv.ParseFloat(value, 64)
-		return err == nil && validTerminalCosts(n)
+		return err == nil && validTerminalCosts(n) && strconv.FormatFloat(n, 'f', -1, 64) == value
 	case "tokens_in", "tokens_out", "cache_read_tokens", "cache_creation_tokens", "status_code", "duration_ms", "first_token_ms", "attempt_count", "retry_count":
 		n, err := strconv.ParseInt(value, 10, 64)
-		return err == nil && n >= 0
+		return err == nil && n >= 0 && strconv.FormatInt(n, 10) == value
 	case "event_type":
 		return isTerminalEventType(value)
 	}

@@ -37,6 +37,8 @@ func TestAdmissionRecoveryBatchPastInvalidFact(t *testing.T) {
 		{badID, org, "stream", "stream", rid, rid, []byte(`{"payload":"incomplete"}`)},
 		{ev.InvocationID, org, "chat", "chat", rid, rid, raw},
 	}}
+	scan.failNext = map[string]int{"UPDATE request_admissions": 2}
+	scan.failErr = errors.New("expiry trigger rejected stale row")
 	var logRows, intents, inbox int
 	delivery := &mockDB{
 		QueryRowFn: func(_ context.Context, q string, _ ...any) pgx.Row {
@@ -63,6 +65,7 @@ func TestAdmissionRecoveryBatchPastInvalidFact(t *testing.T) {
 		},
 	}
 	c := NewWithCreditStore(nil, delivery, "events", silentLogger(), credits.NewStore(nil, silentLogger()))
+	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero(), "failed expiry must be rate-limited")
 	cursor, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
 	require.NoError(t, err)
 	require.False(t, more)
@@ -77,9 +80,7 @@ func TestAdmissionRecoveryExpiryFailureIsRetried(t *testing.T) {
 	scan.failNext = map[string]int{"UPDATE request_admissions": 1}
 	scan.failErr = errors.New("database temporarily unavailable")
 	c := New(nil, nil, "events", silentLogger())
-	_, _, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
-	require.ErrorIs(t, err, scan.failErr)
-	_, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
-	require.NoError(t, err)
-	require.False(t, more)
+	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
+	require.False(t, c.expireAdmissionBatch(t.Context(), scan).IsZero())
+	require.Len(t, scan.execsBySubstring("UPDATE request_admissions"), 1)
 }
