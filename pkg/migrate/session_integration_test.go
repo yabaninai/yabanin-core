@@ -105,12 +105,12 @@ func TestMigrationSessionTLSProvenanceAndPublicSchema(t *testing.T) {
 	require.NoError(t, probeErr, "TLS server reload/connect")
 	result, err := Run(ctx, u.String(), "eu")
 	require.NoError(t, err)
-	require.EqualValues(t, 29, result.Version)
+	require.EqualValues(t, jointScenario.headVersion, result.Version)
 	_, err = Run(ctx, u.String(), "eu")
 	require.NoError(t, err, "maxconns=1 no-change must release before metadata")
-	_, err = Down(ctx, u.String(), "eu", 30)
+	_, err = Down(ctx, u.String(), "eu", jointScenario.headVersion)
 	require.NoError(t, err, "maxconns=1 no-op must query pinned connection")
-	_, err = Down(ctx, u.String(), "eu", 28)
+	_, err = Down(ctx, u.String(), "eu", jointScenario.headVersion-1)
 	require.NoError(t, err)
 	// Extension installation temporarily appends pg_temp to search_path; the
 	// effective creation schema must still be public for every DDL event.

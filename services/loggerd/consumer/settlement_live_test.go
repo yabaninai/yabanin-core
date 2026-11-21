@@ -32,13 +32,20 @@ func newSettlementLiveEnv(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 	ctx, pool, _ := newInboxLiveEnv(t)
 	setupCreditTables(ctx, t, pool)
-	// Stand hygiene: some package tests tear the credits tables down and
-	// this helper recreates them WITHOUT the production idempotency index.
-	// The AF-06 acceptance (same request id, foreign org) is defined against
-	// the real schema, so the migrated shape is enforced here.
-	_, err := pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_request_id
+	// Stand hygiene: enforce the production usage idempotency domains of
+	// migration 0028 (the migrated stand already carries them). The AF-06
+	// acceptance (same legacy request id, foreign org) conflicts through
+	// the legacy domain, which keeps the pre-0029 global-on-request_id
+	// semantics for NULL-invocation rows. The 0029-contracted global index
+	// must NOT be re-created: invocation rows legitimately share one
+	// client request id.
+	_, err := pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_legacy
 		ON credit_transactions (request_id)
-		WHERE request_id IS NOT NULL AND type = 'usage'`)
+		WHERE request_id IS NOT NULL AND invocation_id IS NULL AND type = 'usage'`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_invocation
+		ON credit_transactions (invocation_id)
+		WHERE invocation_id IS NOT NULL AND type = 'usage'`)
 	require.NoError(t, err)
 	return ctx, pool
 }

@@ -101,26 +101,13 @@ func fencingWallet(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org st
 	return balanceCents, remainderMicro, ledgerRows, ledgerMicro
 }
 
-// fencingRestoreMigratedLedger drops the PRE-0029 global usage index the
-// fixture helpers re-create: on the migrated contract (0029) it must not
-// exist, and the tests below settle multiple invocation rows that share
-// ONE client request id by design.
-func fencingRestoreMigratedLedger(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
-	t.Helper()
-	_, err := pool.Exec(ctx, `DROP INDEX IF EXISTS uniq_credit_transactions_usage_request_id`)
-	require.NoError(t, err)
-}
-
 // TestSettlementWorkerCompetingClaims: a NEWER claim supersedes the stale
 // worker's (attempts bumped, status still 'processing'). The token
 // mismatch alone must fence the batch and the terminal marks; nothing —
 // rows or money — may change; the rightful worker then settles exactly
 // once.
 func TestSettlementWorkerCompetingClaims(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
-	fencingRestoreMigratedLedger(ctx, t, pool)
 
 	const org = "77777777-7777-4777-8777-7777777777f1"
 	const sharedReq = "wfnc-worker-shared-request"
@@ -231,10 +218,7 @@ func TestSettlementWorkerCompetingClaims(t *testing.T) {
 // predicate from the fencing SELECT to prove this control bites: without
 // it, the read locks and passes the recovered rows.
 func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
 	ctx, pool, _ := newNext18dEnv(t)
-	fencingRestoreMigratedLedger(ctx, t, pool)
 
 	const org = "99999999-9999-4999-8999-9999999999f2"
 	const sharedReq = "wfnc-same-token-recovery"
@@ -333,6 +317,7 @@ func TestSettlementWorkerRecoveredLeaseSameToken(t *testing.T) {
 	}
 	bal, rem, rows, micro = fencingWallet(ctx, t, pool, org)
 	assert.EqualValues(t, 9_700, bal, "two independent 150c charges, exactly once")
+	assert.EqualValues(t, 0, rem, "whole-cent charges carry no micro rests — the seeded zero remainder stays")
 	assert.EqualValues(t, 2, rows)
 	assert.EqualValues(t, -3_000_000, micro)
 }
