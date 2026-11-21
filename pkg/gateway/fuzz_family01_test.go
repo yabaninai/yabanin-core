@@ -630,15 +630,16 @@ func fam01Admit04(t *testing.T) {
 	t.Helper()
 	const embBody = `{"model":"m","input":"x"}`
 
-	// Workload cap: preset a 100-µUSD window, saturate the ("", "w1")
-	// window (the auth middleware strips client X-Org-Id in strict APIKey
-	// mode, so a routed matrix request admits under org ""), and the next
-	// request on that workload is refused 429.
+	// Workload cap: preset a 100-µUSD window, saturate matrix-org's "w1"
+	// window (the matrix fixture resolves the bearer to matrix-org and the
+	// auth middleware strips client X-Org-Id copies, so a routed matrix
+	// request admits under the resolved org), and the next request on
+	// that workload is refused 429.
 	gw, _, _ := newAdmissionMatrixGateway(t)
 	presetWorkloadLedger(t, 100)
 	l := workloadLedgerShared.Load()
 	require.NotNil(t, l)
-	l.Charge("", "w1", money.MicroUSD(100))
+	l.Charge("matrix-org", "w1", money.MicroUSD(100))
 	rec := postMatrixRequest(t, gw, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Workload": "w1"})
 	require.Equal(t, http.StatusTooManyRequests, rec.Code, rec.Body.String())
@@ -646,10 +647,10 @@ func fam01Admit04(t *testing.T) {
 	workloadLedgerShared.Store(nil)
 
 	// Token budget: task scope at cap → 429 + Retry-After 60. The org
-	// component is the auth-stamped "" (client X-Org-Id is stripped).
+	// component is the auth-stamped resolved org (matrix-org).
 	gw2, _, _ := newAdmissionMatrixGateway(t)
 	gw2.tokenBudget = NewTokenBudget(1000, 0, time.Minute)
-	gw2.tokenBudget.Record(TaskBudgetScope, "", "tk9", 1000)
+	gw2.tokenBudget.Record(TaskBudgetScope, "matrix-org", "tk9", 1000)
 	rec2 := postMatrixRequest(t, gw2, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Task": "tk9"})
 	require.Equal(t, http.StatusTooManyRequests, rec2.Code, rec2.Body.String())
@@ -663,7 +664,7 @@ func fam01Admit04(t *testing.T) {
 		Capacity: 1, MaxPerTenant: 1, QueueLimit: 0,
 		WaitTimeout: 50 * time.Millisecond, ShedRetryAfter: 90 * time.Second,
 	})
-	held, err := gw3.fair.Admit(context.Background(), "", "w1")
+	held, err := gw3.fair.Admit(context.Background(), "matrix-org", "w1")
 	require.NoError(t, err)
 	rec3 := postMatrixRequest(t, gw3, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Workload": "w1"})
