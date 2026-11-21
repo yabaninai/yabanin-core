@@ -156,12 +156,7 @@ func (s *stand) requireAccountingMaterializedAfterRestart(t *testing.T, rid stri
 	t.Helper()
 	s.restartLoggerd()
 
-	pollUntil(t, 3*time.Minute, "billed row materializes after consumer restart", func() error {
-		if s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 0 {
-			return fmt.Errorf("no request_logs row yet")
-		}
-		return nil
-	})
+	s.waitForRecoveredBilling(t, rid, 3*time.Minute)
 	s.requireBilledRow(t, rid, s.oracleDB.orgID, "consumer outage")
 	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "consumer outage")
 	s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "consumer outage")

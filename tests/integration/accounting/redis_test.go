@@ -184,7 +184,10 @@ func (s *stand) groupDeliveryCursor(t *testing.T, rdb *redis.Client) (string, bo
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	groups, err := rdb.XInfoGroups(ctx, s.eventStream).Result()
-	if err != nil || len(groups) == 0 {
+	if err != nil {
+		t.Fatalf("redis: XINFO GROUPS %s: %v", s.eventStream, err)
+	}
+	if len(groups) == 0 {
 		return "", false
 	}
 	return groups[0].LastDeliveredID, true

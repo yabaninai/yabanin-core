@@ -4,9 +4,10 @@ package accounting
 
 import (
 	"fmt"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/redis/go-redis/v9"
 )
 
 // TestAccountingFactsRecoveryWithoutLiveEvent: FACTS-RECOVERY semantics.
@@ -50,23 +51,22 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 		}
 	}()
 
-	before := s.fixture.Snapshot()
-	status, body, err := s.chat(t, rid, 60*time.Second)
-	if err != nil || status != httpOK || !strings.Contains(body, fixtureAssistantContent) {
-		t.Fatalf("facts: target invocation status=%d body=%q err=%v — serving must not depend on the consumer", status, body, err)
-	}
-	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("facts: ledger delta = %d/%d/%d, want 1/1/1", delta.arrivals, delta.dispatches, delta.receipts)
-	}
+	s.serveWhileConsumerDown(t, rid)
+	s.requireTerminalFactsWhileConsumerDown(t, rid)
+	entries := s.removeUndeliveredFactsNotification(t, rdb, rid)
+	s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
+	s.restartLoggerd()
+	s.waitForRecoveredBilling(t, rid, 6*time.Minute)
+	s.requireBilledRow(t, rid, s.oracleDB.orgID, "facts recovery")
+	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "facts recovery")
+	wantKinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "facts recovery")
+	s.requireReconciledFromFacts(t, rid)
+	s.replayAfterFactsRecovery(t, rdb, rid, entries, wantKinds)
+	s.controlRequest(t, "facts-post")
+}
 
-	// Durable terminal facts committed before publish (0028 design).
-	if !s.oracleTableExists(t, "request_terminal_facts") {
-		t.Fatalf("PRODUCT DEFECT (baseline): request_terminal_facts absent — no durable pre-publish terminal evidence to recover from")
-	}
-	if s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID) == 0 {
-		t.Fatalf("facts: no terminal facts row for served %s while consumer down", rid)
-	}
-
+func (s *stand) removeUndeliveredFactsNotification(t *testing.T, rdb *redis.Client, rid string) []streamEntry {
+	t.Helper()
 	// The queued notification exists; capture its exact field map, then
 	// REMOVE it so no live copy survives.
 	entries := s.findStreamEntries(t, rdb, rid)
@@ -82,29 +82,27 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 	s.assertNoRetryCarrier(t, rdb, rid)
 	// And nothing pending-unacked in the main stream's group that a restart
 	// would redeliver as "live".
-	if cursor, ok := s.groupDeliveryCursor(t, rdb); ok {
-		for _, e := range entries {
-			if entryIDAfter(cursor, e.ID) {
-				t.Fatalf("facts: entry %s for %s was already delivered (cursor %s) — restart would redeliver it; precondition violated", e.ID, rid, cursor)
-			}
+	cursor, ok := s.groupDeliveryCursor(t, rdb)
+	if !ok {
+		t.Fatal("facts: missing consumer group after the healthy control")
+	}
+	for _, id := range ids {
+		if !entryIDAfter(id, cursor) {
+			t.Fatalf("facts: stream entry %s for %s reached delivery cursor %s before deletion", id, rid, cursor)
 		}
 	}
-	t.Logf("facts: live notification removed; only request_terminal_facts remains as evidence")
+	return entries
+}
 
-	// Deterministic sweep visit: age ONLY the target's still-open admission.
-	s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
-
-	// Consumer up: recovery must proceed FROM FACTS, not from a live event
-	// (there is none), and must say so.
-	s.restartLoggerd()
-
+func (s *stand) waitForRecoveredBilling(t *testing.T, rid string, timeout time.Duration) {
+	t.Helper()
 	// The wallet debit lands on the settlement worker's tick (AF-06: the
 	// sweep only writes settlement_jobs intents; the worker debits
 	// credit_transactions asynchronously), so the poll must cover both
 	// boundaries before the immediate exactly-once assertions below —
 	// the same shape as the settlement-fault, client-retry and
 	// event-redelivery cases.
-	pollUntil(t, 6*time.Minute, "recovery materializes from facts", func() error {
+	pollUntil(t, timeout, "request log and wallet debit materialize after restart", func() error {
 		if s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 0 {
 			return fmt.Errorf("no request_logs row yet")
 		}
@@ -113,14 +111,10 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 		}
 		return nil
 	})
-	s.requireBilledRow(t, rid, s.oracleDB.orgID, "facts recovery")
-	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "facts recovery")
-	// Non-vacuity anchor: the recovered state carries the wallet intent
-	// kind exactly once; the full recovered set must survive the late live
-	// replay below unchanged.
-	wantKinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "facts recovery")
-	t.Logf("facts: recovered settlement intent set: %v", wantKinds)
+}
 
+func (s *stand) requireReconciledFromFacts(t *testing.T, rid string) {
+	t.Helper()
 	if !s.oracleTableExists(t, "request_admissions") {
 		t.Fatalf("facts: admissions table absent — reconciliation reason unverifiable")
 	}
@@ -152,6 +146,10 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 		t.Fatalf("facts: provider ledger after recovery = %d/%d/%d, want 1/1/1", arr, disp, recv)
 	}
 
+}
+
+func (s *stand) replayAfterFactsRecovery(t *testing.T, rdb *redis.Client, rid string, entries []streamEntry, wantKinds map[string]int) {
+	t.Helper()
 	// LATE LIVE REPLAY: the original event finally arrives
 	// (lost-then-found). Each replay must be claimed (committed
 	// event_inbox row per fresh entry id) and the consumer must treat it
@@ -179,5 +177,4 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 		t.Fatalf("facts: provider ledger after late live replay = %d/%d/%d, want 1/1/1", arr, disp, recv)
 	}
 
-	s.controlRequest(t, "facts-post")
 }
