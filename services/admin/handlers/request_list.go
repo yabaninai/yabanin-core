@@ -111,12 +111,15 @@ func (h *AdminHandlers) requestDetailAccess(r *http.Request, orgID, requestID, u
 
 	verdict := h.authorizeRequestContent(r, orgID, requestID, grant, false)
 	role, member := h.callerRoleOnOrg(r, orgID)
-	roleGrant := member && adminstore.RoleHas(string(role), adminstore.PermRequestsPayloads)
+	roleGrant := false
+	if member {
+		roleGrant = adminstore.RoleHas(string(role), adminstore.PermRequestsPayloads)
+		access.OrgWideMetadata = adminstore.RoleHas(string(role), adminstore.PermRequestsRead)
+	}
 	access.UserID = userID
 	access.Grant = verdict.Allowed && (grant || roleGrant)
 	access.Originals = verdict.Allowed && originalsGrant
 	access.DenyOwnHistory = adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context())
-	access.OrgWideMetadata = member && adminstore.RoleHas(string(role), adminstore.PermRequestsRead)
 	return access
 }
 
