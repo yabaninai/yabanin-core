@@ -172,11 +172,15 @@ func TestN03P6T07_MalformedCachedOverPrompt_ClampNeverNegativeBill(t *testing.T)
 //   - openai: negative cached_tokens (prompt_tokens_details path, ungated)
 //     INFLATES the non-cache input term → billed EXCEEDS the honest full
 //     list (overcharge), while the legacy prompt_cache_hit_tokens field is
-//     >0-gated and safe.
+//     >0-gated and safe. Preview2 durable accounting now CONTAINS this
+//     variant: the terminal projection rejects negative quantities, so the
+//     chat path fails post-dispatch (accounting_commit_failed,
+//     X-Should-Retry: false) and withholds the overcharging completion
+//     from analytics instead of publishing it.
 //
 // Fix locus: pkg/provider parsers + a per-class floor in ComputeCost —
 // outside N03-P06-T07's write scope. Handoff: T07 record §defect. These
-// pins freeze today's exact numbers so the owner's fix flips them
+// pins freeze today's exact boundaries so the owner's fix flips them
 // deliberately.
 func TestN03P6T07_NegativeProviderFields_DefectPin_D1(t *testing.T) {
 	t.Run("anthropic-negative-creation-bills-negative", func(t *testing.T) {
@@ -222,21 +226,27 @@ func TestN03P6T07_NegativeProviderFields_DefectPin_D1(t *testing.T) {
 		gw := n03p6t06ChatGateway(t, up.URL)
 		cap := captureAll(t)
 
+		// D1 pin, Preview2 durable-accounting boundary: the parser defect
+		// persists (negative cached_tokens is mirrored verbatim into the
+		// event), but the chat path now runs under admitted invocation
+		// accounting, and the terminal projection REJECTS negative
+		// quantities (pkg/eventpublisher validTerminalQuantities). The
+		// completion is therefore failed post-dispatch instead of
+		// publishing an overcharging record: the client sees the
+		// accounting_commit_failed envelope (explicit X-Should-Retry:
+		// false — the reconciler owns the admitted row) and NO
+		// request.completed reaches analytics. The parser fix (pkg/provider
+		// floor) remains the D1 locus; until it lands, the wall contains
+		// it. The anthropic variant above still pins the raw defect on its
+		// uninstrumented endpoint.
 		rec := n03p6t06PostChat(t, gw, body)
-		require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-		assert.Equal(t, "miss", rec.Header().Get(PromptCacheHeader))
-
-		ev := cap.last(t)
-		assert.Equal(t, int64(-300), ev.CacheReadTokens, "DEFECT: negative cached_tokens mirrored verbatim")
-		// nonCache = 800-(-300) = 1100 (the negative read INFLATES the input
-		// term): billed = (1100*2.5 + 100 - 375)/1e6 = 0.002475 > honest full
-		// list 0.0021 — a silent overcharge.
-		wantBilled := n03p6t06OpenAIBilled(800, 10, -300)
-		full := n03p6t06OpenAIFullList(800, 10)
-		assert.InDelta(t, wantBilled, ev.EstimatedCostUSD, 1e-15,
-			"DEFECT D1: the negative read inflates the bill above the honest full list")
-		assert.Greater(t, ev.EstimatedCostUSD, full,
-			"DEFECT D1 pin: prior behavior overcharges vs full list; fix in pkg/provider flips this")
+		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		assert.Contains(t, rec.Body.String(), accountingCommitFailedCode,
+			"DEFECT D1 containment: the corrupt terminal write fails loudly")
+		assert.Equal(t, "false", rec.Header().Get("X-Should-Retry"),
+			"post-dispatch accounting failure must suppress client retries")
+		assert.Empty(t, cap.all(),
+			"DEFECT D1 containment: the overcharging completion is withheld from analytics")
 	})
 }
 
