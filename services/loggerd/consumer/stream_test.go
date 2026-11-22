@@ -655,13 +655,13 @@ func TestHandleRequestComplete_AllFieldsForwarded(t *testing.T) {
 	err := consumer.handleRequestComplete(context.Background(), msg)
 	require.NoError(t, err)
 
-	require.Len(t, values, 43)                                          // +upstream_request, +upstream_response
+	require.Len(t, values, 43)                                                    // +upstream_request, +upstream_response
 	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
-	assert.Equal(t, testOrgUUID, values[1])                             // org_id
-	assert.Equal(t, "claude-3", values[2])                              // model_requested
-	assert.Equal(t, "claude-3-opus", values[3])                         // model_used
-	assert.Equal(t, "https://api.anthropic.com/v1/messages", values[4]) // upstream_url
-	assert.Equal(t, "POST", values[5])                                  // method
+	assert.Equal(t, testOrgUUID, values[1])                                       // org_id
+	assert.Equal(t, "claude-3", values[2])                                        // model_requested
+	assert.Equal(t, "claude-3-opus", values[3])                                   // model_used
+	assert.Equal(t, "https://api.anthropic.com/v1/messages", values[4])           // upstream_url
+	assert.Equal(t, "POST", values[5])                                            // method
 }
 
 func TestHandleRequestComplete_MissingSessionID(t *testing.T) {
@@ -952,14 +952,14 @@ func TestHandleRequestComplete_StringFields(t *testing.T) {
 	err := consumer.handleRequestComplete(context.Background(), msg)
 	require.NoError(t, err)
 
-	require.Len(t, values, 43)                  // +upstream_request, +upstream_response
+	require.Len(t, values, 43)                                                    // +upstream_request, +upstream_response
 	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
-	assert.Equal(t, testOrgUUID, values[1])     // org_id
-	assert.Equal(t, int64(200), values[6])      // status_code from string "200"
-	assert.Equal(t, int64(2500), values[7])     // duration_ms from string "2500"
-	assert.Equal(t, int64(200), values[8])      // tokens_in from string "200"
-	assert.Equal(t, int64(500), values[9])      // tokens_out from string "500"
-	assert.Equal(t, "hit", values[12])          // cache_hit_type
+	assert.Equal(t, testOrgUUID, values[1])                                       // org_id
+	assert.Equal(t, int64(200), values[6])                                        // status_code from string "200"
+	assert.Equal(t, int64(2500), values[7])                                       // duration_ms from string "2500"
+	assert.Equal(t, int64(200), values[8])                                        // tokens_in from string "200"
+	assert.Equal(t, int64(500), values[9])                                        // tokens_out from string "500"
+	assert.Equal(t, "hit", values[12])                                            // cache_hit_type
 	// Verify cost/similarity fields are non-zero (the bug was they were always 0)
 	assert.InDelta(t, 0.97, values[13], 0.001)   // cache_similarity from string "0.97"
 	assert.InDelta(t, 0.050, values[14], 0.0001) // counterfactual_cost_usd from string "0.050"

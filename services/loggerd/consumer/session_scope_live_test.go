@@ -287,6 +287,7 @@ func sscopeShadowEvent(org, requestID, invocationID, session, policyJSON string)
 		OrgID:            org,
 		RequestID:        requestID,
 		InvocationID:     invocationID,
+		SessionID:        session,
 		EventType:        "request.shadow_completed",
 		TS:               1732212000000,
 		ModelRequested:   "gpt-4",
@@ -296,7 +297,7 @@ func sscopeShadowEvent(org, requestID, invocationID, session, policyJSON string)
 		TokensOut:        34,
 		EstimatedCostUSD: 0.004, // real quote — the shadow must still never bill it
 		ResaleCostUSD:    0.004,
-		CostStatus:       "billed",
+		CostStatus:       "priced",
 	}
 	facts, err := ev.TerminalAccountingFields()
 	if err != nil {
@@ -312,7 +313,6 @@ func sscopeShadowEvent(org, requestID, invocationID, session, policyJSON string)
 			wire[key] = value
 		}
 	}
-	wire["session_id"] = session
 	wire["policy"] = policyJSON
 	return redis.XMessage{ID: fmt.Sprintf("%d-%s", time.Now().UnixNano(), requestID), Values: wire}, factsBytes
 }
@@ -364,10 +364,10 @@ func TestSessionScopeLive_RecoveryFirstMirrorDecisionAndPrimaryCharge(t *testing
 	// Now the primary arrives with a real quote: the positive control.
 	primaryEvent := eventpublisher.Event{
 		OrgID: org, RequestID: requestID, InvocationID: invPrimary,
-		EventType: "request.completed", TS: 1732212000001,
+		SessionID: session, EventType: "request.completed", TS: 1732212000001,
 		ModelRequested: "gpt-4", ModelUsed: "gpt-4",
 		StatusCode: 200, TokensIn: 12, TokensOut: 34,
-		EstimatedCostUSD: 0.004, ResaleCostUSD: 0.004, CostStatus: "billed",
+		EstimatedCostUSD: 0.004, ResaleCostUSD: 0.004, CostStatus: "priced",
 	}
 	primaryFacts, err := primaryEvent.TerminalAccountingFields()
 	require.NoError(t, err, "build primary facts")
