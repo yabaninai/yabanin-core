@@ -26,6 +26,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/migrate"
 	"github.com/reireirei/yabanin/pkg/upstream"
 	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
 	testpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -207,6 +208,7 @@ func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
 		testpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
+		_ = testcontainers.TerminateContainer(pg)
 		t.Fatalf("start R00905-owned Postgres: %v", err)
 	}
 	t.Cleanup(func() {

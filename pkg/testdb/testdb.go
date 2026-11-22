@@ -290,8 +290,10 @@ func pgStandStartReal(tb testing.TB) (*pgStand, error) {
 		testpostgres.WithDatabase("yabanin"),
 		testpostgres.WithUsername("yabanin"),
 		testpostgres.WithPassword("yabanin"),
+		testpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
+		_ = testcontainers.TerminateContainer(container)
 		return nil, fmt.Errorf("start disposable postgres (is Docker running?): %w", err)
 	}
 	stand := &pgStand{container: container, started: time.Now()}
