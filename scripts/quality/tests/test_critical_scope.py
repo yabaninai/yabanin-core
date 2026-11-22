@@ -5180,16 +5180,22 @@ class R2SelectorRepairControls(unittest.TestCase):
         self.assertEqual(rows['fnvalue_test.go'].get('resolution') or [], [])
 
     def test_mv01_capture_variants_and_method_value(self):
-        """MV-01 variants: parenthesized and direct field calls keep the
-        uncertainty; a concrete method-value capture stays a definite
-        reference and must not inherit it."""
+        """MV-01 variants retain field uncertainty and bind only the
+        receiver-qualified local method value, excluding a foreign same-name
+        method."""
         module = self.write_module('fnvariants', {
             'auth.go': ('package auth\n\nconst Limit = 5\n\n'
                         'func Allowed(n int) bool { return n > Limit }\n\n'
                         'type holder struct{ Allowed func(int) bool }\n\n'
                         'type gate struct{}\n\n'
                         'func (g gate) Open(n int) bool { return n > 0 }\n'),
-            'variants_test.go': ('package auth\n\nimport "testing"\n\n'
+            'foreign/open.go': ('package foreign\n\n'
+                                'type Gate struct{}\n\n'
+                                'func (Gate) Open(n int) bool { return n > 0 }\n'),
+            'variants_test.go': ('package auth\n\nimport (\n'
+                                 '\t"testing"\n'
+                                 '\t"example.test/fnvariants/foreign"\n'
+                                 ')\n\n'
                                  'func TestParen(t *testing.T) {\n'
                                  '\tvar h holder\n'
                                  '\th.Allowed = Allowed\n'
@@ -5207,16 +5213,28 @@ class R2SelectorRepairControls(unittest.TestCase):
                                  '\tm := g.Open\n'
                                  '\tif !m(1) {\n'
                                  '\t\tt.Fatal("method value must bind exactly")\n'
+                                 '\t}\n}\n\n'
+                                 'func TestForeignMethodValue(t *testing.T) {\n'
+                                 '\tvar g foreign.Gate\n'
+                                 '\tm := g.Open\n'
+                                 '\tif !m(1) {\n'
+                                 '\t\tt.Fatal("foreign method value must execute")\n'
                                  '\t}\n}\n'),
         })
         rows = self.run_units(module, ['auth.go', 'variants_test.go'], [[]])
         paren = self.unit(rows['variants_test.go'], 'TestParen')
         direct = self.unit(rows['variants_test.go'], 'TestDirectCall')
         method = self.unit(rows['variants_test.go'], 'TestMethodValue')
+        foreign = self.unit(rows['variants_test.go'], 'TestForeignMethodValue')
         self.assertIn('Allowed', paren.get('selrefs') or [], paren)
         self.assertIn('Allowed', direct.get('selrefs') or [], direct)
-        self.assertIn('Open', method.get('refs') or [], method)
+        self.assertIn('gate.Open', method.get('refs') or [], method)
+        self.assertNotIn('Open', method.get('refs') or [], method)
+        self.assertEqual(rows['variants_test.go'].get('resolution') or [], [])
         self.assertNotIn('Open', method.get('selrefs') or [], method)
+        self.assertNotIn('gate.Open', foreign.get('refs') or [], foreign)
+        self.assertNotIn('Open', foreign.get('refs') or [], foreign)
+        self.assertEqual(rows['variants_test.go'].get('resolution') or [], [])
 
     def test_ext01_external_test_binds_production_target(self):
         """EXT-01 coordinator replay: package auth_test's direct target
