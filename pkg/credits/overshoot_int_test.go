@@ -15,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/reireirei/yabanin/pkg/testdb"
 )
 
@@ -60,109 +61,123 @@ func TestOvershoot_ConcurrentAdmissionRace(t *testing.T) {
 			// serve the previous case's final balance (e.g. −100) against
 			// the reset wallet and make the next admission phase flaky.
 			store := NewStore(pool, nil)
+			resetOvershootCase(ctx, t, pool, org, 100)
 
-			// Reset wallet and ledger for this case.
-			if _, err := pool.Exec(ctx,
-				`INSERT INTO org_credits (org_id, balance_cents) VALUES ($1, $2)
-				 ON CONFLICT (org_id) DO UPDATE SET balance_cents = $2`, org, 100); err != nil {
-				t.Fatal(err)
-			}
-			if _, err := pool.Exec(ctx,
-				`DELETE FROM credit_transactions WHERE org_id = $1`, org); err != nil {
-				t.Fatal(err)
-			}
-
-			// Bounded wait: the whole case must finish inside the deadline;
-			// a hung phase fails the test instead of hanging the run.
+			// Bounded wait: the whole case must finish inside the deadline.
 			caseCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 			defer cancel()
-
-			// Admission phase: every goroutine runs the production
-			// floor-aware CheckBalance, then "serves" (counts). Any error
-			// other than a floor rejection is a bug and is reported.
-			var admitted, rejected atomic.Int64
-			start := make(chan struct{})
-			var wg sync.WaitGroup
-			for i := 0; i < tc.concurrency; i++ {
-				wg.Add(1)
-				go func() {
-					defer wg.Done()
-					<-start
-					if _, err := store.CheckBalance(caseCtx, org); err != nil {
-						if errors.Is(err, ErrInsufficientCredits) {
-							rejected.Add(1)
-							return
-						}
-						t.Errorf("admission: unexpected error: %v", err)
-						return
-					}
-					admitted.Add(1)
-				}()
-			}
-			close(start)
-			done := make(chan struct{})
-			go func() { wg.Wait(); close(done) }()
-			select {
-			case <-done:
-			case <-caseCtx.Done():
-				t.Fatalf("admission phase exceeded deadline: %v", caseCtx.Err())
-			}
 
 			// Deterministic admits: the deduction phase starts only after
 			// every admission read has completed, so each goroutine saw the
 			// untouched 100¢ wallet (100 > floor −100).
-			if admitted.Load() != tc.admitted || rejected.Load() != 0 {
+			admitted, rejected := runAdmissionPhase(caseCtx, t, store, org, tc.concurrency)
+			if admitted != tc.admitted || rejected != 0 {
 				t.Fatalf("admission race: admitted=%d rejected=%d, want exactly %d admitted and 0 rejected",
-					admitted.Load(), rejected.Load(), tc.admitted)
+					admitted, rejected, tc.admitted)
 			}
 
-			// Settlement phase (what loggerd does after completion): charge
-			// every admitted request and classify every error. Only a floor
-			// rejection may end a charge; anything else fails the test.
-			debits := int64(0)
-			for i := int64(0); i < tc.admitted; i++ {
-				err := store.Deduct(caseCtx, org, costCents,
-					fmt.Sprintf("race-%d-%d", tc.concurrency, i), nil)
-				if err == nil {
-					debits++
-					continue
-				}
-				if errors.Is(err, ErrInsufficientCredits) {
-					continue
-				}
-				t.Fatalf("settlement %d: unexpected error: %v", i, err)
-			}
-
-			// Ledger truth from the fixture DB — independent of the store's
-			// in-memory cache and of the in-process counters.
-			var walletCents int64
-			if err := pool.QueryRow(caseCtx,
-				`SELECT balance_cents FROM org_credits WHERE org_id = $1`, org).Scan(&walletCents); err != nil {
-				t.Fatalf("wallet row: %v", err)
-			}
-			var usageRows int64
-			if err := pool.QueryRow(caseCtx,
-				`SELECT count(*) FROM credit_transactions WHERE org_id = $1 AND type = 'usage'`, org).Scan(&usageRows); err != nil {
-				t.Fatalf("ledger count: %v", err)
-			}
+			debits := settleAdmissions(caseCtx, t, store, org, tc.concurrency, admitted, costCents)
+			walletCents, usageRows := queryOvershootTruth(caseCtx, t, pool, org)
 			if debits != tc.debits || walletCents != tc.finalCents || usageRows != tc.debits {
 				t.Errorf("overshoot accounting: debits=%d (want %d), wallet=%d (want %d), usage rows=%d (want %d)",
 					debits, tc.debits, walletCents, tc.finalCents, usageRows, tc.debits)
 			}
-			// Derived diagnostics (review fix): uncollected notional is the
+
+			// Derived diagnostics: uncollected notional is the
 			// served-but-never-collected remainder — rejections × cost, NOT
 			// a wallet-arithmetic difference (which double-counts what
 			// settlement did collect); overshoot exists only while the
 			// wallet is negative.
 			uncollected := (tc.admitted - debits) * costCents
-			overshoot := int64(0)
-			if walletCents < 0 {
-				overshoot = -walletCents
-			}
+			overshoot := max(int64(0), -walletCents)
 			t.Logf("concurrency=%3d: admitted=%3d debits=%3d final_wallet=%d cents (overshoot beyond $0 = %d cents, uncollected = %d cents)",
 				tc.concurrency, tc.admitted, debits, walletCents, overshoot, uncollected)
 		})
 	}
+}
+
+func resetOvershootCase(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org string, walletCents int64) {
+	t.Helper()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO org_credits (org_id, balance_cents) VALUES ($1, $2)
+		 ON CONFLICT (org_id) DO UPDATE SET balance_cents = $2`, org, walletCents); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := pool.Exec(ctx,
+		`DELETE FROM credit_transactions WHERE org_id = $1`, org); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// runAdmissionPhase races `concurrency` goroutines through the production
+// floor-aware CheckBalance behind one start gate; only a floor rejection may
+// land in the rejected count, and the phase deadline fails the case instead
+// of hanging the run.
+func runAdmissionPhase(ctx context.Context, t *testing.T, store *Store, org string, concurrency int) (admitted, rejected int64) {
+	t.Helper()
+	var admittedCount, rejectedCount atomic.Int64
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := 0; i < concurrency; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-start
+			if _, err := store.CheckBalance(ctx, org); err != nil {
+				if errors.Is(err, ErrInsufficientCredits) {
+					rejectedCount.Add(1)
+					return
+				}
+				t.Errorf("admission: unexpected error: %v", err)
+				return
+			}
+			admittedCount.Add(1)
+		}()
+	}
+	close(start)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("admission phase exceeded deadline: %v", ctx.Err())
+	}
+	return admittedCount.Load(), rejectedCount.Load()
+}
+
+// settleAdmissions charges every admitted request once, mirroring what
+// loggerd does after completion; anything other than a floor rejection is a
+// bug and fails the case.
+func settleAdmissions(ctx context.Context, t *testing.T, store *Store, org string, concurrency int, admitted, costCents int64) (debits int64) {
+	t.Helper()
+	for i := int64(0); i < admitted; i++ {
+		err := store.Deduct(ctx, org, costCents,
+			fmt.Sprintf("race-%d-%d", concurrency, i), nil)
+		if err == nil {
+			debits++
+			continue
+		}
+		if errors.Is(err, ErrInsufficientCredits) {
+			continue
+		}
+		t.Fatalf("settlement %d: unexpected error: %v", i, err)
+	}
+	return debits
+}
+
+// queryOvershootTruth reads wallet and usage-row counts from the fixture DB —
+// independent of the store's in-memory cache and of the in-process counters.
+func queryOvershootTruth(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org string) (walletCents, usageRows int64) {
+	t.Helper()
+	if err := pool.QueryRow(ctx,
+		`SELECT balance_cents FROM org_credits WHERE org_id = $1`, org).Scan(&walletCents); err != nil {
+		t.Fatalf("wallet row: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM credit_transactions WHERE org_id = $1 AND type = 'usage'`, org).Scan(&usageRows); err != nil {
+		t.Fatalf("ledger count: %v", err)
+	}
+	return walletCents, usageRows
 }
 
 // TestOvershoot_ReplayIsIdempotent: loggerd replay/restart redelivers the
