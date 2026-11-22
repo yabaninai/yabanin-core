@@ -732,6 +732,12 @@ func (c *StreamConsumer) deliverEventPolicy(ctx context.Context, msg redis.XMess
 		// so a shadow row sharing the primary's id would double-charge the
 		// org. See the v9 plan (S3) for the analytics audit.
 		return c.handleRequestShadowCompleteProfile(ctx, msg, policy)
+	case "request.invalid":
+		// Typed refusal history: a producer-stamped status makes the
+		// generic invalid event a durable pre-dispatch refusal record with
+		// the exact wire status; unstamped producers keep the legacy
+		// generic behavior. See refusal.go for the full contract.
+		return c.handleRequestInvalidProfile(ctx, msg, policy)
 	default:
 		c.logger.Info("generic event received",
 			slog.String("event_type", eventType),

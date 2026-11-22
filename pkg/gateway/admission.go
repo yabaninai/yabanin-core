@@ -231,6 +231,12 @@ func (gw *gateway) resolveAdmissionModel(w http.ResponseWriter, r *http.Request,
 	if info.Fallback && gw.unknownModelPolicy == "reject" {
 		msg := fmt.Sprintf("model %q is not available on this gateway", in.Model)
 		apierrors.WriteWithCode(w, http.StatusNotFound, apierrors.ErrorCodeNotFound, msg, "model_not_found")
+		// Refusal history: the stamped status marks this pre-dispatch
+		// refusal as a typed record for the durable log — the consumer
+		// persists request.invalid events carrying an explicit status with
+		// exactly that wire status, and keeps the legacy generic behavior
+		// for the unstamped request.invalid producers. No dispatch,
+		// admission, terminal fact or charge exists on this path.
 		publishEventWithContext(r.Context(), gw.publisher, l, eventBase{
 			EventType:      "request.invalid",
 			RequestID:      out.RequestID,
@@ -239,6 +245,7 @@ func (gw *gateway) resolveAdmissionModel(w http.ResponseWriter, r *http.Request,
 			OrgID:          out.OrgID,
 			TeamID:         out.TeamID,
 			ModelRequested: in.Model,
+			StatusCode:     http.StatusNotFound,
 			Error:          msg,
 			Labels:         labelsFrom(r.Context()),
 		}.build())
