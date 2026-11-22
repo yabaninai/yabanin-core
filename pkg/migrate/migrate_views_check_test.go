@@ -134,7 +134,7 @@ func TestCheckMetricsViews_ReadyAfterMigrateRun_Integration(t *testing.T) {
 	_, dsn := dedicatedDB(t)
 
 	res := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 31, res.Version)
+	assert.EqualValues(t, 34, res.Version)
 
 	missing, unreadable, err := feedback.CheckMetricsViews(ctx, appPoolOn(t, dsn))
 	require.NoError(t, err)
@@ -153,9 +153,9 @@ func TestMigrateRunFirstUpProvisionsViews_Integration(t *testing.T) {
 	// restart shape.
 	first := runLogged(t, ctx, dsn)
 	assert.GreaterOrEqual(t, first.Applied, 1, "fresh first-up must apply the consolidated baseline")
-	assert.EqualValues(t, 31, first.Version)
+	assert.EqualValues(t, 34, first.Version)
 	second := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 31, second.Version)
+	assert.EqualValues(t, 34, second.Version)
 
 	var n int
 	require.NoError(t, owner.QueryRow(ctx,

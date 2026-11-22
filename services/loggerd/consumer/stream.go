@@ -817,7 +817,10 @@ func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context,
 		}
 	}
 
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return err
+	}
 	row := budgetRequestLogRow(ev, sessionIDStr, errorMsg)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	// Budget-refused requests carry no gateway-minted invocation today; the
@@ -957,7 +960,10 @@ func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEven
 // code; the completed shape binds the defaulted status and an optional
 // error.
 func (c *StreamConsumer) insertTerminalRequestLog(ctx context.Context, tx InboxTx, msg redis.XMessage, ev requestEvent, errorValue any, statusCode int64) (pgconn.CommandTag, error) {
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
 	row := fullRequestLogRow(ev, sessionIDStr, errorValue, statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)
@@ -1140,7 +1146,10 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 		return err
 	}
 
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return err
+	}
 	row := shadowRequestLogRow(ev, sessionIDStr, statusCode)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)
@@ -2108,19 +2117,29 @@ func (c *StreamConsumer) enrichToolCallsIfAbsent(ctx context.Context, tx InboxTx
 }
 
 // enrichPolicyDecisionIfAbsent commits the policy decision with the
-// enrichment only when no decision row exists for the request yet. The
-// org GUC is pinned first because policy_decisions carries the org
-// isolation RLS posture and a bare probe would read zero rows.
+// enrichment only when no decision row exists for THIS delivery's identity
+// yet. The org GUC is pinned first because policy_decisions carries the org
+// isolation RLS posture and a bare probe would read zero rows. The probe
+// binds the invocation id (0033) in addition to org and request: a primary
+// and its shadow mirror may share both org_id and request_id (0028), so a
+// bare (org, request) probe let whichever delivery materialized first
+// suppress the other's decision rows — a recovery-first mirror lost its
+// decision record while the primary still charged. Any probe error other
+// than a clean miss fails the enrichment (delivery error, no ack,
+// redelivery) rather than being mistaken for absence.
 func (c *StreamConsumer) enrichPolicyDecisionIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) error {
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_org', $1, true)", ev.orgID); err != nil {
 		return fmt.Errorf("pin policy decision org GUC: %w", err)
 	}
 	var one int
-	if err := tx.QueryRow(ctx,
-		`SELECT 1 FROM policy_decisions WHERE org_id = $1 AND request_id = $2 LIMIT 1`,
-		ev.orgID, ev.requestID,
-	).Scan(&one); err == nil {
+	switch err := tx.QueryRow(ctx,
+		`SELECT 1 FROM policy_decisions WHERE org_id = $1 AND request_id = $2 AND invocation_id = $3 LIMIT 1`,
+		ev.orgID, ev.requestID, ev.invocationID,
+	).Scan(&one); {
+	case err == nil:
 		return nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("probe policy decision enrichment: %w", err)
 	}
 	return c.insertPolicyDecision(ctx, tx, ev)
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
@@ -531,7 +532,10 @@ func TestHandleRequestComplete_NonUUIDSessionIDHashed(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43) // +upstream_request, +upstream_response, +observability parity
-	assert.Equal(t, goldenOpenCodeSession, values[0])
+	// The stored id is the registry id offered by the org-scoped mapping
+	// (0032): deterministic per (org, raw), never the verbatim non-UUID
+	// string (the LG-U1 invariant).
+	assert.Equal(t, uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID+"\x00"+"ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String(), values[0])
 	// Legacy/absent observability fields must land as NULL ("unknown"),
 	// not as fake zeros that would poison TTFT/retry aggregates.
 	assert.Nil(t, values[30], "first_token_ms")
@@ -652,7 +656,7 @@ func TestHandleRequestComplete_AllFieldsForwarded(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43)                                          // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0])                         // session_id
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
 	assert.Equal(t, testOrgUUID, values[1])                             // org_id
 	assert.Equal(t, "claude-3", values[2])                              // model_requested
 	assert.Equal(t, "claude-3-opus", values[3])                         // model_used
@@ -949,7 +953,7 @@ func TestHandleRequestComplete_StringFields(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43)                  // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0]) // session_id
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
 	assert.Equal(t, testOrgUUID, values[1])     // org_id
 	assert.Equal(t, int64(200), values[6])      // status_code from string "200"
 	assert.Equal(t, int64(2500), values[7])     // duration_ms from string "2500"
