@@ -139,10 +139,10 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 			l.Debug("close upstream body", "error", cerr)
 		}
 	}()
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, responsesBodyLimit))
+	limited, err := io.ReadAll(io.LimitReader(resp.Body, responsesBodyLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -157,6 +157,11 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(limited)
+		return
+	}
+	if len(limited) > responsesBodyLimit {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, "upstream response too large")
 		return
 	}
 	usage := parseResponsesUsage(limited)

@@ -134,14 +134,19 @@ func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rc
 			l.Debug("close upstream body", "error", cerr)
 		}
 	}()
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, messagesResponseLimit))
+	limited, err := io.ReadAll(io.LimitReader(resp.Body, messagesResponseLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		gw.forwardAnthropicError(w, rctx, admitted, resp, limited, upstreamURL, started)
+		return
+	}
+	if len(limited) > messagesResponseLimit {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, "upstream response too large")
 		return
 	}
 	usage := provider.Anthropic{}.ParseUsage(limited)
