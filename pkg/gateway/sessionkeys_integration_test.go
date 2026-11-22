@@ -89,9 +89,9 @@ func TestSessionUsageDatabaseVisibilityAndOutage(t *testing.T) {
 	r := chi.NewRouter()
 	r.Get("/session-keys/{id}/usage", gw.sessionKeyUsage)
 	read := func(id string) *httptest.ResponseRecorder {
-		req := httptest.NewRequestWithContext(ctx, http.MethodGet, "/session-keys/"+id+"/usage", nil)
+		req := httptest.NewRequestWithContext(withPrincipal(ctx, principal{APIKeyID: "test-parent"}), http.MethodGet, "/session-keys/"+id+"/usage", nil)
 		rec := httptest.NewRecorder()
-		r.ServeHTTP(rec, req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "test-parent"})))
+		r.ServeHTTP(rec, req)
 		return rec
 	}
 	const absent = "d0602833-fef7-4671-87bc-db975fd3493a"

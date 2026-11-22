@@ -67,14 +67,8 @@ type r018OrgJudgeStand struct {
 // own upstream pool and resolver/credential chain), so every claim crosses
 // the boundaries production crosses: auth → policyPreUpstream → per-org
 // compile over the store → judge transport → upstream.
-func newR018OrgJudgeStand(t *testing.T, ctx context.Context) *r018OrgJudgeStand {
+func newR018OrgJudgeStand(t *testing.T, directPool *pgxpool.Pool) *r018OrgJudgeStand {
 	t.Helper()
-	dsn := startPolicyAvailabilityPostgres(t, ctx)
-	directPool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open isolated Postgres pool: %v", err)
-	}
-	t.Cleanup(directPool.Close)
 	store := adminstore.New(directPool, slog.New(slog.DiscardHandler), nil)
 
 	recorder := &r018UpstreamRecorder{}
@@ -98,10 +92,7 @@ func newR018OrgJudgeStand(t *testing.T, ctx context.Context) *r018OrgJudgeStand 
 			"r018-model": {ModelName: "r018-model", Provider: "openai", Enabled: true},
 		}},
 	}
-	runtime, err := NewPolicyRuntime(store, nil, PolicyModeEnforce, nil, slog.New(slog.DiscardHandler)) //nolint:contextcheck // Policy compilation has no context parameter, as in buildPolicyRuntime.
-	if err != nil {
-		t.Fatalf("construct real policy runtime: %v", err)
-	}
+	runtime := newTestRuntime(t, store, nil, PolicyModeEnforce)
 	clock := newPolicyAvailabilityClock()
 	runtime.now = clock.Now
 	srcs, ok := promptStudioSourcesFrom(store)
@@ -442,9 +433,14 @@ func runR018JudgelessHeaderAbsent(t *testing.T, ctx context.Context, stand *r018
 // stand and the five orgs are seeded once, then every pinned scenario runs
 // in the original order over the real HTTP boundary.
 func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
 	defer cancel()
-	stand := newR018OrgJudgeStand(t, ctx)
+	pool, err := pgxpool.New(ctx, startPolicyAvailabilityPostgres(t, ctx))
+	if err != nil {
+		t.Fatalf("open isolated Postgres pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	stand := newR018OrgJudgeStand(t, pool)
 	orgA, keyA, promptA, policyA := seedR018SubjectOrg(t, ctx, stand.store)
 	keyB := seedR018ForeignOwnerOrg(t, ctx, stand.store)
 	keyC := seedR018JudgelessOrg(t, ctx, stand.store)
