@@ -98,6 +98,11 @@ func TestTP03_JudgeVerdictValidation(t *testing.T) {
 			wantErr: "judge returned invalid JSON",
 		},
 		{
+			name:    "null decision cannot become false",
+			content: `{"cheap_quality":0.5,"premium_quality":0.5,"should_upgrade":null,"reason":"r"}`,
+			wantErr: "should_upgrade",
+		},
+		{
 			name:    "missing reason field is an error",
 			content: `{"cheap_quality":0.5,"premium_quality":0.5,"should_upgrade":false}`,
 			wantErr: `missing field "reason"`,
@@ -195,5 +200,25 @@ func TestMeasuredJudgePreservesUsageForInvalidVerdict(t *testing.T) {
 	v, call, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
 	if v != nil || err == nil || arrived.Load() != 1 || call.Model != model || call.Status != 200 || call.Usage.PromptTokens != 11 || call.Usage.CompletionTokens != 3 {
 		t.Fatalf("invalid verdict lost provider facts: call=%+v verdict=%v arrivals=%d err=%v", call, v, arrived.Load(), err)
+	}
+}
+
+func TestMeasuredJudgeStopsAtFirstProvider(t *testing.T) {
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { secondCalls.Add(1) }))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", second.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, `{"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
+	}))
+	defer first.Close()
+	j := NewJudge(first.URL, nil)
+	verdict, call, err := j.EvaluateMeasured(t.Context(), "prompt", "A", "B", nil)
+	if secondCalls.Load() != 0 || verdict != nil || err == nil || call.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("additional contacts=%d verdict=%v call=%+v err=%v", secondCalls.Load(), verdict, call, err)
+	}
+	if call.Usage.PromptTokens != 5 || call.Usage.CompletionTokens != 2 {
+		t.Fatalf("lost reported usage on unsuccessful response: %+v", call)
 	}
 }

@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
@@ -50,9 +51,13 @@ func NewJudge(evaluatorURL string, log *slog.Logger) *Judge {
 	return &Judge{
 		evaluatorURL: evaluatorURL,
 		model:        "gpt-4o-mini",
-		client:       &http.Client{Timeout: 10 * time.Second},
-		timeout:      10 * time.Second,
-		log:          log.With("component", "evalgate"),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// An admission covers one request to the configured evaluator.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		timeout: 10 * time.Second,
+		log:     log.With("component", "evalgate"),
 	}
 }
 
@@ -118,6 +123,11 @@ Return ONLY valid JSON with these exact fields:
 
 	call.Status = resp.StatusCode
 	if resp.StatusCode != http.StatusOK {
+		const maxErrorBody = 64 << 10
+		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
+		if readErr == nil && len(raw) <= maxErrorBody && json.Valid(raw) {
+			call.Usage = provider.OpenAI{}.ParseUsage(raw)
+		}
 		return nil, call, fmt.Errorf("judge returned status %d", resp.StatusCode)
 	}
 
@@ -160,7 +170,7 @@ func parseVerdict(raw json.RawMessage) (*Verdict, error) {
 		return nil, fmt.Errorf("judge returned invalid JSON: %w", err)
 	}
 	for _, field := range [...]string{"cheap_quality", "premium_quality", "should_upgrade", "reason"} {
-		if _, ok := fields[field]; !ok {
+		if value, ok := fields[field]; !ok || bytes.Equal(value, []byte("null")) {
 			return nil, fmt.Errorf("judge verdict missing field %q", field)
 		}
 	}
