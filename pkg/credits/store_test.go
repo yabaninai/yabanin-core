@@ -2,6 +2,7 @@ package credits
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sync"
@@ -694,5 +695,13 @@ func TestNewStoreWithConfig_NilLogger(t *testing.T) {
 	}
 	if balance.BalanceCents != 0 {
 		t.Errorf("expected zero balance, got %d", balance.BalanceCents)
+	}
+}
+
+func TestUsageMetadataJSONFailsClosedOnUnsupportedValue(t *testing.T) {
+	_, err := usageMetadataJSON(map[string]interface{}{"unsupported": make(chan int)})
+	var typeErr *json.UnsupportedTypeError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("unsupported metadata must return its marshal error, got %v", err)
 	}
 }
