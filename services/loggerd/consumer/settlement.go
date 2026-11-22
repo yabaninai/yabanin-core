@@ -486,35 +486,38 @@ func (w *SettlementWorker) tick(ctx context.Context) {
 		if len(jobs) == 0 {
 			break
 		}
-		// NEXT-18d (§5.5): jobs of one org apply as ONE batch transaction —
-		// ledger, spend upserts, job transitions and the reserve decrement
-		// commit together, semantically equivalent to the sequential
-		// per-job execution. Singletons and any pre-commit failed batch
-		// fall back to the per-job executor, which is the reference
-		// semantics. Two exceptions must never reach the per-job path:
-		// a fencing loss (budget.ErrStaleSettlementToken) — a newer worker
-		// re-claimed these jobs, so THIS worker must not touch them again;
-		// and an uncertain commit (budget.ErrCommitUncertain) — the batch
-		// may have landed, so re-execution could re-charge recorded debt.
-		// Fenced lease recovery settles both: the rightful owner settles
-		// re-claimed jobs; committed groups are terminal and no-op on
-		// recovery; uncommitted jobs return via expired lease.
 		for _, group := range groupJobsByOrg(jobs) {
-			if len(group) > 1 {
-				switch w.executeOrgBatch(ctx, group) {
-				case orgBatchCommitted, orgBatchStale, orgBatchUncertain:
-					continue
-				}
-			}
-			for i := range group {
-				w.executeJob(ctx, &group[i])
-			}
+			w.settleOrgGroup(ctx, group)
 		}
 	}
 
 	w.publishBacklog(ctx)
 	w.cleanupInbox(ctx)
 	w.cleanupSettledJobs(ctx)
+}
+
+// settleOrgGroup applies one org's claimed jobs. NEXT-18d (§5.5): jobs of
+// one org apply as ONE batch transaction — ledger, spend upserts, job
+// transitions and the reserve decrement commit together, semantically
+// equivalent to the sequential per-job execution. Singletons and any
+// pre-commit failed batch fall back to the per-job executor, which is the
+// reference semantics. Two outcomes must never reach the per-job path:
+// a fencing loss (orgBatchStale) — a newer worker re-claimed these jobs,
+// so THIS worker must not touch them again; and an uncertain commit
+// (orgBatchUncertain) — the batch may have landed, so re-execution could
+// re-charge recorded debt. Fenced lease recovery settles both: the
+// rightful owner settles re-claimed jobs; committed groups are terminal
+// and no-op on recovery; uncommitted jobs return via expired lease.
+func (w *SettlementWorker) settleOrgGroup(ctx context.Context, group []settlementJob) {
+	if len(group) > 1 {
+		switch w.executeOrgBatch(ctx, group) {
+		case orgBatchCommitted, orgBatchStale, orgBatchUncertain:
+			return
+		}
+	}
+	for i := range group {
+		w.executeJob(ctx, &group[i])
+	}
 }
 
 // settleAllowanceLink decodes the reserve linkage an intent payload carries
