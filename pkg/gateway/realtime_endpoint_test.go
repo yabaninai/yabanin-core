@@ -25,6 +25,7 @@ import (
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/policy"
 	"github.com/reireirei/yabanin/pkg/resolver"
+	"github.com/stretchr/testify/require"
 )
 
 // Cancel-settle fixtures: an enforce-mode plan with a zero Reservation keeps
@@ -406,26 +407,25 @@ func TestRealtime_ClientCancelSettlesConsumedPrefix(t *testing.T) {
 // single completed response whose terminal frame exceeds the hold's
 // 1 MiB RAM window (temp-file spill path), a completed response
 // followed by trailing metadata, and two completed responses in one
-// session. Every response.done carries usage 7/3 with status
-// completed, so each shape arms the terminal hold.
+// session. The final completed response carries usage 7/3.
 func realtimeBoundaryWire(t *testing.T, shape string) string {
 	t.Helper()
-	response := func(id, text string) string {
+	response := func(id, text string, inputTokens, outputTokens int) string {
 		created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
 		delta := `{"type":"response.output_text.delta","delta":"assistant text"}`
-		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":7,"output_tokens":3}}}`, id, text)
+		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":%d,"output_tokens":%d}}}`, id, text, inputTokens, outputTokens)
 		return "event: response.created\ndata: " + created + "\n\n" +
 			"event: response.output_text.delta\ndata: " + delta + "\n\n" +
 			"event: response.done\ndata: " + done + "\n\n"
 	}
 	switch shape {
 	case "large":
-		return response("first", strings.Repeat("a", (1<<20)+1))
+		return response("first", strings.Repeat("a", (1<<20)+1), 7, 3)
 	case "trailing":
-		return response("first", "one") +
+		return response("first", "one", 7, 3) +
 			"event: rate_limits.updated\ndata: {\"type\":\"rate_limits.updated\",\"rate_limits\":[]}\n\n"
 	case "multiple":
-		return response("first", "one") + response("second", "two")
+		return response("first", "one", 2, 1) + response("second", "two", 7, 3)
 	default:
 		t.Fatalf("unknown realtime boundary shape %q", shape)
 		return ""
@@ -462,47 +462,28 @@ func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
 				gw.invocations = store
 
 				rec := postR105(t, gw, "/v1/realtime", `{"model":"m","input":"boundary"}`, nil)
-				if rec.Code != http.StatusOK {
-					t.Fatalf("status %d body %q", rec.Code, rec.Body.String())
-				}
-				if got := rec.Header().Get("Content-Type"); got != "text/event-stream" {
-					t.Fatalf("content type %q", got)
-				}
-				if len(store.admitted) != 1 {
-					t.Fatalf("admissions: %d, want 1", len(store.admitted))
-				}
-				if store.admitted[0].Kind != invocationKindStream {
-					t.Fatalf("admission kind %q, want %q", store.admitted[0].Kind, invocationKindStream)
-				}
-				if store.factsCalls == 0 {
-					t.Fatal("terminal facts were never committed")
-				}
+				require.Equal(t, http.StatusOK, rec.Code)
+				require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+				require.Len(t, store.admitted, 1)
+				require.Equal(t, invocationKindStream, store.admitted[0].Kind)
+				require.Positive(t, store.factsCalls)
 				body := rec.Body.String()
 				if commitFails {
-					if strings.Contains(body, `"type":"response.done"`) {
-						t.Fatal("a completed terminal reached the client despite the facts-commit failure")
-					}
-					if !strings.Contains(body, accountingCommitFailedCode) {
-						t.Fatalf("no accounting_commit_failed frame in body %q", body)
-					}
-					if !strings.HasSuffix(body, "data: [DONE]\n\n") {
-						t.Fatalf("stream does not end with [DONE]: %q", body)
-					}
+					require.Empty(t, store.facts)
+					require.NotContains(t, body, `"type":"response.done"`)
+					require.Contains(t, body, accountingCommitFailedCode)
+					require.Equal(t, 1, strings.Count(body, "data: [DONE]"))
+					require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"))
 					return
 				}
-				if body != wire {
-					t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
-				}
-				if len(store.facts) != 1 {
-					t.Fatalf("terminal facts rows: %d, want 1", len(store.facts))
-				}
+				require.True(t, body == wire, "healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+				require.Len(t, store.facts, 1)
 				f := store.facts[0]
-				if f.Kind != invocationKindStream || f.OrgID != "org-test" {
-					t.Fatalf("facts kind/org: %+v", f)
-				}
-				if f.Fields["tokens_in"] != "7" || f.Fields["tokens_out"] != "3" {
-					t.Fatalf("facts tokens %q/%q, want 7/3", f.Fields["tokens_in"], f.Fields["tokens_out"])
-				}
+				require.Equal(t, store.admitted[0].InvocationID, f.InvocationID)
+				require.Equal(t, invocationKindStream, f.Kind)
+				require.Equal(t, "org-test", f.OrgID)
+				require.Equal(t, "7", f.Fields["tokens_in"])
+				require.Equal(t, "3", f.Fields["tokens_out"])
 			})
 		}
 	}

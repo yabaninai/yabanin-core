@@ -10,11 +10,22 @@ import (
 	"testing"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/stretchr/testify/require"
 
 	"github.com/reireirei/yabanin/pkg/config"
 	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
+
+type paidRouteControl struct {
+	name           string
+	path, body     string
+	upstreamBody   string
+	upstreamStream bool   // upstream answers text/event-stream
+	stream         bool   // client asked for SSE
+	marker         string // substring unique to the upstream answer
+	wantTokensOut  string
+}
 
 // TestPreview2PaidRouteControls pins the Preview2 durable admission gate on
 // every newly wired inference route — embeddings, legacy completions (JSON
@@ -32,15 +43,7 @@ import (
 //     X-Should-Retry: false, the SSE route replaces the held [DONE] with
 //     the accounting error frame and [DONE].
 func TestPreview2PaidRouteControls(t *testing.T) {
-	cases := []struct {
-		name           string
-		path, body     string
-		upstreamBody   string
-		upstreamStream bool   // upstream answers text/event-stream
-		stream         bool   // client asked for SSE
-		marker         string // substring unique to the upstream answer
-		wantTokensOut  string
-	}{
+	cases := []paidRouteControl{
 		{"embeddings", "/v1/embeddings", `{"model":"m","input":"hello"}`,
 			`{"object":"list","data":[{"embedding":[0.1],"index":0}],"usage":{"prompt_tokens":7,"total_tokens":7}}`,
 			false, false, `"embedding":[0.1]`, "0"},
@@ -60,134 +63,89 @@ func TestPreview2PaidRouteControls(t *testing.T) {
 			false, false, `"relevance_score":0.9`, "0"},
 	}
 	for _, tc := range cases {
-		for _, variant := range []struct {
-			name  string
-			store *fakeInvocationStore
-		}{
-			{"healthy", &fakeInvocationStore{}},
-			{"unconfirmed_start", &fakeInvocationStore{admitErr: errors.New("database unavailable")}},
-			{"terminal_write_failure", &fakeInvocationStore{factsErr: errors.New("terminal write unavailable")}},
-		} {
-			t.Run(tc.name+"/"+variant.name, func(t *testing.T) {
-				var hits atomic.Int64
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					hits.Add(1)
-					if tc.upstreamStream {
-						w.Header().Set("Content-Type", "text/event-stream")
-					} else {
-						w.Header().Set("Content-Type", "application/json")
-					}
-					_, _ = w.Write([]byte(tc.upstreamBody))
-				}))
-				defer server.Close()
-
-				info := resolver.ModelInfo{ModelName: "canon-model", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
-				gw := &gateway{
-					cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-					log:         slog.New(slog.DiscardHandler),
-					auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
-					res:         stubModelResolver{"m": info},
-					pool:        upstream.NewPool(upstream.Options{}),
-					invocations: variant.store,
-				}
-				if tc.stream {
-					gw.streamUsageProviders = map[string]bool{"openai": true}
-				}
-
-				req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, strings.NewReader(tc.body))
-				req.Header.Set("Authorization", "Bearer test-key")
-				req.Header.Set("Content-Type", "application/json")
-				rec := httptest.NewRecorder()
-				r := chi.NewRouter()
-				gw.routes(r)
-				r.ServeHTTP(rec, req)
-
-				switch variant.name {
-				case "unconfirmed_start":
-					if rec.Code != http.StatusServiceUnavailable {
-						t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-					}
-					body := rec.Body.String()
-					if !strings.Contains(body, "history_unavailable") || !strings.Contains(body, "the paid call was not sent") {
-						t.Fatalf("refusal envelope %q", body)
-					}
-					if hits.Load() != 0 {
-						t.Fatal("an unconfirmed durable start must precede all provider traffic")
-					}
-					if n := len(variant.store.admitted); n != 0 {
-						t.Fatalf("admitted rows %d", n)
-					}
-					if n := len(variant.store.facts); n != 0 {
-						t.Fatalf("facts rows %d", n)
-					}
-					return
-				case "terminal_write_failure":
-					// Exactly one paid dispatch, one admitted invocation —
-					// and no success answer for it.
-					if hits.Load() != 1 {
-						t.Fatalf("provider hits %d", hits.Load())
-					}
-					if n := len(variant.store.admitted); n != 1 {
-						t.Fatalf("admitted rows %d", n)
-					}
-					body := rec.Body.String()
-					if !strings.Contains(body, "accounting_commit_failed") || !strings.Contains(body, "NOT safe to retry") {
-						t.Fatalf("accounting failure envelope %q", body)
-					}
-					if tc.stream {
-						// A stream's content frames were truthfully delivered
-						// live; what the failure withholds is the success
-						// terminator — the held [DONE] is replaced by the
-						// accounting frame and only then closed.
-						if rec.Code != http.StatusOK {
-							t.Fatalf("stream status %d %s", rec.Code, body)
-						}
-						if !strings.HasSuffix(body, "data: [DONE]\n\n") {
-							t.Fatalf("stream must end on [DONE] after the accounting frame: %q", body)
-						}
-					} else {
-						if strings.Contains(body, tc.marker) {
-							t.Fatalf("upstream answer surfaced after losing the terminal facts row: %q", body)
-						}
-						if rec.Code != http.StatusInternalServerError {
-							t.Fatalf("status %d %s", rec.Code, body)
-						}
-						if got := rec.Header().Get("X-Should-Retry"); got != "false" {
-							t.Fatalf("X-Should-Retry %q", got)
-						}
-					}
-					return
-				default: // healthy
-					if rec.Code != http.StatusOK {
-						t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-					}
-					if hits.Load() != 1 {
-						t.Fatalf("provider hits %d", hits.Load())
-					}
-					if !strings.Contains(rec.Body.String(), tc.marker) {
-						t.Fatalf("upstream answer missing: %q", rec.Body.String())
-					}
-					if n := len(variant.store.admitted); n != 1 {
-						t.Fatalf("admitted rows %d", n)
-					}
-					if n := len(variant.store.facts); n != 1 {
-						t.Fatalf("facts rows %d", n)
-					}
-					a, f := variant.store.admitted[0], variant.store.facts[0]
-					if a.InvocationID != f.InvocationID {
-						t.Fatalf("admission %s not joined to facts %s", a.InvocationID, f.InvocationID)
-					}
-					if a.OrgID != "org-test" || f.OrgID != "org-test" {
-						t.Fatalf("tenant attribution lost: admit %+v facts %+v", a, f)
-					}
-					if got := f.Fields["tokens_in"]; got != "7" {
-						t.Fatalf("tokens_in %q want 7 (real upstream usage, D3)", got)
-					}
-					if got := f.Fields["tokens_out"]; got != tc.wantTokensOut {
-						t.Fatalf("tokens_out %q want %q", got, tc.wantTokensOut)
-					}
-				}
-			})
-		}
+		t.Run(tc.name+"/healthy", func(t *testing.T) {
+			store := &fakeInvocationStore{}
+			rec, hits := tc.serve(t, store)
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			require.EqualValues(t, 1, hits)
+			require.Contains(t, rec.Body.String(), tc.marker)
+			require.Len(t, store.admitted, 1)
+			require.Len(t, store.facts, 1)
+			a, f := store.admitted[0], store.facts[0]
+			require.NotEmpty(t, a.InvocationID)
+			require.Equal(t, a.InvocationID, f.InvocationID)
+			require.Equal(t, "org-test", a.OrgID)
+			require.Equal(t, "org-test", f.OrgID)
+			require.Equal(t, "7", f.Fields["tokens_in"])
+			require.Equal(t, tc.wantTokensOut, f.Fields["tokens_out"])
+		})
+		t.Run(tc.name+"/unconfirmed_start", func(t *testing.T) {
+			store := &fakeInvocationStore{admitErr: errors.New("database unavailable")}
+			rec, hits := tc.serve(t, store)
+			require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+			require.Contains(t, rec.Body.String(), "history_unavailable")
+			require.Contains(t, rec.Body.String(), "the paid call was not sent")
+			require.Zero(t, hits)
+			require.Empty(t, store.admitted)
+			require.Empty(t, store.facts)
+		})
+		t.Run(tc.name+"/terminal_write_failure", func(t *testing.T) {
+			store := &fakeInvocationStore{factsErr: errors.New("terminal write unavailable")}
+			rec, hits := tc.serve(t, store)
+			require.EqualValues(t, 1, hits)
+			require.Len(t, store.admitted, 1)
+			require.Empty(t, store.facts)
+			body := rec.Body.String()
+			require.Contains(t, body, "accounting_commit_failed")
+			require.Contains(t, body, "NOT safe to retry")
+			if tc.stream {
+				require.Equal(t, http.StatusOK, rec.Code)
+				require.Contains(t, body, tc.marker)
+				require.Equal(t, 1, strings.Count(body, "data: [DONE]"))
+				require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"), body)
+				return
+			}
+			require.NotContains(t, body, tc.marker)
+			require.Equal(t, http.StatusInternalServerError, rec.Code)
+			require.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
+		})
 	}
+}
+
+func (tc paidRouteControl) serve(t *testing.T, store *fakeInvocationStore) (*httptest.ResponseRecorder, int64) {
+	t.Helper()
+	var hits atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		hits.Add(1)
+		if tc.upstreamStream {
+			w.Header().Set("Content-Type", "text/event-stream")
+		} else {
+			w.Header().Set("Content-Type", "application/json")
+		}
+		_, _ = w.Write([]byte(tc.upstreamBody))
+	}))
+	t.Cleanup(server.Close)
+
+	info := resolver.ModelInfo{ModelName: "canon-model", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
+	gw := &gateway{
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: store,
+	}
+	if tc.stream {
+		gw.streamUsageProviders = map[string]bool{"openai": true}
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, strings.NewReader(tc.body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	r := chi.NewRouter()
+	gw.routes(r)
+	r.ServeHTTP(rec, req)
+
+	return rec, hits.Load()
 }
