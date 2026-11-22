@@ -246,14 +246,10 @@ func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	}
 }
 
-func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
-	ctx := context.Background()
-	pool := setupFixtureDB(t)
-	setupTestTables(ctx, t, pool)
-	defer teardownTestTables(ctx, t, pool)
-
-	store := NewStore(pool, nil)
-
+// graceCheckWithinLimit exercises the inside-the-grace window: a wallet
+// driven to −50 (grace −100) still passes CheckBalance.
+func graceCheckWithinLimit(ctx context.Context, t *testing.T, store *Store) {
+	t.Helper()
 	// Top up $0.50 (50 cents).
 	err := store.TopUp(ctx, "org-check", 50, "inv-030")
 	if err != nil {
@@ -274,9 +270,16 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 	if bal.BalanceCents != -50 {
 		t.Errorf("expected balance_cents=-50, got %d", bal.BalanceCents)
 	}
+}
 
+// graceCheckRejectsBeyondLimit drives the wallet past the grace floor and
+// verifies the rejection is a clean rollback observed on the fixture DB —
+// not a cached wallet read (the store could serve balance 100 from memory
+// while the wallet row or the ledger drifted) and not a swallowed write.
+func graceCheckRejectsBeyondLimit(ctx context.Context, t *testing.T, store *Store, pool *pgxpool.Pool) {
+	t.Helper()
 	// Top up to 100 cents so we can deduct enough to go below grace.
-	err = store.TopUp(ctx, "org-check", 150, "inv-grace-topup")
+	err := store.TopUp(ctx, "org-check", 150, "inv-grace-topup")
 	if err != nil {
 		t.Fatalf("TopUp for grace test: %v", err)
 	}
@@ -287,9 +290,6 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 		t.Fatalf("expected ErrInsufficientCredits when balance exceeds grace period, got %v", err)
 	}
 
-	// Rejection must be a clean rollback observed on the fixture DB — not a
-	// cached wallet read (the store could serve balance 100 from memory
-	// while the wallet row or the ledger drifted) and not a swallowed write.
 	var walletCents int64
 	if err := pool.QueryRow(ctx,
 		`SELECT balance_cents FROM org_credits WHERE org_id = 'org-check'`).Scan(&walletCents); err != nil {
@@ -307,9 +307,15 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 	if strayRows != 0 {
 		t.Errorf("rejected request must leave zero usage rows, got %d", strayRows)
 	}
+}
 
+// graceCheckRejectsBelowFloor pins the rejection on a manually lowered
+// wallet: the balance is set below grace directly in the fixture DB, the
+// in-memory cache is invalidated, and CheckBalance must still refuse.
+func graceCheckRejectsBelowFloor(ctx context.Context, t *testing.T, store *Store) {
+	t.Helper()
 	// Manually set balance below grace period to test CheckBalance rejection.
-	_, err = store.db.Exec(ctx, `UPDATE org_credits SET balance_cents = -200 WHERE org_id = 'org-check'`)
+	_, err := store.db.Exec(ctx, `UPDATE org_credits SET balance_cents = -200 WHERE org_id = 'org-check'`)
 	if err != nil {
 		t.Fatalf("manual balance update: %v", err)
 	}
@@ -324,6 +330,19 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 	if !errors.Is(err, ErrInsufficientCredits) {
 		t.Fatalf("expected CheckBalance to return ErrInsufficientCredits, got %v", err)
 	}
+}
+
+func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
+	ctx := context.Background()
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	defer teardownTestTables(ctx, t, pool)
+
+	store := NewStore(pool, nil)
+
+	graceCheckWithinLimit(ctx, t, store)
+	graceCheckRejectsBeyondLimit(ctx, t, store, pool)
+	graceCheckRejectsBelowFloor(ctx, t, store)
 }
 
 func TestTransactions_Recorded(t *testing.T) {
@@ -594,6 +613,18 @@ func verifyPerIDLedger(ctx context.Context, t *testing.T, pool *pgxpool.Pool, or
 	}
 }
 
+// usageTxnCount counts the ledger rows a given request ID produced — the
+// idempotency oracle: a replayed request must leave exactly one usage row.
+func usageTxnCount(txns []Transaction, requestID string) int {
+	usageTxns := 0
+	for _, tx := range txns {
+		if tx.Type == "usage" && tx.RequestID != nil && *tx.RequestID == requestID {
+			usageTxns++
+		}
+	}
+	return usageTxns
+}
+
 func TestDeduct_IdempotentDuplicate(t *testing.T) {
 	ctx := context.Background()
 	pool := setupFixtureDB(t)
@@ -637,12 +668,7 @@ func TestDeduct_IdempotentDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTransactions: %v", err)
 	}
-	usageTxns := 0
-	for _, tx := range txns {
-		if tx.Type == "usage" && tx.RequestID != nil && *tx.RequestID == requestID {
-			usageTxns++
-		}
-	}
+	usageTxns := usageTxnCount(txns, requestID)
 	if usageTxns != 1 {
 		t.Errorf("expected 1 usage transaction for this request_id, got %d", usageTxns)
 	}
