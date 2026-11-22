@@ -148,37 +148,32 @@ func sameMockArgs(got, want []any) bool {
 	return true
 }
 
-// unexpectedBind fails the lookup with the distinct wrong-key error.
-func unexpectedBind(route string, got, want []any) errRow {
-	return errRow{err: fmt.Errorf("%w: %s binds %v, want %v", errUnexpectedMockLookup, route, got, want)}
+// fixtureLookup distinguishes a missing row from a query bound to the wrong identity.
+func fixtureLookup(route string, row *fakeRow, got []any, want ...any) pgx.Row {
+	if !sameMockArgs(got, want) {
+		return errRow{err: fmt.Errorf("%w: %s binds %v, want %v", errUnexpectedMockLookup, route, got, want)}
+	}
+	if row == nil {
+		return errRow{err: pgx.ErrNoRows}
+	}
+	return row
 }
 
-// admissionRow routes the mock QueryRow surface under strict lookup
-// expectations:
-//
-//   - the schema probe (0028+ = 1 / pre-0028 = 0);
-//   - the reservations mode read ("off" by default — partial-usage billing
-//     of failed events stays inert unless a test overrides this route);
-//   - the admission lookup, which must bind exactly the scenario's
-//     invocation identity (configured row, or configured no-rows);
-//   - the terminal-facts lookup, which must bind exactly the scenario's
-//     invocation AND org (jsonb payload of the configured map, or
-//     configured no-rows);
-//   - the optional enrichment probes (tool_calls, policy_decisions),
-//     which must bind their production (request, org) / (org, request)
-//     identities and answer no-rows — every scenario here starts from an
-//     empty ledger;
-//   - anything else fails with errUnexpectedMockLookup, never ErrNoRows.
+func terminalFactsRow(facts map[string]any) *fakeRow {
+	if facts == nil {
+		return nil
+	}
+	raw, err := json.Marshal(facts)
+	if err != nil {
+		panic(err) // Invalid fixtures must fail before the first query.
+	}
+	return &fakeRow{vals: []any{string(raw)}}
+}
+
+// admissionRow returns a strict query fixture for an initially empty enrichment ledger.
 func admissionRow(schemaCols int, admission *fakeRow, facts map[string]any) func(context.Context, string, ...any) pgx.Row {
 	id := identityFromFacts(facts)
-	factsJSON := ""
-	if facts != nil {
-		raw, err := json.Marshal(facts)
-		if err != nil {
-			panic(err) // the canonical fixture must always marshal
-		}
-		factsJSON = string(raw)
-	}
+	terminalFacts := terminalFactsRow(facts)
 	return func(_ context.Context, query string, args ...any) pgx.Row {
 		switch {
 		case strings.Contains(query, "information_schema.columns"):
@@ -186,31 +181,13 @@ func admissionRow(schemaCols int, admission *fakeRow, facts map[string]any) func
 		case strings.Contains(query, "FROM organizations"):
 			return &fakeRow{vals: []any{"off"}}
 		case strings.Contains(query, "FROM request_admissions"):
-			if want := []any{id.invocation}; !sameMockArgs(args, want) {
-				return unexpectedBind("request_admissions", args, want)
-			}
-			if admission == nil {
-				return errRow{err: pgx.ErrNoRows}
-			}
-			return admission
+			return fixtureLookup("request_admissions", admission, args, id.invocation)
 		case strings.Contains(query, "FROM request_terminal_facts"):
-			if want := []any{id.invocation, id.org}; !sameMockArgs(args, want) {
-				return unexpectedBind("request_terminal_facts", args, want)
-			}
-			if facts == nil {
-				return errRow{err: pgx.ErrNoRows}
-			}
-			return &fakeRow{vals: []any{factsJSON}}
+			return fixtureLookup("request_terminal_facts", terminalFacts, args, id.invocation, id.org)
 		case strings.Contains(query, "FROM tool_calls") && strings.Contains(query, "LIMIT 1"):
-			if want := []any{id.request, id.org}; !sameMockArgs(args, want) {
-				return unexpectedBind("tool_calls probe", args, want)
-			}
-			return errRow{err: pgx.ErrNoRows}
+			return fixtureLookup("tool_calls probe", nil, args, id.request, id.org)
 		case strings.Contains(query, "FROM policy_decisions"):
-			if want := []any{id.org, id.request}; !sameMockArgs(args, want) {
-				return unexpectedBind("policy_decisions probe", args, want)
-			}
-			return errRow{err: pgx.ErrNoRows}
+			return fixtureLookup("policy_decisions probe", nil, args, id.org, id.request)
 		default:
 			return errRow{err: fmt.Errorf("%w: %q binds %v", errUnexpectedMockLookup, query, args)}
 		}
