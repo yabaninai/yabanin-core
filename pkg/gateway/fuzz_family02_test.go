@@ -266,6 +266,27 @@ func (r *f02Rows) Next() bool {
 	return r.idx < len(r.rows)
 }
 
+// f02scanDest copies one row cell into a single Scan destination, keeping
+// f02Rows.Scan linear. An unsupported destination type is an error.
+func f02scanDest(d any, cell any) error {
+	switch d := d.(type) {
+	case *string:
+		*d, _ = cell.(string)
+	case *int64:
+		*d, _ = cell.(int64)
+	case *float64:
+		*d, _ = cell.(float64)
+	case **string:
+		if s, ok := cell.(string); ok {
+			v := s
+			*d = &v
+		}
+	default:
+		return fmt.Errorf("f02Rows: unsupported dest %T", d)
+	}
+	return nil
+}
+
 func (r *f02Rows) Scan(dest ...any) error {
 	if r.idx < 0 || r.idx >= len(r.rows) {
 		return errors.New("f02Rows: scan past end")
@@ -278,20 +299,8 @@ func (r *f02Rows) Scan(dest ...any) error {
 		if i >= len(cur) {
 			break
 		}
-		switch d := d.(type) {
-		case *string:
-			*d, _ = cur[i].(string)
-		case *int64:
-			*d, _ = cur[i].(int64)
-		case *float64:
-			*d, _ = cur[i].(float64)
-		case **string:
-			if s, ok := cur[i].(string); ok {
-				v := s
-				*d = &v
-			}
-		default:
-			return fmt.Errorf("f02Rows: unsupported dest %T", d)
+		if err := f02scanDest(d, cur[i]); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -840,16 +849,16 @@ func fuzzF0202(t *testing.T) {
 	}
 }
 
-// F02-03 malformed forms fail at the gate; the middleware renders the legacy
-// 401 for non-JWT shapes; missing header and non-Bearer scheme stay legacy.
-func fuzzF0203(t *testing.T) {
-	t.Helper()
-	k := mustRSAJWK(t, "k1")
-	srv := newJWKSServer(t, k)
-	a := newTestJWTAuth(t, srv, nil)
-	mw := jwtMiddleware(a)
+// f02b64 encodes one JWT segment with raw unpadded URL base64.
+func f02b64(s string) string {
+	return base64.RawURLEncoding.EncodeToString([]byte(s))
+}
 
-	b64 := func(s string) string { return base64.RawURLEncoding.EncodeToString([]byte(s)) }
+// f02ScenarioMalformedTokens asserts every malformed JWT shape fails at the
+// authenticator with the stable 401/form verdict, while a well-formed
+// header with a garbage payload dies at signature verification instead.
+func f02ScenarioMalformedTokens(t *testing.T, a *JWTAuthenticator) {
+	t.Helper()
 	badHdr, _ := json.Marshal(map[string]string{"alg": "RS256"}) // no kid
 	malformed := []string{
 		"not-a-jwt",
@@ -857,36 +866,31 @@ func fuzzF0203(t *testing.T) {
 		"a.b.c.d",
 		"..",
 		"***.b.c",
-		b64("notjson") + ".b.c",
-		b64(string(badHdr)) + ".b.c",
+		f02b64("notjson") + ".b.c",
+		f02b64(string(badHdr)) + ".b.c",
 	}
 	for _, tok := range malformed {
 		_, err := a.Authenticate(context.Background(), tok)
-		ae, ok := err.(*jwtAuthError)
-		if !ok || ae.status != http.StatusUnauthorized || ae.reason != "form" {
-			t.Fatalf("F02-03: %q: want 401/form, got %+v (%v)", tok, ae, err)
-		}
+		f02expectJWTError(t, fmt.Sprintf("F02-03: %q", tok), err, http.StatusUnauthorized, "form")
 	}
 
 	// Well-formed header, garbage payload: the kid lookup succeeds and the
 	// parse fails → signature reason (not "form").
 	goodHdr, _ := json.Marshal(map[string]string{"alg": "RS256", "kid": "k1"})
-	garbagePayload := b64(string(goodHdr)) + "." + b64("not-json") + "." + b64("c2ln")
-	_, gpErr := a.Authenticate(context.Background(), garbagePayload)
-	gpAe, gpOK := gpErr.(*jwtAuthError)
-	if !gpOK || gpAe.status != http.StatusUnauthorized || gpAe.reason != "signature" {
-		t.Fatalf("F02-03: garbage payload: want 401/signature, got %+v (%v)", gpAe, gpErr)
-	}
+	garbagePayload := f02b64(string(goodHdr)) + "." + f02b64("not-json") + "." + f02b64("c2ln")
+	_, err := a.Authenticate(context.Background(), garbagePayload)
+	f02expectJWTError(t, "F02-03: garbage payload", err, http.StatusUnauthorized, "signature")
+}
 
-	// Middleware: non-JWT shapes fall to the legacy path → "invalid API key".
-	for _, tok := range []string{"not-a-jwt", "a.b", b64("notjson") + ".b.c"} {
-		req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-		req.Header.Set("Authorization", "Bearer "+tok)
-		rec := httptest.NewRecorder()
-		mw.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(rec, req)
-		if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid API key") {
-			t.Fatalf("F02-03: %q: %d %s", tok, rec.Code, rec.Body.String())
-		}
+// f02ScenarioLegacyFallbacks asserts the middleware renders the legacy 401
+// for non-JWT shapes, a missing Authorization header, and a non-Bearer
+// scheme — the JWT fork must stay untouched in all three cases.
+func f02ScenarioLegacyFallbacks(t *testing.T, mw *AuthMiddleware, k jwkPair) {
+	t.Helper()
+	for _, tok := range []string{"not-a-jwt", "a.b", f02b64("notjson") + ".b.c"} {
+		rec := f02driveBearer(t, mw, tok,
+			http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+		f02expectStatus(t, fmt.Sprintf("F02-03: %q", tok), rec, http.StatusUnauthorized, "invalid API key")
 	}
 
 	// No Authorization at all → missing-header 401.
@@ -904,6 +908,19 @@ func fuzzF0203(t *testing.T) {
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("F02-03: basic scheme: %d", rec.Code)
 	}
+}
+
+// F02-03 malformed forms fail at the gate; the middleware renders the legacy
+// 401 for non-JWT shapes; missing header and non-Bearer scheme stay legacy.
+func fuzzF0203(t *testing.T) {
+	t.Helper()
+	k := mustRSAJWK(t, "k1")
+	srv := newJWKSServer(t, k)
+	a := newTestJWTAuth(t, srv, nil)
+	mw := jwtMiddleware(a)
+
+	f02ScenarioMalformedTokens(t, a)
+	f02ScenarioLegacyFallbacks(t, mw, k)
 }
 
 // F02-04 algorithm confusion: none and HS256 are rejected BEFORE any JWKS
@@ -1825,16 +1842,13 @@ func fuzzF0214(t *testing.T) {
 	f02expectAbsentBody(t, "F02-14: empty groups", recE, "groups")
 }
 
-// F02-15 no DB → 501 on every endpoint; label policy default + auth gate.
-func fuzzF0215(t *testing.T) {
+// f02ScenarioPolicyUnavailable asserts every session-key endpoint renders
+// the stable 501 "session_keys_unavailable" while the gateway has no DB.
+func f02ScenarioPolicyUnavailable(t *testing.T, gw *gateway) {
 	t.Helper()
-	gw := &gateway{gatewayCore: gatewayCore{log: fuzzDiscardLogger()}}
-
 	unavailable := func(rec *httptest.ResponseRecorder, want string) {
 		t.Helper()
-		if rec.Code != http.StatusNotImplemented || !strings.Contains(rec.Body.String(), "session_keys_unavailable") {
-			t.Fatalf("F02-15 %s: %d %s", want, rec.Code, rec.Body.String())
-		}
+		f02expectStatus(t, "F02-15 "+want, rec, http.StatusNotImplemented, "session_keys_unavailable")
 	}
 	rec := httptest.NewRecorder()
 	gw.mintSessionKey(rec, httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/yabanin/session-keys", nil))
@@ -1854,11 +1868,16 @@ func fuzzF0215(t *testing.T) {
 	rec = httptest.NewRecorder()
 	gw.sessionLabelPolicy(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/label-policy", nil))
 	unavailable(rec, "label policy")
+}
 
-	// With a DB: org gate first (401), then the default policy (200).
+// f02ScenarioLabelPolicyGate asserts the label-policy endpoint gates on the
+// org header (401 without it), then renders the default policy as JSON with
+// exactly one label_policies query.
+func f02ScenarioLabelPolicyGate(t *testing.T) {
+	t.Helper()
 	db := f02DB()
 	gw2 := f02SessionGW(db, &memSessionKV{}, nil)
-	rec = httptest.NewRecorder()
+	rec := httptest.NewRecorder()
 	gw2.sessionLabelPolicy(rec, httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/label-policy", nil))
 	if rec.Code != http.StatusUnauthorized {
 		t.Fatalf("F02-15: no org: %d", rec.Code)
@@ -1873,9 +1892,13 @@ func fuzzF0215(t *testing.T) {
 	if got := len(db.f02Find("row", "label_policies")); got != 1 {
 		t.Fatalf("F02-15: label_policies queries %d", got)
 	}
+}
 
-	// Stored policy shapes: malformed JSON and an empty column both fall
-	// back to the default policy; a valid custom policy renders.
+// f02ScenarioStoredPolicyShapes asserts malformed JSON and an empty policy
+// column both fall back to the default policy, while a valid stored custom
+// policy renders verbatim.
+func f02ScenarioStoredPolicyShapes(t *testing.T) {
+	t.Helper()
 	policyReq := func() (*httptest.ResponseRecorder, *http.Request) {
 		reqP := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/label-policy", nil)
 		reqP.Header.Set("X-Org-Id", "org-1")
@@ -1904,15 +1927,21 @@ func fuzzF0215(t *testing.T) {
 	}
 }
 
-// F02-16 mint → revoke → use lifecycle on the freshly minted row.
-func fuzzF0216(t *testing.T) {
+// F02-15 no DB → 501 on every endpoint; label policy default + auth gate.
+func fuzzF0215(t *testing.T) {
 	t.Helper()
-	db := f02DB()
-	db.modelRows = [][]any{{"gpt-x", int64(1), int64(1), int64(1), 0.0}}
-	kv := &memSessionKV{}
-	var logs bytes.Buffer
-	gw := f02SessionGW(db, kv, &logs)
+	gw := &gateway{gatewayCore: gatewayCore{log: fuzzDiscardLogger()}}
 
+	f02ScenarioPolicyUnavailable(t, gw)
+	f02ScenarioLabelPolicyGate(t)
+	f02ScenarioStoredPolicyShapes(t)
+}
+
+// f02ScenarioMintOracle drives a mint and asserts the session_keys INSERT
+// oracle: exactly one row, a non-empty hash argument, and no ybs_ secret in
+// the logs. It returns the inserted hash for the downstream oracles.
+func f02ScenarioMintOracle(t *testing.T, gw *gateway, db *f02RecordingDB, logs *bytes.Buffer) string {
+	t.Helper()
 	rec := httptest.NewRecorder()
 	gw.mintSessionKey(rec, mintReq(t, principal{APIKeyID: "parent-1", CanMintSessions: true}, `{}`))
 	if rec.Code != http.StatusCreated {
@@ -1929,8 +1958,13 @@ func fuzzF0216(t *testing.T) {
 	if strings.Contains(logs.String(), "ybs_") {
 		t.Fatal("F02-16: secret leaked into logs")
 	}
+	return hash
+}
 
-	r := f02Router(gw)
+// f02ScenarioRevokeMinted revokes the freshly minted session and asserts
+// the guarded cache purge hit exactly "org:resolve:<hash>".
+func f02ScenarioRevokeMinted(t *testing.T, r chi.Router, kv *memSessionKV, hash string) {
+	t.Helper()
 	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-new", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNoContent {
 		t.Fatalf("F02-16: revoke minted: %d %s", rec.Code, rec.Body.String())
 	}
@@ -1940,7 +1974,12 @@ func fuzzF0216(t *testing.T) {
 	if len(dels) != 1 || dels[0] != "org:resolve:"+hash {
 		t.Fatalf("F02-16: purge dels %v (hash %q)", dels, hash)
 	}
+}
 
+// f02ScenarioUsageMinted asserts the minted session's usage renders two
+// requests through an own-tenant query bound to org-1 + sess-new.
+func f02ScenarioUsageMinted(t *testing.T, r chi.Router, db *f02RecordingDB) {
+	t.Helper()
 	rec2 := f02Call(t, r, http.MethodGet, "/session-keys/sess-new/usage", "", principal{APIKeyID: "parent-1"})
 	if rec2.Code != http.StatusOK || !strings.Contains(rec2.Body.String(), `"requests":2`) {
 		t.Fatalf("F02-16: usage minted: %d %s", rec2.Code, rec2.Body.String())
@@ -1949,6 +1988,21 @@ func fuzzF0216(t *testing.T) {
 	if len(rows) != 1 || rows[0].args[0] != "org-1" || rows[0].args[1] != "sess-new" {
 		t.Fatalf("F02-16: own-tenant usage rows %+v", rows)
 	}
+}
+
+// F02-16 mint → revoke → use lifecycle on the freshly minted row.
+func fuzzF0216(t *testing.T) {
+	t.Helper()
+	db := f02DB()
+	db.modelRows = [][]any{{"gpt-x", int64(1), int64(1), int64(1), 0.0}}
+	kv := &memSessionKV{}
+	var logs bytes.Buffer
+	gw := f02SessionGW(db, kv, &logs)
+
+	hash := f02ScenarioMintOracle(t, gw, db, &logs)
+	r := f02Router(gw)
+	f02ScenarioRevokeMinted(t, r, kv, hash)
+	f02ScenarioUsageMinted(t, r, db)
 
 	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-new", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
 		t.Fatalf("F02-16: foreign: %d", rec.Code)
@@ -2123,6 +2177,63 @@ func fuzzF0217(t *testing.T) {
 	f02ScenarioLegacySessionResolve(t)
 }
 
+// f02ScenarioBrokenTenantWiring proves tenant discrimination on cross-tenant
+// wiring: a token valid for org A fails against org B's middleware while the
+// correct twin still passes.
+func f02ScenarioBrokenTenantWiring(t *testing.T, authA, authB *JWTAuthenticator, tokA string) {
+	t.Helper()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer "+tokA)
+	jwtMiddleware(authB).ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("broken variant accepted") })).ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("F02-18: cross-tenant wiring not caught: %d", rec.Code)
+	}
+	rec2 := httptest.NewRecorder()
+	req2 := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
+	req2.Header.Set("Authorization", "Bearer "+tokA)
+	jwtMiddleware(authA).ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec2, req2)
+	if rec2.Code != http.StatusOK {
+		t.Fatalf("F02-18: correct twin must pass: %d", rec2.Code)
+	}
+}
+
+// f02tamperedToken re-encodes a token's payload with org_id swapped to
+// org-evil, leaving the original signature segments untouched.
+func f02tamperedToken(t *testing.T, tok string) string {
+	t.Helper()
+	parts := strings.Split(tok, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	claims["org_id"] = "org-evil"
+	evil, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return parts[0] + "." + base64.RawURLEncoding.EncodeToString(evil) + "." + parts[2]
+}
+
+// f02ScenarioCorruptedPrincipal proves the visibility oracle: a foreign
+// parent id on an owned session must 404 while the correct twin revokes.
+func f02ScenarioCorruptedPrincipal(t *testing.T) {
+	t.Helper()
+	db := f02DB()
+	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	r := f02Router(f02SessionGW(db, &memSessionKV{}, nil))
+	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
+		t.Fatalf("F02-18: corrupted principal not caught: %d", rec.Code)
+	}
+	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNoContent {
+		t.Fatalf("F02-18: correct twin must revoke: %d", rec.Code)
+	}
+}
+
 // F02-18 deliberately broken variants: the oracles must catch each one
 // (control against vacuous expectations).
 func fuzzF0218(t *testing.T) {
@@ -2138,54 +2249,14 @@ func fuzzF0218(t *testing.T) {
 	tokA := signToken(t, keyA, baseClaims())
 	srvB := newJWKSServer(t, mustRSAJWK(t, "k1"))
 	authB := newTestJWTAuth(t, srvB, func(w *JWTWiring) { w.Issuer = "https://idp-b.example" })
-	rec := httptest.NewRecorder()
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer "+tokA)
-	jwtMiddleware(authB).ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("broken variant accepted") })).ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized {
-		t.Fatalf("F02-18: cross-tenant wiring not caught: %d", rec.Code)
-	}
-	rec2 := httptest.NewRecorder()
-	req2 := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req2.Header.Set("Authorization", "Bearer "+tokA)
-	jwtMiddleware(authA).ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusOK {
-		t.Fatalf("F02-18: correct twin must pass: %d", rec2.Code)
-	}
+	f02ScenarioBrokenTenantWiring(t, authA, authB, tokA)
 
 	// (b) Tampered payload: all claims valid, but the signature no longer
 	// covers the bytes — must fail closed on signature.
-	parts := strings.Split(tokA, ".")
-	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
-	if err != nil {
-		t.Fatal(err)
-	}
-	var claims map[string]any
-	if err := json.Unmarshal(payload, &claims); err != nil {
-		t.Fatal(err)
-	}
-	claims["org_id"] = "org-evil"
-	evil, err := json.Marshal(claims)
-	if err != nil {
-		t.Fatal(err)
-	}
-	tampered := parts[0] + "." + base64.RawURLEncoding.EncodeToString(evil) + "." + parts[2]
-	_, err = authA.Authenticate(context.Background(), tampered)
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
-		t.Fatalf("F02-18: tampered payload not caught: %+v (%v)", ae, err)
-	}
+	_, err := authA.Authenticate(context.Background(), f02tamperedToken(t, tokA))
+	f02expectJWTError(t, "F02-18: tampered payload not caught", err, http.StatusUnauthorized, "signature")
 
 	// (c) Corrupted session principal: a foreign parent id on an owned
 	// session — the visibility oracle must 404 (the correct twin 204s).
-	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
-	gw := f02SessionGW(db, &memSessionKV{}, nil)
-	r := f02Router(gw)
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-18: corrupted principal not caught: %d", rec.Code)
-	}
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNoContent {
-		t.Fatalf("F02-18: correct twin must revoke: %d", rec.Code)
-	}
+	f02ScenarioCorruptedPrincipal(t)
 }
