@@ -200,8 +200,11 @@ func TestUpstreamGuardRetainsRequestValuesAfterCancellation(t *testing.T) {
 			return nil, stop
 		})
 	require.NoError(t, err)
-	_, err = client.Do(ctx, "/v1/models", nil, "", false, nil)
+	resp, err := client.Do(ctx, "/v1/models", nil, "", false, nil)
 	require.ErrorIs(t, err, stop)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
 }
 
 func TestForwardJSON_ContextCanceled(t *testing.T) {

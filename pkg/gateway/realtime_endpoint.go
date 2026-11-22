@@ -536,7 +536,7 @@ func (s *realtimeRelaySink) settleEnd(rctx context.Context, idle *idleReader, re
 	if s.werr != nil {
 		return budget.TerminationClientCancel, s.werr
 	}
-	if rerr == io.EOF {
+	if errors.Is(rerr, io.EOF) {
 		return budget.TerminationCompleted, nil
 	}
 	return realtimeBreakTerm(rctx, idle), rerr

@@ -453,8 +453,8 @@ func (s *f02LastUsedStore) Exec(_ context.Context, sql string, args ...any) (pgc
 // expected HTTP status and machine reason.
 func f02expectJWTError(t *testing.T, label string, err error, wantStatus int, wantReason string) {
 	t.Helper()
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != wantStatus || ae.reason != wantReason {
+	var ae *jwtAuthError
+	if !errors.As(err, &ae) || ae.status != wantStatus || ae.reason != wantReason {
 		t.Fatalf("%s: want %d/%s, got %+v (%v)", label, wantStatus, wantReason, ae, err)
 	}
 }
@@ -836,8 +836,8 @@ func fuzzF0202(t *testing.T) {
 	for _, tc := range cases {
 		before := jwtErrors(tc.reason)
 		_, err := a.Authenticate(context.Background(), tc.token)
-		ae, ok := err.(*jwtAuthError)
-		if !ok || ae.status != http.StatusUnauthorized || ae.reason != tc.reason {
+		var ae *jwtAuthError
+		if !errors.As(err, &ae) || ae.status != http.StatusUnauthorized || ae.reason != tc.reason {
 			t.Fatalf("F02-02 %s: want 401/%s, got %+v (%v)", tc.name, tc.reason, ae, err)
 		}
 		if got := jwtErrors(tc.reason); got < before+1 {
@@ -939,8 +939,8 @@ func fuzzF0204(t *testing.T) {
 		}
 		tok := base64.RawURLEncoding.EncodeToString(header) + ".e30.AA"
 		_, err = a.Authenticate(context.Background(), tok)
-		ae, ok := err.(*jwtAuthError)
-		if !ok || ae.status != http.StatusUnauthorized || ae.reason != "alg" {
+		var ae *jwtAuthError
+		if !errors.As(err, &ae) || ae.status != http.StatusUnauthorized || ae.reason != "alg" {
 			t.Fatalf("F02-04: want 401/alg, got %+v (%v)", ae, err)
 		}
 	}
@@ -950,8 +950,8 @@ func fuzzF0204(t *testing.T) {
 
 	ec := mustESJWK(t, "k1") // RSA key's kid, EC material
 	_, err := a.Authenticate(context.Background(), signToken(t, ec, baseClaims()))
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
+	var ae *jwtAuthError
+	if !errors.As(err, &ae) || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
 		t.Fatalf("F02-04: want 401/signature for ES-vs-RSA kid, got %+v (%v)", ae, err)
 	}
 }
@@ -1264,8 +1264,8 @@ func fuzzF0208(t *testing.T) {
 	encSrv := newJWKSServer(t, encKey)
 	encAuth := newTestJWTAuth(t, encSrv, nil)
 	_, err := encAuth.Authenticate(context.Background(), signToken(t, encKey, baseClaims()))
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
+	var ae *jwtAuthError
+	if !errors.As(err, &ae) || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
 		t.Fatalf("F02-08: use:enc key must not verify, got %+v (%v)", ae, err)
 	}
 
@@ -1279,8 +1279,7 @@ func fuzzF0208(t *testing.T) {
 	}})
 	octAuth := newTestJWTAuth(t, octSrv, nil)
 	_, err = octAuth.Authenticate(context.Background(), signToken(t, octTok, baseClaims()))
-	ae, ok = err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
+	if !errors.As(err, &ae) || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
 		t.Fatalf("F02-08: oct key must not verify, got %+v (%v)", ae, err)
 	}
 }

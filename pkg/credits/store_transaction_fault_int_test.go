@@ -26,7 +26,7 @@ func TestDeductMicroSerializationRetryChargesOnce(t *testing.T) {
 	require.NoError(t, store.DeductMicro(ctx, org, money.MicroUSD(250000), request, nil))
 	assertRetrySequence(t, ctx, pool, 2)
 	assertCreditState(t, ctx, pool, org, 75, 0, 1, -250000)
-	requireReconciled(ctx, t, pool, org)
+	requireReconciledSeeded(ctx, t, pool, org, 100)
 }
 
 func TestDeductMicroSerializationRetryExhaustionLeavesNoDebit(t *testing.T) {
@@ -43,7 +43,7 @@ func TestDeductMicroSerializationRetryExhaustionLeavesNoDebit(t *testing.T) {
 	require.Equal(t, "40001", pgErr.Code)
 	assertRetrySequence(t, ctx, pool, int64(maxDeductRetries+1))
 	assertCreditState(t, ctx, pool, org, 100, 0, 0, 0)
-	requireReconciled(ctx, t, pool, org)
+	requireReconciledSeeded(ctx, t, pool, org, 100)
 }
 
 func TestDeductMicroMetadataMarshalFailureRollsBackWalletAndLedger(t *testing.T) {
@@ -60,7 +60,7 @@ func TestDeductMicroMetadataMarshalFailureRollsBackWalletAndLedger(t *testing.T)
 		t.Fatalf("unmarshalable metadata must reject the debit, got %v", err)
 	}
 	assertCreditState(t, ctx, pool, org, 100, 0, 0, 0)
-	requireReconciled(ctx, t, pool, org)
+	requireReconciledSeeded(ctx, t, pool, org, 100)
 }
 
 func TestDeductMicroCommitFailureRollsBackWalletAndLedger(t *testing.T) {
@@ -87,7 +87,7 @@ func TestDeductMicroCommitFailureRollsBackWalletAndLedger(t *testing.T) {
 		t.Fatalf("deferred commit failure must return constraint error 23514, got %v", err)
 	}
 	assertCreditState(t, ctx, pool, org, 100, 0, 0, 0)
-	requireReconciled(ctx, t, pool, org)
+	requireReconciledSeeded(ctx, t, pool, org, 100)
 }
 
 func TestDeductOnceMicroClosedPoolFailsBeforeTransaction(t *testing.T) {

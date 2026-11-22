@@ -55,16 +55,25 @@ func ledgerTotals(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID s
 }
 
 // requireReconciled pins the AF-05 invariant for a wallet seeded from a
-// micro-clean state (balance 0, empty ledger): owed micro total derived from
-// the wallet plus its residue equals the exact micro the ledger recorded —
-// owed = (−balance_cents)*10000 + remainder == −SUM(amount_micro_usd).
+// micro-clean state (balance 0, empty ledger); see requireReconciledSeeded
+// for the general seeded form.
 func requireReconciled(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID string) {
+	t.Helper()
+	requireReconciledSeeded(ctx, t, pool, orgID, 0)
+}
+
+// requireReconciledSeeded pins the AF-05 invariant for a wallet seeded with
+// seedCents: prepaid seed cents carry no ledger rows, so every ledger
+// identity is offset by the seed —
+// balance == seed + SUM(amount_cents) and
+// −SUM(amount_micro_usd) == (seed − balance)*10000 + remainder.
+func requireReconciledSeeded(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID string, seedCents int64) {
 	t.Helper()
 	balanceCents, remainder := walletRow(ctx, t, pool, orgID)
 	ledgerCents, ledgerMicro, _ := ledgerTotals(ctx, t, pool, orgID)
-	assert.Equal(t, ledgerCents, balanceCents, "wallet cents must equal the cents ledger sum")
-	assert.Equal(t, -balanceCents*int64(money.MicroPerCent)+remainder, -ledgerMicro,
-		"owed µUSD (wallet + residue) must equal the exact µUSD the ledger billed")
+	assert.Equal(t, seedCents+ledgerCents, balanceCents, "wallet cents must equal seed plus the cents ledger sum")
+	assert.Equal(t, (seedCents-balanceCents)*int64(money.MicroPerCent)+remainder, -ledgerMicro,
+		"owed µUSD (seed-offset wallet + residue) must equal the exact µUSD the ledger billed")
 }
 
 // Acceptance: 1000 individual requests at $0.004 bill exactly $4.00, across
