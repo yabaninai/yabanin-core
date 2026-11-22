@@ -73,27 +73,32 @@ func TestIntegration_RequestRowKeyIdentity(t *testing.T) {
 	assert.Equal(t, "gpt-4o", byKey[mustKey(t, key2)].ModelUsed)
 
 	// DETAIL, correlation-scoped row-key selection: the selected row's own
-	// facts, never the sibling's.
-	d1, err := store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", mustKey(t, key1))
+	// facts. Members with requests:read can see org-wide metadata.
+	_, err = store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", mustKey(t, key1))
+	assert.ErrorIs(t, err, ErrNotFound, "a caller with no scope gets the fail-closed miss even for a physically present row")
+
+	metaCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{OrgWideMetadata: true})
+	d1, err := store.GetRequestDetailRowInCorrelation(metaCtx, orgID, "req-x", mustKey(t, key1))
 	require.NoError(t, err)
 	assert.Equal(t, "gpt-4o-mini", d1.ModelUsed)
 	assert.Equal(t, int64(100), d1.TokensIn)
 	assert.Equal(t, int64(50), d1.TokensOut)
 
-	d2, err := store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", mustKey(t, key2))
+	d2, err := store.GetRequestDetailRowInCorrelation(metaCtx, orgID, "req-x", mustKey(t, key2))
 	require.NoError(t, err)
 	assert.Equal(t, int64(200), d2.TokensIn, "the sibling's facts, not the other row's")
 
-	dBig, err := store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", 9007199254740993)
+	dBig, err := store.GetRequestDetailRowInCorrelation(metaCtx, orgID, "req-x", 9007199254740993)
 	require.NoError(t, err)
 	assert.Equal(t, int64(300), dBig.TokensIn, "the beyond-2^53 row answers under its exact key")
 
-	// The selection is fenced by correlation AND org.
-	_, err = store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", mustKey(t, keyOther))
+	// The selection is fenced by correlation AND org — and the fence holds
+	// for a caller who legitimately sees this org's metadata.
+	_, err = store.GetRequestDetailRowInCorrelation(metaCtx, orgID, "req-x", mustKey(t, keyOther))
 	assert.ErrorIs(t, err, ErrNotFound, "a key belonging to another correlation is a miss")
-	_, err = store.GetRequestDetailRowInCorrelation(ctx, orgID, "req-x", mustKey(t, keyForeign))
+	_, err = store.GetRequestDetailRowInCorrelation(metaCtx, orgID, "req-x", mustKey(t, keyForeign))
 	assert.ErrorIs(t, err, ErrNotFound, "a foreign org's row must never answer this org's read")
-	_, err = store.GetRequestDetailRowInCorrelation(ctx, otherOrg, "req-x", mustKey(t, key2))
+	_, err = store.GetRequestDetailRowInCorrelation(metaCtx, otherOrg, "req-x", mustKey(t, key2))
 	assert.ErrorIs(t, err, ErrNotFound, "this org's row must never answer the foreign org's read")
 }
 
