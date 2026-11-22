@@ -596,43 +596,54 @@ func (s *Store) deductAlreadyApplied(ctx context.Context, tx pgx.Tx, orgID strin
 // split into whole cents plus the sub-cent residue carried by
 // remainder_micro_usd. The residue that reaches a whole cent is charged
 // immediately (carry), keeping the invariant: charged µUSD = charged
-// cents*10000 + remainder growth. The wallet row is rejected (no row →
-// ErrInsufficientCredits) unless new_wallet_cents > floor, or
-// new_wallet_cents == floor with an exactly zero new remainder (only an
-// exact floor landing may stand).
+// cents*10000 + remainder growth. The effective floor is the wallet's own
+// grace_floor_cents override when set, otherwise the store's global grace
+// period — the same resolution the batch executor applies, so the
+// outcome never depends on how many jobs the queue groups. A missing
+// wallet row is ErrNoWallet; an existing wallet below the floor is
+// ErrInsufficientCredits — distinct facts with distinct dispositions.
+// Only new_wallet_cents > floor, or new_wallet_cents == floor with an
+// exactly zero new remainder, may stand (only an exact floor landing).
 func (s *Store) applyMicroCharge(ctx context.Context, tx pgx.Tx, orgID string, amount money.MicroUSD) (newBalance, newRemainder, chargeCents int64, err error) {
+	var allowed bool
 	err = tx.QueryRow(ctx, `
 		WITH wallet AS (
-			SELECT balance_cents, remainder_micro_usd
+			SELECT balance_cents, remainder_micro_usd, grace_floor_cents
 			FROM org_credits WHERE org_id = $1 FOR UPDATE
 		),
 		parts AS (
 			SELECT w.balance_cents,
 				   w.remainder_micro_usd,
+				   COALESCE(w.grace_floor_cents, $3::bigint) AS floor_cents,
 				   $2::bigint / 10000 AS ded_cents,
 				   $2::bigint % 10000 AS ded_rem
 			FROM wallet w
 		),
 		carry AS (
 			SELECT balance_cents,
+				   floor_cents,
 				   ded_cents + (remainder_micro_usd + ded_rem) / 10000 AS charge_cents,
 				   (remainder_micro_usd + ded_rem) % 10000 AS new_remainder
 			FROM parts
 		)
 		SELECT balance_cents - charge_cents AS new_balance,
 			   new_remainder,
-			   charge_cents
+			   charge_cents,
+			   (balance_cents - charge_cents > floor_cents
+			    OR (balance_cents - charge_cents = floor_cents AND new_remainder = 0)) AS allowed
 		FROM carry
-		WHERE balance_cents - charge_cents > $3
-		   OR (balance_cents - charge_cents = $3 AND new_remainder = 0)
-	`, orgID, int64(amount), s.cfg.GracePeriodCents).Scan(&newBalance, &newRemainder, &chargeCents)
+	`, orgID, int64(amount), s.cfg.GracePeriodCents).Scan(&newBalance, &newRemainder, &chargeCents, &allowed)
 
 	if errors.Is(err, pgx.ErrNoRows) {
-		// Insufficient credits.
-		return 0, 0, 0, ErrInsufficientCredits
+		// No wallet row: a missing billing wallet, not a floor rejection.
+		return 0, 0, 0, ErrNoWallet
 	}
 	if err != nil {
 		return 0, 0, 0, fmt.Errorf("deduct balance check: %w", err)
+	}
+	if !allowed {
+		// The wallet exists but the charge would land below its floor.
+		return 0, 0, 0, ErrInsufficientCredits
 	}
 
 	_, err = tx.Exec(ctx,

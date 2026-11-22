@@ -599,3 +599,73 @@ func TestMoneyReview_B8_GenuineRollbackStillFallsBack(t *testing.T) {
 	assert.Equal(t, int64(1), total)
 	assert.Equal(t, []int64{-int64(moneyReviewCent)}, amounts)
 }
+
+// Floor resolution details (review follow-up): (a) a NULL org floor falls
+// back to the global grace period — a NULL column must not park charges
+// that the global floor allows; (b) sub-cent charges carry their residue
+// through remainder_micro_usd; (c) an exact-floor landing stands only
+// with an exactly zero new remainder — a sub-cent charge at the floor
+// leaves residue and must park.
+func TestMoneyReview_B8_FloorResolutionCarryAndNullFallback(t *testing.T) {
+	ctx, pool := newSettlementLiveEnv(t)
+	moneyReviewReset(t, ctx, pool)
+
+	floorZero := int64(moneyReviewFloorZero)
+
+	reviewLog := &moneyReviewLog{}
+	w, db := moneyReviewWorker(t, pool, reviewLog)
+
+	// (a) NULL org floor + wallet 0 + 1¢ charge: the global floor is
+	// −100¢, so the charge stands and the wallet legitimately overdraws
+	// to −1 — the NULL fallback must resolve to the GLOBAL floor, not to
+	// zero and not to an unconditional park.
+	orgNull := "b8-null-floor-org"
+	moneyReviewOrg(t, ctx, pool, orgNull, &[]int64{0}[0], nil)
+	jobNull := moneyReviewSeedJob(t, ctx, pool, orgNull, "b8-null-req", "b8000000-0000-4000-8000-00000000b810", int64(moneyReviewCent))
+	drainSettlementQueue(ctx, t, w, db, orgNull, ChargeKindResaleDeduction)
+
+	status, _, _ := jobStatus(ctx, t, db, jobNull)
+	assert.Equal(t, "settled", status, "a NULL org floor falls back to the global grace period: the 1¢ charge stands")
+	balance, _, _ := moneyReviewWallet(t, ctx, pool, orgNull)
+	assert.Equal(t, int64(-1), balance, "the wallet sits at the global −100¢ floor semantics: charged to −1")
+	total, amounts := moneyReviewUsage(t, ctx, pool, orgNull)
+	assert.Equal(t, int64(1), total)
+	assert.Equal(t, []int64{-int64(moneyReviewCent)}, amounts)
+
+	// (b) explicit org floor 0 + wallet 100¢ + sub-cent 1.5¢ charge: the
+	// residue carries into remainder_micro_usd (100 − 1 = 99¢, remainder
+	// 5000µ) — carry arithmetic must survive the floor-resolution change.
+	orgCarry := "b8-carry-org"
+	hundred := int64(100)
+	moneyReviewOrg(t, ctx, pool, orgCarry, &hundred, &floorZero)
+	jobCarry := moneyReviewSeedJob(t, ctx, pool, orgCarry, "b8-carry-req", "b8000000-0000-4000-8000-00000000b811", 15000)
+	drainSettlementQueue(ctx, t, w, db, orgCarry, ChargeKindResaleDeduction)
+
+	status, _, _ = jobStatus(ctx, t, db, jobCarry)
+	assert.Equal(t, "settled", status, "a sub-cent charge above the org floor settles")
+	balance, remainder, _ := moneyReviewWallet(t, ctx, pool, orgCarry)
+	assert.Equal(t, int64(99), balance, "one whole cent charged")
+	assert.Equal(t, int64(5000), remainder, "the 0.5¢ residue carries in remainder_micro_usd")
+	total, amounts = moneyReviewUsage(t, ctx, pool, orgCarry)
+	assert.Equal(t, int64(2), total)
+	assert.Equal(t, []int64{-15000}, amounts)
+
+	// (c) org floor 0 + wallet 0 + sub-cent 0.5¢ charge: the balance would
+	// land exactly AT the floor but the new remainder is non-zero — only
+	// an exact floor landing with zero residue may stand, so this parks.
+	orgFloorSub := "b8-floor-subcent-org"
+	zero := int64(0)
+	moneyReviewOrg(t, ctx, pool, orgFloorSub, &zero, &floorZero)
+	jobSub := moneyReviewSeedJob(t, ctx, pool, orgFloorSub, "b8-sub-req", "b8000000-0000-4000-8000-00000000b812", 5000)
+	drainSettlementQueue(ctx, t, w, db, orgFloorSub, ChargeKindResaleDeduction)
+
+	status, _, lastErr := jobStatus(ctx, t, db, jobSub)
+	assert.Equal(t, "requires_attention", status, "a sub-cent charge at the exact floor leaves residue and must park")
+	assert.Equal(t, budget.ReasonInsufficientCredits, lastErr)
+	balance, remainder, _ = moneyReviewWallet(t, ctx, pool, orgFloorSub)
+	assert.Equal(t, int64(0), balance)
+	assert.Equal(t, int64(0), remainder, "a parked charge must not move the wallet")
+	total, amounts = moneyReviewUsage(t, ctx, pool, orgFloorSub)
+	assert.Equal(t, int64(2), total)
+	assert.Empty(t, amounts)
+}

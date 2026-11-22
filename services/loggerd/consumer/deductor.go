@@ -110,15 +110,18 @@ func (d *Deductor) ProcessDeductionInvocation(ctx context.Context, orgID, modelU
 	if err != nil {
 		// Observability at the deduction layer: the disposition (retry vs
 		// terminal debt) belongs to the settlement worker, but the failed
-		// charge attempt must be visible here too.
-		if credits.IsInsufficientCredits(err) {
-			d.logger.Warn("credit deduction blocked — insufficient balance",
+		// charge attempt must be visible here too. No-wallet must be
+		// classified FIRST: IsInsufficientCredits also matches ErrNoWallet,
+		// and folding a missing wallet into the insufficient-balance voice
+		// hides the setup problem from operators.
+		if credits.IsNoWallet(err) {
+			d.logger.Warn("credit deduction skipped — no wallet",
 				slog.String("org_id", orgID),
 				slog.String("request_id", requestID),
 				slog.Int64("amount_micro_usd", int64(amount)),
 			)
-		} else if credits.IsNoWallet(err) {
-			d.logger.Warn("credit deduction skipped — no wallet",
+		} else if credits.IsInsufficientCredits(err) {
+			d.logger.Warn("credit deduction blocked — insufficient balance",
 				slog.String("org_id", orgID),
 				slog.String("request_id", requestID),
 				slog.Int64("amount_micro_usd", int64(amount)),

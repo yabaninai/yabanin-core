@@ -43,6 +43,7 @@ func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 			org_id TEXT PRIMARY KEY,
 			balance_cents BIGINT NOT NULL DEFAULT 0,
 			remainder_micro_usd BIGINT NOT NULL DEFAULT 0 CHECK (remainder_micro_usd >= 0 AND remainder_micro_usd < 10000),
+			grace_floor_cents BIGINT CHECK (grace_floor_cents >= -100000 AND grace_floor_cents <= 0),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 	`)
