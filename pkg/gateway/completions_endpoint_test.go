@@ -334,7 +334,7 @@ func TestCompletions_Stream_ClientHint_TrailerAndBillFollowProviderCacheOnly(t *
 func checkCompletionCacheBilling(t *testing.T, stream bool) {
 	t.Helper()
 	// The gateway test tariff is $2.50/M input, $1.25/M cached input and $10/M output.
-	for _, tc := range []struct {
+	cases := []struct {
 		header    string
 		usage     string
 		cacheRead int64
@@ -342,55 +342,71 @@ func checkCompletionCacheBilling(t *testing.T, stream bool) {
 	}{
 		{"miss", `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}`, 0, (100*2.5 + 5*10) / 1e6},
 		{"hit", `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":30}}`, 30, (70*2.5 + 30*1.25 + 5*10) / 1e6},
-	} {
+	}
+	for _, tc := range cases {
 		t.Run(tc.header, func(t *testing.T) {
-			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				raw, err := io.ReadAll(r.Body)
-				if err != nil {
-					t.Errorf("reading provider request: %v", err)
-					return
-				}
-				if n := strings.Count(string(raw), "cache_control"); n > 1 {
-					t.Errorf("provider received %d cache markers for one client hint", n)
-				}
-				if stream {
-					w.Header().Set("Content-Type", "text/event-stream")
-					_, err = fmt.Fprintf(w, "data: {\"choices\":[{\"text\":\"hi\"}]}\n\ndata: {\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n", tc.usage)
-				} else {
-					_, err = fmt.Fprintf(w, `{"id":"cmpl","choices":[{"text":"hi"}],"usage":%s}`, tc.usage)
-				}
-				if err != nil {
-					t.Errorf("writing provider response: %v", err)
-				}
-			}))
-			defer server.Close()
-			cfg := config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL}
-			store := &fakeInvocationStore{}
-			gw := &gateway{
-				cfg: cfg, log: slog.Default(), auth: NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
-				res:  stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-				pool: upstream.NewPool(upstream.Options{}), invocations: store,
-				streamUsageProviders: map[string]bool{"openai": true},
-			}
-			var ev *eventpub.Event
-			gw.eventNote = func(e *eventpub.Event) { ev = e }
-			rec := postCompletions(t, gw, fmt.Sprintf(`{"model":"m","prompt":"abc","stream":%t,"cache_control":{"type":"ephemeral"}}`, stream))
-			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-			header := PromptCacheHeader
-			if stream {
-				header = promptCacheTrailerKey
-			}
-			require.Equal(t, tc.header, rec.Header().Get(header))
-			require.NotNil(t, ev)
-			require.EqualValues(t, 100, ev.TokensIn)
-			require.EqualValues(t, 5, ev.TokensOut)
-			require.Equal(t, tc.cacheRead, ev.CacheReadTokens)
-			require.InDelta(t, tc.costUSD, ev.EstimatedCostUSD, 1e-12)
-			require.Len(t, store.admitted, 1)
-			require.Len(t, store.facts, 1)
-			require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
+			assertCompletionCacheBillingCase(t, stream, tc.header, tc.usage, tc.cacheRead, tc.costUSD)
 		})
 	}
+}
+
+func assertCompletionCacheBillingCase(t *testing.T, stream bool, wantHeader, usage string, cacheRead int64, costUSD float64) {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		writeCacheBillingProviderReply(t, w, r, stream, usage)
+	}))
+	defer server.Close()
+	cfg := config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL}
+	store := &fakeInvocationStore{}
+	gw := &gateway{
+		cfg: cfg, log: slog.Default(), auth: NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
+		res:  stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+		pool: upstream.NewPool(upstream.Options{}), invocations: store,
+		streamUsageProviders: map[string]bool{"openai": true},
+	}
+	var ev *eventpub.Event
+	gw.eventNote = func(e *eventpub.Event) { ev = e }
+	rec := postCompletions(t, gw, fmt.Sprintf(`{"model":"m","prompt":"abc","stream":%t,"cache_control":{"type":"ephemeral"}}`, stream))
+	assertCompletionCacheBillingFacts(t, rec, ev, store, stream, wantHeader, cacheRead, costUSD)
+}
+
+func writeCacheBillingProviderReply(t *testing.T, w http.ResponseWriter, r *http.Request, stream bool, usage string) {
+	t.Helper()
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		t.Errorf("reading provider request: %v", err)
+		return
+	}
+	if n := strings.Count(string(raw), "cache_control"); n > 1 {
+		t.Errorf("provider received %d cache markers for one client hint", n)
+	}
+	if stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, err = fmt.Fprintf(w, "data: {\"choices\":[{\"text\":\"hi\"}]}\n\ndata: {\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n", usage)
+	} else {
+		_, err = fmt.Fprintf(w, `{"id":"cmpl","choices":[{"text":"hi"}],"usage":%s}`, usage)
+	}
+	if err != nil {
+		t.Errorf("writing provider response: %v", err)
+	}
+}
+
+func assertCompletionCacheBillingFacts(t *testing.T, rec *httptest.ResponseRecorder, ev *eventpub.Event, store *fakeInvocationStore, stream bool, wantHeader string, cacheRead int64, costUSD float64) {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	header := PromptCacheHeader
+	if stream {
+		header = promptCacheTrailerKey
+	}
+	require.Equal(t, wantHeader, rec.Header().Get(header))
+	require.NotNil(t, ev)
+	require.EqualValues(t, 100, ev.TokensIn)
+	require.EqualValues(t, 5, ev.TokensOut)
+	require.Equal(t, cacheRead, ev.CacheReadTokens)
+	require.InDelta(t, costUSD, ev.EstimatedCostUSD, 1e-12)
+	require.Len(t, store.admitted, 1)
+	require.Len(t, store.facts, 1)
+	require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
 }
 
 func TestCompletionsBufferedResponseLimit(t *testing.T) {
