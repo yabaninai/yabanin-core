@@ -1733,7 +1733,11 @@ def verify_package_baseline(root, base, config, package, selection, side,
     base suite actually executed at their base-revision location count as
     baseline coverage, whether or not the current tree shifted or relocated
     them, and consumers that cannot be matched to any base-revision function
-    stay bound instead of silently disappearing. Every coverage run draws
+    stay bound instead of silently disappearing. A focused owner probe may
+    substitute for the current unit suite once every bound consumer's
+    current blocks are witnessed in it; the base archive always runs, so
+    vacuous collisions and counterpart spans are classified from base
+    evidence, never from the tree under test. Every coverage run draws
     down the package's one shared unit deadline, never a fresh budget.
     A clean verification consumes the queue — the re-baseline stays in
     evidence — while a loss keeps the failed queue for diagnosis.
@@ -1742,11 +1746,8 @@ def verify_package_baseline(root, base, config, package, selection, side,
     # The approved package/kind budget covers startup too: the deadline
     # starts before archive/materialization, not at the first go test.
     shared_deadline(package, unit_budget(config))
-    focused = current_owner_coverage(root, package, selection, side, modes,
-                                     config)
-    if focused is not None:
-        record_owner_coverage_proof(package, selection, focused)
-        return
+    probe = current_owner_coverage(root, package, selection, side, modes,
+                                   config)
     with tempfile.TemporaryDirectory(prefix='yabanin-baseline-') as workspace:
         base_root = Path(workspace) / 'base'
         base_root.mkdir()
@@ -1754,8 +1755,8 @@ def verify_package_baseline(root, base, config, package, selection, side,
         covered_base = [covered_functions(base_root, package, mode, 'base tree',
                                           config)
                         for mode in modes]
-    covered_now = [covered_functions(root, package, mode, config=config)
-                   for mode in modes]
+    probe, covered_now = bounded_current_side(
+        probe, root, package, selection, covered_base, previous, side, modes)
     rebaselined, unit_lost, block_lost = [], [], []
     for name, consumers in sorted(selection.lost_baseline,
                                   key=lambda record:
@@ -1775,34 +1776,46 @@ def verify_package_baseline(root, base, config, package, selection, side,
     evidence = EVIDENCE['packages'].get(package)
     if evidence is not None:
         evidence['rebaselined'] = sorted(rebaselined)
+        if probe is not None:
+            evidence['baseline_independent_coverage'] = probe['modes']
 
 
-def record_owner_coverage_proof(package, selection, proof):
-    """Persist the current-only proof after it makes base evidence irrelevant."""
-    selection.lost_baseline = []
-    evidence = EVIDENCE['packages'].get(package)
-    if evidence is None:
-        return
-    evidence['rebaselined'] = sorted(
-        name + ' → ' + ', '.join(sorted({row['name'] for row in consumers}))
-        for name, consumers in proof['obligations'])
-    evidence['baseline_independent_coverage'] = proof['modes']
+def bounded_current_side(probe, root, package, selection, covered_base,
+                         previous, side, modes):
+    """Current-side profiles: focused rows when witnessed, full runs else.
+
+    The focused probe bounds only the current side: the base archive
+    still classifies vacuous like-name collisions and maps counterpart
+    spans, so a witnessed probe replaces the current unit suite without
+    making the tree under test its own baseline authority. Returns the
+    probe actually used alongside one profile list per build mode.
+    """
+    if probe is not None and not probe_bounds_current(
+            probe, selection, covered_base, previous, side, modes):
+        probe = None
+    if probe is None:
+        return None, [covered_functions(root, package, mode, config=config)
+                      for mode in modes]
+    return probe, [probe['rows'].get(mode, []) for mode in modes]
 
 
 def current_owner_coverage(root, package, selection, side, modes, config):
-    """Prove an unchanged verdict from complete current blocks alone.
+    """Focused current-side profiles that may bound the complete run.
 
-    A focused positive is sufficient: if every mapped consumer's current
-    blocks run, baseline coverage and counterpart identity cannot change the
-    result of baseline_record. Missing owners, skipped/failed top-level owners,
-    or any uncovered block fall back to the original complete profiles.
-    Skipped subtests are recorded; they are not evidence for any covered block.
-    The probe shares the existing package deadline and has a short ceiling.
+    The probe never replaces base evidence: it returns one focused real
+    profile per build mode so verify_package_baseline can substitute it
+    for the current unit suite once every bound consumer's current
+    blocks are witnessed in it. Missing owners, a failed run, or skipped
+    or failed top-level owners abandon the probe; unwitnessed blocks are
+    decided later against the base classification, not here. Skipped
+    subtests are recorded; they are not evidence for any covered block.
+    The probe shares the existing package deadline and has a short
+    ceiling.
     """
     obligations = list(selection.lost_baseline)
     if not obligations:
         return None
-    proof = {'obligations': obligations, 'modes': []}
+    proof = {'modes': [], 'rows': {}}
     probe_deadline = min(shared_deadline(package, unit_budget(config)),
                          time.monotonic() + OWNER_COVERAGE_PROBE_SECONDS)
     for index, mode in enumerate(modes):
@@ -1812,6 +1825,7 @@ def current_owner_coverage(root, package, selection, side, modes, config):
             return None
         if mode_proof:
             proof['modes'].append(mode_proof)
+            proof['rows'][mode] = mode_proof.pop('rows')
     if not proof['modes']:
         return None
     return proof
@@ -1819,7 +1833,7 @@ def current_owner_coverage(root, package, selection, side, modes, config):
 
 def current_mode_owner_coverage(root, package, obligations, side, index,
                                 mode, modes, deadline):
-    """Prove complete current blocks for one build mode, or request fallback."""
+    """One build mode's focused profile, or None when it cannot run."""
     consumers = unique_rows(row for _, rows in obligations for row in rows
                             if mode_applies(side, row['file'], index, modes))
     if not consumers:
@@ -1830,31 +1844,57 @@ def current_mode_owner_coverage(root, package, obligations, side, index,
     result = focused_coverage(root, package, mode, tests, deadline)
     if result is None or set(result['passed']) != set(tests):
         return None
-    witnessed = covered_consumer_rows(consumers, result['blocks'])
-    if witnessed is None:
-        return None
     return {
         'mode': mode, 'tests': tests, 'passed': result['passed'],
         'skipped': result['skipped'],
         'coverprofile_sha256': result['sha256'],
-        'consumers': witnessed,
+        'consumers': witnessed_consumer_entries(consumers, result['blocks']),
+        'rows': result['blocks'],
     }
 
 
-def covered_consumer_rows(consumers, profile):
-    """Profile rows proving every current block for each mapped consumer."""
-    witnessed = []
-    for row in consumers:
-        blocks = in_span(profile, row)
-        if not blocks or any(block[2] == 0 for block in blocks):
-            return None
-        witnessed.append({
-            'file': row['file'], 'function': row['name'],
-            'body_sha256': row['hash'],
-            'blocks': [{'span': block[3], 'count': block[2]}
-                       for block in blocks],
-        })
-    return witnessed
+def witnessed_consumer_entries(consumers, profile):
+    """Witness entries for executed consumers; unwitnessed ones drop out."""
+    return [entry for entry in
+            (consumer_witness(row, profile) for row in consumers) if entry]
+
+
+def consumer_witness(row, profile):
+    """Entry proving every current block of one consumer, or None."""
+    blocks = in_span(profile, row)
+    if not blocks or any(block[2] == 0 for block in blocks):
+        return None
+    return {
+        'file': row['file'], 'function': row['name'],
+        'body_sha256': row['hash'],
+        'blocks': [{'span': block[3], 'count': block[2]}
+                   for block in blocks],
+    }
+
+
+def probe_bounds_current(probe, selection, covered_base, previous, side,
+                         modes):
+    """Whether the focused profiles witness every bound consumer's blocks.
+
+    The base profile decides which consumers stay bound: vacuous
+    like-name collisions never enter the record, so the probe owes no
+    execution for them, while every bound consumer must show all its
+    current blocks executed in the focused profile — otherwise the
+    complete current suite, not the probe, is the evidence.
+    """
+    for _name, consumers in selection.lost_baseline:
+        for row in consumers:
+            _counterpart, vacuous = bound_counterpart(
+                row, covered_base, previous, side, modes, selection.renames)
+            if vacuous:
+                continue
+            for index, mode in enumerate(modes):
+                if not mode_applies(side, row['file'], index, modes):
+                    continue
+                rows = probe['rows'].get(mode)
+                if rows is None or consumer_witness(row, rows) is None:
+                    return False
+    return True
 
 
 def unique_rows(rows):
@@ -1976,13 +2016,9 @@ def baseline_record(name, consumers, covered_base, covered_now, previous,
     """
     kept, unit_lost, block_lost = [], [], []
     for row in consumers:
-        counterpart, strength = base_counterpart(row, previous, renames)
-        if counterpart is None:
-            counterpart, strength = applicable_counterpart(
-                row, previous, renames, side, modes)
-        covered_at_base = counterpart is not None and \
-            exercised_any(counterpart, covered_base, previous, modes)
-        if vacuous_collision(counterpart, strength, covered_at_base):
+        counterpart, vacuous = bound_counterpart(
+            row, covered_base, previous, side, modes, renames)
+        if vacuous:
             continue  # vacuous like-name collision: the base never covered it
         if not exercised(row, covered_now, side, modes):
             unit_lost.append(row['name'])
@@ -2003,6 +2039,23 @@ def baseline_record(name, consumers, covered_base, covered_now, previous,
     if not kept:
         return None, None
     return name + ' → ' + ', '.join(sorted(set(kept))), None
+
+
+def bound_counterpart(row, covered_base, previous, side, modes, renames):
+    """(Counterpart, vacuous) head of one consumer's classification.
+
+    Shared by baseline_record and the focused-probe bound so both decide
+    vacuous like-name collisions from the same base profile: a consumer
+    the base suite never executed at its resolved counterpart is not the
+    record's to keep, and no current-tree run can change that.
+    """
+    counterpart, strength = base_counterpart(row, previous, renames)
+    if counterpart is None:
+        counterpart, strength = applicable_counterpart(
+            row, previous, renames, side, modes)
+    covered_at_base = counterpart is not None and \
+        exercised_any(counterpart, covered_base, previous, modes)
+    return counterpart, vacuous_collision(counterpart, strength, covered_at_base)
 
 
 def vacuous_collision(counterpart, strength, covered_at_base):
