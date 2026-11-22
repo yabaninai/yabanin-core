@@ -145,7 +145,7 @@ func TestCV02JourneyVerifierArchivedSkippedKeepsGateGreen(t *testing.T) {
 
 // An archived 390px case that EXECUTED fails the gate and names it.
 func TestCV02JourneyVerifierArchivedRunFailsGate(t *testing.T) {
-	for _, executed := range []string{"passed", "failed", "timedOut", "interrupted"} {
+	for _, executed := range []string{"passed", "failed", "timedOut", "interrupted", ""} {
 		specs := cv02VerifierDesktopManifest()
 		specs = append(specs, cv02VerifierFlat(cv02ArchivedJourneyCases[0], executed))
 

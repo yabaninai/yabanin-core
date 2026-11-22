@@ -640,20 +640,21 @@ func cv02ArchivedCaseVerdicts(specs []cv02FlatSpec) (cases []cv02CaseResult, pro
 // each occurrence and each recorded attempt — and returns the first executed
 // result status, or "" when every observation is absent, skipped or not-run.
 func cv02ArchivedExecutedStatus(got []cv02FlatSpec) string {
-	executed := ""
 	for _, fs := range got {
 		for _, test := range fs.Spec.Tests {
 			for _, res := range test.Results {
-				if res.Status == "" || res.Status == "skipped" || res.Status == "not-run" {
+				switch res.Status {
+				case "skipped", "not-run":
 					continue
-				}
-				if executed == "" {
-					executed = res.Status
+				case "":
+					return "missing-status"
+				default:
+					return res.Status
 				}
 			}
 		}
 	}
-	return executed
+	return ""
 }
 
 // cv02ExtractJSONObject finds the Playwright JSON report inside captured
