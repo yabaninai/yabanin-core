@@ -50,8 +50,64 @@ explicit coverage decision. Dependency-only edits still run policy/security and
 normal product tests; this runner does not pretend that unchanged functions were
 modified or that their missing historic fuzz tests are new-code violations.
 
-Each affected package has at most 300 seconds per check kind (unit suite,
-fuzzing, mutation), including subprocess startup and its supported build modes.
+Selection runs through the qualified conservative selector by default: changed
+declarations bind their real consumers — including baseline, relocated and
+cross-package test consumers — and unresolved mapping widens the selection
+instead of running too little. Every selected row carries a `seed` flag in
+`report.json`: literally-changed bodies, consumers bound to changed
+declarations or rewritten tests, and every production function of a widened
+package all carry fuzz-seed demands — widening is the conservative fallback
+and keeps the historical demand instead of dropping it. Seed flags are
+demands, not self-executing guarantees: they are enforced only in build modes
+where the package actually has fuzz targets (`report.json` records the scope
+as `selector.seed_demand_scope`); in a fuzz-less package the selected
+critical function relies on the unit-suite gate passing in every configured
+build mode — a deliberate contract, not an oversight. A rewritten test (same
+name, new body) does not keep its baseline coverage selected on text alone:
+after binding, the gate re-runs the package's unit suite per build mode
+under a real coverage profile, both at the base revision and in the current
+tree, and the proof is block-level — a consumer whose base-revision body is
+identical must still execute every base-executed block (shift- and
+move-aligned through base-side spans, so relocating a function in the
+current tree cannot make its lost coverage vacuous) and blocks with
+`lost_block_coverage` naming file and block otherwise, while a consumer the
+whole suite no longer exercises at all blocks with `lost_unit_coverage`.
+A changed body cannot map its base blocks, so it must execute every block
+it now has. The rest re-baseline silently and are recorded as `rebaselined`
+selector evidence. Test units pair with their baseline twins by name and
+body hash together, never by name alone: Go allows duplicate test names in
+mutually exclusive files (build tags, GOOS), and an unchanged twin must not
+spend or replace a rewritten sibling's baseline. Baseline helpers reachable
+from a lost unit resolve across every same-named twin — the closure unions
+all (name, body) helpers, so a rewrite cannot redirect its baseline through
+a name-collapsed helper while a platform twin still carries it. A moved
+production counterpart sharing its name with twins resolves only by body
+hash with a unique build-mode footprint; when no counterpart resolves at
+all — an ambiguous twin whose body also changed — each applicable mode must
+execute every current block, and an unexecuted one blocks with
+`lost_block_coverage` instead of re-baselining on an unmappable baseline. Bare names the base never
+covered (for example stdlib `Set`/`WriteHeader` calls that collide with
+production method names) are vacuous and never block, and vacuous means no
+applicable base build mode ever executed the like-named consumer — a
+consumer one mode covered is a real baseline even when another mode never
+did; a consumer that cannot be matched to any
+base-revision function is not vacuous — it re-baselines with evidence while
+covered and blocks while uncovered. The blank identifier is not package
+state, so `var _ Iface = ...` compile assertions never widen.
+`CRITICAL_SCOPE_SELECTOR=legacy` selects the pre-qualification selector as an
+explicit emergency override; any other value fails the gate closed instead
+of guessing a mode.
+
+Each affected package runs on the approved versioned budget block in
+`critical.json` (`budget.schema_version` 1): 300 seconds per package for the
+unit suite, 420 seconds for fuzzing and 300 seconds for mutation, including
+subprocess startup and shared across the package's supported build modes.
+Baseline-coverage verification runs draw down the same per-package unit
+budget as the normal unit phase — one wall-clock budget per package, never a
+fresh one per verification subprocess — and a suite that outlives it is
+killed as a whole process group and reported as an exhausted unit budget.
+The runner rejects any other budget instead of silently guessing; a legacy
+flat `seconds_per_package_and_kind` field is an error, not a fallback.
 Missing coverage, timeout or an unfinished run blocks. Extended campaigns
 belong in separate runs; never raise this budget secretly or interpret an
 exhausted budget as success.
@@ -74,9 +130,12 @@ versioned in `critical.json` (schema 2):
   `skipped: no gremlins-qualified unit mode (N/A)` explicitly.
 - Where fuzz targets are absent but the package has unit tests, the gate
   requires that unit suite to pass in each configured build mode — the real
-  requirement that exists there. A package with no tests at all reports
-  `skipped: no unit tests in package (N/A)` and enforces nothing else here;
-  normal build, vet, lint and test gates still apply outside this runner.
+  requirement that exists there. A package whose fuzz or unit-test targets
+  disappear from a build mode (renamed or constraint-tagged out) blocks the
+  gate loudly instead of turning every check not-applicable; a package with no
+  tests at all reports `skipped: no unit tests in package (N/A)` and enforces
+  nothing else here; normal build, vet, lint and test gates still apply
+  outside this runner.
 
 Not-applicable entries are printed with their reasons and stored in
 `report.json`; they never fabricate fuzz executions, mutation kills or

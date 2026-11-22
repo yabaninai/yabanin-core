@@ -2,11 +2,31 @@
 """Bind critical checks to changed production declarations, not file counts."""
 from collections import Counter
 from fnmatch import fnmatchcase
+import os
 from pathlib import Path
 import tempfile
 
 import policy
 import source
+
+MODE_ENV = 'CRITICAL_SCOPE_SELECTOR'
+LEGACY = 'legacy'
+CONSERVATIVE = 'conservative'
+
+
+def selector_mode():
+    """Active selector variant: conservative by default; `legacy` is the
+    explicit emergency override; unknown values fail closed."""
+    value = os.environ.get(MODE_ENV, CONSERVATIVE)
+    if value not in (LEGACY, CONSERVATIVE):
+        raise ValueError('Unknown ' + MODE_ENV + ' value: ' + value)
+    return value
+
+
+def selection_evidence():
+    """Binding evidence of the last conservative selection, for reports."""
+    import critical_conservative
+    return critical_conservative.EVIDENCE['packages']
 
 
 def is_critical(path, patterns):
@@ -66,17 +86,60 @@ def changed_functions(root, baseline, package, helper):
 
 
 def targets(root, base, config):
-    selected = packages(root, base, config['critical_paths'])
+    mode = selector_mode()
+    if mode == CONSERVATIVE:
+        import critical_conservative
+        selected = critical_conservative.packages(root, base, config['critical_paths'])
+        changes = source.changes(root, base)
+        critical_conservative.reset_selection()
+    else:
+        selected = packages(root, base, config['critical_paths'])
     if not selected:
         return {}
+    if mode == CONSERVATIVE:
+        # One absolute unit budget per selected package starts BEFORE the
+        # shared baseline archive, so selection startup is charged; the
+        # same deadline covers current/baseline scans, coverage
+        # verification and, after banking, the package's unit phase.
+        for package in selected:
+            critical_conservative.shared_deadline(
+                package, critical_conservative.unit_budget(config))
     result = {}
     with tempfile.TemporaryDirectory(prefix='yabanin-critical-base-') as tmp:
         baseline = Path(tmp)
         source.archive(root, base, baseline)
+        if mode == CONSERVATIVE:
+            # Charge the one shared archive to every selected package, then
+            # bank each remainder while another package's selector work runs.
+            critical_conservative.pause_started_unit_budgets()
         for package in selected:
-            if not package_files(root, package):
-                continue
-            rows = changed_functions(root, baseline, package, policy.HERE / 'units.go')
-            if rows:
-                result[package] = rows
+            if mode == CONSERVATIVE:
+                critical_conservative.resume_unit_deadline(
+                    package, critical_conservative.unit_budget(config))
+                try:
+                    if not package_files(root, package):
+                        continue
+                    rows = critical_conservative.changed_functions(
+                        root, baseline, package, policy.HERE / 'units.go',
+                        changes, config.get('build_tags'), config)
+                    if rows:
+                        result[package] = rows
+                finally:
+                    critical_conservative.pause_unit_budget(package)
+            else:
+                if not package_files(root, package):
+                    continue
+                rows = changed_functions(root, baseline, package,
+                                         policy.HERE / 'units.go')
+                if rows:
+                    result[package] = rows
+    if mode == CONSERVATIVE:
+        critical_conservative.widen_cross_package(root, config, policy.HERE / 'units.go',
+                                                  result)
+        critical_conservative.verify_lost_baseline(root, base, config)
+        # Bank every started package's remainder — no-rewrite packages and
+        # cross-package consumers included — so no deadline keeps running
+        # through other packages' execution; each package resumes its own
+        # remainder in its unit phase instead of a fresh budget.
+        critical_conservative.pause_started_unit_budgets()
     return result

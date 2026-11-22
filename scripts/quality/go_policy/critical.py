@@ -12,6 +12,7 @@ import tempfile
 import time
 
 import mutation_audit
+import critical_conservative as conservative
 import critical_results as results
 import critical_scope as scope
 import source
@@ -54,6 +55,20 @@ def unit_suite(root, package, tags, out, deadline):
     return {'status': 'passed', 'evidence': log.name}
 
 
+def seed_functions(functions):
+    """Functions whose fuzz-seed block coverage this package must prove.
+
+    Conservative selection marks every selected function as seed-demanding:
+    literally-changed bodies, consumers bound to changed declarations or
+    rewritten tests, and — because an unresolved mapping must not drop the
+    historical demand — every production function of a widened package.
+    Legacy rows carry no marker and keep the historical demand on every
+    selected function.
+    """
+    marked = [fn for fn in functions if 'seed' in fn]
+    return [fn for fn in marked if fn['seed']] if marked else list(functions)
+
+
 def fuzz(root, package, functions, tags, out, deadline, max_fuzz_seconds=None):
     names = fuzz_targets(root, package, tags, out, deadline)
     if not names:
@@ -61,7 +76,7 @@ def fuzz(root, package, functions, tags, out, deadline, max_fuzz_seconds=None):
     profile = out / 'fuzz-seeds.cover'
     checked(go_args(tags) + ['-run=^(' + '|'.join(names) + ')$', '-coverprofile=' + str(profile),
                             './' + package], root, out / 'fuzz-seeds.log', deadline)
-    results.seed_coverage(profile, functions)
+    results.seed_coverage(profile, seed_functions(functions))
     executions = {}
     for index, name in enumerate(names):
         checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$', '-fuzztime=1x',
@@ -87,13 +102,44 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
     return results.mutation_report(report, functions, package)
 
 
+BUDGET_KINDS = ('unit', 'fuzz', 'mutation')
+APPROVED_BUDGET = {'unit': 300, 'fuzz': 420, 'mutation': 300}
+
+
+def budget(config):
+    """Approved per-package seconds by check kind; any deviation is an error.
+
+    The versioned budget block replaced the flat seconds_per_package_and_kind
+    field so fuzzing can carry a different approved ceiling than unit and
+    mutation. Kind budgets are shared across the package's build modes.
+    """
+    block = config.get('budget')
+    if not isinstance(block, dict) or block.get('schema_version') != 1:
+        raise ValueError('Expected budget schema 1 with seconds_per_package by kind')
+    seconds = block.get('seconds_per_package')
+    if not isinstance(seconds, dict) or set(seconds) != set(BUDGET_KINDS):
+        raise ValueError('Budget must define exactly unit, fuzz and mutation seconds')
+    if seconds != APPROVED_BUDGET:
+        raise ValueError('Expected approved budgets unit=300s fuzz=420s mutation=300s')
+    return seconds
+
+
 def validate_config(config):
-    if config.get('schema_version') != 2 or config.get('seconds_per_package_and_kind') != 300:
-        raise ValueError('Expected schema 2 and approved 300-second check budget')
+    if config.get('schema_version') != 2:
+        raise ValueError('Expected critical config schema 2')
+    if 'seconds_per_package_and_kind' in config:
+        raise ValueError('Legacy seconds_per_package_and_kind was replaced by the '
+                         'versioned budget block')
+    budget(config)
     if not config.get('critical_paths') or not config.get('build_tags'):
         raise ValueError('Critical scope and build modes must not be empty')
     if config.get('fuzz_applicability') != 'fuzz-targets':
         raise ValueError("Expected fuzz applicability 'fuzz-targets' (per-mode target detection)")
+    validate_mutation_scope(config)
+
+
+def validate_mutation_scope(config):
+    """Mutation qualification is an explicit list of critical packages."""
     qualified = config.get('mutation_qualified_packages')
     if not isinstance(qualified, list):
         raise ValueError('mutation_qualified_packages must be an explicit versioned list')
@@ -122,8 +168,14 @@ def active_functions(root, package, functions, tags, out, deadline):
 def run_package(root, package, functions, config, out, gremlins):
     result = {}
     qualified = package in set(config['mutation_qualified_packages'])
+    seconds = budget(config)
     for kind in ('unit', 'fuzz', 'mutation'):
-        deadline = time.monotonic() + config['seconds_per_package_and_kind']
+        deadline = time.monotonic() + seconds[kind]
+        if kind == 'unit':
+            # The unit phase resumes the remainder banked at the end of
+            # this package's own baseline verification; other packages'
+            # verification and execution cannot spend it.
+            deadline = conservative.resume_unit_deadline(package, seconds[kind])
         covered = set()
         for index, tags in enumerate(config['build_tags']):
             target = out / kind / str(index)
@@ -182,9 +234,19 @@ def run(args):
     validate_config(config)
     base = source.git(root, 'rev-parse', '--verify', '--end-of-options', args.base + '^{commit}').decode().strip()
     before = source.snapshot(root)
+    mode = scope.selector_mode()
     targets = scope.targets(root, base, config)
     report = {'base': base, 'source': before, 'config_sha256': source.digest(HERE / 'critical.json'),
               'packages': {}, 'status': 'not_applicable' if not targets else 'running'}
+    if mode != scope.LEGACY:
+        report['selector'] = {
+            'mode': mode,
+            'evidence': scope.selection_evidence(),
+            'seed_demand_scope': (
+                'seed flags are fuzz-seed demands, enforced only in build modes '
+                'where the package has fuzz targets; a selected critical function '
+                'in a fuzz-less package relies on the unit-suite gate'),
+        }
     source.write(out / 'report.json', report)
     try:
         if targets:
@@ -203,6 +265,8 @@ def run(args):
         source.write(out / 'report.json', report)
         for line in applicability_lines(report):
             print('Critical Go applicability: ' + line)
+        if report.get('selector'):
+            print('Critical selector: ' + report['selector']['mode'])
     print('Critical Go checks: ' + report['status'] + '; ' + str(out / 'report.json'))
     print('Report SHA256: ' + source.digest(out / 'report.json'))
     return 0

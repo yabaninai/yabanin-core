@@ -52,6 +52,23 @@ def coverage_rows(path):
     return rows
 
 
+def coverage_blocks(path):
+    """All cover-profile blocks of a file, keeping unexecuted ones.
+
+    Block-level verification needs the zero-count branches a rewrite no
+    longer takes, so unlike coverage_rows nothing is dropped here.
+    """
+    blocks = []
+    for line in Path(path).read_text().splitlines()[1:]:
+        match = re.fullmatch(r'(.+):(\d+)\.(\d+),(\d+)\.(\d+) (\d+) (\d+)', line)
+        if not match:
+            raise ValueError('Malformed block coverage: ' + line)
+        spec = match[2] + '.' + match[3] + ',' + match[4] + '.' + match[5]
+        # match[6] counts statements of the block; match[7] its executions.
+        blocks.append((match[1], int(match[2]), int(match[7]), spec))
+    return blocks
+
+
 def seed_coverage(path, functions):
     rows = coverage_rows(path)
     for fn in functions:
