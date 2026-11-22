@@ -11,6 +11,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	pgconn "github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	evaluator "github.com/reireirei/yabanin/pkg/rulesengine"
 	"github.com/stretchr/testify/assert"
@@ -137,6 +138,105 @@ func TestGetByOrg_CacheMissNoPool(t *testing.T) {
 	result, err := store.GetByOrg(ctx, orgID)
 	require.NoError(t, err)
 	assert.Nil(t, result)
+}
+
+// TestGetByOrg_TypedNilPool pins the no-durable-store gateway wiring: the
+// gateway passes w.pool (a *pgxpool.Pool) as the dbConn interface, so a
+// start without Postgres hands the store a TYPED nil. The typed nil hides
+// inside the interface and defeats an untyped == nil check — before the
+// constructor normalization this panicked in loadFromDB
+// (pgxpool.(*Pool).Acquire on a nil pool) during an ordinary authorized
+// request. GetByOrg must degrade to the documented cache-only mode instead.
+func TestGetByOrg_TypedNilPool(t *testing.T) {
+	ctx := context.Background()
+
+	mockRDB := &mockCache{
+		getFn: func(ctx context.Context, key string) *redis.StringCmd {
+			return redis.NewStringResult("", redis.Nil)
+		},
+	}
+
+	var pool *pgxpool.Pool // typed nil, exactly as wired when no durable store is configured
+	store := New(pool, mockRDB, 0, nil, newTestLogger())
+
+	result, err := store.GetByOrg(ctx, "test-org-typed-nil")
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+// TestGetByOrg_TypedNilPoolDisconnectedRedis is the captured seed#4 shape:
+// a typed-nil pool plus a configured-but-disconnected Redis. The cache read
+// fails, the store falls through to the DB, and the typed-nil pool must
+// degrade to cache-only mode instead of panicking in loadFromDB.
+func TestGetByOrg_TypedNilPoolDisconnectedRedis(t *testing.T) {
+	ctx := context.Background()
+
+	mockRDB := &mockCache{
+		getFn: func(ctx context.Context, key string) *redis.StringCmd {
+			return redis.NewStringResult("", errors.New("dial tcp: connection refused"))
+		},
+	}
+
+	var pool *pgxpool.Pool
+	store := New(pool, mockRDB, 0, nil, newTestLogger())
+
+	result, err := store.GetByOrg(ctx, "test-org-typed-nil")
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+// TestGetByOrg_TypedNilPoolAndRedis covers the deployment with BOTH optional
+// dependencies physically absent: gateway.go wires a nil *pgxpool.Pool and a
+// nil *redis.Client into the interfaces, so both arrive as typed nils and
+// GetByOrg must return the empty set without touching either.
+func TestGetByOrg_TypedNilPoolAndRedis(t *testing.T) {
+	ctx := context.Background()
+
+	var pool *pgxpool.Pool
+	var rdb *redis.Client
+	store := New(pool, rdb, 0, nil, newTestLogger())
+
+	result, err := store.GetByOrg(ctx, "test-org-typed-nil")
+	require.NoError(t, err)
+	assert.Nil(t, result)
+}
+
+// TestGetByOrg_TypedNilRedisLoadsFromDB pins the redis half of the wiring: a
+// gateway without Redis passes w.rdb (a *redis.Client) as the cacheOps
+// interface, so the absent cache arrives as a typed nil. GetByOrg must skip
+// the cache and load from the DB instead of panicking inside the redis
+// client.
+func TestGetByOrg_TypedNilRedisLoadsFromDB(t *testing.T) {
+	ctx := context.Background()
+	orgID := "test-org-typed-nil-redis"
+
+	mockDB := &mockDB{
+		queryFn: func(ctx context.Context, sql string, args ...interface{}) (pgx.Rows, error) {
+			assert.Equal(t, orgID, args[0])
+			return &mockPGXRows{data: [][]interface{}{{"r1", orgID, "model_requested == 'auto'", "claude-3", int64(5), true}}}, nil
+		},
+	}
+
+	var rdb *redis.Client
+	store := New(mockDB, rdb, 0, nil, newTestLogger())
+
+	result, err := store.GetByOrg(ctx, orgID)
+	require.NoError(t, err)
+	assert.Len(t, result, 1)
+	assert.Equal(t, "claude-3", result[0].TargetModel)
+}
+
+// TestInvalidate_TypedNilRedis: the invalidation half must tolerate the same
+// typed-nil cache wiring as the read path.
+func TestInvalidate_TypedNilRedis(t *testing.T) {
+	ctx := context.Background()
+
+	var rdb *redis.Client
+	store := New(nil, rdb, 0, nil, newTestLogger())
+
+	assert.NotPanics(t, func() {
+		store.Invalidate(ctx, "any-org")
+	})
 }
 
 func TestGetByOrg_CacheMissDBSuccess(t *testing.T) {
