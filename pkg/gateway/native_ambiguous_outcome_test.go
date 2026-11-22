@@ -6,185 +6,151 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/reireirei/yabanin/pkg/retry"
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
 func TestNativeAcceptedRequestWithoutResponseSuppressesRetry(t *testing.T) {
-	for _, route := range []string{"messages", "responses"} {
-		for _, stream := range []bool{false, true} {
-			t.Run(route+"/stream="+map[bool]string{false: "false", true: "true"}[stream], func(t *testing.T) {
-				var arrivals atomic.Int32
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if _, err := io.Copy(io.Discard, r.Body); err != nil {
-						t.Errorf("read complete paid request: %v", err)
-						return
-					}
-					arrivals.Add(1)
-					conn, _, err := w.(http.Hijacker).Hijack()
-					if err != nil {
-						t.Errorf("hijack response connection: %v", err)
-						return
-					}
-					_ = conn.Close()
-				}))
-				defer server.Close()
+	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		var arrivals atomic.Int32
+		server := httptest.NewServer(closeAfterNativeRequest(t, &arrivals))
+		t.Cleanup(server.Close)
 
-				store := &fakeInvocationStore{}
-				capture := &bodyBoundsEvents{}
-				var rec *httptest.ResponseRecorder
-				if route == "messages" {
-					gw := bodyBoundsMessagesGateway(t, server.URL, store, capture)
-					body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8}`
-					if stream {
-						body = `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}`
-					}
-					rec = postMessages(t, gw, body)
-				} else {
-					gw := bodyBoundsResponsesGateway(t, server.URL, store, capture)
-					body := `{"model":"m","input":"hello"}`
-					if stream {
-						body = `{"model":"m","input":"hello","stream":true}`
-					}
-					rec = postResponses(t, gw, body)
-				}
+		store := &fakeInvocationStore{}
+		capture := &bodyBoundsEvents{}
+		rec := postNativeOutcome(t, route, stream, server.URL, store, capture)
 
-				if rec.Code != http.StatusBadGateway {
-					t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
-				}
-				if got := rec.Header().Get("X-Should-Retry"); got != "false" {
-					t.Fatalf("X-Should-Retry %q; request reached provider but response outcome is unknown", got)
-				}
-				if got := arrivals.Load(); got != 1 {
-					t.Fatalf("provider received %d requests, want one", got)
-				}
-				if len(store.admitted) != 1 || len(store.facts) != 0 {
-					t.Fatalf("admissions=%d terminal facts=%d; unknown dispatch must retain only its admission", len(store.admitted), len(store.facts))
-				}
-				if got := capture.len(); got != 0 {
-					t.Fatalf("published %d events for unknown provider outcome", got)
-				}
-			})
-		}
-	}
+		assertNativeGatewayError(t, rec, "false")
+		require.EqualValues(t, 1, arrivals.Load(), "server accepted the complete provider request")
+		assertNativeAdmissionOnly(t, store, capture)
+	})
 }
 
 func TestNativeProvenDialFailureRemainsRetryable(t *testing.T) {
-	url := closedLoopbackURL(t)
-
-	client, err := upstream.NewClient(url, []string{url})
-	if err != nil {
-		t.Fatal(err)
-	}
+	endpoint := closedLoopbackURL(t)
+	client, err := upstream.NewClient(endpoint, []string{endpoint})
+	require.NoError(t, err)
 	_, dialErr := client.Do(context.Background(), "/v1/messages", []byte(`{}`), "", false, nil)
-	if !retry.DefinitelyNotSent(dialErr) {
-		t.Fatalf("closed-listener error %T %v was not classified as definitely not sent", dialErr, dialErr)
-	}
+	require.True(t, retry.DefinitelyNotSent(dialErr), "closed-listener transport error proves no provider request was sent")
 
-	for _, route := range []string{"messages", "responses"} {
-		for _, stream := range []bool{false, true} {
-			t.Run(route+"/stream="+map[bool]string{false: "false", true: "true"}[stream], func(t *testing.T) {
-				store := &fakeInvocationStore{}
-				capture := &bodyBoundsEvents{}
-				var rec *httptest.ResponseRecorder
-				if route == "messages" {
-					gw := bodyBoundsMessagesGateway(t, url, store, capture)
-					body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8}`
-					if stream {
-						body = `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}`
-					}
-					rec = postMessages(t, gw, body)
-				} else {
-					gw := bodyBoundsResponsesGateway(t, url, store, capture)
-					body := `{"model":"m","input":"hello"}`
-					if stream {
-						body = `{"model":"m","input":"hello","stream":true}`
-					}
-					rec = postResponses(t, gw, body)
-				}
+	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		store := &fakeInvocationStore{}
+		capture := &bodyBoundsEvents{}
+		rec := postNativeOutcome(t, route, stream, endpoint, store, capture)
 
-				if rec.Code != http.StatusBadGateway {
-					t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
-				}
-				if got := rec.Header().Get("X-Should-Retry"); got != "true" {
-					t.Fatalf("X-Should-Retry %q; proven pre-send dial failure should remain retryable", got)
-				}
-				if len(store.admitted) != 1 || len(store.facts) != 0 {
-					t.Fatalf("admissions=%d terminal facts=%d", len(store.admitted), len(store.facts))
-				}
-				if got := capture.len(); got != 0 {
-					t.Fatalf("published %d events for a request that could not reach the provider", got)
-				}
-			})
-		}
-	}
+		assertNativeGatewayError(t, rec, "true")
+		assertNativeAdmissionOnly(t, store, capture)
+	})
 }
 
 func TestNativeRedirectedDialFailureSuppressesRetry(t *testing.T) {
 	childURL := closedLoopbackURL(t)
+	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		var arrivals atomic.Int32
+		server := httptest.NewServer(redirectAfterNativeRequest(t, &arrivals, childURL+"/after-redirect"))
+		t.Cleanup(server.Close)
+
+		store := &fakeInvocationStore{}
+		capture := &bodyBoundsEvents{}
+		rec := postNativeOutcome(t, route, stream, server.URL, store, capture)
+
+		assertNativeGatewayError(t, rec, "false")
+		require.EqualValues(t, 1, arrivals.Load(), "first provider hop accepted the complete request before redirect")
+		assertNativeAdmissionOnly(t, store, capture)
+	})
+}
+
+func runNativeOutcomeCases(t *testing.T, run func(*testing.T, string, bool)) {
+	t.Helper()
 	for _, route := range []string{"messages", "responses"} {
 		for _, stream := range []bool{false, true} {
 			t.Run(route+"/stream="+map[bool]string{false: "false", true: "true"}[stream], func(t *testing.T) {
-				var arrivals atomic.Int32
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					if _, err := io.Copy(io.Discard, r.Body); err != nil {
-						t.Errorf("read complete paid request: %v", err)
-						return
-					}
-					arrivals.Add(1)
-					w.Header().Set("Location", childURL+"/after-redirect")
-					w.WriteHeader(http.StatusTemporaryRedirect)
-				}))
-				defer server.Close()
-
-				store := &fakeInvocationStore{}
-				capture := &bodyBoundsEvents{}
-				var rec *httptest.ResponseRecorder
-				if route == "messages" {
-					gw := bodyBoundsMessagesGateway(t, server.URL, store, capture)
-					body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8}`
-					if stream {
-						body = `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":true}`
-					}
-					rec = postMessages(t, gw, body)
-				} else {
-					gw := bodyBoundsResponsesGateway(t, server.URL, store, capture)
-					body := `{"model":"m","input":"hello"}`
-					if stream {
-						body = `{"model":"m","input":"hello","stream":true}`
-					}
-					rec = postResponses(t, gw, body)
-				}
-
-				if rec.Code != http.StatusBadGateway {
-					t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
-				}
-				if got := rec.Header().Get("X-Should-Retry"); got != "false" {
-					t.Fatalf("X-Should-Retry %q after a prior provider hop accepted the request", got)
-				}
-				if got := arrivals.Load(); got != 1 {
-					t.Fatalf("provider received %d initial requests, want one", got)
-				}
-				if len(store.admitted) != 1 || len(store.facts) != 0 {
-					t.Fatalf("admissions=%d terminal facts=%d", len(store.admitted), len(store.facts))
-				}
+				run(t, route, stream)
 			})
 		}
 	}
+}
+
+func postNativeOutcome(t *testing.T, route string, stream bool, endpoint string, store *fakeInvocationStore, capture *bodyBoundsEvents) *httptest.ResponseRecorder {
+	t.Helper()
+	if route == "messages" {
+		gw := bodyBoundsMessagesGateway(t, endpoint, store, capture)
+		return postMessages(t, gw, nativeMessagesOutcomeBody(stream))
+	}
+	gw := bodyBoundsResponsesGateway(t, endpoint, store, capture)
+	return postResponses(t, gw, nativeResponsesOutcomeBody(stream))
+}
+
+func nativeMessagesOutcomeBody(stream bool) string {
+	body := `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8}`
+	if stream {
+		return strings.TrimSuffix(body, "}") + `,"stream":true}`
+	}
+	return body
+}
+
+func nativeResponsesOutcomeBody(stream bool) string {
+	body := `{"model":"m","input":"hello"}`
+	if stream {
+		return strings.TrimSuffix(body, "}") + `,"stream":true}`
+	}
+	return body
+}
+
+func closeAfterNativeRequest(t *testing.T, arrivals *atomic.Int32) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read complete paid request: %v", err)
+			return
+		}
+		arrivals.Add(1)
+		conn, _, err := w.(http.Hijacker).Hijack()
+		if err != nil {
+			t.Errorf("hijack response connection: %v", err)
+			return
+		}
+		_ = conn.Close()
+	}
+}
+
+func redirectAfterNativeRequest(t *testing.T, arrivals *atomic.Int32, location string) http.HandlerFunc {
+	t.Helper()
+	return func(w http.ResponseWriter, r *http.Request) {
+		if _, err := io.Copy(io.Discard, r.Body); err != nil {
+			t.Errorf("read complete paid request: %v", err)
+			return
+		}
+		arrivals.Add(1)
+		w.Header().Set("Location", location)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+	}
+}
+
+func assertNativeGatewayError(t *testing.T, rec *httptest.ResponseRecorder, retryHint string) {
+	t.Helper()
+	require.Equal(t, http.StatusBadGateway, rec.Code, rec.Body.String())
+	require.Equal(t, retryHint, rec.Header().Get("X-Should-Retry"))
+}
+
+func assertNativeAdmissionOnly(t *testing.T, store *fakeInvocationStore, capture *bodyBoundsEvents) {
+	t.Helper()
+	require.Len(t, store.admitted, 1)
+	require.Empty(t, store.facts)
+	require.Zero(t, capture.len())
 }
 
 func closedLoopbackURL(t *testing.T) string {
 	t.Helper()
 	listener, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, err)
 	endpoint := listener.Addr().String()
-	if err := listener.Close(); err != nil {
-		t.Fatal(err)
-	}
+	require.NoError(t, listener.Close())
 	return "http://" + endpoint
 }
