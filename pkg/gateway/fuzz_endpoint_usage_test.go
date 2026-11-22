@@ -194,6 +194,27 @@ func FuzzEndpointUsageParsers(f *testing.F) {
 	f.Add([]byte(`{"usage":{"total_tokens":4},"response":{"usage":{"total_tokens":99}}}`), []byte("x"))
 	f.Add([]byte(`{"response":{"usage":7}}`), []byte("x"))
 	f.Add([]byte(`{"response":{}}`), []byte("x"))
+	f.Add([]byte(`{"response":5}`), []byte("x"))
+	f.Add([]byte(`{"response":{"usage":"x"}}`), []byte("x"))
+	f.Add([]byte(`{"usage":false}`), []byte("x"))
+	f.Add([]byte(`{"usage":1e999}`), []byte("abcd"))
+	// Deterministic malformed-field seeds, one per documented usage field:
+	// each wrong type must make the whole block unusable, never crash the
+	// oracle or fabricate a partial usage.
+	f.Add([]byte(`{"usage":{"prompt_tokens":"x"}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"input_tokens":[]}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"output_tokens":{}}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"completion_tokens":true}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"total_tokens":"9"}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"cached_tokens":1.5}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"prompt_tokens_details":5}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"input_token_details":[]}}`), []byte("x"))
+	// Typed decoding merges case-insensitive and duplicate keys with
+	// encoding/json's documented rules; the oracle must match them.
+	f.Add([]byte(`{"usage":{"PROMPT_TOKENS":3,"Total_Tokens":0}}`), []byte("abcd"))
+	f.Add([]byte(`{"usage":{"Prompt_Tokens_Details":{"CACHED_TOKENS":4}}}`), []byte("x"))
+	f.Add([]byte(`{"usage":5,"usage":{"prompt_tokens":1}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"prompt_tokens":1,"prompt_tokens":2}}`), []byte("x"))
 	f.Add([]byte(`[1,2]`), []byte(""))
 	f.Add([]byte(`torn`), []byte("abcd"))
 	f.Fuzz(func(t *testing.T, body []byte, input []byte) {
@@ -240,77 +261,88 @@ func FuzzEndpointUsageParsers(f *testing.F) {
 	})
 }
 
-// expectedUsageCounts re-derives the prompt/completion pair: the
-// prompt_tokens/input_tokens split names the input count, the
-// output_tokens/completion_tokens split the output count.
-func expectedUsageCounts(t *testing.T, raw []byte) (int64, int64) {
-	t.Helper()
-	var blk struct {
-		Prompt     *int64 `json:"prompt_tokens"`
-		Input      *int64 `json:"input_tokens"`
-		Output     *int64 `json:"output_tokens"`
-		Completion *int64 `json:"completion_tokens"`
-	}
-	require.NoError(t, json.Unmarshal(raw, &blk))
+// usageLeaf mirrors the parsers' typed decode shape: every documented
+// usage field, decoded in one strict pass. A wrong-typed field — or a bad
+// duplicate whose decode error encoding/json records even when a later
+// duplicate decodes — fails the whole pass, exactly like the production
+// single-unmarshal gate.
+type usageLeaf struct {
+	Prompt        *int64 `json:"prompt_tokens"`
+	Input         *int64 `json:"input_tokens"`
+	Output        *int64 `json:"output_tokens"`
+	Completion    *int64 `json:"completion_tokens"`
+	Total         *int64 `json:"total_tokens"`
+	Cached        *int64 `json:"cached_tokens"`
+	PromptDetails *struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"prompt_tokens_details"`
+	InputDetails *struct {
+		CachedTokens int64 `json:"cached_tokens"`
+	} `json:"input_token_details"`
+}
+
+// expectedUsageIO re-derives the documented in/out pair from a usable
+// usage leaf: the prompt_tokens/input_tokens split names the input count,
+// the output_tokens/completion_tokens split the output count.
+func expectedUsageIO(leaf *usageLeaf) (int64, int64) {
 	var in int64
 	switch {
-	case blk.Prompt != nil:
-		in = *blk.Prompt
-	case blk.Input != nil:
-		in = *blk.Input
+	case leaf.Prompt != nil:
+		in = *leaf.Prompt
+	case leaf.Input != nil:
+		in = *leaf.Input
 	}
 	var out int64
 	switch {
-	case blk.Output != nil:
-		out = *blk.Output
-	case blk.Completion != nil:
-		out = *blk.Completion
+	case leaf.Output != nil:
+		out = *leaf.Output
+	case leaf.Completion != nil:
+		out = *leaf.Completion
 	}
 	return in, out
 }
 
-// expectedUsageBlock re-derives the usage-block contract from the raw
-// bytes: the in/out pair, total_tokens over the in+out sum, cached tokens
-// from the flat field or either details object, and a missing or unusable
-// block reporting false.
-func expectedUsageBlock(t *testing.T, body []byte) (provider.Usage, bool) {
-	t.Helper()
-	var probe struct {
-		Usage *json.RawMessage `json:"usage"`
-	}
-	if err := json.Unmarshal(body, &probe); err != nil || probe.Usage == nil {
-		return provider.Usage{}, false
-	}
-	var blk struct {
-		Total         *int64 `json:"total_tokens"`
-		Cached        *int64 `json:"cached_tokens"`
-		PromptDetails *struct {
-			CachedTokens int64 `json:"cached_tokens"`
-		} `json:"prompt_tokens_details"`
-		InputDetails *struct {
-			CachedTokens int64 `json:"cached_tokens"`
-		} `json:"input_token_details"`
-	}
-	if err := json.Unmarshal(*probe.Usage, &blk); err != nil {
-		return provider.Usage{}, false
-	}
-	in, out := expectedUsageCounts(t, *probe.Usage)
+// expectedUsageTotalCached re-derives the documented total (total_tokens
+// wins over the in+out sum) and cached-token resolution (the flat
+// cached_tokens field, then prompt_tokens_details, then
+// input_token_details).
+func expectedUsageTotalCached(leaf *usageLeaf, in, out int64) (int64, int64) {
 	total := int64(0)
-	if blk.Total != nil {
-		total = *blk.Total
+	if leaf.Total != nil {
+		total = *leaf.Total
 	}
 	if total == 0 {
 		total = in + out
 	}
 	var cached int64
 	switch {
-	case blk.Cached != nil:
-		cached = *blk.Cached
-	case blk.PromptDetails != nil:
-		cached = blk.PromptDetails.CachedTokens
-	case blk.InputDetails != nil:
-		cached = blk.InputDetails.CachedTokens
+	case leaf.Cached != nil:
+		cached = *leaf.Cached
+	case leaf.PromptDetails != nil:
+		cached = leaf.PromptDetails.CachedTokens
+	case leaf.InputDetails != nil:
+		cached = leaf.InputDetails.CachedTokens
 	}
+	return total, cached
+}
+
+// expectedUsageBlock re-derives the usage-block contract from the raw
+// bytes with the parsers' single-pass typed decode: a missing usage
+// object or any decode error — malformed usage data is an expected fuzz
+// input whose documented result is an unusable block, never an oracle
+// crash — reports false; a usable one assembles in/out, total and cached
+// per the documented rules, with key matching following encoding/json
+// (case-insensitive, last duplicate wins, first decode error persists).
+func expectedUsageBlock(t *testing.T, body []byte) (provider.Usage, bool) {
+	t.Helper()
+	var probe struct {
+		Usage *usageLeaf `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil || probe.Usage == nil {
+		return provider.Usage{}, false
+	}
+	in, out := expectedUsageIO(probe.Usage)
+	total, cached := expectedUsageTotalCached(probe.Usage, in, out)
 	return provider.Usage{
 		PromptTokens:     in,
 		CompletionTokens: out,

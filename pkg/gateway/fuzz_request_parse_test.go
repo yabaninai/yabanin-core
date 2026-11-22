@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"net/http/httptest"
@@ -228,8 +229,20 @@ func FuzzRequestParseContract(f *testing.F) {
 	f.Add([]byte(``), "")
 	f.Add([]byte(`{"messages":5}`), "")
 	f.Add([]byte(`{"messages":[{"role":"user"},{"role":"assistant"}]}`), "low")
+	f.Add([]byte(`{"choices":[{"finish_reason":"stop"}],"reasoning_effort":"medium"}`), "high")
 	f.Add([]byte(`[1]`), "")
 	f.Add([]byte(`null`), "")
+	// Unrepresentable numeric literals fail the interface{} decode the
+	// gate uses, so they can never serve from the cache — and the patch
+	// must carry them verbatim through the raw pass-through.
+	f.Add([]byte(`{"choices":[{"finish_reason":"stop","note":1e999}]}`), "")
+	f.Add([]byte(`{"":[{"":1e700}]}`), "0")
+	// Arbitrary invalid UTF-8 in the effort string is normalized by
+	// encoding/json on marshal; the patched key must carry exactly that
+	// normalization, and an invalid-UTF-8 body must round-trip untouched.
+	f.Add([]byte(`{"model":"m"}`), "\xff\xfe")
+	f.Add([]byte(`{"model":"m"}`), "caf\xe9")
+	f.Add([]byte("{\"a\":\"\xff\xfe\",\"messages\":[{\"role\":\"u\"}]}"), "")
 	f.Fuzz(func(t *testing.T, body []byte, effort string) {
 		require.Equal(t, expectedCacheGate(t, body), shouldCache(body))
 		requireMessageExtraction(t, body, extractChatMessages(body))
@@ -320,7 +333,24 @@ func requireEffortInjection(t *testing.T, body []byte, effort string, out []byte
 	require.Equal(t, string(enc), string(patched["reasoning_effort"]))
 	for k, v := range root {
 		if k != "reasoning_effort" {
-			require.JSONEq(t, string(v), string(patched[k]))
+			// A value the interface{} decode cannot represent (numeric
+			// literals beyond float64) only exists as its raw bytes; the
+			// documented pass-through must preserve them verbatim.
+			var probe interface{}
+			if err := json.Unmarshal(v, &probe); err != nil {
+				require.Equal(t, compactJSON(t, v), string(patched[k]))
+			} else {
+				require.JSONEq(t, string(v), string(patched[k]))
+			}
 		}
 	}
+}
+
+// compactJSON returns the syntactic compact form of raw JSON bytes
+// without a semantic decode, so unrepresentable literals compare intact.
+func compactJSON(t *testing.T, raw []byte) string {
+	t.Helper()
+	var buf bytes.Buffer
+	require.NoError(t, json.Compact(&buf, raw))
+	return buf.String()
 }
