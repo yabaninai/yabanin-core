@@ -768,30 +768,49 @@ func fuzzF0221(t *testing.T, _ *f02BootDB) {
 	run := func(cfg config.Gateway) error {
 		return RunGatewayServerWithJWT(cfg, nil, nil, nil, l, ctx, JWTWiring{}, CircuitScopeWiring{})
 	}
+	f02CheckBootInvalidAuthMode(t, run, up.srv.URL)
+	f02CheckBootMissingEventStream(t, run, up.srv.URL)
+	f02CheckBootInvalidEncryptionKey(t, run, up.srv.URL)
+	f02CheckBootOccupiedListenPort(t, run, up.srv.URL)
+	if got := up.count(); got != 0 {
+		t.Fatalf("F02-21: negatives reached upstream %d times", got)
+	}
+}
 
-	// Validate() wrap.
-	badMode := f02BootConfig(f02FreeAddr(t), up.srv.URL, "k")
+func f02CheckBootInvalidAuthMode(t *testing.T, run func(config.Gateway) error, provider string) {
+	t.Helper()
+	// Validate() wraps invalid auth mode with gateway config context.
+	badMode := f02BootConfig(f02FreeAddr(t), provider, "k")
 	badMode.AuthMode = "bogus"
 	if err := run(badMode); err == nil || !strings.Contains(err.Error(), "invalid gateway config") ||
 		!strings.Contains(err.Error(), "auth_mode must be") {
 		t.Fatalf("F02-21: auth_mode negative: %v", err)
 	}
+}
 
-	noStream := f02BootConfig(f02FreeAddr(t), up.srv.URL, "k")
+func f02CheckBootMissingEventStream(t *testing.T, run func(config.Gateway) error, provider string) {
+	t.Helper()
+	noStream := f02BootConfig(f02FreeAddr(t), provider, "k")
 	noStream.EventStream = ""
 	if err := run(noStream); err == nil || !strings.Contains(err.Error(), "event_stream is required") {
 		t.Fatalf("F02-21: event_stream negative: %v", err)
 	}
+}
 
+func f02CheckBootInvalidEncryptionKey(t *testing.T, run func(config.Gateway) error, provider string) {
+	t.Helper()
 	// buildGateway passthrough (NOT the Validate wrap).
-	badKey := f02BootConfig(f02FreeAddr(t), up.srv.URL, "k")
+	badKey := f02BootConfig(f02FreeAddr(t), provider, "k")
 	badKey.EncryptionKey = "f02-not-a-valid-key"
 	if err := run(badKey); err == nil || !strings.Contains(err.Error(), "invalid encryption_key") {
 		t.Fatalf("F02-21: encryption_key negative: %v", err)
 	} else if strings.Contains(err.Error(), "invalid gateway config") {
 		t.Fatalf("F02-21: encryption_key negative wrapped by Validate: %v", err)
 	}
+}
 
+func f02CheckBootOccupiedListenPort(t *testing.T, run func(config.Gateway) error, provider string) {
+	t.Helper()
 	// Occupied listen port: hold the address, expect the listen failure.
 	held, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
@@ -802,7 +821,7 @@ func fuzzF0221(t *testing.T, _ *f02BootDB) {
 			t.Errorf("F02-21: close held listener: %v", err)
 		}
 	}()
-	occupied := f02BootConfig(held.Addr().String(), up.srv.URL, "k")
+	occupied := f02BootConfig(held.Addr().String(), provider, "k")
 	errCh := make(chan error, 1)
 	go func() { errCh <- run(occupied) }()
 	select {
@@ -812,9 +831,6 @@ func fuzzF0221(t *testing.T, _ *f02BootDB) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("F02-21: occupied-port boot never returned")
-	}
-	if got := up.count(); got != 0 {
-		t.Fatalf("F02-21: negatives reached upstream %d times", got)
 	}
 }
 
