@@ -93,12 +93,8 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 			assertPolicyRouteError(t, tc.path, resp, "invalid_request_error", policyDenyErrorCode)
 			require.Equal(t, before, upstreamCalls.Load(), "recovered policy denial contacted upstream")
 			resp = policyAvailabilityRequest(t, ctx, client, server.URL, tc.path, tc.body, plainKey)
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("ordinary request after policy recovery status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
-			}
-			if got := upstreamCalls.Load(); got != before+1 {
-				t.Fatalf("upstream calls after recovery = %d, want %d", got, before+1)
-			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+			require.Equal(t, before+1, upstreamCalls.Load(), "upstream calls after recovery")
 		})
 	}
 
@@ -115,12 +111,8 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	proxy.SetUnavailable(true)
 	before := upstreamCalls.Load()
 	resp := policyAvailabilityRequest(t, ctx, failOpenClient, failOpenServer.URL, "/v1/chat/completions", `{"model":"r00905-model","messages":[{"role":"user","content":"hello"}]}`, failOpenKey)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("cold fail-open request status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
-	}
-	if got := upstreamCalls.Load(); got != before+1 {
-		t.Fatalf("cold fail-open upstream calls = %d, want %d", got, before+1)
-	}
+	require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+	require.Equal(t, before+1, upstreamCalls.Load(), "cold fail-open upstream calls")
 	proxy.SetUnavailable(false)
 
 	// A reachable, empty policy snapshot remains a healthy success and does
@@ -128,12 +120,8 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	_, emptyKey := createPolicyAvailabilityIdentity(t, ctx, seedStore, "healthy-empty")
 	emptyBefore := upstreamCalls.Load()
 	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions", `{"model":"r00905-model","messages":[{"role":"user","content":"hello"}]}`, emptyKey)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("reachable empty policy snapshot status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
-	}
-	if got := upstreamCalls.Load(); got != emptyBefore+1 {
-		t.Fatalf("reachable empty snapshot upstream calls = %d, want %d", got, emptyBefore+1)
-	}
+	require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+	require.Equal(t, emptyBefore+1, upstreamCalls.Load(), "reachable empty snapshot upstream calls")
 }
 
 func assertPolicyRouteError(t *testing.T, path string, resp policyAvailabilityResponse, anthropicType, code string) {
