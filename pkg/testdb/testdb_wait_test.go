@@ -3,10 +3,13 @@ package testdb
 import (
 	"context"
 	"errors"
+	"os"
 	"testing"
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/stretchr/testify/require"
 )
 
 // stubRow is a minimal pgx.Row over a canned value or error.
@@ -129,4 +132,19 @@ func TestCoreTablesPresentQ(t *testing.T) {
 	if coreTablesPresentQ(ctx, &broken) {
 		t.Fatalf("query error must count as absent")
 	}
+}
+
+func TestPostgresStandReturnsMigrationError(t *testing.T) {
+	requireDocker(t)
+	t.Chdir(t.TempDir())
+	require.NoError(t, os.WriteFile("go.mod", []byte("module fixture\n"), 0600))
+	require.NoError(t, os.Mkdir("migrations", 0700))
+	require.NoError(t, os.WriteFile("migrations/0001.up.sql", []byte("SELECT 1/0;"), 0600))
+
+	stand, err := pgStandStartReal(t)
+	require.Nil(t, stand)
+	var dbErr *pgconn.PgError
+	require.ErrorAs(t, err, &dbErr)
+	require.Equal(t, "22012", dbErr.Code)
+	require.ErrorContains(t, err, "0001.up.sql")
 }

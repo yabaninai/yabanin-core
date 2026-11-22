@@ -48,17 +48,18 @@ func requireDocker(tb testing.TB) {
 }
 
 // repoRoot walks up from the working directory to the directory holding go.mod.
-func repoRoot(tb testing.TB) string {
-	tb.Helper()
+func repoRoot() (string, error) {
 	dir, err := os.Getwd()
-	require.NoError(tb, err)
+	if err != nil {
+		return "", err
+	}
 	for {
 		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
-			return dir
+			return dir, nil
 		}
 		parent := filepath.Dir(dir)
 		if parent == dir {
-			tb.Fatal("go.mod not found while walking up from the working directory")
+			return "", errors.New("go.mod not found while walking up from the working directory")
 		}
 		dir = parent
 	}
@@ -72,20 +73,30 @@ func repoRoot(tb testing.TB) string {
 // role the RLS pools assume is provisioned here exactly as the deployment
 // layer does (NOLOGIN least-privilege + application-surface grants; LOGIN
 // and the password stay a deploy-layer concern the stands never need).
-func applyMigrations(tb testing.TB, pool *pgxpool.Pool) {
-	tb.Helper()
-	root := repoRoot(tb)
+func applyMigrations(pool *pgxpool.Pool) error {
+	root, err := repoRoot()
+	if err != nil {
+		return err
+	}
 	paths, err := filepath.Glob(filepath.Join(root, "migrations", "*.up.sql"))
-	require.NoError(tb, err)
-	require.NotEmpty(tb, paths, "no up-migrations discovered")
+	if err != nil {
+		return err
+	}
+	if len(paths) == 0 {
+		return errors.New("no up-migrations discovered")
+	}
 	sort.Strings(paths)
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
 	for _, p := range paths {
 		sqlBytes, err := os.ReadFile(p) //nolint:gosec // G304: repo-relative migration fixture
-		require.NoError(tb, err, "read %s", p)
+		if err != nil {
+			return fmt.Errorf("read %s: %w", p, err)
+		}
 		_, err = pool.Exec(ctx, string(sqlBytes))
-		require.NoError(tb, err, "apply %s", p)
+		if err != nil {
+			return fmt.Errorf("apply %s: %w", p, err)
+		}
 	}
 	const bootstrap = `DO $$ BEGIN
 		IF NOT EXISTS (SELECT FROM pg_catalog.pg_roles WHERE rolname = 'yabanin_app') THEN
@@ -98,7 +109,10 @@ func applyMigrations(tb testing.TB, pool *pgxpool.Pool) {
 	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT SELECT, INSERT, UPDATE, DELETE ON TABLES TO yabanin_app;
 	ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT USAGE, SELECT ON SEQUENCES TO yabanin_app;`
 	_, err = pool.Exec(ctx, bootstrap)
-	require.NoError(tb, err, "bootstrap yabanin_app role")
+	if err != nil {
+		return fmt.Errorf("bootstrap yabanin_app role: %w", err)
+	}
+	return nil
 }
 
 // waitStablePostmaster blocks until the server's postmaster start time reads
@@ -317,48 +331,49 @@ func pgStandStartReal(tb testing.TB) (*pgStand, error) {
 		return fail(err)
 	}
 	stand.pool = pool
+	if err := initializePostgres(ctx, pool); err != nil {
+		pool.Close()
+		return fail(err)
+	}
+	return stand, nil
+}
+
+func waitPostgresPing(ctx context.Context, pool *pgxpool.Pool) error {
 	// The image entrypoint restarts the server between first-boot setup
 	// and the real start; wait out that window, then migrate — the same
 	// set a real deployment applies — before any test sees the pool.
 	deadline := time.Now().Add(60 * time.Second)
 	for {
 		pingCtx, cancel := context.WithTimeout(ctx, 2*time.Second)
-		err = pool.Ping(pingCtx)
+		err := pool.Ping(pingCtx)
 		cancel()
 		if err == nil {
-			break
+			return nil
 		}
 		if time.Now().After(deadline) {
-			pool.Close()
-			return fail(fmt.Errorf("disposable postgres never became ready: %w", err))
+			return fmt.Errorf("disposable postgres never became ready: %w", err)
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
-	// A successful Ping can still land in the FIRST-boot server: the
-	// entrypoint then restarts the whole cluster and re-initializes the
-	// data directory, wiping anything applied in the meantime. Under
-	// heavy parallel container churn that window widens enough to swallow
-	// the migration pass, so require the postmaster start time to be
-	// stable across a settle window before migrating.
-	if err := waitStablePostmaster(ctx, pool); err != nil {
-		pool.Close()
-		return fail(err)
+}
+
+func initializePostgres(ctx context.Context, pool *pgxpool.Pool) error {
+	if err := waitPostgresPing(ctx, pool); err != nil {
+		return err
 	}
-	applyMigrations(tb, pool)
-	// Belt and braces: if the restart raced the migration pass, the core
-	// table is gone — wait out the restart and apply migrations again.
-	if !coreTablesPresent(ctx, pool) {
+	// If first-boot startup races the migration pass, repeat it once.
+	for attempt := 0; attempt < 2; attempt++ {
 		if err := waitStablePostmaster(ctx, pool); err != nil {
-			pool.Close()
-			return fail(err)
+			return err
 		}
-		applyMigrations(tb, pool)
-		if !coreTablesPresent(ctx, pool) {
-			pool.Close()
-			return fail(errors.New("migrations did not survive the postgres first-boot restart"))
+		if err := applyMigrations(pool); err != nil {
+			return err
+		}
+		if coreTablesPresent(ctx, pool) {
+			return nil
 		}
 	}
-	return stand, nil
+	return errors.New("migrations did not survive the postgres first-boot restart")
 }
 
 // ensurePostgres returns the shared per-binary stand's pool and DSN. FIX-12:
