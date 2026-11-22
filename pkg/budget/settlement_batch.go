@@ -120,6 +120,19 @@ var ErrBatchReservedUnderflow = errors.New("settlement batch: scope reserve unde
 // claim of the same settlement job.
 var ErrStaleSettlementToken = errors.New("settlement batch: stale fencing token")
 
+// ErrCommitUncertain reports a settlement batch commit whose durable
+// outcome is not provably rolled back: every commit-stage error except
+// pgx.ErrTxCommitRollback (server-answered SQLSTATE 08007
+// transaction_resolution_unknown, 40003 statement_completion_unknown,
+// transport and response loss, cancellation). The commit may have
+// landed. The caller must NOT fall back to per-job re-execution — that
+// would re-apply dispositions to jobs that may already be terminal
+// (settled, or parked as debt the ledger records as uncollectable). Jobs
+// left processing recover through fenced lease expiry: committed
+// dispositions are terminal and no-op on recovery, a provably
+// rolled-back group re-executes under the re-claim.
+var ErrCommitUncertain = errors.New("settlement batch: commit outcome uncertain")
+
 // SettleEntry is one claimed settlement job projected for batch execution.
 // AllowanceID > 0 links the job to the allocation whose reserve it
 // decrements; Bound is that allocation's request bound (§5.3 Finalize
@@ -242,7 +255,20 @@ func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCen
 	}
 
 	if err := tx.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("settlement batch commit: %w", err)
+		// Default to uncertain for EVERY commit-stage error. Only
+		// pgx.ErrTxCommitRollback proves a rollback (pgx returns it when
+		// the COMMIT command executed and rolled the transaction back);
+		// a server-answered PgError is NOT proof — SQLSTATE 08007
+		// (transaction_resolution_unknown) and 40003
+		// (statement_completion_unknown) report exactly that the outcome
+		// could not be resolved — and transport errors carry no outcome
+		// at all. Uncertain groups never re-execute; fenced lease
+		// recovery decides. Pre-commit failures keep the fallback
+		// contract unchanged.
+		if errors.Is(err, pgx.ErrTxCommitRollback) {
+			return nil, fmt.Errorf("settlement batch commit: %w", err)
+		}
+		return nil, fmt.Errorf("%w: settlement batch commit: %w", ErrCommitUncertain, err)
 	}
 	return dispositions, nil
 }

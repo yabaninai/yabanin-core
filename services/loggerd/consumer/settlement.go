@@ -489,19 +489,20 @@ func (w *SettlementWorker) tick(ctx context.Context) {
 		// NEXT-18d (§5.5): jobs of one org apply as ONE batch transaction —
 		// ledger, spend upserts, job transitions and the reserve decrement
 		// commit together, semantically equivalent to the sequential
-		// per-job execution. Singletons and any failed batch fall back to
-		// the per-job executor, which is the reference semantics. The one
-		// exception is a fencing loss (budget.ErrStaleSettlementToken): a
-		// newer worker has re-claimed these jobs, so THIS worker must not
-		// touch them again — no batch retry, no unfenced per-job writes.
-		// The rightful owner settles them; jobs it never re-claimed return
-		// via this worker's expired lease (recoverExpiredLeases).
+		// per-job execution. Singletons and any pre-commit failed batch
+		// fall back to the per-job executor, which is the reference
+		// semantics. Two exceptions must never reach the per-job path:
+		// a fencing loss (budget.ErrStaleSettlementToken) — a newer worker
+		// re-claimed these jobs, so THIS worker must not touch them again;
+		// and an uncertain commit (budget.ErrCommitUncertain) — the batch
+		// may have landed, so re-execution could re-charge recorded debt.
+		// Fenced lease recovery settles both: the rightful owner settles
+		// re-claimed jobs; committed groups are terminal and no-op on
+		// recovery; uncommitted jobs return via expired lease.
 		for _, group := range groupJobsByOrg(jobs) {
 			if len(group) > 1 {
 				switch w.executeOrgBatch(ctx, group) {
-				case orgBatchCommitted:
-					continue
-				case orgBatchStale:
+				case orgBatchCommitted, orgBatchStale, orgBatchUncertain:
 					continue
 				}
 			}
@@ -573,6 +574,14 @@ const (
 	// writes to jobs another worker owns. The rightful owner settles the
 	// re-claimed jobs; unaffected ones return via lease expiry.
 	orgBatchStale
+	// orgBatchUncertain: the batch commit's durable outcome is
+	// unobservable (budget.ErrCommitUncertain — transport or response
+	// loss, not a server-rejected commit). The commit may have landed, so
+	// per-job re-execution could re-charge a wallet the ledger may have
+	// just recorded as uncollectable debt. Leave the group alone: jobs a
+	// landed commit already made terminal no-op on recovery, a truly
+	// rolled-back group re-executes under the fenced re-claim.
+	orgBatchUncertain
 )
 
 // executeOrgBatch applies one org's claimed jobs through the §5.5 batch
@@ -581,7 +590,9 @@ const (
 // work is left); orgBatchFallback means the caller must fall back to the
 // per-job executor (nothing committed on an error path, so re-execution is
 // safe); orgBatchStale means ownership was lost to a newer claim and the
-// jobs must be left alone entirely.
+// jobs must be left alone entirely; orgBatchUncertain means the commit's
+// durable outcome is unobservable and the group must be left to fenced
+// lease recovery instead of any re-execution.
 func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) orgBatchResult {
 	entries := make([]budget.SettleEntry, 0, len(group))
 	for _, job := range group {
@@ -632,6 +643,20 @@ func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settleme
 				slog.String("error", err.Error()),
 			)
 			return orgBatchStale
+		}
+		if errors.Is(err, budget.ErrCommitUncertain) {
+			// Response-loss window: the commit may or may not have
+			// landed. Neither a batch retry nor a per-job fallback is
+			// safe — a landed commit is already terminal, and a
+			// re-execution would re-charge a wallet the ledger may have
+			// just recorded as uncollectable debt. Fenced lease recovery
+			// decides: committed jobs no-op, rolled-back ones re-run.
+			w.logger.Error("settlement org batch commit uncertain — no fallback, lease recovery decides",
+				slog.String("org_id", group[0].OrgID),
+				slog.Int("jobs", len(group)),
+				slog.String("error", err.Error()),
+			)
+			return orgBatchUncertain
 		}
 		w.logger.Warn("settlement org batch failed — falling back to per-job execution",
 			slog.String("org_id", group[0].OrgID),
@@ -1108,6 +1133,12 @@ func (w *SettlementWorker) classifyFailure(err error, attempts int) (disposition
 		// durable debt, not a retryable condition and not a silent zero.
 		metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
 		return "requires_attention", "insufficient_credits"
+	case errors.Is(err, credits.ErrChargeIdentityConflict):
+		// A usage row under this invocation identity already exists with a
+		// different org or amount — a permanent integrity conflict. Must be
+		// classified before the unique-violation case: the conflict wraps
+		// SQLSTATE 23505 but is NOT the legacy request-id conflict.
+		return "requires_attention", "invocation_identity_conflict"
 	case isUniqueViolation(err):
 		// A usage ledger row for this request already exists under a
 		// DIFFERENT org (the idempotency index is global on request_id) —
