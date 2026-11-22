@@ -1688,8 +1688,15 @@ class ConservativeScopeControls(unittest.TestCase):
         (self.pkg / 'dispatch_test.go').write_text(
             'package auth\n\nimport "testing"\n\n'
             'func TestDispatch(t *testing.T) {\n'
-            '\tvar h struct{ Allowed func(int) bool }\n'
-            '\th.Allowed(1)\n}\n')
+            '\th := struct{ Allowed func(int) bool }{\n'
+            '\t\tAllowed: func(n int) bool { return n > 0 },\n'
+            '\t}\n'
+            '\tif !h.Allowed(1) { t.Fatal("dispatch target did not run") }\n'
+            '}\n')
+        suite = run_guarded(['go', 'test', '-count=1', './pkg/auth'],
+                            cwd=self.root, timeout=60,
+                            env=dict(os.environ, GOWORK='off', GOFLAGS=''))
+        self.assertEqual(suite.returncode, 0, suite.stdout + suite.stderr)
         self.assertEqual(self.names(), {'Allowed', 'Neighbor', 'Guarded'})
 
     def test_concrete_method_consumer_stays_narrow(self):
@@ -1735,12 +1742,18 @@ class ConservativeScopeControls(unittest.TestCase):
         (self.pkg / 'hook.go').write_text(
             'package auth\n\n'
             'type opener interface{ Allowed(n int) bool }\n\n'
+            'type openerFunc func(int) bool\n'
+            'func (f openerFunc) Allowed(n int) bool { return f(n) }\n\n'
             'type gate struct{ opener }\n')
         (self.pkg / 'gate_test.go').write_text(
             'package auth\n\nimport "testing"\n\n'
             'func TestGate(t *testing.T) {\n'
-            '\tvar g gate\n'
+            '\tg := gate{opener: openerFunc(func(n int) bool { return n > 0 })}\n'
             '\tif !g.Allowed(1) { t.Fatal("denied") }\n}\n')
+        suite = run_guarded(['go', 'test', '-count=1', './pkg/auth'],
+                            cwd=self.root, timeout=60,
+                            env=dict(os.environ, GOWORK='off', GOFLAGS=''))
+        self.assertEqual(suite.returncode, 0, suite.stdout + suite.stderr)
         self.commit('interface promotion')
         (self.pkg / 'gate_test.go').write_text(
             (self.pkg / 'gate_test.go').read_text().replace('t.Fatal("denied")', 't.Fatal("no")'))
@@ -2579,10 +2592,9 @@ G8_DUAL_DENY_SPEC = '7.3,8.1'
 G8_COUNTERPART_REASON = ('lost_block_coverage: pkg/auth: TestAllowedDefault no '
                          'longer covers Allowed, pkg/auth/allowed_default_moved.go:' +
                          G8_DUAL_DENY_SPEC)
-# Correct sharing leaves ~4s of the pool for the special-mode suite which
-# needs ~3s, while a fresh 3s per-mode half-budget cannot fit it: only a
-# genuinely shared deadline completes both modes.
-G8_A3_PATCHED_SECONDS = 6
+# Derive fixture sleeps from the banked remainder; no product budget changes.
+# Test-only deadline for the tiny two-mode fixture; product budget stays 300s.
+G8_A3_PATCHED_SECONDS = 12
 G8_A3_DEFAULT_SLOW_MS = 1000
 G8_A3_SPECIAL_SLOW_MS = 3000
 G8_A3_WALL_LIMIT = 120
@@ -2718,6 +2730,69 @@ G8_A3_SLOW_SPECIAL = ('//go:build special\n\npackage auth\n'
                       str(G8_A3_SPECIAL_SLOW_MS) + '*time.Millisecond) }\n')
 G8_A3_NORMAL_POLICY = G7_POLICY_BLOCKS.replace('if n > Limit {',
                                                'if Limit < n {')
+G8_A3_SHARED_BUDGET_DRIVER = r'''import sys, tempfile, subprocess, time
+from pathlib import Path
+sys.path.insert(0, sys.argv[1])
+import critical
+import critical_conservative as conservative
+import critical_scope
+critical.APPROVED_BUDGET = {"unit":12,"fuzz":420,"mutation":300}
+config = {"critical_paths":["pkg/auth/**"], "build_tags":["","special"],
+          "budget":{"schema_version":1,"seconds_per_package":{"unit":12,"fuzz":420,"mutation":300}},
+          "mutation_qualified_packages":[]}
+rows = critical_scope.targets(Path.cwd(), sys.argv[2], config)
+selected = rows.get("pkg/auth", [])
+print("SELECTED:" + str(len(selected)))
+if len(selected) != 1:
+    raise AssertionError("expected one selected unit, got " + str(len(selected)))
+key = ("pkg/auth", "unit")
+remaining = conservative.UNIT_REMAINDERS[key]
+if remaining < 2:
+    raise AssertionError("fixture left too little budget for a meaningful split: " + str(remaining))
+default_ms = max(1, int(remaining * 0.03 * 1000))
+special_ms = max(1, int(remaining * 0.55 * 1000))
+if special_ms <= remaining * 500:
+    raise AssertionError("special fixture must exceed a fresh half-remainder")
+slow_default = ("//go:build !special\n\npackage auth\nimport (\"testing\"; \"time\")\n"+
+                "func TestSlowDefault(t *testing.T) { time.Sleep("+str(default_ms)+"*time.Millisecond) }\n")
+slow_special = ("//go:build special\n\npackage auth\nimport (\"testing\"; \"time\")\n"+
+                "func TestSlowSpecial(t *testing.T) { time.Sleep("+str(special_ms)+"*time.Millisecond) }\n")
+Path("pkg/auth/slow_default_test.go").write_text(slow_default)
+Path("pkg/auth/slow_special_test.go").write_text(slow_special)
+for tags in ("", "special"):
+    args = ["go", "test", "-count=1"] + (["-tags="+tags] if tags else []) + ["./pkg/auth"]
+    suite = subprocess.run(args, text=True, capture_output=True, timeout=30)
+    if suite.returncode:
+        raise AssertionError("real fixture suite failed: " + suite.stdout + suite.stderr)
+
+try:
+    critical.run_package(Path.cwd(), "pkg/auth", selected, config,
+                         Path(tempfile.mkdtemp(prefix="g8a3-shared-")), "gremlins-not-used")
+except subprocess.TimeoutExpired as exc:
+    raise AssertionError("shared unit phase unexpectedly exhausted: " + str(exc)) from exc
+print("UNIT-PHASE-OK")
+
+# Broken control: give special mode a fresh half-budget; its 55% sleep must fail.
+conservative.pause_unit_budget("pkg/auth")
+conservative.UNIT_REMAINDERS[key] = remaining
+run_mode = critical.run_mode
+def fresh_half(kind, root, package, functions, tags, out, deadline, gremlins, qualified):
+    if kind == "unit" and tags == "special":
+        deadline = time.monotonic() + remaining / 2
+    return run_mode(kind, root, package, functions, tags, out, deadline, gremlins, qualified)
+critical.run_mode = fresh_half
+try:
+    critical.run_package(Path.cwd(), "pkg/auth", selected, config,
+                         Path(tempfile.mkdtemp(prefix="g8a3-broken-")), "gremlins-not-used")
+except subprocess.TimeoutExpired as exc:
+    if "go" not in exc.cmd or "test" not in exc.cmd:
+        raise
+    print("FRESH-PER-MODE-NEGATIVE-CAUGHT")
+else:
+    raise AssertionError("fresh-half-per-mode control unexpectedly passed")
+finally:
+    critical.run_mode = run_mode
+'''
 
 
 class G7AuditRepairControls(unittest.TestCase):
@@ -3224,56 +3299,15 @@ class G7AuditRepairControls(unittest.TestCase):
                               'negative leg is vacuous')
 
     def test_normal_unit_phase_shares_one_budget_across_modes(self):
-        # G8-A3-NORMAL-UNIT: the normal unit phase draws from the same
-        # per-package shared deadline in every build mode. With the
-        # patched pool the default-mode suite spends ~1s and the
-        # special-mode suite (~3s) still fits the shared remainder; a
-        # per-mode fresh half-budget cannot, so completing both modes
-        # proves the deadline was shared, not reset per mode.
-        # The product's named exhaustion guard (remaining() raising
-        # "Per-package check budget exhausted") is a pre-launch check
-        # that cannot fire here: mode_deadline is always <= the shared
-        # remaining time, so an overspending mode dies as an anonymous
-        # subprocess timeout first. The harness therefore surfaces the
-        # real exhaustion path under a named budget error so the broken
-        # variant fails with an explicit, checkable cause instead of an
-        # unhandled TimeoutExpired traceback.
+        # Both mode suites run against one banked package remainder. The
+        # special case consumes 55% of that remainder; a fresh half-budget
+        # control must fail on the same real Go test.
         root, _ = self.write_repo(G7_POLICY_BLOCKS, G8_A3_NORMAL_TESTS)
         (root / 'pkg/auth/slow_default_test.go').write_text(G8_A3_SLOW_DEFAULT)
         (root / 'pkg/auth/slow_special_test.go').write_text(G8_A3_SLOW_SPECIAL)
         base = self.commit_fixture(root, 'slow modes')
         (root / 'pkg/auth/policy.go').write_text(G8_A3_NORMAL_POLICY)
-        for tags in ('', 'special'):
-            argv = ['go', 'test', '-count=1']
-            if tags:
-                argv.append('-tags=' + tags)
-            argv.append('./pkg/auth')
-            suite = run_guarded(argv, cwd=root, timeout=60,
-                                env=self.selector_env())
-            self.assertEqual(suite.returncode, 0, suite.stdout + suite.stderr)
-        code = (
-            'import sys,tempfile,subprocess\n'
-            'from pathlib import Path\n'
-            'sys.path.insert(0,sys.argv[1])\n'
-            'import critical\n'
-            'critical.APPROVED_BUDGET={"unit":' + str(G8_A3_PATCHED_SECONDS) +
-            ',"fuzz":420,"mutation":300}\n'
-            'config={"critical_paths":["pkg/auth/**"],"build_tags":["","special"],'
-            '"budget":{"schema_version":1,"seconds_per_package":{"unit":' +
-            str(G8_A3_PATCHED_SECONDS) + ',"fuzz":420,"mutation":300}},'
-            '"mutation_qualified_packages":[]}\n'
-            'import critical_scope\n'
-            'rows=critical_scope.targets(Path.cwd(),sys.argv[2],config)\n'
-            'print("SELECTED:"+str(len(rows.get("pkg/auth",[]))))\n'
-            'try:\n'
-            '    critical.run_package(Path.cwd(),"pkg/auth",rows["pkg/auth"],config,'
-            'Path(tempfile.mkdtemp(prefix="g8a3-")),"gremlins-not-used")\n'
-            'except subprocess.TimeoutExpired as exhausted:\n'
-            '    raise ValueError("unit budget exhausted for pkg/auth: "'
-            '+ " ".join(exhausted.cmd) +\n'
-            '        " exceeded the shared per-package unit deadline") from exhausted\n'
-            'print("UNIT-PHASE-OK")\n'
-        )
+        code = G8_A3_SHARED_BUDGET_DRIVER
         start = time.monotonic()
         proc = run_guarded(['python3', '-c', code, self.selector_tree(), base],
                            cwd=root, timeout=150, env=self.selector_env())
@@ -3281,6 +3315,7 @@ class G7AuditRepairControls(unittest.TestCase):
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn('SELECTED:1', proc.stdout)
         self.assertIn('UNIT-PHASE-OK', proc.stdout)
+        self.assertIn('FRESH-PER-MODE-NEGATIVE-CAUGHT', proc.stdout)
         self.assertLess(wall, G8_A3_WALL_LIMIT)
 
     def test_run_guarded_timeout_cleans_up_child_processes(self):
@@ -3522,6 +3557,11 @@ G8F_RECEIVER_TESTS = (
     '{ t.Fatal("beta false denial") } }\n'
     'func FuzzOther(f *testing.F) { f.Add(0); '
     'f.Fuzz(func(t *testing.T,n int) { Other(n) }) }\n'
+)
+G8F_RECEIVER_BETA_ONLY_TESTS = (
+    'package auth\nimport "testing"\n'
+    'func TestCheck(t *testing.T) { if !(Beta{}).Check(1) '
+    '{ t.Fatal("beta false denial") } }\n'
 )
 G8F_RECEIVER_CHANGED = G8F_RECEIVER_POLICY.replace(
     'func (a Alpha) Check(n int) bool { if n > Limit { return false }; '
@@ -3773,6 +3813,18 @@ class G8FollowupRepairControls(G7AuditRepairControls):
                      for row in result['rows'] if row['name'] == 'Check']
         self.assertEqual(survivors, [('Check', 'Beta')],
                          json.dumps(result['rows']))
+
+    def test_receiver_method_deletion_ignores_sibling_reference(self):
+        # G8F-RECV-SIBLING: Beta.Check cannot witness a surviving Alpha.Check.
+        root, base = self.write_repo(G8F_RECEIVER_POLICY,
+                                     G8F_RECEIVER_BETA_ONLY_TESTS)
+        (root / 'pkg/auth/policy.go').write_text(G8F_RECEIVER_DROP_ALPHA)
+        result = self.selector_output(root, base)
+        self.assertIn('removed production function without visible consumers: Alpha.Check',
+                      result['widened'], json.dumps(result['widened']))
+        self.assertFalse(any('removed function still referenced: Alpha.Check'
+                             in reason for reason in result['widened']),
+                         json.dumps(result['widened']))
 
     def test_unreferenced_production_removal_widens(self):
         # G8F-REMOVED-FUNC: a vanished production function is never proof
@@ -5177,8 +5229,11 @@ class R2SelectorRepairControls(unittest.TestCase):
                          + (foreign.get('selrefs') or []), foreign)
         self.assertNotIn('Open', (foreign.get('refs') or [])
                          + (foreign.get('selrefs') or []), foreign)
+        self.assertNotIn('OtherGate.Open', (foreign.get('refs') or [])
+                         + (foreign.get('selrefs') or []), foreign)
         self.assertIn('Allowed', target.get('refs') or [], target)
-        self.assertIn('Open', target.get('refs') or [], target)
+        self.assertIn('Gate.Open', target.get('refs') or [], target)
+        self.assertNotIn('OtherGate.Open', target.get('refs') or [], target)
         for path, out in rows.items():
             self.assertEqual(out.get('resolution') or [], [], (path, out.get('resolution')))
 
@@ -5215,10 +5270,10 @@ class R2SelectorRepairControls(unittest.TestCase):
         self.assertIn('Allowed', helper.get('refs') or [], helper)
         self.assertEqual(sorted(helper.get('refs') or []),
                          ['Allowed', 'auth'], helper)
-        self.assertIn('Open', gate.get('refs') or [], gate)
+        self.assertIn('Gate.Open', gate.get('refs') or [], gate)
         self.assertIn('Gate', gate.get('refs') or [], gate)
         self.assertEqual(sorted(gate.get('refs') or []),
-                         ['Gate', 'Open', 'auth'], gate)
+                         ['Gate', 'Gate.Open', 'auth'], gate)
         self.assertEqual(sorted(test.get('refs') or []),
                          ['externalAllowed', 'externalGate', 'testing'], test)
         for path, out in rows.items():

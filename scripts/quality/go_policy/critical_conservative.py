@@ -739,7 +739,7 @@ def note_removed_function(row, previous, current, selection):
     if dispatch_reference(row['name'], previous, current):
         selection.widen('removed function in dynamic-dispatch package: ' + label)
         return
-    files = referencing_files(row['name'], previous, current)
+    files = referencing_files(row, previous, current)
     if files:
         selection.widen('removed function still referenced: ' + label +
                         ' (' + ', '.join(files) + ')')
@@ -755,11 +755,43 @@ def dispatch_reference(name, previous, current):
     return name in previous.dispatch_names or name in current.dispatch_names
 
 
-def referencing_files(name, previous, current):
-    """Baseline files referencing name that still mention it now."""
-    return [path for path in sorted(previous.files)
-            if path in current.files and name in unit_refs(previous.files[path]['units'])
-            and mentions(current, path, name)]
+def referencing_files(row, previous, current):
+    """Find surviving textual consumers without merging method twins."""
+    name = row['name']
+    recv = row.get('recv', '')
+    key = identity_key(row)
+    files = []
+    for path in sorted(previous.files):
+        if path not in current.files:
+            continue
+        before = previous.files[path]['units']
+        now = current.files[path]['units']
+        if recv:
+            if key not in unit_refs(before):
+                continue
+            exact = key in unit_refs(now)
+            fallback = name in unit_floor_refs(now) and mentions_receiver_method(
+                current, path, recv, name)
+            if exact or fallback:
+                files.append(path)
+        elif name in unit_refs(before) and mentions(current, path, name):
+            files.append(path)
+    return files
+
+
+def unit_floor_refs(units):
+    """Name-only references whose analyzer resolution was conservative."""
+    return {name for item in units for name in item.get('floor_refs', [])}
+
+
+def mentions_receiver_method(current, path, recv, name):
+    """Match a literal receiver still calling a method after its deletion."""
+    receiver = re.escape(recv)
+    method = re.escape(name)
+    pattern = (r'\(?\s*&?\s*\b' + receiver +
+               r'\s*\{[^{}]*\}\s*\)?\s*\.\s*' + method + r'\b')
+    text = (current.root / path).read_text(errors='replace')
+    return re.search(pattern, text) is not None
 
 
 def unit_refs(units):
