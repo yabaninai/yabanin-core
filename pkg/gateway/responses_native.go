@@ -600,6 +600,9 @@ type responsesUsageBody struct {
 }
 
 func copyResponsesPassthrough(dst, src http.Header) {
+	if src.Get("X-Should-Retry") == "false" {
+		dst.Set("X-Should-Retry", "false")
+	}
 	for _, key := range []string{"Retry-After", "X-Request-Id"} {
 		if value := src.Get(key); value != "" {
 			dst.Set(key, value)
