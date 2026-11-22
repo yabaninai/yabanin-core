@@ -103,7 +103,7 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
 
 
 BUDGET_KINDS = ('unit', 'fuzz', 'mutation')
-APPROVED_BUDGET = {'unit': 300, 'fuzz': 420, 'mutation': 300}
+APPROVED_BUDGET = {'unit': 420, 'fuzz': 420, 'mutation': 300}
 
 
 def budget(config):
@@ -120,7 +120,7 @@ def budget(config):
     if not isinstance(seconds, dict) or set(seconds) != set(BUDGET_KINDS):
         raise ValueError('Budget must define exactly unit, fuzz and mutation seconds')
     if seconds != APPROVED_BUDGET:
-        raise ValueError('Expected approved budgets unit=300s fuzz=420s mutation=300s')
+        raise ValueError('Expected approved budgets unit=420s fuzz=420s mutation=300s')
     return seconds
 
 

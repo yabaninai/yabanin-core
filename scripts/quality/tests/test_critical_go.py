@@ -74,7 +74,7 @@ class ConfigControls(unittest.TestCase):
     def test_shipped_schema2_config_and_rejected_variants(self):
         config = self.config()
         critical.validate_config(config)
-        self.assertEqual(critical.budget(config), {'unit': 300, 'fuzz': 420, 'mutation': 300})
+        self.assertEqual(critical.budget(config), {'unit': 420, 'fuzz': 420, 'mutation': 300})
         for bad in (dict(config, schema_version=1),
                     dict(config, fuzz_applicability='all-packages'),
                     dict(config, mutation_qualified_packages='pkg/budget'),

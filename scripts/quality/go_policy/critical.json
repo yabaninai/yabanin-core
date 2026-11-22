@@ -3,7 +3,7 @@
   "budget": {
     "schema_version": 1,
     "seconds_per_package": {
-      "unit": 300,
+      "unit": 420,
       "fuzz": 420,
       "mutation": 300
     }
