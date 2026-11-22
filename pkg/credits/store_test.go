@@ -441,15 +441,28 @@ func TestConcurrentDeductions(t *testing.T) {
 	phaseCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
 	defer cancel()
 
-	results := make([]error, workers)
+	results := runDeductionPhase(phaseCtx, t, store, "org-concurrent", amountCents, ids)
+	unresolved := unresolvedContentions(t, results, ids)
+	settleContentions(phaseCtx, t, store, "org-concurrent", amountCents, ids, results, unresolved)
+	assertDeterministicOutcome(t, results, ids, wantDebits, wantFloor)
+	verifyWalletFloor(ctx, t, pool, store, "org-concurrent", 1000, amountCents, wantDebits)
+	verifyPerIDLedger(ctx, t, pool, "org-concurrent", results, ids, wantDebits)
+}
+
+// runDeductionPhase fires one Deduct per request ID behind a common gate and
+// waits for all results under the phase deadline, so a hung worker fails the
+// test instead of hanging the run.
+func runDeductionPhase(ctx context.Context, t *testing.T, store *Store, org string, amountCents int64, ids []string) []error {
+	t.Helper()
+	results := make([]error, len(ids))
 	gate := make(chan struct{})
 	var wg sync.WaitGroup
-	for i := 0; i < workers; i++ {
+	for i := range ids {
 		wg.Add(1)
 		go func(i int) {
 			defer wg.Done()
 			<-gate
-			results[i] = store.Deduct(phaseCtx, "org-concurrent", amountCents, ids[i], nil)
+			results[i] = store.Deduct(ctx, org, amountCents, ids[i], nil)
 		}(i)
 	}
 	close(gate)
@@ -457,15 +470,20 @@ func TestConcurrentDeductions(t *testing.T) {
 	go func() { wg.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-phaseCtx.Done():
-		t.Fatalf("deduction phase exceeded deadline: %v", phaseCtx.Err())
+	case <-ctx.Done():
+		t.Fatalf("deduction phase exceeded deadline: %v", ctx.Err())
 	}
+	return results
+}
 
-	// Classify. Only recognized contention may be unresolved here; a floor
-	// rejection is already final (the wallet only moves down during the
-	// test), and ErrNoWallet for a just-funded wallet or any connection /
-	// schema error is a bug, not a balance decision.
-	unresolved := []int{}
+// unresolvedContentions classifies the phase results. Only recognized
+// contention may remain unresolved here: a floor rejection is already final
+// (the wallet only moves down during the test), and ErrNoWallet for a
+// just-funded wallet or any connection/schema error is a bug, not a balance
+// decision.
+func unresolvedContentions(t *testing.T, results []error, ids []string) []int {
+	t.Helper()
+	var unresolved []int
 	for i, err := range results {
 		switch {
 		case err == nil:
@@ -476,13 +494,17 @@ func TestConcurrentDeductions(t *testing.T) {
 			t.Fatalf("deduction %d (%s): unexpected error: %v", i, ids[i], err)
 		}
 	}
+	return unresolved
+}
 
-	// Post-phase: settle unresolved contentions sequentially. No concurrent
-	// writers remain, so contention cannot persist beyond a bounded number
-	// of attempts; every retry ends in success or a floor rejection.
+// settleContentions retries unresolved contention sequentially: no concurrent
+// writers remain post-phase, so a bounded number of attempts must end in
+// success or a floor rejection.
+func settleContentions(ctx context.Context, t *testing.T, store *Store, org string, amountCents int64, ids []string, results []error, unresolved []int) {
+	t.Helper()
 	for _, i := range unresolved {
 		for attempt := 1; attempt <= 5; attempt++ {
-			err := store.Deduct(phaseCtx, "org-concurrent", amountCents, ids[i], nil)
+			err := store.Deduct(ctx, org, amountCents, ids[i], nil)
 			if err == nil || errors.Is(err, ErrInsufficientCredits) {
 				results[i] = err
 				break
@@ -492,9 +514,13 @@ func TestConcurrentDeductions(t *testing.T) {
 			}
 		}
 	}
+}
 
-	// Deterministic outcome: 22 debits + 3 floor rejections — no scheduling
-	// may change the split (the floor is a hard ledger bound).
+// assertDeterministicOutcome pins the scheduling-independent ledger truth:
+// exactly wantDebits charges land and wantFloor floor rejections occur —
+// the floor is a hard ledger bound.
+func assertDeterministicOutcome(t *testing.T, results []error, ids []string, wantDebits, wantFloor int) {
+	t.Helper()
 	successes, floor := 0, 0
 	for i, err := range results {
 		switch {
@@ -510,25 +536,31 @@ func TestConcurrentDeductions(t *testing.T) {
 		t.Fatalf("deterministic outcome violated: %d debits + %d floor rejections, want %d + %d",
 			successes, floor, wantDebits, wantFloor)
 	}
+}
 
-	// Exact accounting and the grace floor, observed on the fixture DB —
-	// independent of the store's in-memory cache.
+// verifyWalletFloor asserts exact accounting and the grace floor on the
+// fixture DB — independent of the store's in-memory cache.
+func verifyWalletFloor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, store *Store, org string, startCents, amountCents int64, debits int) {
+	t.Helper()
 	var walletCents int64
 	if err := pool.QueryRow(ctx,
-		`SELECT balance_cents FROM org_credits WHERE org_id = 'org-concurrent'`).Scan(&walletCents); err != nil {
+		`SELECT balance_cents FROM org_credits WHERE org_id = $1`, org).Scan(&walletCents); err != nil {
 		t.Fatalf("wallet row: %v", err)
 	}
-	if want := 1000 - amountCents*wantDebits; walletCents != want {
+	if want := startCents - amountCents*int64(debits); walletCents != want {
 		t.Errorf("exact accounting violated: wallet %d, want %d", walletCents, want)
 	}
 	if walletCents < store.cfg.GracePeriodCents {
 		t.Errorf("grace period violated: %d < %d", walletCents, store.cfg.GracePeriodCents)
 	}
+}
 
-	// Ledger rows: exactly one usage row per successful request ID and zero
-	// for rejected ones (per-ID comparison, not just counts).
+// verifyPerIDLedger checks usage rows per request ID — exactly one row per
+// successful deduction and zero for rejected ones, not just counts.
+func verifyPerIDLedger(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org string, results []error, ids []string, wantDebits int) {
+	t.Helper()
 	rows, err := pool.Query(ctx,
-		`SELECT request_id FROM credit_transactions WHERE org_id = 'org-concurrent' AND type = 'usage'`)
+		`SELECT request_id FROM credit_transactions WHERE org_id = $1 AND type = 'usage'`, org)
 	if err != nil {
 		t.Fatalf("ledger query: %v", err)
 	}
@@ -550,7 +582,7 @@ func TestConcurrentDeductions(t *testing.T) {
 	if len(ledger) != wantDebits {
 		t.Fatalf("expected %d distinct usage rows, got %d", wantDebits, len(ledger))
 	}
-	for i := 0; i < workers; i++ {
+	for i := range ids {
 		want := 0
 		if results[i] == nil {
 			want = 1
