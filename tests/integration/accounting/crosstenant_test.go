@@ -59,15 +59,25 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 func (s *stand) requireCrossTenantDebit(t *testing.T, rid, org string) string {
 	t.Helper()
 	requireEventually(t, time.Minute, 100*time.Millisecond, func() bool {
-		return s.oracleCount(t, `SELECT count(*) FROM settlement_jobs WHERE request_id=$1 AND org_id=$2 AND charge_kind='resale_deduction' AND status='settled'`, rid, org) == 1
-	}, "both tenants must independently settle their wallet debit")
+		return s.oracleCount(t, `SELECT count(*) FROM settlement_jobs
+			WHERE request_id=$1 AND org_id=$2 AND status='settled'
+			  AND charge_kind IN ('resale_deduction','team_spend')`, rid, org) == 2
+	}, "the tenant must settle both the wallet debit and the team spend")
 	id := s.requireUUIDKeyedCharge(t, rid, org, "cross-tenant")
 	c := s.oracleUsageByInvocation(t, id, org)
 	if c.SumCents > 0 || c.TopupRows != 0 {
 		t.Fatalf("unexpected wallet totals for invocation %s: %+v", id, c)
 	}
-	if n := s.oracleSettlementJobs(t, rid, org); n != 1 {
-		t.Fatalf("tenant %s has %d settlement jobs for %s, want exactly one", org, n, rid)
+	s.requireSettlementIntents(t, rid, org, "cross-tenant", map[string]int{"resale_deduction": 1, "team_spend": 1})
+	const scopedCharges = `SELECT count(*) FROM settlement_jobs j
+		WHERE j.org_id=$1 AND j.request_id=$2 AND j.invocation_id=$3::uuid
+		  AND j.amount_micro_usd=$4 AND j.status='settled'
+		  AND (j.charge_kind='resale_deduction' OR
+		       (j.charge_kind='team_spend' AND EXISTS (
+		            SELECT 1 FROM organizations_teams team
+		            WHERE team.id::text=j.payload->>'team_id' AND team.org_id::text=j.org_id)))`
+	if got := s.oracleCount(t, scopedCharges, org, rid, id, fixtureMicroUSDCost); got != 2 {
+		t.Fatalf("tenant %s invocation %s has %d settled, correctly attributed charges of %d micro-USD, want 2", org, id, got, fixtureMicroUSDCost)
 	}
 	return id
 }
