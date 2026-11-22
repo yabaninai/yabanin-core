@@ -45,7 +45,7 @@ class PackageDeadlineIsolation(unittest.TestCase):
             'critical_paths': ['pkg/**'],
             'build_tags': [''],
             'budget': {'schema_version': 1, 'seconds_per_package': {
-                'unit': 300, 'fuzz': 420, 'mutation': 300,
+                'unit': 420, 'fuzz': 420, 'mutation': 300,
             }},
         }
         with (
@@ -84,26 +84,26 @@ class PackageDeadlineIsolation(unittest.TestCase):
             ])
             # Each package pays the one shared archive (10s), its own scan
             # (10s), its own baseline archive (10s), and its two coverage
-            # profiles (40s): 70s of its versioned 300s budget.
+            # profiles (40s): 70s of its versioned 420s budget.
             self.assertEqual(conservative.UNIT_REMAINDERS[
-                ('pkg/a', 'unit')], 230)
+                ('pkg/a', 'unit')], 350)
             self.assertEqual(conservative.UNIT_REMAINDERS[
-                ('pkg/b', 'unit')], 230)
+                ('pkg/b', 'unit')], 350)
             self.assertFalse(conservative.DEADLINES)
 
             # The normal unit phase resumes only its own bank; executing one
             # package cannot spend the other package's saved remainder.
-            deadline_a = conservative.resume_unit_deadline('pkg/a', 300)
+            deadline_a = conservative.resume_unit_deadline('pkg/a', 420)
             self.assertEqual(
-                conservative.resume_unit_deadline('pkg/a', 300), deadline_a,
+                conservative.resume_unit_deadline('pkg/a', 420), deadline_a,
                 'repeated resume reset the active package deadline')
-            self.assertEqual(deadline_a - clock['now'], 230)
+            self.assertEqual(deadline_a - clock['now'], 350)
             clock['now'] += 20
             conservative.pause_unit_budget('pkg/a')
             self.assertEqual(conservative.UNIT_REMAINDERS[
-                ('pkg/a', 'unit')], 210)
+                ('pkg/a', 'unit')], 330)
             self.assertEqual(conservative.UNIT_REMAINDERS[
-                ('pkg/b', 'unit')], 230)
+                ('pkg/b', 'unit')], 350)
 
 
 if __name__ == '__main__':

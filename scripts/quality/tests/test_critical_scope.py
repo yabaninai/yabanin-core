@@ -2702,7 +2702,7 @@ G8_COUNTERPART_REASON = ('lost_block_coverage: pkg/auth: TestAllowedDefault no '
                          'longer covers Allowed, pkg/auth/allowed_default_moved.go:' +
                          G8_DUAL_DENY_SPEC)
 # Derive fixture sleeps from the banked remainder; no product budget changes.
-# Test-only deadline for the tiny two-mode fixture; product budget stays 300s.
+# Test-only deadline for the tiny two-mode fixture; product unit budget is 420s.
 G8_A3_PATCHED_SECONDS = 12
 G8_A3_DEFAULT_SLOW_MS = 1000
 G8_A3_SPECIAL_SLOW_MS = 3000
@@ -4596,7 +4596,7 @@ for package in packages:
     cc.RUNS[package] = (selection, side(package), side(package))
 setups = iter(sorted(cc.RUNS))
 config = {"budget": {"schema_version": 1, "seconds_per_package":
-                     {"unit": 300, "fuzz": 420, "mutation": 300}},
+                     {"unit": 420, "fuzz": 420, "mutation": 300}},
           "build_tags": [""], "mutation_qualified_packages": []}
 cc.verify_lost_baseline(Path.cwd(), sys.argv[3], config)
 out = Path(tempfile.mkdtemp(prefix="g8r-budget-"))
@@ -4622,7 +4622,7 @@ print(json.dumps(result))
 
         A heavy pkg/a must not spend pkg/b's banked unit remainder, while
         pkg/b's own setup and baseline coverage are charged to its one
-        300s unit budget: hand-fixed 10s setup + 2x20s coverage leave 250s
+        420s unit budget: hand-fixed 10s setup + 2x20s coverage leave 370s
         at pkg/b's unit boundary. B runs all three kinds, and each kind
         is bounded by its own approved budget, never mixed.
         """
@@ -4642,14 +4642,14 @@ print(json.dumps(result))
                 (e for e in result['events'] if e['package'] == package
                  and e['boundary'] == 'unit'), None)
             self.assertIsNotNone(event, result)
-            # Own setup + verify consume at most 50 of the 300s unit
-            # budget: floor = 300 - 10 - 2*20. Unrelated A work must not
+            # Own setup + verify consume at most 50 of the 420s unit
+            # budget: floor = 420 - 10 - 2*20. Unrelated A work must not
             # push a package's unit remainder below that floor.
-            self.assertGreaterEqual(event['remaining'], 250, result)
+            self.assertGreaterEqual(event['remaining'], 370, result)
         b_events = [e for e in result['events'] if e['package'] == 'pkg/b']
         b_unit_bucket = sum(e['seconds'] for e in b_events
                             if e['boundary'] in ('setup', 'coverage', 'unit'))
-        self.assertLessEqual(b_unit_bucket, 300)  # 10+20+20+20 = 70
+        self.assertLessEqual(b_unit_bucket, 420)  # 10+20+20+20 = 70
         self.assertLessEqual(
             sum(e['seconds'] for e in b_events if e['boundary'] == 'fuzz'),
             420)
@@ -4660,24 +4660,24 @@ print(json.dumps(result))
     def test_unit_budget_caps_b_owned_total_including_setup(self):
         """G8R-MULTI-PACKAGE-BUDGET: a B-owned overrun exhausts, setup included.
 
-        Hand-fixed: setup 10 + coverage 2x20 leave 250s, so a 255s unit
-        run makes the B-owned unit-bucket total 305 > 300 and must end in
+        Hand-fixed: setup 10 + coverage 2x20 leave 370s, so a 375s unit
+        run makes the B-owned unit-bucket total 425 > 420 and must end in
         the pinned exhaustion error, never a pass. A scheduler that omits
         setup charging (295 charged) or resets per subprocess would pass
         it.
         """
-        result = self.run_budget_scenario(255, ['pkg/b'])
+        result = self.run_budget_scenario(375, ['pkg/b'])
         self.assertEqual(result['outcome'], 'budget_exhausted', result)
         self.assertIn('Per-package check budget exhausted', result['error'])
         b_unit = next(e for e in result['events']
                       if e['package'] == 'pkg/b' and e['boundary'] == 'unit')
-        self.assertEqual(b_unit['seconds'], 255)
-        self.assertEqual(b_unit['remaining'], 250)
+        self.assertEqual(b_unit['seconds'], 375)
+        self.assertEqual(b_unit['remaining'], 370)
         b_unit_bucket = sum(
             e['seconds'] for e in result['events']
             if e['package'] == 'pkg/b'
             and e['boundary'] in ('setup', 'coverage', 'unit'))
-        self.assertEqual(b_unit_bucket, 305)
+        self.assertEqual(b_unit_bucket, 425)
 
 
 # G9-CHAIN fixtures: a test-file initializer chain (var relay = Allowed;
