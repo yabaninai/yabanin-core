@@ -27,9 +27,9 @@ const rerankMaxDocuments = 512
 
 // rerankRequest is the validated client shape of the rerank route.
 type rerankRequest struct {
-	Model     string
-	Query     string
-	Documents json.RawMessage
+	Model     string          `json:"model"`
+	Query     string          `json:"query"`
+	Documents json.RawMessage `json:"documents"`
 }
 
 // parseRerankRequest reads and validates the client request. Every refusal
