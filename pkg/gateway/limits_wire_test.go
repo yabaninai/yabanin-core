@@ -342,25 +342,70 @@ func readStatusLine(conn net.Conn) (string, error) {
 // observable without ever hanging the corpus.
 func readHeadBlock(t *testing.T, conn net.Conn) (status string, head string) {
 	t.Helper()
+	status, head, _ = readHeadBlockResult(conn)
+	return status, head
+}
+
+func readHeadBlockStrict(t *testing.T, conn net.Conn, phase string) (status string, head string) {
+	t.Helper()
+	status, head, err := readHeadBlockResult(conn)
+	if err != nil {
+		t.Fatalf("read %s response headers: %v; received %q", phase, err, head)
+	}
+	return status, head
+}
+
+func readHeadBlockResult(conn net.Conn) (status string, head string, err error) {
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
 	var sb strings.Builder
 	buf := make([]byte, 1)
 	for {
-		n, err := conn.Read(buf[:])
-		if err != nil {
-			return sb.String(), sb.String()
+		n, readErr := conn.Read(buf[:])
+		if n > 0 {
+			sb.Write(buf[:n])
 		}
-		sb.WriteByte(buf[0])
 		s := sb.String()
 		if strings.HasSuffix(s, "\r\n\r\n") {
 			lines := strings.SplitN(s, "\r\n", 2)
-			return lines[0], s
+			return lines[0], s, nil
+		}
+		if readErr != nil {
+			return s, s, readErr
 		}
 		if sb.Len() > 16<<10 {
-			return sb.String(), sb.String()
+			return s, s, fmt.Errorf("HTTP response headers exceed %d bytes", 16<<10)
 		}
-		_ = n
 	}
+}
+
+func writeChunkedBody(t *testing.T, conn net.Conn, body string) int {
+	t.Helper()
+	var payloadBytesSent int
+	const chunkBytes = 1 << 20
+	for off := 0; off < len(body); off += chunkBytes {
+		end := off + chunkBytes
+		if end > len(body) {
+			end = len(body)
+		}
+		if _, err := fmt.Fprintf(conn, "%x\r\n", end-off); err != nil {
+			t.Fatalf("write chunk header at payload offset %d: %v", payloadBytesSent, err)
+		}
+		n, err := io.WriteString(conn, body[off:end])
+		payloadBytesSent += n
+		if err != nil || n != end-off {
+			t.Fatalf("write chunk payload at offset %d: wrote %d of %d bytes: %v", off, n, end-off, err)
+		}
+		if _, err := io.WriteString(conn, "\r\n"); err != nil {
+			t.Fatalf("write chunk terminator after %d payload bytes: %v", payloadBytesSent, err)
+		}
+	}
+	if _, err := io.WriteString(conn, "0\r\n\r\n"); err != nil {
+		t.Fatalf("write terminal chunk after %d payload bytes: %v", payloadBytesSent, err)
+	}
+	if payloadBytesSent != len(body) {
+		t.Fatalf("chunked payload bytes sent = %d, want %d", payloadBytesSent, len(body))
+	}
+	return payloadBytesSent
 }
 
 // dialLimitsWire dials the wire server, sends raw bytes and sets a read
@@ -405,17 +450,17 @@ func TestWireBodyExactCapAccepted(t *testing.T) {
 		"Authorization: Bearer test-key\r\n"+
 		"Content-Type: application/json\r\n"+
 		fmt.Sprintf("Content-Length: %d\r\nConnection: close\r\n\r\n", len(body))+body)
-	status, head := readHeadBlock(t, conn)
+	status, head := readHeadBlockStrict(t, conn, "Content-Length exact-cap")
 	_ = conn.Close()
-	if !strings.Contains(status, "200") {
+	if !strings.HasPrefix(status, "HTTP/1.1 200 ") {
 		t.Fatalf("exact-cap body (CL framing) must be accepted with 200, got %q %q", status, head)
 	}
 	if got := calls.Load(); got != 1 {
 		t.Fatalf("upstream calls = %d, want 1 for exact-cap CL body", got)
 	}
 
-	// Chunked framing at the exact cap: the JSON body split into ten 1 MiB
-	// chunks plus the terminal zero chunk — exactly 10 MiB of payload data.
+	// Chunked framing at the exact cap: ten 1 MiB data chunks plus the
+	// terminal zero chunk — exactly 10 MiB of payload data.
 	calls.Store(0)
 	conn, err := (&net.Dialer{}).DialContext(context.Background(), "tcp", addr)
 	if err != nil {
@@ -430,27 +475,10 @@ func TestWireBodyExactCapAccepted(t *testing.T) {
 	if _, err := io.WriteString(conn, head2); err != nil {
 		t.Fatal(err)
 	}
-	for off := 0; off < len(body); off += 1 << 20 {
-		end := off + (1 << 20)
-		if end > len(body) {
-			end = len(body)
-		}
-		if _, err := fmt.Fprintf(conn, "%x\r\n", end-off); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := conn.Write([]byte(body[off:end])); err != nil {
-			t.Fatal(err)
-		}
-		if _, err := io.WriteString(conn, "\r\n"); err != nil {
-			t.Fatal(err)
-		}
-	}
-	if _, err := io.WriteString(conn, "0\r\n\r\n"); err != nil {
-		t.Fatal(err)
-	}
+	payloadBytesSent := writeChunkedBody(t, conn, body)
 	_ = conn.SetReadDeadline(time.Now().Add(30 * time.Second))
-	status, _ = readHeadBlock(t, conn)
-	if !strings.Contains(status, "200") {
+	status, _ = readHeadBlockStrict(t, conn, fmt.Sprintf("chunked exact-cap after %d payload bytes", payloadBytesSent))
+	if !strings.HasPrefix(status, "HTTP/1.1 200 ") {
 		t.Fatalf("exact-cap chunked body must be accepted with 200, got %q", status)
 	}
 	if got := calls.Load(); got != 1 {
