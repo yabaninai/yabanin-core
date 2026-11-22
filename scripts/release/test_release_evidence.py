@@ -25,9 +25,11 @@ twins can never be recorded as byte-equal.
 """
 import base64
 import hashlib
+import io
 import json
 import re
 import sys
+import tarfile
 import tempfile
 import subprocess
 import unittest
@@ -198,7 +200,7 @@ _UNSET = object()
 
 def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64", omit_subject=False,
                   image_schema=2, attestation_schema=2, omit_config=False, conflicting_inline=False, bases=(GO_DIGEST, ALPINE_DIGEST),
-                  wrong_subject_digest=False, wrong_att_subject=False, subject_override=_UNSET):
+                  wrong_subject_digest=False, wrong_att_subject=False, subject_override=_UNSET, rootfs=()):
     # Build the content graph independently from the implementation under test.
     store = td / "artifacts/release-evidence/build-receipts" / role
     store.mkdir(parents=True, exist_ok=True)
@@ -211,9 +213,12 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
         (store / digest).write_bytes(data)
         return {"digest": "sha256:" + digest, "size": len(data), "mediaType": media}
 
-    config = write({"os": "linux", "architecture": selected_platform, "config": {"role": role}},
+    config = write({"os": "linux", "architecture": selected_platform,
+                    "config": {"role": role, "Entrypoint": [role]},
+                    "rootfs": {"diff_ids": [layer["digest"] for layer in rootfs]}},
                    "application/vnd.oci.image.config.v1+json")
-    child = write({"schemaVersion": image_schema, "mediaType": manifest_type, "config": config, "layers": []}, manifest_type)
+    child = write({"schemaVersion": image_schema, "mediaType": manifest_type,
+                   "config": config, "layers": list(rootfs)}, manifest_type)
     child["platform"] = {"os": "linux", "architecture": selected_platform}
     source = {"revision": head, "localdir:context": context, "localdir:dockerfile": str(Path(recipe).parent)}
     request = {"configSource": {"path": Path(recipe).name},
@@ -2904,6 +2909,114 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
         self.verify_fails(
             lambda td, ev: ev.__setitem__("task_base", "0" * 40),
             "task_base mismatch")
+
+
+class MockAlpineAggregateTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root, self.ev = build_fixture(self.temp.name)
+        self.head = self.ev["freshness"]["head"]
+        self.role = "mock-provider"
+        self.proof = self.root / "artifacts/release-evidence/mock-provider-proof"
+        self.ev["containers"].append({"repo_ref": "alpine",
+                                      "role": "runtime base (mock image)", "version": "3.21.10"})
+        self.row = next(row for row in self.ev["distribution"]["quickstart_images"]
+                        if row["name"] == self.role)
+
+    def legal_payload(self):
+        payload = {"lib/apk/db/installed": b"P:toy\nV:1-r0\no:toy\nL:MIT\nc:commit\nA:x86_64\n"}
+        package = {"name": "toy", "origin": "toy", "version": "1-r0",
+                   "license": "MIT", "commit": "commit", "arch": "x86_64"}
+        notices = {name: ("Fixture " + name).encode() for name in ("LICENSE", "NOTICE", "LICENSING.md")}
+        notices["toy/LICENSE"] = b"Independent license text"
+        for name in ("LICENSE", "NOTICE", "LICENSING.md"):
+            (self.root / name).write_bytes(notices[name])
+        for name, data in notices.items():
+            payload["usr/share/licenses/yabanin/" + name] = data
+        self.source = self.proof / "source-companion/toy.tar"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(b"Independent source bytes")
+        source_sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        self.source.with_name("SHA256SUMS").write_text(f"{source_sha}  toy.tar\n")
+        manifest = {"schema": 1, "platform": "linux/amd64", "packages": [package],
+                    "notices": {name: {"sha256": hashlib.sha256(data).hexdigest()}
+                                for name, data in notices.items()},
+                    "sources": {"toy": {"version": "1-r0", "commit": "commit",
+                                        "notices": ["toy/LICENSE"], "inputs": ["toy.tar"]}},
+                    "companion_files": {"toy.tar": source_sha}, "recipe_links": {},
+                    "recipe_executables": []}
+        path = self.root / "deploy/mock-provider/legal/MANIFEST.json"
+        path.parent.mkdir()
+        payload["usr/share/licenses/yabanin/MANIFEST.json"] = json.dumps(manifest).encode()
+        path.write_bytes(payload["usr/share/licenses/yabanin/MANIFEST.json"])
+        return payload
+
+    def layer(self, contents):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as output:
+            for name, data in contents.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(data)
+                output.addfile(entry, io.BytesIO(data))
+        data = buffer.getvalue()
+        digest = hashlib.sha256(data).hexdigest()
+        loc = self.proof / "layers" / digest
+        loc.parent.mkdir(parents=True, exist_ok=True)
+        loc.write_bytes(data)
+        return {"size": len(data), "digest": "sha256:" + digest,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar"}
+
+    def bind(self, *layers):
+        self.row["image_id"] = fixture_image(
+            self.root, self.role, self.head, "deploy/mock-provider",
+            "deploy/mock-provider/Dockerfile", rootfs=layers,
+        )
+
+    def failures(self):
+        return re_ev._container_gaps(self.root, self.ev)
+
+    def test_missing_then_complete_proof(self):
+        self.assertIn("PENDING gap: mock-provider alpine", "\n".join(self.failures()))
+        self.bind(self.layer(self.legal_payload()))
+        self.assertEqual(self.failures(), [])
+        self.ev["containers"].pop()
+        self.assertIn("missing or ambiguous mock-provider Alpine base record", "\n".join(self.failures()))
+
+    def test_stale_source_or_foreign_subject_cannot_reuse_proof(self):
+        self.bind(self.layer(self.legal_payload()))
+        self.ev["freshness"]["head"] = "f" * 40
+        self.assertIn("different builder-recorded source revision", "\n".join(self.failures()))
+        self.ev["freshness"]["head"] = self.head
+        self.row["image_id"] = "sha256:" + "0" * 64
+        self.assertIn("missing regular receipt blob", "\n".join(self.failures()))
+
+    def test_modified_layer_and_source_bytes_fail(self):
+        layer = self.layer(self.legal_payload())
+        self.bind(layer)
+        path = self.proof / "layers" / layer["digest"][7:]
+        data = path.read_bytes()
+        path.write_bytes(b"x" + data[1:])
+        self.assertIn("mock-provider layer digest mismatch", "\n".join(self.failures()))
+        path.write_bytes(data)
+        self.source.write_bytes(b"Foreign source bytes")
+        self.assertIn("source hash mismatch: toy.tar", "\n".join(self.failures()))
+
+    def test_valid_oci_cannot_substitute_licenses_or_omit_companion(self):
+        payload = self.legal_payload()
+        self.bind(self.layer(payload))
+        self.source.unlink()
+        self.assertIn("missing source: toy.tar", "\n".join(self.failures()))
+        self.source.write_bytes(b"Independent source bytes")
+        payload["usr/share/licenses/yabanin/toy/LICENSE"] = b"Substituted license"
+        self.bind(self.layer(payload))
+        self.assertIn("notice hash mismatch: toy/LICENSE", "\n".join(self.failures()))
+
+    def test_whiteout_cannot_preserve_a_required_lower_notice(self):
+        original = self.layer(self.legal_payload())
+        remove = self.layer({"usr/share/licenses/yabanin/toy/.wh.LICENSE": b""})
+        self.bind(original, remove)
+        self.assertIn("missing notice: toy/LICENSE", "\n".join(self.failures()))
 
 
 class QuickstartBuildCollectionTest(unittest.TestCase):
