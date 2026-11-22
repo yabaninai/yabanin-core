@@ -3,6 +3,7 @@
 package accounting
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/json"
 	"fmt"
@@ -893,25 +894,38 @@ func (f *fixture) VerifyEvidence() {
 	if f.writeErr != nil {
 		f.t.Fatalf("harness: fixture evidence write failed earlier: %v", f.writeErr)
 	}
-	for name, want := range map[string]int{
-		"arrivals":   len(f.arrivals),
-		"dispatches": len(f.dispatches),
-		"receipts":   len(f.receipts),
+	for name, records := range map[string][]fixtureRecord{
+		"arrivals": f.arrivals, "dispatches": f.dispatches, "receipts": f.receipts,
 	} {
 		data, err := os.ReadFile(filepath.Join(f.ledgerDir, name+".jsonl"))
 		if err != nil {
 			f.t.Fatalf("harness: fixture evidence %s unreadable: %v", name, err)
 		}
-		got := 0
-		for _, line := range data {
-			if line == '\n' {
-				got++
-			}
-		}
-		if got != want {
-			f.t.Fatalf("harness: fixture evidence %s has %d entries, oracle state has %d", name, got, want)
+		if err := verifyFixtureLedger(data, records); err != nil {
+			f.t.Fatalf("harness: fixture evidence %s: %v", name, err)
 		}
 	}
+}
+
+func verifyFixtureLedger(data []byte, records []fixtureRecord) error {
+	for i, record := range records {
+		line, rest, ok := bytes.Cut(data, []byte{'\n'})
+		if !ok {
+			return fmt.Errorf("missing complete ledger entry %d", i+1)
+		}
+		expected, err := json.Marshal(record)
+		if err != nil {
+			return err
+		}
+		if !bytes.Equal(line, expected) {
+			return fmt.Errorf("entry %d differs from recorded %s at %s", i+1, record.RequestID, record.At)
+		}
+		data = rest
+	}
+	if len(data) != 0 {
+		return fmt.Errorf("%d unexpected trailing bytes", len(data))
+	}
+	return nil
 }
 
 // append records one ledger entry in memory and mirrors it to the JSONL
@@ -920,6 +934,7 @@ func (f *fixture) VerifyEvidence() {
 func (f *fixture) append(name string, rec fixtureRecord) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
+	rec.At = time.Now().UTC()
 	switch name {
 	case "arrivals":
 		f.arrivals = append(f.arrivals, rec)
