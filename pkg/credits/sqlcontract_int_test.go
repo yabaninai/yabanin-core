@@ -135,14 +135,25 @@ func sqlc03fCreditsBalance(ctx context.Context, t *testing.T, pool *pgxpool.Pool
 func TestSQLContractCredits(t *testing.T) {
 	pool := testdb.Postgres(t)
 	fx := sqlc03fSeed(t, pool)
-	ctx := context.Background()
 
+	// A fresh store per call keeps every case on the DB path (TTL 1ms
+	// expires the cache fast).
 	newStore := func(grace int64) *Store {
 		return NewStoreWithConfig(pool, nil, Config{GracePeriodCents: grace, CacheTTL: time.Millisecond})
 	}
 
-	// GetBalance — remainder-aware wallet present; a fresh store per call
-	// keeps every case on the DB path (TTL 1ms expires the cache fast).
+	sqlc03fGetBalanceContract(t, newStore, fx)
+	sqlc03fCheckBalanceContract(t, newStore, fx)
+	sqlc03fTopUpContract(t, newStore, fx)
+	sqlc03fDeductContract(t, newStore, fx)
+	sqlc03fDeductMicroContract(t, newStore, fx)
+	sqlc03fGetTransactionsContract(t, newStore, fx)
+	sqlc03fLowBalanceContract(t, pool, newStore, fx)
+}
+
+func sqlc03fGetBalanceContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	ctx := context.Background()
+	// GetBalance — remainder-aware wallet present.
 	sqlc03fContract(t, "GetBalance[orgA]", func(ctx context.Context) error {
 		bal, err := newStore(DefaultConfig().GracePeriodCents).GetBalance(ctx, fx.OrgA)
 		if err != nil {
@@ -157,13 +168,16 @@ func TestSQLContractCredits(t *testing.T) {
 	bal, err := newStore(0).GetBalance(ctx, fx.MissingOrg)
 	require.ErrorIs(t, err, ErrNoWallet, "GetBalance[missing] must report ErrNoWallet")
 	assert.Nil(t, bal)
+}
 
-	// CheckBalance — funded wallet admits; the admission rule runs on the
-	// effective floor: the row's persisted grace_floor_cents (§8) wins when
-	// set, NULL falls back to the configured grace floor. The empty wallet
-	// is rejected exactly at the floor (≤) and the low wallet with a
-	// persisted -1 floor admits even under a raised store floor.
-	_, err = newStore(DefaultConfig().GracePeriodCents).CheckBalance(ctx, fx.OrgA)
+// sqlc03fCheckBalanceContract pins the admission rule on the raw SQL: it
+// runs on the effective floor — the row's persisted grace_floor_cents (§8)
+// wins when set, NULL falls back to the configured grace floor. The empty
+// wallet is rejected exactly at the floor (≤) and the low wallet with a
+// persisted -1 floor admits even under a raised store floor.
+func sqlc03fCheckBalanceContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	ctx := context.Background()
+	_, err := newStore(DefaultConfig().GracePeriodCents).CheckBalance(ctx, fx.OrgA)
 	require.NoError(t, err, "CheckBalance[orgA]")
 	_, err = newStore(0).CheckBalance(ctx, fx.OrgB)
 	require.ErrorIs(t, err, ErrInsufficientCredits, "CheckBalance[empty wallet, no overdraft]")
@@ -173,8 +187,12 @@ func TestSQLContractCredits(t *testing.T) {
 	require.ErrorIs(t, err, ErrInsufficientCredits, "CheckBalance[at-floor is inclusive rejection]")
 	_, err = newStore(3).CheckBalance(ctx, fx.LowWalletID)
 	require.NoError(t, err, "CheckBalance[persisted -1 floor wins over a raised store floor (§8)]")
+}
 
-	// TopUp — the upsert + ledger CTE executes and moves the wallet.
+// sqlc03fTopUpContract exercises the upsert + ledger CTE and the zero-amount
+// validation rejection.
+func sqlc03fTopUpContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	ctx := context.Background()
 	sqlc03fContract(t, "TopUp[orgA]", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
 		if err := st.TopUp(ctx, fx.OrgA, 100, fx.Token+"-inv-topup"); err != nil {
@@ -187,10 +205,13 @@ func TestSQLContractCredits(t *testing.T) {
 		assert.GreaterOrEqual(t, bal.BalanceCents, int64(5086), "top-up must land on the wallet")
 		return nil
 	})
-	err = newStore(0).TopUp(ctx, fx.OrgA, 0, "")
+	err := newStore(0).TopUp(ctx, fx.OrgA, 0, "")
 	require.Error(t, err, "TopUp[zero amount] is a validation rejection")
+}
 
-	// Deduct — whole-cent path with an idempotent replay.
+// sqlc03fDeductContract covers the whole-cent path with an idempotent
+// replay.
+func sqlc03fDeductContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
 	sqlc03fContract(t, "Deduct[orgA]+replay", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
 		if err := st.Deduct(ctx, fx.OrgA, 10, fx.Token+"-req-deduct", map[string]interface{}{"env": "contract"}); err != nil {
@@ -206,10 +227,13 @@ func TestSQLContractCredits(t *testing.T) {
 		assert.GreaterOrEqual(t, bal.BalanceCents, int64(5075), "exactly one deduction must have applied")
 		return nil
 	})
+}
 
-	// DeductMicro — sub-cent charge leaves its residue on the wallet
-	// (reserved/grace schema in play), and the grace floor rejects a charge
-	// that would cross it.
+// sqlc03fDeductMicroContract covers the sub-cent path: the charge leaves its
+// residue on the wallet (reserved/grace schema in play), and the grace floor
+// rejects a charge that would cross it.
+func sqlc03fDeductMicroContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	ctx := context.Background()
 	sqlc03fContract(t, "DeductMicro[orgA,subcent]", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
 		before, err := st.GetBalance(ctx, fx.OrgA)
@@ -226,11 +250,14 @@ func TestSQLContractCredits(t *testing.T) {
 		assert.NotEqual(t, before.BalanceMicroUSD, after.BalanceMicroUSD, "sub-cent charge must move the exact balance")
 		return nil
 	})
-	err = newStore(0).DeductMicro(ctx, fx.LowWalletID, money.MicroUSD(200*int64(money.MicroPerCent)), fx.Token+"-req-over", nil)
+	err := newStore(0).DeductMicro(ctx, fx.LowWalletID, money.MicroUSD(200*int64(money.MicroPerCent)), fx.Token+"-req-over", nil)
 	require.ErrorIs(t, err, ErrInsufficientCredits, "DeductMicro[below explicit floor]")
+}
 
-	// GetTransactions — limit variants: explicit, defaulting (0/negative/
-	// oversize clamp to 50) and the empty result for an unknown org.
+// sqlc03fGetTransactionsContract covers the limit variants: explicit,
+// defaulting (0/negative/oversize clamp to 50) and the empty result for an
+// unknown org.
+func sqlc03fGetTransactionsContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
 	sqlc03fContract(t, "GetTransactions[orgA,limit2]", func(ctx context.Context) error {
 		txns, err := newStore(0).GetTransactions(ctx, fx.OrgA, 2)
 		if err != nil {
@@ -265,8 +292,11 @@ func TestSQLContractCredits(t *testing.T) {
 		assert.Empty(t, txns, "an unknown org has no ledger")
 		return nil
 	})
+}
 
-	// LowBalanceOrgs — threshold and limit combinations on the real scan.
+// sqlc03fLowBalanceContract covers threshold and limit combinations on the
+// real scan.
+func sqlc03fLowBalanceContract(t *testing.T, pool *pgxpool.Pool, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
 	sqlc03fContract(t, "LowBalanceOrgs[threshold5]", func(ctx context.Context) error {
 		orgs, err := newStore(0).LowBalanceOrgs(ctx, 5, 100)
 		if err != nil {
