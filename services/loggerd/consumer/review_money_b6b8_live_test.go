@@ -79,7 +79,7 @@ func moneyReviewSeedUsage(t *testing.T, ctx context.Context, pool *pgxpool.Pool,
 	_, err := pool.Exec(ctx, `
 		INSERT INTO credit_transactions
 			(org_id, amount_cents, balance_after, type, request_id, invocation_id, amount_micro_usd)
-		VALUES ($1, $2, 0, 'usage', $3, NULLIF($4, ''), $5)`,
+		VALUES ($1, $2, 0, 'usage', $3, NULLIF($4, '')::uuid, $5)`,
 		orgID, money.MicroUSD(amountMicro).Cents(), requestID, invocationID, amountMicro)
 	require.NoError(t, err)
 }
@@ -94,7 +94,7 @@ func moneyReviewSeedJob(t *testing.T, ctx context.Context, pool *pgxpool.Pool, o
 	err = pool.QueryRow(ctx, `
 		INSERT INTO settlement_jobs
 			(org_id, request_id, charge_kind, amount_cents, amount_micro_usd, status, payload, invocation_id)
-		VALUES ($1, $2, $3, $4, $5, 'pending', $6, NULLIF($7, ''))
+		VALUES ($1, $2, $3, $4, $5, 'pending', $6, NULLIF($7, '')::uuid)
 		RETURNING id`,
 		orgID, requestID, ChargeKindResaleDeduction, money.MicroUSD(amountMicro).Cents(), amountMicro, payload, invocationID).Scan(&id)
 	require.NoError(t, err, "seed resale settlement job")
