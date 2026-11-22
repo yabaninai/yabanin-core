@@ -1476,43 +1476,45 @@ func buildGatewayObservability(ctx context.Context, w *gatewayWiring, gw *gatewa
 		}
 	}
 
-	// V9: shadow-mode — mirror sampled non-streaming traffic to a candidate
-	// model. Disabled by default; an invalid config degrades to disabled.
-	// The pin check reuses the shared adminStore.
-	if w.cfg.Shadow.Enabled {
-		scfg := shadow.Config{
-			Enabled:        true,
-			Model:          w.cfg.Shadow.Model,
-			UpstreamURL:    w.cfg.Shadow.UpstreamURL,
-			APIKey:         w.cfg.Shadow.APIKey,
-			SampleRate:     w.cfg.Shadow.SampleRate,
-			Timeout:        w.cfg.Shadow.ShadowTimeout(),
-			MaxConcurrent:  w.cfg.Shadow.MaxConcurrent,
-			DailyBudgetUSD: w.cfg.Shadow.DailyBudgetUSD,
-		}
-		if vcfg, err := scfg.Validate(); err != nil {
-			w.l.Warn("shadow-mode disabled: invalid configuration", "error", err)
-		} else {
-			gw.shadow = shadow.NewDispatcher(vcfg, w.l.With("component", "shadow"))
-			// Residency-pinned orgs are never mirrored: their data may not
-			// leave the pinned region, and the shadow provider is arbitrary.
-			// Same adminStore lookup the residency enforcer uses (PA.5).
-			gw.shadow.SetPinnedOrgFunc(func(ctx context.Context, orgID string) bool {
-				if w.adminStore == nil {
-					return false
-				}
-				region, rerr := w.adminStore.GetOrgResidencyRegion(ctx, orgID)
-				if rerr != nil {
-					// Fail-safe for shadow: unknown region ⇒ not pinned.
-					// The residency enforcer itself is fail-closed at
-					// request time and will deny if the org is regulated.
-					return false
-				}
-				return region != "" && region != "global"
-			})
-			w.l.Info("shadow-mode initialized", "model", vcfg.Model, "sample_rate", vcfg.SampleRate,
-				"timeout", vcfg.Timeout, "max_concurrent", vcfg.MaxConcurrent, "daily_budget_usd", vcfg.DailyBudgetUSD)
-		}
+	configureShadowDispatcher(w, gw)
+}
+
+func configureShadowDispatcher(w *gatewayWiring, gw *gateway) {
+	if !w.cfg.Shadow.Enabled {
+		return
+	}
+	scfg := shadow.Config{
+		Enabled:        true,
+		Model:          w.cfg.Shadow.Model,
+		UpstreamURL:    w.cfg.Shadow.UpstreamURL,
+		APIKey:         w.cfg.Shadow.APIKey,
+		SampleRate:     w.cfg.Shadow.SampleRate,
+		Timeout:        w.cfg.Shadow.ShadowTimeout(),
+		MaxConcurrent:  w.cfg.Shadow.MaxConcurrent,
+		DailyBudgetUSD: w.cfg.Shadow.DailyBudgetUSD,
+	}
+	if vcfg, err := scfg.Validate(); err != nil {
+		w.l.Warn("shadow-mode disabled: invalid configuration", "error", err)
+	} else {
+		gw.shadow = shadow.NewDispatcher(vcfg, w.l.With("component", "shadow"))
+		// Residency-pinned orgs are never mirrored: their data may not
+		// leave the pinned region, and the shadow provider is arbitrary.
+		// Same adminStore lookup the residency enforcer uses (PA.5).
+		gw.shadow.SetPinnedOrgFunc(func(ctx context.Context, orgID string) bool {
+			if w.adminStore == nil {
+				return false
+			}
+			region, rerr := w.adminStore.GetOrgResidencyRegion(ctx, orgID)
+			if rerr != nil {
+				// Fail-safe for shadow: unknown region ⇒ not pinned.
+				// The residency enforcer itself is fail-closed at
+				// request time and will deny if the org is regulated.
+				return false
+			}
+			return region != "" && region != "global"
+		})
+		w.l.Info("shadow-mode initialized", "model", vcfg.Model, "sample_rate", vcfg.SampleRate,
+			"timeout", vcfg.Timeout, "max_concurrent", vcfg.MaxConcurrent, "daily_budget_usd", vcfg.DailyBudgetUSD)
 	}
 }
 
