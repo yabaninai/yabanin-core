@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http/httptest"
@@ -237,6 +236,7 @@ func FuzzRequestParseContract(f *testing.F) {
 	// must carry them verbatim through the raw pass-through.
 	f.Add([]byte(`{"choices":[{"finish_reason":"stop","note":1e999}]}`), "")
 	f.Add([]byte(`{"":[{"":1e700}]}`), "0")
+	f.Add([]byte(`{"s":[1e700,"<"]}`), "x")
 	// Arbitrary invalid UTF-8 in the effort string is normalized by
 	// encoding/json on marshal; the patched key must carry exactly that
 	// normalization, and an invalid-UTF-8 body must round-trip untouched.
@@ -327,30 +327,31 @@ func requireEffortInjection(t *testing.T, body []byte, effort string, out []byte
 	}
 	var patched map[string]json.RawMessage
 	require.NoError(t, json.Unmarshal(out, &patched))
-	require.Contains(t, patched, "reasoning_effort")
+	// The patch adds exactly one key when absent — a pre-existing
+	// reasoning_effort is rewritten in place, so the keyset never grows —
+	// and never drops or renames another key.
+	wantKeys := make([]string, 0, len(root)+1)
+	for k := range root {
+		wantKeys = append(wantKeys, k)
+	}
+	if _, present := root["reasoning_effort"]; !present {
+		wantKeys = append(wantKeys, "reasoning_effort")
+	}
+	gotKeys := make([]string, 0, len(patched))
+	for k := range patched {
+		gotKeys = append(gotKeys, k)
+	}
+	require.ElementsMatch(t, wantKeys, gotKeys)
 	enc, err := json.Marshal(effort)
 	require.NoError(t, err)
 	require.Equal(t, string(enc), string(patched["reasoning_effort"]))
 	for k, v := range root {
 		if k != "reasoning_effort" {
-			// A value the interface{} decode cannot represent (numeric
-			// literals beyond float64) only exists as its raw bytes; the
-			// documented pass-through must preserve them verbatim.
-			var probe interface{}
-			if err := json.Unmarshal(v, &probe); err != nil {
-				require.Equal(t, compactJSON(t, v), string(patched[k]))
-			} else {
-				require.JSONEq(t, string(v), string(patched[k]))
-			}
+			// Sibling values pass through the raw capture: literals the
+			// float64 decode cannot represent must survive intact, and
+			// escape spellings may differ (the encoder HTML-escapes).
+			require.True(t, sameJSONValue(v, patched[k]),
+				"sibling value %q changed through the patch", k)
 		}
 	}
-}
-
-// compactJSON returns the syntactic compact form of raw JSON bytes
-// without a semantic decode, so unrepresentable literals compare intact.
-func compactJSON(t *testing.T, raw []byte) string {
-	t.Helper()
-	var buf bytes.Buffer
-	require.NoError(t, json.Compact(&buf, raw))
-	return buf.String()
 }
