@@ -446,51 +446,70 @@ func realtimeBoundaryWire(t *testing.T, shape string) string {
 func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
 	for _, shape := range []string{"large", "trailing", "multiple", "cr", "crlf"} {
 		for _, commitFails := range []bool{false, true} {
-			name := shape + "/healthy"
-			if commitFails {
-				name = shape + "/facts-failure"
-			}
-			t.Run(name, func(t *testing.T) {
-				wire := realtimeBoundaryWire(t, shape)
-				server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-					w.Header().Set("Content-Type", "text/event-stream")
-					_, _ = w.Write([]byte(wire))
-				}))
-				defer server.Close()
-
-				store := &fakeInvocationStore{}
-				if commitFails {
-					store.factsErr = errors.New("terminal facts insert failed")
-				}
-				gw := r105TestGateway(t, realtimeTestModel(server.URL))
-				gw.invocations = store
-
-				rec := postR105(t, gw, "/v1/realtime", `{"model":"m","input":"boundary"}`, nil)
-				require.Equal(t, http.StatusOK, rec.Code)
-				require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
-				require.Len(t, store.admitted, 1)
-				require.Equal(t, invocationKindStream, store.admitted[0].Kind)
-				require.Positive(t, store.factsCalls)
-				body := rec.Body.String()
-				if commitFails {
-					require.Empty(t, store.facts)
-					require.NotContains(t, body, `"type":"response.done"`)
-					require.Contains(t, body, accountingCommitFailedCode)
-					require.Equal(t, 1, strings.Count(body, "data: [DONE]"))
-					require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"))
-					return
-				}
-				if body != wire {
-					t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
-				}
-				require.Len(t, store.facts, 1)
-				f := store.facts[0]
-				require.Equal(t, store.admitted[0].InvocationID, f.InvocationID)
-				require.Equal(t, invocationKindStream, f.Kind)
-				require.Equal(t, "org-test", f.OrgID)
-				require.Equal(t, "7", f.Fields["tokens_in"])
-				require.Equal(t, "3", f.Fields["tokens_out"])
-			})
+			name := realtimeBoundaryOutcomeName(commitFails)
+			t.Run(shape+"/"+name, func(t *testing.T) { assertRealtimeTerminalBoundaryCase(t, shape, commitFails) })
 		}
 	}
+}
+
+func realtimeBoundaryOutcomeName(commitFails bool) string {
+	if commitFails {
+		return "facts-failure"
+	}
+	return "healthy"
+}
+
+func assertRealtimeTerminalBoundaryCase(t *testing.T, shape string, commitFails bool) {
+	t.Helper()
+	wire := realtimeBoundaryWire(t, shape)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(wire))
+	}))
+	defer server.Close()
+	store := &fakeInvocationStore{}
+	if commitFails {
+		store.factsErr = errors.New("terminal facts insert failed")
+	}
+	gw := r105TestGateway(t, realtimeTestModel(server.URL))
+	gw.invocations = store
+	rec := postR105(t, gw, "/v1/realtime", `{"model":"m","input":"boundary"}`, nil)
+	assertRealtimeTerminalBoundaryResponse(t, rec, store)
+	if commitFails {
+		assertRealtimeBoundaryCommitFailure(t, rec.Body.String(), store)
+		return
+	}
+	assertRealtimeBoundaryCommitted(t, shape, wire, rec.Body.String(), store)
+}
+
+func assertRealtimeTerminalBoundaryResponse(t *testing.T, rec *httptest.ResponseRecorder, store *fakeInvocationStore) {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Len(t, store.admitted, 1)
+	require.Equal(t, invocationKindStream, store.admitted[0].Kind)
+	require.Positive(t, store.factsCalls)
+}
+
+func assertRealtimeBoundaryCommitFailure(t *testing.T, body string, store *fakeInvocationStore) {
+	t.Helper()
+	require.Empty(t, store.facts)
+	require.NotContains(t, body, `"type":"response.done"`)
+	require.Contains(t, body, accountingCommitFailedCode)
+	require.Equal(t, 1, strings.Count(body, "data: [DONE]"))
+	require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"))
+}
+
+func assertRealtimeBoundaryCommitted(t *testing.T, shape, wire, body string, store *fakeInvocationStore) {
+	t.Helper()
+	if body != wire {
+		t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+	}
+	require.Len(t, store.facts, 1)
+	facts := store.facts[0]
+	require.Equal(t, store.admitted[0].InvocationID, facts.InvocationID)
+	require.Equal(t, invocationKindStream, facts.Kind)
+	require.Equal(t, "org-test", facts.OrgID)
+	require.Equal(t, "7", facts.Fields["tokens_in"])
+	require.Equal(t, "3", facts.Fields["tokens_out"])
 }
