@@ -187,8 +187,8 @@ func seedPolicyAvailabilityPolicy(t *testing.T, ctx context.Context, store *admi
 	}
 }
 
-func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
-	t.Helper()
+func startPolicyAvailabilityPostgres(tb testing.TB, ctx context.Context) string {
+	tb.Helper()
 	pg, err := testpostgres.Run(ctx, "pgvector/pgvector:pg16",
 		testpostgres.WithDatabase("yabanin"),
 		testpostgres.WithUsername("postgres"),
@@ -197,24 +197,24 @@ func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
 	)
 	if err != nil {
 		_ = testcontainers.TerminateContainer(pg)
-		t.Fatalf("start R00905-owned Postgres: %v", err)
+		tb.Fatalf("start R00905-owned Postgres: %v", err)
 	}
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cleanupCancel()
 		_ = pg.Terminate(cleanupCtx)
 	})
 	host, err := pg.Host(ctx)
 	if err != nil {
-		t.Fatalf("get Postgres host: %v", err)
+		tb.Fatalf("get Postgres host: %v", err)
 	}
 	port, err := pg.MappedPort(ctx, "5432")
 	if err != nil {
-		t.Fatalf("get Postgres port: %v", err)
+		tb.Fatalf("get Postgres port: %v", err)
 	}
 	dsn := "postgres://postgres:postgres@" + net.JoinHostPort(host, strings.Split(port.Port(), "/")[0]) + "/yabanin?sslmode=disable"
 	if _, err := migrate.Run(ctx, dsn, "sg"); err != nil {
-		t.Fatalf("apply production migrations to isolated Postgres: %v", err)
+		tb.Fatalf("apply production migrations to isolated Postgres: %v", err)
 	}
 	return dsn
 }

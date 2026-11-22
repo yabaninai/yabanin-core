@@ -98,7 +98,7 @@ func TestProcessMessage_RequestInvalid_UnstampedKeepsLegacyBehavior(t *testing.T
 	delete(msg.Values, "status_code")
 
 	require.NoError(t, consumer.processMessage(context.Background(), msg))
-	require.Len(t, rc.queries, 0, "an unstamped request.invalid records no row")
+	require.Empty(t, rc.queries, "an unstamped request.invalid records no row")
 }
 
 // Duplicate delivery of the same stream entry is a no-op against
@@ -130,7 +130,7 @@ func TestProcessMessage_RequestInvalid_InvocationClaimParks(t *testing.T) {
 
 	err := consumer.processMessage(context.Background(), msg)
 	require.ErrorIs(t, err, errRefusalInvocationConflict)
-	require.Len(t, rc.queries, 0, "a parked refusal writes no row")
+	require.Empty(t, rc.queries, "a parked refusal writes no row")
 }
 
 // The paid-history guarantee: a contradictory identity-bearing refusal
@@ -152,7 +152,7 @@ func TestProcessMessage_RequestInvalid_PaidHistoryNotSuppressed(t *testing.T) {
 	refusal.Values["invocation_id"] = testInvocationID
 	err := consumer.processMessage(context.Background(), refusal)
 	require.ErrorIs(t, err, errRefusalInvocationConflict)
-	require.Len(t, rc.queries, 0, "the refusal must not reach request_logs")
+	require.Empty(t, rc.queries, "the refusal must not reach request_logs")
 
 	require.NoError(t, consumer.processMessage(context.Background(), invocationChargedMsg("1-5b")))
 	require.Len(t, rc.queries, 1, "the paid request's genuine history survives the parked refusal")

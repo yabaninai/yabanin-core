@@ -348,7 +348,7 @@ func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JW
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
-	l := slog.New(slog.NewTextHandler(io.Discard, nil))
+	l := slog.New(slog.DiscardHandler)
 	go func() {
 		done <- RunGatewayServerWithJWT(cfg, rdb, pool, nil, l, ctx, jwtw, CircuitScopeWiring{})
 	}()
@@ -788,7 +788,7 @@ func fuzzF0221(t *testing.T, _ *f02BootDB) {
 	t.Helper()
 	f02BootEnv(t)
 	up := f02UpstreamRecorder(t)
-	l := slog.New(slog.NewTextHandler(io.Discard, nil))
+	l := slog.New(slog.DiscardHandler)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 

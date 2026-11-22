@@ -65,7 +65,7 @@ func TestConfig_NegativeGracePeriodPreserved(t *testing.T) {
 // exercises the real path — the boundary matrix runs on the migrated
 // fixture stand instead. The AF-01 regression intent is unchanged.
 func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	pool := setupTestDB(t)
 
 	const floor = int64(-100)
@@ -81,7 +81,7 @@ func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			org := seedAdmissionWallet(t, pool, tc.balance, nil)
+			org := seedAdmissionWallet(t, ctx, pool, tc.balance, nil)
 			bal, err := s.CheckBalance(ctx, org)
 			if tc.wantAdmit {
 				if err != nil {

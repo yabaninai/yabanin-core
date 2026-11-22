@@ -405,7 +405,7 @@ func TestDuplicateInvocationProbeFailureFailsDelivery(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Error(t, err, "the probe failure must fail the delivery for redelivery, never pass as absence")
-	assert.ErrorContains(t, err, "probe policy decision enrichment")
+	require.ErrorContains(t, err, "probe policy decision enrichment")
 	assert.Equal(t, 2, logInsertCount, "the duplicate arm was actually reached")
 	assert.Equal(t, 1, decisionInserts, "the failed enrichment inserts nothing on top of the first decision")
 }

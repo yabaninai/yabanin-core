@@ -22,10 +22,10 @@ func TestResolveSessionID_EmptyInputsAreNil(t *testing.T) {
 	require.NoError(t, err)
 	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, "")
 	require.NoError(t, err, "statement-free guards must not fail the delivery")
-	assert.Nil(t, out)
+	assert.Nil(t, out.sqlValue())
 	out, err = consumer.resolveSessionID(context.Background(), tx, "", "ses_x")
 	require.NoError(t, err)
-	assert.Nil(t, out)
+	assert.Nil(t, out.sqlValue(), "org without a valid uuid can never satisfy sessions_org_id_fkey")
 }
 
 func TestResolveSessionID_InvalidOrgFailsOpenToNil(t *testing.T) {
@@ -42,7 +42,7 @@ func TestResolveSessionID_InvalidOrgFailsOpenToNil(t *testing.T) {
 
 	out, err := consumer.resolveSessionID(context.Background(), tx, "org-abc", "ses_x")
 	require.NoError(t, err, "statement-free guards must not fail the delivery")
-	assert.Nil(t, out, "org without a valid uuid can never satisfy sessions_org_id_fkey")
+	assert.Nil(t, out.sqlValue(), "org without a valid uuid can never satisfy sessions_org_id_fkey")
 	assert.False(t, queried, "registry must not be consulted for an invalid org")
 }
 
@@ -64,9 +64,9 @@ func TestResolveSessionID_UpsertArgsAndFailureFailsDelivery(t *testing.T) {
 	require.NoError(t, err)
 
 	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, "ses_f7c8cea03ffeQF8w3WLp7oRA9w")
-	assert.Nil(t, out)
+	assert.Nil(t, out.sqlValue())
 	require.Error(t, err, "a failed upsert statement aborts the delivery transaction (PostgreSQL 25P02 on the next statement), so swallowing the error would fake a success the commit cannot deliver")
-	assert.ErrorContains(t, err, "session registry upsert")
+	require.ErrorContains(t, err, "session registry upsert")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -124,8 +124,8 @@ func TestResolveSessionID_ValidClientUUIDIsOrgScoped(t *testing.T) {
 
 	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, testSessionUUID)
 	require.NoError(t, err)
-	require.IsType(t, "", out)
-	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), out.(string))
+	require.True(t, out.present)
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), out.sqlValue())
 	require.Len(t, qargs, 3)
 	assert.Equal(t, testSessionUUID, qargs[2], "client_session still carries the raw UUID")
 }
@@ -167,7 +167,7 @@ func TestConsumer_SessionRegistryFailureFailsDelivery(t *testing.T) {
 	}
 	err := consumer.handleRequestComplete(context.Background(), msg)
 	require.Error(t, err, "the aborted transaction cannot commit; the delivery must report failure for redelivery")
-	assert.ErrorContains(t, err, "session registry upsert")
+	require.ErrorContains(t, err, "session registry upsert")
 	assert.Zero(t, requestLogInserts, "no request_logs write follows a poisoned transaction")
 }
 
