@@ -539,11 +539,9 @@ func analyze(files []parsedFile, paths []string, modes [][]string, ctx context.C
 		modeList = [][]string{nil}
 	}
 	dir := filepath.Dir(paths[0])
-	for _, item := range files {
-		if filepath.Dir(item.path) != dir {
-			res.note(item.path, "resolution-fallback: paths span multiple directories")
-			return res
-		}
+	if path := foreignDir(files, dir); path != "" {
+		res.note(path, "resolution-fallback: paths span multiple directories")
+		return res
 	}
 	okAny := false
 	deadlineFloored := false
@@ -560,7 +558,8 @@ func analyze(files []parsedFile, paths []string, modes [][]string, ctx context.C
 	// Expiry inside the last mode — after the loop-top gate has passed
 	// for the final time — must still floor the whole request: the
 	// per-group floor covers only its own files and no later iteration
-	// exists to propagate it. Note set-semantics keeps it single.
+	// exists to propagate it. The flag keeps the loop-top and the
+	// after-loop propagation from counting as two failures.
 	if ctx.Err() != nil && !deadlineFloored {
 		markFloor(res, files, nil, "resolution-fallback: analysis deadline exceeded")
 	}
@@ -570,6 +569,17 @@ func analyze(files []parsedFile, paths []string, modes [][]string, ctx context.C
 		}
 	}
 	return res
+}
+
+// foreignDir reports the first analyzed path outside the request's root
+// directory, or "" when every path shares it.
+func foreignDir(files []parsedFile, dir string) string {
+	for _, item := range files {
+		if filepath.Dir(item.path) != dir {
+			return item.path
+		}
+	}
+	return ""
 }
 
 // analyzeMode checks one build mode coherently: fresh FileSet, per-mode
@@ -705,9 +715,9 @@ func goListExports(dir string, mode []string, ctx context.Context) (map[string]s
 // helper is the child's exclusive reaper: after a successful Start it
 // blocks in waitid(P_PID, WEXITED|WNOWAIT) until the direct child has
 // exited but is still waitable, then — while its numeric identity is
-// still reserved and cannot be reused — signals the owned group before
-// the single Cmd.Wait reaps the leader. Cancellation and the final
-// signal serialize on one per-command mutex behind an armed flag: an
+// still reserved and cannot be reused — the reserved-identity signal
+// fires the owned group before the single Cmd.Wait reaps the leader.
+// Cancellation and the final signal serialize on the same mutex: an
 // in-flight signal completes before reaping, and a late Cancel returns
 // os.ErrProcessDone instead of signaling a reused PID. Ownership is
 // established by waitid alone, never by probing kill(pid, 0). A failed
@@ -717,9 +727,9 @@ func goListExports(dir string, mode []string, ctx context.Context) (map[string]s
 // terminates the direct child through Process.Kill before Wait and
 // surfaces likewise. The completion signal cleans up toolchain or
 // wrapper grandchildren — ESRCH just means no target remained; their
-// reaping belongs to the process they were reparented to, and
-// WaitDelay bounds inherited-pipe drainage, since Linux promises no
-// hard reap bound for tasks in uninterruptible sleep.
+// reaping belongs to the process they were reparented to, and WaitDelay
+// bounds inherited-pipe drainage, since Linux promises no hard reap
+// bound for tasks in uninterruptible sleep.
 func runGoList(ctx context.Context, dir string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, "go", args...)
 	cmd.Dir = dir
@@ -763,16 +773,28 @@ func runGoList(ctx context.Context, dir string, args ...string) (string, error) 
 	}
 	mu.Unlock()
 	werr := cmd.Wait()
-	if werr != nil {
-		if ctx.Err() != nil {
-			return "", fmt.Errorf("deadline exceeded: %w", ctx.Err())
-		}
-		return "", fmt.Errorf("%v: %s", werr, firstLine(stderr.String()))
-	}
-	if sigErr != nil && sigErr != syscall.ESRCH {
-		return "", fmt.Errorf("group cleanup failed: %v", sigErr)
+	if err := classifyWait(werr, sigErr, ctx, stderr.String()); err != nil {
+		return "", err
 	}
 	return stdout.String(), nil
+}
+
+// classifyWait folds the single Wait outcome and the reserved group
+// signal into the helper's terminal error: a deadline breach is
+// reported as the context cause, command failures keep their first
+// stderr line, and an unexpected group-signal failure fails closed
+// instead of certifying on a broken cleanup.
+func classifyWait(werr, sigErr error, ctx context.Context, stderr string) error {
+	if werr != nil {
+		if ctx.Err() != nil {
+			return fmt.Errorf("deadline exceeded: %w", ctx.Err())
+		}
+		return fmt.Errorf("%v: %s", werr, firstLine(stderr))
+	}
+	if sigErr != nil && sigErr != syscall.ESRCH {
+		return fmt.Errorf("group cleanup failed: %v", sigErr)
+	}
+	return nil
 }
 
 // waitIDTypePID is Linux's P_PID id type for waitid(2); the syscall
@@ -934,6 +956,17 @@ func checkGroup(group *fileGroup, exports map[string]string, res *resolution, ch
 		markFloor(res, group.items, nil, "resolution-fallback: type errors: "+firstLine(errs[0]))
 		return false
 	}
+	bindGroupDecisions(group, pkg, checked, asts, info, res)
+	return true
+}
+
+// bindGroupDecisions certifies the group's package and binds its
+// per-file decisions to the analyzed production target: the internal
+// group's own checked package, or the in-memory target the internal
+// check handed to the external group. For external groups the
+// declaration index covers the group's own package-level declarations
+// reached by bare references.
+func bindGroupDecisions(group *fileGroup, pkg *types.Package, checked *types.Package, asts []*ast.File, info *types.Info, res *resolution) {
 	group.pkg = pkg
 	target := pkg
 	if checked != nil {
@@ -943,7 +976,6 @@ func checkGroup(group *fileGroup, exports map[string]string, res *resolution, ch
 	for i, item := range group.items {
 		collectDecisions(item, asts[i], target, decls, info, res)
 	}
-	return true
 }
 
 // groupDeclarations indexes the checked external group's package-level
