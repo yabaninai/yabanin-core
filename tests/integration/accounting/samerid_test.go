@@ -3,9 +3,11 @@
 package accounting
 
 import (
-	"fmt"
+	"database/sql"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestAccountingSameOrgTwoPaidInvocationsSharedCorrelationId: TWO
@@ -31,93 +33,57 @@ func TestAccountingSameOrgTwoPaidInvocationsSharedCorrelationId(t *testing.T) {
 	rid := s.reqPrefix + "tgt-samerid"
 	before := s.fixture.Snapshot()
 
-	// Invocation 1: buffered, distinct body A.
-	statusA, _, errA := s.chatFull(t, rid, 30*time.Second, chatOptions{
-		content: "Same-rid distinct body A " + s.runID,
-	})
-	if errA != nil || statusA != httpOK {
-		t.Fatalf("same-rid: invocation A status=%d err=%v", statusA, errA)
-	}
+	org := s.oracleDB.orgID
+	status, body, err := s.chatFull(t, rid, 30*time.Second, chatOptions{content: "Same-rid distinct body A " + s.runID})
+	require.NoError(t, err)
+	require.Equal(t, httpOK, status, body)
+	validateChatReply(t, s, body)
+	first := s.oracleAdmissions(t, rid, org)
+	require.Len(t, first, 1)
+	require.NotEmpty(t, first[0].InvocationID)
 
-	// Invocation 2: streamed, distinct body B (no cache hit on the pair).
-	statusB, _, errB := s.chatFull(t, rid, 30*time.Second, chatOptions{
-		stream:  true,
-		content: "Same-rid distinct body B " + s.runID,
-	})
-	if errB != nil || statusB != httpOK {
-		t.Fatalf("same-rid: invocation B status=%d err=%v", statusB, errB)
-	}
-
-	// Two independent provider receipts for the correlation id.
+	status, body, err = s.chatFull(t, rid, 30*time.Second, chatOptions{stream: true, content: "Same-rid distinct body B " + s.runID})
+	require.NoError(t, err)
+	require.Equal(t, httpOK, status, body)
+	validateChatSSE(t, s, body)
 	arr, disp, recv := s.fixture.Counts(rid)
-	if arr != 2 || disp != 2 || recv != 2 {
-		t.Fatalf("same-rid: ledger arr/disp/recv = %d/%d/%d, want 2/2/2 (two independent paid calls)", arr, disp, recv)
-	}
-	if delta := s.fixture.Since(before); delta.arrivals != 2 || delta.dispatches != 2 || delta.receipts != 2 {
-		t.Fatalf("same-rid: ledger delta = %d/%d/%d, want 2/2/2", delta.arrivals, delta.dispatches, delta.receipts)
-	}
+	expected := fixtureTotals{arrivals: 2, dispatches: 2, receipts: 2}
+	require.Equal(t, expected, fixtureTotals{arrivals: arr, dispatches: disp, receipts: recv})
+	require.Equal(t, expected, s.fixture.Since(before))
 
-	// Two billed rows, each with the exact token usage (cost is validated
-	// per-row by requireBilledRow on the correlation id's rows below).
-	billed := 0
-	for _, r := range s.oracleRequestLogRows(t, rid, s.oracleDB.orgID) {
-		if r.Status == httpOK && r.TokensIn == fixturePromptTokens && r.TokensOut == fixtureCompletionTokens {
-			billed++
+	// Settlement runs asynchronously. A provider receipt alone does not
+	// establish that the second wallet debit is already visible.
+	requireEventually(t, 3*time.Minute, 500*time.Millisecond, func() bool {
+		return s.oracleCreditTotals(t, rid, org).UsageRows >= 2
+	}, "both paid invocations must settle independently")
+	wantDebit := int64(-fixtureMicroUSDCost)
+	require.Equal(t, []int64{wantDebit, wantDebit}, s.oracleWalletUsageRows(t, rid, org))
+	rows := s.oracleRequestLogRows(t, rid, org)
+	require.Len(t, rows, 2)
+	for _, row := range rows {
+		require.EqualValues(t, httpOK, row.Status)
+		require.EqualValues(t, fixturePromptTokens, row.TokensIn)
+		require.EqualValues(t, fixtureCompletionTokens, row.TokensOut)
+		require.InDelta(t, s.expectedFixtureCostUSD(), row.CostUSD, 1e-9)
+	}
+	admissions := s.oracleAdmissions(t, rid, org)
+	require.Len(t, admissions, 2)
+	require.NotEqual(t, admissions[0].InvocationID, admissions[1].InvocationID)
+	require.Contains(t, []string{admissions[0].InvocationID, admissions[1].InvocationID}, first[0].InvocationID)
+	for _, a := range admissions {
+		require.Equal(t, "reconciled", a.State)
+		require.True(t, a.ResolvedAt.Valid)
+		require.Equal(t, sql.NullString{String: reasonEventLive, Valid: true}, a.ResolveReason)
+		charge := s.oracleUsageByInvocation(t, a.InvocationID, org)
+		require.EqualValues(t, 1, charge.UsageRows)
+		require.Equal(t, wantDebit, charge.SumMicroUSD)
+		for _, kind := range []string{"resale_deduction", "team_spend"} {
+			require.Equal(t, 1, s.oracleCount(t, "SELECT count(*) FROM settlement_jobs WHERE invocation_id=$1::uuid AND org_id=$2 AND request_id=$3 AND charge_kind=$4", a.InvocationID, org, rid, kind))
 		}
+		require.Equal(t, 1, s.oracleCount(t, `SELECT count(*) FROM request_terminal_facts f
+			JOIN request_logs l ON l.invocation_id=f.invocation_id AND l.org_id::text=f.org_id
+			WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3 AND l.request_id=$3`, a.InvocationID, org, rid))
 	}
-	if billed != 2 {
-		t.Fatalf("same-rid: billed rows = %d, want exactly 2 — two successful paid invocations must bill independently under one correlation id (0028 minted-identity domain)", billed)
-	}
-	for _, r := range s.oracleRequestLogRows(t, rid, s.oracleDB.orgID) {
-		if r.Status == httpOK && (r.TokensIn != fixturePromptTokens || r.TokensOut != fixtureCompletionTokens) {
-			t.Fatalf("same-rid: billed row carries unexpected usage tokens=%d/%d", r.TokensIn, r.TokensOut)
-		}
-	}
-
-	// Wallet: TWO usage rows, EACH a signed -32 micro-USD debit.
-	usage := s.oracleWalletUsageRows(t, rid, s.oracleDB.orgID)
-	if len(usage) != 2 {
-		t.Fatalf("same-rid: wallet usage rows = %d (%v), want exactly 2 — independent billing", len(usage), usage)
-	}
-	for i, micro := range usage {
-		if micro != int64(-fixtureMicroUSDCost) {
-			t.Fatalf("same-rid: usage row %d signed micro = %d, want %d (each invocation)", i+1, micro, -fixtureMicroUSDCost)
-		}
-	}
-	t.Logf("same-rid: two independent wallet debits of -%d micro-USD each", fixtureMicroUSDCost)
-
-	// Two DISTINCT minted invocation IDs, both reconciled via live delivery.
-	if !s.oracleTableExists(t, "request_admissions") {
-		t.Fatalf("PRODUCT DEFECT (baseline): no admissions — minted-identity independence unverifiable")
-	}
-	pollUntil(t, 6*time.Minute, "both same-rid admissions reconcile", func() error {
-		adms := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-		if len(adms) != 2 {
-			return fmt.Errorf("admissions = %d (%s), want exactly 2 minted invocations", len(adms), fmtAdmissions(adms))
-		}
-		if adms[0].InvocationID == adms[1].InvocationID {
-			return abortf("both invocations share minted id %s", adms[0].InvocationID)
-		}
-		for _, a := range adms {
-			requireAdmissionVocabulary(t, a)
-			switch a.State {
-			case "reconciled":
-				if a.ResolveReason.String != reasonEventLive {
-					return abortf("reconciled reason %q, want %q", a.ResolveReason.String, reasonEventLive)
-				}
-			case "admitted":
-				return fmt.Errorf("still admitted: %s", fmtAdmissions(adms))
-			default:
-				return abortf("state %s for a fully served invocation: %s", a.State, fmtAdmissions(adms))
-			}
-		}
-		return nil
-	})
-
-	// Settlement intents: at most one per (invocation, kind) — two here.
-	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs > 2 {
-		t.Fatalf("same-rid: settlement jobs = %d, want <= 2", jobs)
-	}
-
+	s.requireSettlementIntents(t, rid, org, "same correlation", map[string]int{"resale_deduction": 2, "team_spend": 2})
 	s.controlRequest(t, "samerid-post")
 }
