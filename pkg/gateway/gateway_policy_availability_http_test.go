@@ -204,6 +204,7 @@ func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
 		testpostgres.WithDatabase("yabanin"),
 		testpostgres.WithUsername("postgres"),
 		testpostgres.WithPassword("postgres"),
+		testpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
 		t.Fatalf("start R00905-owned Postgres: %v", err)
@@ -222,17 +223,7 @@ func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
 		t.Fatalf("get Postgres port: %v", err)
 	}
 	dsn := "postgres://postgres:postgres@" + net.JoinHostPort(host, strings.Split(port.Port(), "/")[0]) + "/yabanin?sslmode=disable"
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if _, err = migrate.Run(ctx, dsn, "sg"); err == nil {
-			break
-		}
-		if !time.Now().Before(deadline) {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err != nil {
+	if _, err := migrate.Run(ctx, dsn, "sg"); err != nil {
 		t.Fatalf("apply production migrations to isolated Postgres: %v", err)
 	}
 	return dsn
