@@ -141,6 +141,14 @@ func (db *payloadGrantFakeDB) queryRowPeekTarget(args ...interface{}) pgx.Row {
 	return &mockPGXRow{data: [][]interface{}{{grant.RowKey}}}
 }
 
+// grantRedeemableFor answers the party/state predicate of the keyed consume
+// UPDATE (the binding pin stays in queryRowConsume): same org, request,
+// grantee and scope, a non-empty scope, still unexpired and unconsumed.
+func grantRedeemableFor(grant RequestPayloadGrant, orgID, requestID, rootID, scope string, now time.Time) bool {
+	return grant.OrgID == orgID && grant.RequestID == requestID && grant.RootID == rootID &&
+		grant.Scope == scope && grant.Scope != "" && now.Before(grant.ExpiresAt) && !grantConsumed(grant)
+}
+
 // queryRowConsume answers the keyed consume UPDATE — RETURNING the grant
 // row on success, no rows when any predicate denies.
 func (db *payloadGrantFakeDB) queryRowConsume(args ...interface{}) pgx.Row {
@@ -153,10 +161,10 @@ func (db *payloadGrantFakeDB) queryRowConsume(args ...interface{}) pgx.Row {
 	grant, ok := db.grants[hash]
 	orgID, requestID, rootID := args[1].(string), args[2].(string), args[3].(string)
 	now, scope, rowKey := args[4].(time.Time), args[5].(string), args[6].(int64)
-	if rowKey <= 0 || grant.RowKey != rowKey {
+	if rowKey <= 0 || !ok || grant.RowKey != rowKey {
 		return &mockPGXRow{err: pgx.ErrNoRows}
 	}
-	if !ok || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || grant.Scope != scope || !now.Before(grant.ExpiresAt) || grant.Scope == "" || grantConsumed(grant) {
+	if !grantRedeemableFor(grant, orgID, requestID, rootID, scope, now) {
 		return &mockPGXRow{err: pgx.ErrNoRows}
 	}
 	grant.Scope = "consumed:" + grant.Scope
@@ -438,15 +446,9 @@ func TestRequestPayloadGrant_ConsumeAuditFailureRollsBackAndRetrySucceeds(t *tes
 	if _, err := store.ConsumeRequestPayloadGrantScope(grant.Token, "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now.Add(3*time.Second)); err == nil {
 		t.Fatal("token redeemed twice after retry")
 	}
-	used := 0
-	for _, action := range db.audited {
-		if action == "request_payload.grant_used" {
-			used++
-		}
-	}
-	if used != 1 {
-		t.Fatalf("grant_used audit rows = %d, want exactly 1 (the rolled-back attempt must leave none)", used)
-	}
+	// Exactly one issued event and one used event survive: the rolled-back
+	// attempt must leave neither a use event nor a duplicate issue event.
+	require.Equal(t, []string{"request_payload.grant_issued", "request_payload.grant_used"}, db.audited)
 }
 
 // TestRequestPayloadGrant_LegacyUnboundGrantIsPermanentlyUnusable pins the

@@ -97,6 +97,33 @@ func enforceActiveRequestGrantCap(ctx context.Context, tx auditTx, rootID string
 	return nil
 }
 
+// beginGrantTx opens the single-commit transaction shared by issuance and
+// consume: the grant state row and its mandatory audit row must commit
+// together. The caller owns the deferred rollback so it fires on its return.
+func (s *Store) beginGrantTx() (context.Context, auditTx, error) {
+	ctx := context.Background()
+	tx, err := s.db.BeginAuditTx(ctx)
+	if err != nil {
+		return nil, nil, err
+	}
+	return ctx, tx, nil
+}
+
+// reserveRequestGrantIssuance runs the in-transaction admission phase:
+// serialize on the grantor root, enforce the active-grant cap, then bind the
+// grant to its one physical target row. All three see the same transaction
+// state, so a concurrent issuance cannot slip past the cap between count and
+// insert.
+func reserveRequestGrantIssuance(ctx context.Context, tx auditTx, orgID, requestID, rootID string, now time.Time) (int64, error) {
+	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, rootID); err != nil {
+		return 0, fmt.Errorf("lock payload grants: %w", err)
+	}
+	if err := enforceActiveRequestGrantCap(ctx, tx, rootID, now); err != nil {
+		return 0, err
+	}
+	return resolveRequestPayloadGrantTarget(ctx, tx, orgID, requestID)
+}
+
 // resolveRequestPayloadGrantTarget binds a new grant to exactly one physical
 // request_logs row: the client correlation alone is not row identity (0028
 // allows two invocations to share it), so issuance resolves the carrier
@@ -136,19 +163,12 @@ func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope s
 	}
 	grant := RequestPayloadGrant{ID: hex.EncodeToString(raw[:16]), Token: hex.EncodeToString(raw[16:]), OrgID: orgID, RequestID: requestID, RootID: rootID, ExpiresAt: now.Add(ttl), Scope: scope}
 	hash := sha256.Sum256([]byte(grant.Token))
-	ctx := context.Background()
-	tx, err := s.db.BeginAuditTx(ctx)
+	ctx, tx, err := s.beginGrantTx()
 	if err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("begin payload grant transaction: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtextextended($1, 0))`, rootID); err != nil {
-		return RequestPayloadGrant{}, fmt.Errorf("lock payload grants: %w", err)
-	}
-	if err := enforceActiveRequestGrantCap(ctx, tx, rootID, now); err != nil {
-		return RequestPayloadGrant{}, err
-	}
-	if grant.RowKey, err = resolveRequestPayloadGrantTarget(ctx, tx, orgID, requestID); err != nil {
+	if grant.RowKey, err = reserveRequestGrantIssuance(ctx, tx, orgID, requestID, rootID, now); err != nil {
 		return RequestPayloadGrant{}, err
 	}
 	if _, err = tx.Exec(ctx, `INSERT INTO request_payload_grants (id, token_hash, grantor_root, grantee, org_id, request_id, request_row_key, scope, expires_at, created_at) VALUES ($1::uuid, $2, $3::uuid, $3::uuid, $4::uuid, $5, $6::bigint, $7, $8, $9)`, grant.ID, hash[:], rootID, orgID, requestID, grant.RowKey, grant.Scope, grant.ExpiresAt, now); err != nil {
@@ -221,6 +241,28 @@ func (s *Store) PeekRequestPayloadGrantTarget(ctx context.Context, token, orgID,
 	return *bound, nil
 }
 
+// consumeGrantRow runs the keyed consume UPDATE inside the open transaction:
+// the atomic predicate matches only a grant bound to exactly the addressed
+// row, so a denied predicate is the generic invalid error while an
+// infrastructure failure keeps the token untouched.
+func consumeGrantRow(ctx context.Context, tx auditTx, hash [32]byte, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (RequestPayloadGrant, error) {
+	var grant RequestPayloadGrant
+	err := tx.QueryRow(ctx, `
+		UPDATE request_payload_grants SET consumed_at=$5
+		WHERE token_hash=$1 AND org_id=$2::uuid AND request_id=$3 AND grantee=$4::uuid AND scope=$6
+		  AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > $5
+		  AND request_row_key = $7::bigint
+		RETURNING id::text, org_id::text, request_id, grantor_root::text, COALESCE(request_row_key, 0), expires_at, scope`,
+		hash[:], orgID, requestID, rootID, now, scope, rowKey).Scan(&grant.ID, &grant.OrgID, &grant.RequestID, &grant.RootID, &grant.RowKey, &grant.ExpiresAt, &grant.Scope)
+	if err != nil {
+		if IsNotFound(err) {
+			return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
+		}
+		return RequestPayloadGrant{}, fmt.Errorf("consume payload grant: %w", err)
+	}
+	return grant, nil
+}
+
 // ConsumeRequestPayloadGrantScope is the detailed fail-closed consume path.
 // rowKey is the physical row the redemption addresses: the atomic predicate
 // matches only a grant bound to exactly that row, so a concurrent sibling, a
@@ -234,25 +276,14 @@ func (s *Store) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, 
 	if s.cachedRequestPayloadGrantConsumed(hash, now) {
 		return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
 	}
-	ctx := context.Background()
-	tx, err := s.db.BeginAuditTx(ctx)
+	ctx, tx, err := s.beginGrantTx()
 	if err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("begin payload grant consume: %w", err)
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	var grant RequestPayloadGrant
-	err = tx.QueryRow(ctx, `
-		UPDATE request_payload_grants SET consumed_at=$5
-		WHERE token_hash=$1 AND org_id=$2::uuid AND request_id=$3 AND grantee=$4::uuid AND scope=$6
-		  AND revoked_at IS NULL AND consumed_at IS NULL AND expires_at > $5
-		  AND request_row_key = $7::bigint
-		RETURNING id::text, org_id::text, request_id, grantor_root::text, COALESCE(request_row_key, 0), expires_at, scope`,
-		hash[:], orgID, requestID, rootID, now, scope, rowKey).Scan(&grant.ID, &grant.OrgID, &grant.RequestID, &grant.RootID, &grant.RowKey, &grant.ExpiresAt, &grant.Scope)
+	grant, err := consumeGrantRow(ctx, tx, hash, orgID, requestID, rowKey, rootID, scope, now)
 	if err != nil {
-		if IsNotFound(err) {
-			return RequestPayloadGrant{}, ErrInvalidRequestPayloadGrant
-		}
-		return RequestPayloadGrant{}, fmt.Errorf("consume payload grant: %w", err)
+		return RequestPayloadGrant{}, err
 	}
 	// The mandatory use-audit row joins the consume in ONE transaction: a
 	// failed or lost audit rolls the consume back too, so the token is never

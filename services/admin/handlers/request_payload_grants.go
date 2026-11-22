@@ -43,16 +43,7 @@ func (h *AdminHandlers) apiRootRequestPayloadGrant() http.HandlerFunc {
 		if !ok {
 			return
 		}
-		switch body.Action {
-		case "list":
-			respondRequestPayloadGrantList(w, r, store)
-			return
-		case "revoke":
-			respondRequestPayloadGrantRevoke(w, r, store, body.Token)
-			return
-		case "", "issue":
-		default:
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "unknown request payload grant action"})
+		if !dispatchRequestPayloadGrantAction(w, r, store, body) {
 			return
 		}
 		orgID, requestID, scope, ttl, ok := parseRequestPayloadGrantIssue(w, body)
@@ -71,6 +62,25 @@ func (h *AdminHandlers) apiRootRequestPayloadGrant() http.HandlerFunc {
 			RequestID string    `json:"request_id"`
 			ExpiresAt time.Time `json:"expires_at"`
 		}{grant.ID, grant.Token, grant.OrgID, grant.RequestID, grant.ExpiresAt})
+	}
+}
+
+// dispatchRequestPayloadGrantAction serves the list and revoke actions and
+// rejects unknown ones. It returns false once a response was written; true
+// continues to the default issue path.
+func dispatchRequestPayloadGrantAction(w http.ResponseWriter, r *http.Request, store requestPayloadGrantStore, body requestPayloadGrantAction) bool {
+	switch body.Action {
+	case "list":
+		respondRequestPayloadGrantList(w, r, store)
+		return false
+	case "revoke":
+		respondRequestPayloadGrantRevoke(w, r, store, body.Token)
+		return false
+	case "", "issue":
+		return true
+	default:
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "unknown request payload grant action"})
+		return false
 	}
 }
 

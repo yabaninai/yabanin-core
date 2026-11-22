@@ -44,16 +44,7 @@ func (h *AdminHandlers) apiOrgRequestExport() http.HandlerFunc {
 			writeJSON(w, http.StatusBadRequest, apiError{Error: "payload grants require request_id filter"})
 			return
 		}
-		if h.denySubjectOriginalsScope(w, r, orgID, filters) {
-			return
-		}
-		filters.Page, filters.PageSize = 1, 200
-		if !authorizeRequestList(h, r, &filters) {
-			auditRequestExportDecision(h, r, orgID, filters, "", false, "authorization_denied", 0)
-			writeJSON(w, http.StatusForbidden, apiError{Error: "request history access denied"})
-			return
-		}
-		grantScope, ok := h.authorizeExportGrant(w, r, orgID, filters, grantToken)
+		grantScope, ok := h.authorizeExportRequest(w, r, orgID, &filters, grantToken)
 		if !ok {
 			return
 		}
@@ -74,23 +65,43 @@ func (h *AdminHandlers) apiOrgRequestExport() http.HandlerFunc {
 			// is consumed: the attempt is final.
 			filters = preflight
 		}
-		// ---- Phase: disclosure (the 200 commits; stream failures are final) ----
-		access := adminstore.RequestPayloadAccess{
-			UserID: filters.PayloadUserID, Grant: filters.PayloadGrant,
-			Originals:      grantScope == adminstore.RequestPayloadScopeOriginals,
-			DenyOwnHistory: filters.PayloadDenied, OrgWideMetadata: filters.OrgWideMetadata,
+		h.streamRequestExport(w, r, orgID, filters, grantScope, exportPayloadAccess(r, filters, grantScope))
+	}
+}
+
+// authorizeExportRequest runs the export authorization phases in order:
+// subject scope-escalation deny, request-list/content authorization, then
+// grant scope/retention authorization. ok=false once a denial is journalled
+// and written; grantScope is "" unless a bearer grant was accepted.
+func (h *AdminHandlers) authorizeExportRequest(w http.ResponseWriter, r *http.Request, orgID string, filters *adminstore.RequestListFilters, grantToken string) (string, bool) {
+	if h.denySubjectOriginalsScope(w, r, orgID, *filters) {
+		return "", false
+	}
+	filters.Page, filters.PageSize = 1, 200
+	if !authorizeRequestList(h, r, filters) {
+		auditRequestExportDecision(h, r, orgID, *filters, "", false, "authorization_denied", 0)
+		writeJSON(w, http.StatusForbidden, apiError{Error: "request history access denied"})
+		return "", false
+	}
+	return h.authorizeExportGrant(w, r, orgID, *filters, grantToken)
+}
+
+// exportPayloadAccess is the payload access view for the disclosure: a
+// delegated agent/CI subject (N04-P05 T03) is pinned to the subject's own
+// attribution with payload scope only when delegated and originals closed
+// (never delegatable); otherwise the authorized filter view applies.
+func exportPayloadAccess(r *http.Request, filters adminstore.RequestListFilters, grantScope string) adminstore.RequestPayloadAccess {
+	if filters.DelegateAgentID != "" {
+		subject, _ := adminstore.RequestPayloadSubjectFromContext(r.Context())
+		return adminstore.RequestPayloadAccess{
+			Delegated: true, Grant: filters.DelegatePayload, Originals: false, DenyOwnHistory: false,
+			SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID,
 		}
-		if filters.DelegateAgentID != "" {
-			// Delegated subject (N04-P05 T03): the stream is pinned to the
-			// subject's own attribution; payload scope only when delegated.
-			// Originals stay closed — never delegatable.
-			subject, _ := adminstore.RequestPayloadSubjectFromContext(r.Context())
-			access = adminstore.RequestPayloadAccess{
-				Delegated: true, Grant: filters.DelegatePayload, Originals: false, DenyOwnHistory: false,
-				SubjectType: subject.Type, AgentID: subject.AgentID, APIKeyID: subject.APIKeyID,
-			}
-		}
-		h.streamRequestExport(w, r, orgID, filters, grantScope, access)
+	}
+	return adminstore.RequestPayloadAccess{
+		UserID: filters.PayloadUserID, Grant: filters.PayloadGrant,
+		Originals:      grantScope == adminstore.RequestPayloadScopeOriginals,
+		DenyOwnHistory: filters.PayloadDenied, OrgWideMetadata: filters.OrgWideMetadata,
 	}
 }
 
@@ -110,18 +121,29 @@ func (h *AdminHandlers) denySubjectOriginalsScope(w http.ResponseWriter, r *http
 	return true
 }
 
+// exportGrantScope resolves the requested grant scope from the query,
+// defaulting to payload.read. ok=false once the invalid-scope 400 is
+// written.
+func exportGrantScope(w http.ResponseWriter, r *http.Request) (string, bool) {
+	grantScope := r.URL.Query().Get("scope")
+	if grantScope == "" {
+		grantScope = adminstore.RequestPayloadScopeRead
+	}
+	if grantScope != adminstore.RequestPayloadScopeRead && grantScope != adminstore.RequestPayloadScopeOriginals {
+		writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid payload scope"})
+		return "", false
+	}
+	return grantScope, true
+}
+
 // authorizeExportGrant resolves and validates the requested grant scope and,
 // for the originals scope, enforces org retention. Returns ok=false once the
 // denial is journalled and written.
 func (h *AdminHandlers) authorizeExportGrant(w http.ResponseWriter, r *http.Request, orgID string, filters adminstore.RequestListFilters, grantToken string) (string, bool) {
 	grantScope := ""
 	if grantToken != "" {
-		grantScope = r.URL.Query().Get("scope")
-		if grantScope == "" {
-			grantScope = adminstore.RequestPayloadScopeRead
-		}
-		if grantScope != adminstore.RequestPayloadScopeRead && grantScope != adminstore.RequestPayloadScopeOriginals {
-			writeJSON(w, http.StatusBadRequest, apiError{Error: "invalid payload scope"})
+		var ok bool
+		if grantScope, ok = exportGrantScope(w, r); !ok {
 			return "", false
 		}
 		if !isRoot(r) || adminstore.RequestPayloadDenyOwnHistoryFromContext(r.Context()) {
