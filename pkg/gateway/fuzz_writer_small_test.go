@@ -5,6 +5,7 @@ import (
 	"encoding/base64"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 
 	"github.com/reireirei/yabanin/pkg/guardhooks"
@@ -124,7 +125,8 @@ func writerSmallLateCase(t *testing.T, index int) {
 		require.Equal(t, "approaching; exceeded", w.Header().Get("X-Yabanin-Budget-Warning"))
 	case 8:
 		// labelSecret reports only secret-category scan hits.
-		require.True(t, labelSecret("token sk-abcdefghijklmnop1234 embedded"))
+		syntheticKey := "sk-" + strings.Repeat("0", 24)
+		require.True(t, labelSecret("token "+syntheticKey+" embedded"))
 		require.False(t, labelSecret("plain operator text"))
 	case 9:
 		// stripLabelHeaders removes the aggregate and per-key label headers,
