@@ -11,6 +11,13 @@ import (
 // ErrRequestExportTooLarge reports that an export would exceed its hard row cap.
 var ErrRequestExportTooLarge = errors.New("request export exceeds row limit")
 
+// ErrOriginalRetentionDisabled reports that an originals-scoped disclosure
+// was refused because the org's effective original-text retention is off at
+// the disclosure snapshot — not merely stale-off at an earlier authorization
+// check. It is a fail-closed boundary: no row, and no originals field of any
+// row, is emitted.
+var ErrOriginalRetentionDisabled = errors.New("request export originals: org retention disabled")
+
 // exportPageSize is the page size the export walk uses (the store list cap).
 const exportPageSize = 200
 
@@ -49,6 +56,11 @@ type exportQueryRunner interface {
 // concurrent writer deletes them, so the delete neither aborts the export
 // nor skips the row.
 //
+// When access.Originals allows original-text disclosure, the effective org
+// retention decision is evaluated as the first read of that same snapshot:
+// retention disabled in-flight after authorization fails the stream with
+// ErrOriginalRetentionDisabled before any row is read.
+//
 // The payload boundary decision travels in ctx per row, so the detail loader
 // re-applies it row by row. Callback errors stop the stream promptly. The
 // snapshot transaction is rolled back on every error path (including context
@@ -69,6 +81,23 @@ func (s *Store) StreamRequestExport(ctx context.Context, filters RequestListFilt
 	// Rollback is the error path (the explicit Commit below runs on success);
 	// WithoutCancel so a canceled stream still releases its connection.
 	defer func() { _ = tx.Rollback(context.WithoutCancel(ctx)) }()
+	// Retention at disclosure (ordering contract): when this export can
+	// disclose original text, the effective retention decision is the FIRST
+	// read of the snapshot transaction, so it and every row the walk
+	// discloses share one point-in-time. An authorize-time decision alone is
+	// only a preflight — retention disabled in-flight between authorization
+	// and disclosure must not let retained originals flow under a stale
+	// allow. No data read happens before this check, so any failure here
+	// discloses nothing.
+	if access.Originals {
+		setting, settingErr := getOrgOriginalRetentionOn(ctx, tx, filters.OrgID)
+		if settingErr != nil {
+			return 0, fmt.Errorf("request export retention: %w", settingErr)
+		}
+		if !setting.Effective {
+			return 0, ErrOriginalRetentionDisabled
+		}
+	}
 	total, err := streamRequestExport(ctx,
 		func(ctx context.Context, f RequestListFilters) ([]RequestListRow, int, error) {
 			return listRequestsOn(ctx, tx, f)
