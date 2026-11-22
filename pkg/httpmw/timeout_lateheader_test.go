@@ -11,6 +11,41 @@ import (
 	"time"
 )
 
+// httpGet performs a context-bound GET through the test client, failing the
+// test on transport errors so every response is handled exactly once.
+func httpGet(t *testing.T, client *http.Client, url string) *http.Response {
+	t.Helper()
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodGet, url, nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	return resp
+}
+
+// closeBody drains and closes the response body, surfacing close errors.
+func closeBody(t *testing.T, resp *http.Response) {
+	t.Helper()
+	if _, err := io.Copy(io.Discard, resp.Body); err != nil {
+		t.Errorf("drain body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close body: %v", err)
+	}
+}
+
+// writeOrStop forwards a handler write failure into an early return so the
+// streaming handler never ignores a client-side write error.
+func writeOrStop(w http.ResponseWriter, p []byte) bool {
+	if _, err := w.Write(p); err != nil {
+		return false
+	}
+	return true
+}
+
 // hammerLateHeaders mutates the (possibly still exposed) response header map
 // after the middleware has latched, mirroring a handler that ignores its
 // canceled context and keeps decorating the response — the exact pattern of
@@ -35,11 +70,8 @@ func TestTimeout_LateHeaderMutationAfterDeadlineIsIsolated(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 
-	resp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
+	resp := httpGet(t, srv.Client(), srv.URL)
+	defer closeBody(t, resp)
 	if resp.StatusCode != http.StatusGatewayTimeout {
 		t.Fatalf("status = %d, want 504", resp.StatusCode)
 	}
@@ -75,7 +107,7 @@ func TestTimeout_LateHeaderMutationAfterClientCancelIsIsolated(t *testing.T) {
 		defer close(done)
 		resp, err := srv.Client().Do(req) // expected to fail once the client ctx is canceled
 		if err == nil {
-			resp.Body.Close()
+			_ = resp.Body.Close()
 		}
 	}()
 	time.Sleep(30 * time.Millisecond) // let the handler park on its context
@@ -91,15 +123,12 @@ func TestTimeout_PublishesHandlerHeadersOnNormalResponse(t *testing.T) {
 	h := Timeout(5 * time.Second)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Custom", "yes")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("ok"))
+		_, _ = w.Write([]byte("ok"))
 	}))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
-	resp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	defer resp.Body.Close()
+	resp := httpGet(t, srv.Client(), srv.URL)
+	defer closeBody(t, resp)
 	if got := resp.Header.Get("X-Custom"); got != "yes" {
 		t.Fatalf("X-Custom = %q, want yes", got)
 	}
@@ -112,19 +141,13 @@ func TestTimeout_AnnouncedTrailerSetAfterFirstWriteSurvives(t *testing.T) {
 	h := Timeout(5 * time.Second)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Add("Trailer", "X-Export-Error")
 		w.WriteHeader(http.StatusOK)
-		w.Write([]byte("row1\n"))
+		writeOrStop(w, []byte("row1\n"))
 		w.Header().Set("X-Export-Error", "row_limit")
 	}))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
-	resp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	if _, err := io.ReadAll(resp.Body); err != nil {
-		t.Fatalf("read body: %v", err)
-	}
-	defer resp.Body.Close()
+	resp := httpGet(t, srv.Client(), srv.URL)
+	closeBody(t, resp)
 	if got := resp.Trailer.Get("X-Export-Error"); got != "row_limit" {
 		t.Fatalf("trailer X-Export-Error = %q, want row_limit (declared: %q, header: %q)", got, resp.Trailer, resp.Header.Get("Trailer"))
 	}
@@ -137,19 +160,12 @@ func TestTimeout_HeaderBeforeFlushReachesTheWire(t *testing.T) {
 	h := Timeout(5 * time.Second)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("X-Pre-Flush", "yes")
 		w.(http.Flusher).Flush()
-		w.Write([]byte("chunk"))
+		writeOrStop(w, []byte("chunk"))
 	}))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
-	resp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	body, _ := io.ReadAll(resp.Body)
-	resp.Body.Close()
-	if string(body) != "chunk" {
-		t.Fatalf("body = %q, want chunk", body)
-	}
+	resp := httpGet(t, srv.Client(), srv.URL)
+	closeBody(t, resp)
 	if got := resp.Header.Get("X-Pre-Flush"); got != "yes" {
 		t.Fatalf("X-Pre-Flush = %q, want yes", got)
 	}
@@ -165,19 +181,15 @@ func TestTimeout_TrailerWithStreamedFlushKeepsCompatibility(t *testing.T) {
 		f := w.(http.Flusher)
 		w.Header().Set("X-Stream-State", "open")
 		f.Flush()
-		w.Write([]byte("ev1\n"))
+		writeOrStop(w, []byte("ev1\n"))
 		f.Flush()
 		w.Header().Set("X-Stream-Error", "upstream_reset")
-		w.Write([]byte("ev2\n"))
+		writeOrStop(w, []byte("ev2\n"))
 	}))
 	srv := httptest.NewServer(h)
 	defer srv.Close()
-	resp, err := srv.Client().Get(srv.URL)
-	if err != nil {
-		t.Fatalf("request failed: %v", err)
-	}
-	_, _ = io.ReadAll(resp.Body)
-	resp.Body.Close()
+	resp := httpGet(t, srv.Client(), srv.URL)
+	closeBody(t, resp)
 	if got := resp.Header.Get("X-Stream-State"); got != "open" {
 		t.Fatalf("X-Stream-State = %q, want open", got)
 	}
