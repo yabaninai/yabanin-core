@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/reireirei/yabanin/pkg/provider"
@@ -292,7 +294,7 @@ func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey 
 }
 
 func (c *Client) sendForward(req *http.Request, sent []byte) (http.Header, []byte, []byte, error) {
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil, nil, errors.New("upstream request timeout")
@@ -381,7 +383,7 @@ func (c *Client) Stream(ctx context.Context, data []byte, apiKey string) (*http.
 		req.Header.Set(requestid.RequestIDHeader, string(id))
 	}
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, errors.New("upstream stream deadline exceeded")
@@ -446,7 +448,7 @@ func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string
 		req.Header.Set(requestid.RequestIDHeader, string(id))
 	}
 	applyExtraHeaders(req, extra)
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, errors.New("upstream request timeout")
@@ -457,6 +459,20 @@ func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 	return resp, nil
+}
+
+func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
+	var wrote atomic.Bool
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			wrote.Store(true)
+		},
+	}
+	resp, err := c.client.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	if err != nil && wrote.Load() {
+		return resp, &retry.RequestMayHaveBeenSentError{Err: err}
+	}
+	return resp, err
 }
 
 // applyExtraHeaders overlays extra onto req. An empty value removes the header.

@@ -42,3 +42,23 @@ func IsRequestNotSent(err error) bool {
 	var ns *RequestNotSentError
 	return errors.As(err, &ns)
 }
+
+// RequestMayHaveBeenSentError marks a failed transport operation after an
+// HTTP request hop may have reached its recipient.
+type RequestMayHaveBeenSentError struct {
+	Err error
+}
+
+func (e *RequestMayHaveBeenSentError) Error() string {
+	if e == nil || e.Err == nil {
+		return "request may have been sent"
+	}
+	return e.Err.Error()
+}
+
+func (e *RequestMayHaveBeenSentError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Err
+}
