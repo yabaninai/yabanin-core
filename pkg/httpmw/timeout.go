@@ -32,10 +32,33 @@ type timeoutWriter struct {
 	w           http.ResponseWriter
 	hijack      func() (net.Conn, *bufio.ReadWriter, error)
 	timedOut    bool
+	synced      bool
+	hdr         http.Header
 	wroteHeader bool
 }
 
-func (tw *timeoutWriter) Header() http.Header { return tw.w.Header() }
+// Header returns the writer-owned header map. The handler goroutine is the
+// only mutator of this map; the middleware goroutine reads it only after the
+// handler goroutine has finished, and syncs it before the first forwarded
+// write. Returning the underlying writer's map here would let a late handler
+// mutate the real response header map that net/http clones in finishRequest —
+// the live concurrent-map fatal this wrapper prevents.
+func (tw *timeoutWriter) Header() http.Header { return tw.hdr }
+
+// syncHeadersLocked copies the handler-set headers into the real response
+// header map exactly once, before the first forwarded write. It runs on the
+// handler goroutine while the middleware goroutine is parked in select; once
+// the deadline latch fires, forwarding is permanently off, so the two
+// goroutines never touch the real map concurrently.
+func (tw *timeoutWriter) syncHeadersLocked() {
+	if tw.synced {
+		return
+	}
+	tw.synced = true
+	for k, vv := range tw.hdr {
+		tw.w.Header()[k] = vv
+	}
+}
 
 func (tw *timeoutWriter) Write(p []byte) (int, error) {
 	tw.mu.Lock()
@@ -43,6 +66,7 @@ func (tw *timeoutWriter) Write(p []byte) (int, error) {
 	if tw.timedOut {
 		return 0, http.ErrHandlerTimeout
 	}
+	tw.syncHeadersLocked()
 	tw.wroteHeader = true // Write implies an implicit WriteHeader(200)
 	return tw.w.Write(p)
 }
@@ -53,6 +77,7 @@ func (tw *timeoutWriter) WriteHeader(statusCode int) {
 	if tw.timedOut {
 		return
 	}
+	tw.syncHeadersLocked()
 	tw.wroteHeader = true
 	tw.w.WriteHeader(statusCode)
 }
@@ -130,7 +155,7 @@ func timeoutHandler(timeout time.Duration) func(http.Handler) http.Handler {
 			r = r.Clone(ctx)
 			r = r.WithContext(context.WithValue(ctx, TimeoutKey, timeout))
 
-			tw := &timeoutWriter{w: w}
+			tw := &timeoutWriter{w: w, hdr: make(http.Header)}
 			if hj, ok := w.(http.Hijacker); ok {
 				tw.hijack = hj.Hijack
 			}
@@ -181,7 +206,29 @@ func timeoutHandler(timeout time.Duration) func(http.Handler) http.Handler {
 					tw.mu.Unlock()
 				}
 			case <-done:
-				// Handler completed normally — nothing to do
+				// Handler completed — publish its final header intent. The
+				// handler goroutine has finished, so reading tw.hdr is safe.
+				tw.mu.Lock()
+				if !tw.wroteHeader {
+					for k, vv := range tw.hdr {
+						tw.w.Header()[k] = vv
+					}
+				} else if announced := tw.hdr.Get("Trailer"); len(announced) > 0 {
+					// Response already started: only announced trailer values
+					// set after the first write (e.g. X-Export-Error) can
+					// still reach the wire.
+					for _, name := range strings.Split(announced, ",") {
+						name = strings.TrimSpace(name)
+						if name == "" {
+							continue
+						}
+						key := http.CanonicalHeaderKey(name)
+						if vv, ok := tw.hdr[key]; ok {
+							tw.w.Header()[key] = vv
+						}
+					}
+				}
+				tw.mu.Unlock()
 			}
 		})
 	}
