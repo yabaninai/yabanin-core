@@ -38,9 +38,9 @@ func TestDeductMicroSerializationRetryExhaustionLeavesNoDebit(t *testing.T) {
 	installCreditInsertSerializationFailure(t, ctx, pool, maxDeductRetries+1)
 
 	err := NewStore(pool, nil).DeductMicro(ctx, org, money.MicroUSD(250000), request, nil)
-	if !isSerializationFailure(err) {
-		t.Fatalf("retry exhaustion must return the serialization failure, got %v", err)
-	}
+	var pgErr *pgconn.PgError
+	require.ErrorAs(t, err, &pgErr)
+	require.Equal(t, "40001", pgErr.Code)
 	assertRetrySequence(t, ctx, pool, int64(maxDeductRetries+1))
 	assertCreditState(t, ctx, pool, org, 100, 0, 0, 0)
 	requireReconciled(ctx, t, pool, org)
@@ -95,10 +95,11 @@ func TestDeductOnceMicroClosedPoolFailsBeforeTransaction(t *testing.T) {
 	pool, err := pgxpool.New(ctx, "postgres://unused:unused@127.0.0.1:1/unused")
 	require.NoError(t, err)
 	pool.Close()
+	_, poolErr := pool.Acquire(ctx)
+	require.Error(t, poolErr)
 	err = NewStore(pool, nil).deductOnceMicro(ctx, "org-credit", money.MicroUSD(1), "request-credit", "", nil, false)
-	if err == nil || errors.Is(err, ErrInsufficientCredits) {
-		t.Fatalf("closed pool must fail at transaction start, got %v", err)
-	}
+	require.ErrorIs(t, err, poolErr)
+	require.ErrorContains(t, err, "deduct begin tx")
 }
 
 func installCreditInsertSerializationFailure(t *testing.T, ctx context.Context, pool *pgxpool.Pool, failures int) {
@@ -155,7 +156,6 @@ func TestEffectiveBalanceOverflowInCheckBalanceFailsClosed(t *testing.T) {
 	require.NoError(t, err)
 
 	balance, err := NewStore(pool, nil).CheckBalance(ctx, org)
-	if err == nil || balance != nil {
-		t.Fatalf("unrepresentable wallet must fail closed, balance=%+v err=%v", balance, err)
-	}
+	require.Nil(t, balance)
+	require.EqualError(t, err, "balance 9223372036854775807 cents out of representable range")
 }
