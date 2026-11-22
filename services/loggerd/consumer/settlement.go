@@ -1082,7 +1082,19 @@ func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, ex
 }
 
 func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settlementJob, execErr error, reason string) {
-	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr), job.Attempts)
+	// Durable parity with the batch executor (writeTerminalStates) only
+	// where the classification has a documented batch disposition code AND
+	// a pinned assertion: insufficient_credits and request_identity_
+	// conflict. Every other terminal outcome keeps the raw bounded
+	// diagnostic (poison guard text, no-wallet text, invocation sentinel,
+	// retry-budget exhaustion) — the classifier's reason and the full
+	// error stay in the parked log below either way.
+	durable := truncateErr(execErr)
+	switch reason {
+	case budget.ReasonInsufficientCredits, budget.ReasonIdentityConflict:
+		durable = reason
+	}
+	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, durable, job.Attempts)
 	if err != nil {
 		w.logger.Error("settlement requires-attention mark failed",
 			slog.Int64("job_id", job.ID),

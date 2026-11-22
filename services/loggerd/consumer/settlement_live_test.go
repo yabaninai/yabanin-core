@@ -383,7 +383,8 @@ func TestSettlementLive_InsufficientFundsBecomesDurableDebt(t *testing.T) {
 
 	status, _, lastErr := jobStatus(ctx, t, pool, jobID)
 	assert.Equal(t, "requires_attention", status)
-	assert.Contains(t, lastErr, "insufficient credits", "the durable record names the reason")
+	assert.Equal(t, budget.ReasonInsufficientCredits, lastErr,
+		"the durable record carries the classified reason (durable parity with the batch executor)")
 
 	balance, _ := requireWalletState(ctx, t, pool, af06OrgA)
 	assert.Equal(t, int64(-100), balance, "floor is not bypassed: wallet untouched")
@@ -449,7 +450,8 @@ func TestSettlementLive_SameRequestOtherOrgDoesNotStealCharge(t *testing.T) {
 	assert.Equal(t, "settled", statusA)
 	statusB, _, lastErrB := jobStatus(ctx, t, pool, jobB)
 	assert.Equal(t, "requires_attention", statusB, "identity conflict is a diagnostic, not a charge")
-	assert.Contains(t, strings.ToLower(lastErrB), "duplicate", "last_error names the unique violation")
+	assert.Equal(t, "request_identity_conflict", lastErrB,
+		"last_error carries the classified disposition reason (durable parity with the batch executor); the raw unique-violation text stays in the worker log")
 
 	rowsA, microA := ledgerUsage(ctx, t, pool, af06OrgA, "req-af06-shared")
 	assert.Equal(t, int64(1), rowsA)
