@@ -46,13 +46,14 @@ func (f *bodyBoundsFixture) serveBody(t *testing.T, body []byte) http.HandlerFun
 // serveShortRead declares the full claimed length and then breaks the
 // connection after prefix bytes: the dispatch happened, but the success
 // body never arrives completely.
-func (f *bodyBoundsFixture) serveShortRead(t *testing.T, body []byte, prefix int) http.HandlerFunc {
+func (f *bodyBoundsFixture) serveShortRead(t *testing.T, status int, body []byte, prefix int) http.HandlerFunc {
 	t.Helper()
 	return func(w http.ResponseWriter, r *http.Request) {
 		f.contacts.Add(1)
 		f.declaredLen.Store(int64(len(body)))
 		w.Header().Set("Content-Length", strconv.Itoa(len(body)))
 		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
 		n, _ := w.Write(body[:prefix])
 		f.servedBytes.Store(int64(n))
 	}
@@ -225,7 +226,7 @@ func TestMessagesNativeJSON_OversizedUpstreamRefusedNotTruncated(t *testing.T) {
 func TestMessagesNativeJSON_ShortReadSuppressesReplay(t *testing.T) {
 	full := anthropicBodyOfSize(t, 4096)
 	var fixture bodyBoundsFixture
-	server := newBodyBoundsServer(t, fixture.serveShortRead(t, full, 256))
+	server := newBodyBoundsServer(t, fixture.serveShortRead(t, http.StatusOK, full, 256))
 	store := &fakeInvocationStore{}
 	var capture bodyBoundsEvents
 	gw := bodyBoundsMessagesGateway(t, server.URL, store, &capture)
@@ -285,7 +286,7 @@ func TestResponsesNativeJSON_OversizedUpstreamRefusedNotTruncated(t *testing.T) 
 func TestResponsesNativeJSON_ShortReadSuppressesReplay(t *testing.T) {
 	full := responsesBodyOfSize(t, 4096)
 	var fixture bodyBoundsFixture
-	server := newBodyBoundsServer(t, fixture.serveShortRead(t, full, 256))
+	server := newBodyBoundsServer(t, fixture.serveShortRead(t, http.StatusOK, full, 256))
 	store := &fakeInvocationStore{}
 	var capture bodyBoundsEvents
 	gw := bodyBoundsResponsesGateway(t, server.URL, store, &capture)
@@ -321,5 +322,30 @@ func TestNativeBufferedProviderErrorBound(t *testing.T) {
 				t.Fatalf("provider error returned status %d and %d bytes, want 429 and %d bytes", rec.Code, rec.Body.Len(), tc.limit)
 			}
 		})
+	}
+}
+
+func TestNativePaidErrorBodyShortRead(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		gateway func(*testing.T, string, *fakeInvocationStore, *bodyBoundsEvents) *gateway
+		post    func(*testing.T, *gateway, string) *httptest.ResponseRecorder
+		body    string
+	}{
+		{"messages", bodyBoundsMessagesGateway, postMessages, `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"Hi"}],"max_tokens":8,"stream":%t}`},
+		{"responses", bodyBoundsResponsesGateway, postResponses, `{"model":"m","input":"Hi","stream":%t}`},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				var fixture bodyBoundsFixture
+				buf := []byte(`{"error":"aaaabbbb"}`)
+				server := newBodyBoundsServer(t, fixture.serveShortRead(t, http.StatusUnprocessableEntity, buf, len(buf)-3))
+				store := &fakeInvocationStore{}
+				var capture bodyBoundsEvents
+				gw := tc.gateway(t, server.URL, store, &capture)
+				rec := tc.post(t, gw, fmt.Sprintf(tc.body, stream))
+				assertRefusalNotPayable(t, rec, store, &capture, &fixture, "failed to read upstream response")
+			})
+		}
 	}
 }

@@ -215,9 +215,21 @@ func writePaidBodyError(w http.ResponseWriter, message string) {
 
 // Keep provider errors within their passthrough bound. A success needs one
 // extra byte to distinguish an exact fit from a truncated answer.
-func readNativeBufferedBody(resp *http.Response, limit int64) ([]byte, error) {
+func readNativeBufferedBody(w http.ResponseWriter, gate *reservationGate, resp *http.Response, limit int64) ([]byte, bool) {
+	readLimit := limit
 	if resp.StatusCode == http.StatusOK {
-		limit++
+		readLimit++
 	}
-	return io.ReadAll(io.LimitReader(resp.Body, limit))
+	body, err := io.ReadAll(io.LimitReader(resp.Body, readLimit))
+	if err != nil {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, "failed to read upstream response")
+		return nil, false
+	}
+	if int64(len(body)) > limit {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, "upstream response too large")
+		return nil, false
+	}
+	return body, true
 }

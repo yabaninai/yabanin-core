@@ -63,47 +63,16 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 
-	// NEXT-18c (ADR-0001 §5.1): pre-check + reserve before the upstream
-	// call (no cache branch on this pipeline). The gate rides the
-	// request-derived context for the finishers below.
-	rctx := withPolicyEvent(r.Context(), policyEvent)
-	rctx = withInvocationIdentity(rctx, admitted.Invocation)
-	gate, ok := gw.reservationPlan(w, r, "responses.native",
-		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
-			admitted.Info, admitted.Body, nil, false))
+	ctx := withPolicyEvent(r.Context(), policyEvent)
+	rctx, gate, ok := gw.reservePaidDispatch(ctx, w, r, "responses.native", admitted, nil, false)
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
+	client, upstreamBody, apiKey, _, upstreamURL, ok := gw.paidUpstreamClient(l, w, gate, admitted, prov)
+	if !ok {
 		return
 	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, prov)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", prov, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
-		return
-	}
-	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
-	// Preview2 durable accounting: the confirmed start commits immediately
-	// BEFORE the first paid provider dispatch — after every fallible local
-	// setup step above (pool wiring, model remap), so a local failure never
-	// strands a durable admission for a request that never dispatched. One
-	// admission per request; the JSON and stream branches below share it
-	// and the kind binds to the transport actually dispatched. Fail closed:
-	// an unwritten start (write error, timeout or lost ACK — outcome
-	// unknown) refuses the request with ZERO provider arrivals under the
-	// history_unavailable envelope, and the escrow is released.
-	if err := gw.confirmPaidInvocation(rctx, invocationKindForChat(probe.Stream)); err != nil {
-		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
-		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
-		writeInvocationStartRefusal(w, err)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindForChat(probe.Stream)) {
 		return
 	}
 	if probe.Stream {
@@ -134,31 +103,13 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
 		return
 	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			l.Debug("close upstream body", "error", cerr)
-		}
-	}()
-	limited, err := readNativeBufferedBody(resp, responsesBodyLimit)
-	if err != nil {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		writePaidBodyError(w, "failed to read upstream response")
+	defer closeUpstream(l, resp)
+	limited, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
+	if !ok {
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		if ferr := gw.finishResponsesNative(w, rctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); ferr != nil {
-			// The client envelope is already the upstream failure; the
-			// withheld event is logged loudly (finishRequestLogged canon).
-			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
-		}
-		copyResponsesPassthrough(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(limited)
-		return
-	}
-	if len(limited) > responsesBodyLimit {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		writePaidBodyError(w, "upstream response too large")
+		gw.forwardResponsesError(w, rctx, l, admitted, resp, limited, upstreamURL, started)
 		return
 	}
 	usage := parseResponsesUsage(limited)
@@ -198,6 +149,15 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 	_, _ = w.Write(limited)
 }
 
+func (gw *gateway) forwardResponsesError(w http.ResponseWriter, ctx context.Context, l *slog.Logger, admitted admitted, resp *http.Response, body []byte, upstreamURL string, started time.Time) {
+	if err := gw.finishResponsesNative(w, ctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); err != nil {
+		l.Error("terminal facts commit failed; event withheld from consumer", "error", err)
+	}
+	copyResponsesPassthrough(w.Header(), resp.Header)
+	w.WriteHeader(resp.StatusCode)
+	_, _ = w.Write(body)
+}
+
 func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, started time.Time) {
 	l := logctx.From(rctx, gw.log)
 	streamCtx, cancelStream := context.WithCancel(rctx)
@@ -209,24 +169,13 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
 		return
 	}
-	defer func() {
-		if cerr := resp.Body.Close(); cerr != nil {
-			l.Debug("close upstream body", "error", cerr)
-		}
-	}()
+	defer closeUpstream(l, resp)
 	if resp.StatusCode != http.StatusOK {
-		limited, readErr := io.ReadAll(io.LimitReader(resp.Body, responsesBodyLimit))
-		if readErr != nil {
-			gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-			apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		limited, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
+		if !ok {
 			return
 		}
-		if ferr := gw.finishResponsesNative(w, rctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); ferr != nil {
-			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
-		}
-		copyResponsesPassthrough(w.Header(), resp.Header)
-		w.WriteHeader(resp.StatusCode)
-		_, _ = w.Write(limited)
+		gw.forwardResponsesError(w, rctx, l, admitted, resp, limited, upstreamURL, started)
 		return
 	}
 	copyResponsesPassthrough(w.Header(), resp.Header)
