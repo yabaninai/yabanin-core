@@ -12,31 +12,20 @@ import (
 	"github.com/reireirei/yabanin/pkg/circuit"
 )
 
-// refusalAdmissionsClosed reports whether the admission accounting for one
-// refused request behind a dispatched call with identity healthyID is exact:
-// the refusal starts at most one admission with an identity distinct from
-// the dispatch, and the void list equals that admission exactly once — no
-// repeated void, no substitution with the dispatched identity, nothing
-// missing. Zero starts (early rejection before admission) is valid and
-// voids nothing.
+// A breaker refusal may create one new admission. Only that admission may be voided.
 func refusalAdmissionsClosed(admitted []admissionRecord, voided []string, healthyID string) bool {
-	extra := len(admitted) - 1
-	if extra < 0 || extra > 1 || len(voided) != extra {
+	if healthyID == "" || len(admitted) == 0 || admitted[0].InvocationID != healthyID {
 		return false
 	}
-	seen := make(map[string]bool, len(voided))
-	for _, id := range voided {
-		if id == healthyID || seen[id] {
-			return false
-		}
-		seen[id] = true
+	switch len(admitted) {
+	case 1:
+		return len(voided) == 0
+	case 2:
+		refusedID := admitted[1].InvocationID
+		return refusedID != "" && refusedID != healthyID && len(voided) == 1 && voided[0] == refusedID
+	default:
+		return false
 	}
-	for _, rec := range admitted[1:] {
-		if !seen[rec.InvocationID] {
-			return false
-		}
-	}
-	return true
 }
 
 func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
@@ -54,6 +43,7 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 				require.Equal(t, 1, upstream.totalCalls(), "the healthy call contacted the provider exactly once")
 				require.Len(t, store.admitted, 1)
+				healthyID := store.admitted[0].InvocationID
 				require.Len(t, store.facts, 1)
 				key := circuit.GlobalBreakerKey
 				if scope == circuit.ScopePerEndpoint {
@@ -73,7 +63,7 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 				}
 				require.Equal(t, 1, upstream.totalCalls(), "entry refusal contacted provider")
 				require.Len(t, store.facts, 1, "entry refusal added a terminal charge")
-				require.True(t, refusalAdmissionsClosed(store.admitted, store.voided, store.admitted[0].InvocationID),
+				require.True(t, refusalAdmissionsClosed(store.admitted, store.voided, healthyID),
 					"breaker refusal must close its admission exactly: %d admissions, voided %v", len(store.admitted), store.voided)
 			})
 		}
@@ -103,6 +93,15 @@ func TestRefusalAdmissionsClosed(t *testing.T) {
 			name:     "correct zero-start early rejection",
 			admitted: []admissionRecord{{InvocationID: "dispatched"}},
 			want:     true,
+		},
+		{
+			name:     "healthy admission replaced during refusal",
+			admitted: []admissionRecord{{InvocationID: "replacement"}},
+		},
+		{
+			name:     "empty refusal identity cannot witness a void",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {}},
+			voided:   []string{""},
 		},
 		{
 			name:     "duplicate admission starts for one refusal",
