@@ -607,8 +607,11 @@ func TestGoldenEvent_Chat_UnknownModelReject(t *testing.T) {
 		OrgID:          "org-g1",
 		TeamID:         "team-g1",
 		ModelRequested: "ghost",
-		Error:          `model "ghost" is not available on this gateway`,
-		Labels:         map[string]string{},
+		// Refusal history: the exact wire status is stamped on the event so
+		// the consumer's typed refusal record binds the client-visible 404.
+		StatusCode: http.StatusNotFound,
+		Error:      `model "ghost" is not available on this gateway`,
+		Labels:     map[string]string{},
 	}, nil)
 }
 
@@ -959,8 +962,11 @@ func TestGoldenEvent_Admission_UnknownModelReject_NoChatPath(t *testing.T) {
 		OrgID:          "org-g1",
 		TeamID:         "team-g1",
 		ModelRequested: "ghost",
-		Error:          `model "ghost" is not available on this gateway`,
-		Labels:         map[string]string{},
+		// Refusal history: the exact wire status is stamped on the event so
+		// the consumer's typed refusal record binds the client-visible 404.
+		StatusCode: http.StatusNotFound,
+		Error:      `model "ghost" is not available on this gateway`,
+		Labels:     map[string]string{},
 	}, nil)
 }
 

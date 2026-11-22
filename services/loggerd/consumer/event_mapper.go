@@ -769,6 +769,38 @@ func budgetRequestLogRow(ev requestEvent, sessionID any, errorMsg string) *reque
 	return r
 }
 
+// refusalRequestLogRow is the typed pre-dispatch refusal projection: a
+// request.invalid event whose producer stamped the exact wire status. The
+// shape mirrors the budget refusal (no dispatch happened: model_used empty,
+// method POST, zero duration/tokens) with two differences — the status is
+// the event's own wire status bound verbatim (never a shape default), and
+// the error is the verbatim client-facing refusal message (nil when empty).
+// No response/upstream column is bound under any profile: the refusal
+// records the demand and the reason, never the refused payload.
+func refusalRequestLogRow(ev requestEvent, sessionID any, statusCode int64) *requestLogRow {
+	r := &requestLogRow{}
+	r.set("session_id", sessionID)
+	r.set("org_id", ev.orgIDValue)
+	r.set("model_requested", ev.modelRequested)
+	r.setLiteral("model_used", "''")
+	r.setLiteral("method", "'POST'")
+	r.set("status_code", statusCode)
+	r.setLiteral("duration_ms", "0")
+	r.setLiteral("tokens_in", "0")
+	r.setLiteral("tokens_out", "0")
+	r.set("error", ev.errorOptional())
+	r.set("request_id", ev.requestIDValue)
+	r.set("team_id", ev.teamIDValue)
+	r.set("prompt_hash", ev.promptHash)
+	r.set("task_id", ev.g2.taskIDStr)
+	r.set("agent_id", ev.g2.agentIDStr)
+	r.set("routing_decision", ev.g2.routingDecision)
+	r.set("labels", ev.labels)
+	r.set("user_id", ev.g2.userIDStr)
+	r.set("created_at", ev.createdAt) // W-LOGG: event business time
+	return r
+}
+
 // parseFloat64 extracts a float64 from a Redis stream field map.
 // go-redis v9 returns all stream field values as strings, so we must parse.
 func parseFloat64(fields map[string]interface{}, key string) float64 {

@@ -481,6 +481,8 @@ func fam01Admit01(t *testing.T) {
 	ev := fam01FindEvent(events(), "request.invalid")
 	require.NotNil(t, ev, "the unknown-model rejection must publish request.invalid")
 	require.Equal(t, "m", ev.ModelRequested)
+	require.Equal(t, int64(http.StatusNotFound), ev.StatusCode,
+		"the refusal event carries the exact wire status for the typed refusal history")
 	restore()
 
 	// Unknown model + fallback → resolved core carries the fallback.
@@ -972,6 +974,8 @@ func fam01GeneratedAdmit(t *testing.T, name string) {
 	ev := fam01FindEvent(events(), "request.invalid")
 	require.NotNil(t, ev, "the unknown-model rejection must publish request.invalid")
 	require.Equal(t, name, ev.ModelRequested, "the event carries the exact requested name")
+	require.Equal(t, int64(http.StatusNotFound), ev.StatusCode,
+		"the refusal event carries the exact wire status for the typed refusal history")
 }
 
 // fam01GeneratedHop sends one judge hop whose TARGET is the derived name and
