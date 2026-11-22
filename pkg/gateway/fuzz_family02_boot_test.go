@@ -20,8 +20,12 @@ package cli
 //	                        (zero unintended upstream effects incl. a later
 //	                        denied request); exact X-Request-ID receipt
 //	                        upstream; spoofed X-Org-Id stripped upstream;
-//	                        gateway key never forwarded upstream; degraded
-//	                        health visible (503 redis down) while serving
+//	                        upstream credential = exact cfg.APIKey fallback
+//	                        (documented chain, gateway.go wiring); degraded
+//	                       health visible (503 redis down) while serving;
+//	                       served request durably admitted with bound terminal facts
+//	                       (0028); the duplicate-correlation repeat admits and
+//	                       dispatches again (client_request_id is correlation-only)
 //	F02-21 BOOT-NEGATIVE  Validate wrap ("invalid gateway config" +
 //	                        auth_mode / event_stream texts); buildGateway
 //	                        passthrough (invalid encryption_key, NOT the
@@ -35,9 +39,12 @@ package cli
 //	                        through the traced router, upstream hits 0
 //	                        (no completion -> no shadow mirror, no publish)
 //	F02-23 BOOT-JWT       JWTWiring boot against a loopback JWKS: valid
-//	                        RS256 -> 200, upstream sees the token org id
-//	                        exactly once; static gateway key still accepted
-//	                        (dual mode); expired/garbage tokens -> 401
+//	                        RS256 -> 200, upstream org identity hop exactly
+//	                        absent, outbound credential exactly the fixture
+//	                        fallback (never the presented token), token org
+//	                        durably admitted (0028); static gateway key
+//	                        still accepted (dual mode); expired/garbage
+//	                        tokens -> 401
 //
 // Controls: the corpus runs the same frozen seeds under the original,
 // fixed, and isolated populations with the installed 300s shared budget;
@@ -54,15 +61,25 @@ package cli
 //     loopback 127.0.0.1:1 — XAdd fails fast, errors are swallowed by the
 //     bounded retry loop, health reports degraded. F02-19 (no completed
 //     inference) is the one nil-redis boot and asserts the skipped shape.
-//   - pool stays nil: buildGateway never dials PG, and resolveModelInfo
-//     returns a static ModelInfo (upstream.go:357) so the authorized chain
-//     completes against the httptest upstream at cfg.Provider.
+//   - Positive paid-chat boots (F02-20, F02-23, generated static/JWT
+//     modes) run against one real disposable Postgres per target, migrated
+//     with the production migrations (existing testcontainers wiring): the
+//     durable-admission seam is production code with no injection seam, so a
+//     nil pool fails closed (503 history_unavailable, zero upstream calls —
+//     pinned by TestFamily02BootRefusesPaidCallsWithoutAccounting). The
+//     strict-mode org resolver consults api_keys for any presented bearer
+//     (unknown key 401s before admission), so the static gateway keys are
+//     seeded as real api_keys rows of a real org; JWT claims carry that org
+//     uuid because the org-scoped BYOK registry path needs a real uuid.
+//     Outage and negative-config postures stay pool-less.
 //   - readiness = ANY /healthz response (200 ok and 503 degraded both mean
 //     the listener is serving); failures to start are hard errors, never
 //     skips (per the family contract).
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -75,8 +92,10 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	"github.com/reireirei/yabanin/pkg/config"
+	"github.com/reireirei/yabanin/pkg/pricing"
 )
 
 // --- shared boot fixtures -----------------------------------------------------------
@@ -167,9 +186,9 @@ func (u *f02Upstream) lastBody() string {
 }
 
 // f02BootConfig builds the minimal VALID production config: strict static
-// key, required EventStream/PGURI strings (the pool itself stays nil —
-// buildGateway never dials PG), dead-loopback PG target, no RedisAddr (so
-// no cache_hmac_secret requirement).
+// key, required EventStream/PGURI strings (PGURI stays a dead-loopback
+// target — the server receives its pool as a parameter, never from
+// config), no RedisAddr (so no cache_hmac_secret requirement).
 func f02BootConfig(listen, provider, apiKey string) config.Gateway {
 	return config.Gateway{
 		GatewayServer: config.GatewayServer{
@@ -186,6 +205,92 @@ func f02BootConfig(listen, provider, apiKey string) config.Gateway {
 			FallbackModel: "smart",
 		},
 	}
+}
+
+// f02BootDB is the disposable real database behind the pool-backed boot
+// postures. The durable-admission path is production code with no injection
+// seam: a nil pool fails closed (503 history_unavailable before any
+// provider call), so positive paid-chat boots need the 0028 accounting
+// tables from the production migrations. The strict-mode org resolver also
+// consults api_keys for every presented bearer (an unknown key 401s with
+// "org resolution failed" before admission is ever reached), so the static
+// gateway keys are seeded as real api_keys rows of one real org. JWT claims
+// carry that same org uuid: the org-scoped BYOK registry path runs real
+// uuid-keyed org isolation, so a non-uuid claim org 503s the model registry.
+// A live pool also activates the real prepaid credit gate (CreditGuard
+// checks org_credits and 402s an unfunded org) and the team budget enforcer
+// (403 budget_not_configured), so the org is funded and its team has a
+// budget. Outage postures stay pool-less and assert the fail-closed
+// envelope instead.
+type f02BootDB struct {
+	pool     *pgxpool.Pool
+	loginOrg string
+}
+
+// Static gateway keys of the family; seeded as real api_keys rows when a
+// boot carries a live pool (see f02BootDB).
+const (
+	f02BootStaticKey = "f02-boot-key"
+	f02GenStaticKey  = "f02-gen-key"
+)
+
+// startF02BootDB boots one disposable Postgres per fuzz target (existing
+// testcontainers wiring: production migrations, bounded startup) and seeds
+// the org/team/api_keys rows the strict-mode resolver consults.
+func startF02BootDB(tb testing.TB) *f02BootDB {
+	tb.Helper()
+	// Container startup fails the target on unavailable Docker (no skip);
+	// the helper's cleanup terminates with a detached, bounded context so
+	// pool lifetime stays bound to this target's context.
+	dsn := startPolicyAvailabilityPostgres(tb, tb.Context())
+	pc, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		tb.Fatalf("F02 boot db: parse DSN: %v", err)
+	}
+	pc.MaxConns = 4
+	pool, err := pgxpool.NewWithConfig(tb.Context(), pc)
+	if err != nil {
+		tb.Fatalf("F02 boot db: create pool: %v", err)
+	}
+	tb.Cleanup(pool.Close)
+	ctx := tb.Context()
+	var orgID, teamID string
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO organizations (name, slug) VALUES ('f02-boot', 'f02-boot') RETURNING id::text`,
+	).Scan(&orgID); err != nil {
+		tb.Fatalf("F02 boot db: seed organization: %v", err)
+	}
+	if err := pool.QueryRow(ctx,
+		`INSERT INTO organizations_teams (org_id, name, slug) VALUES ($1::uuid, 'core', 'core') RETURNING id::text`,
+		orgID,
+	).Scan(&teamID); err != nil {
+		tb.Fatalf("F02 boot db: seed team: %v", err)
+	}
+	for _, key := range []string{f02BootStaticKey, f02GenStaticKey} {
+		sum := sha256.Sum256([]byte(key))
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO api_keys (key_hash, org_id, team_id, name, active, can_mint_sessions, labels)
+			 VALUES ($1, $2::uuid, $3::uuid, $4, true, false, '{"team":"core"}'::jsonb)`,
+			hex.EncodeToString(sum[:]), orgID, teamID, key,
+		); err != nil {
+			tb.Fatalf("F02 boot db: seed api key %s: %v", key, err)
+		}
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO org_credits (org_id, balance_cents, updated_at) VALUES ($1, 100000, now())`,
+		orgID,
+	); err != nil {
+		tb.Fatalf("F02 boot db: seed org credits: %v", err)
+	}
+	// Static keys carry team 'core'; the budget enforcer denies teams
+	// without a configured budget (403 budget_not_configured).
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO team_budgets (team_id, monthly_limit_usd, hard_limit) VALUES ($1::uuid, 1000.00, true)`,
+		teamID,
+	); err != nil {
+		tb.Fatalf("F02 boot db: seed team budget: %v", err)
+	}
+	return &f02BootDB{pool: pool, loginOrg: orgID}
 }
 
 // f02BootServer is a live RunGatewayServerWithJWT boot.
@@ -220,14 +325,21 @@ func (bs *f02BootServer) stop() error {
 // f02BootGateway boots the real server and blocks until /healthz answers
 // (any status). A server exit before readiness is a hard failure — the
 // family contract has no skip path.
-func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JWTWiring) *f02BootServer {
+func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JWTWiring, pool *pgxpool.Pool) *f02BootServer {
 	t.Helper()
 	f02BootEnv(t)
+	if pool != nil {
+		// buildGateway installs the pool-backed pricer as the process-global
+		// default at boot (gateway.go:125). Restore the TestMain baseline so
+		// sibling tests keep the file-backed chain regardless of shuffle
+		// order (main_test.go shuffle-safety contract).
+		t.Cleanup(func() { pricing.SetDefaultPricer(pricing.StaticPricer()) })
+	}
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	l := slog.New(slog.NewTextHandler(io.Discard, nil))
 	go func() {
-		done <- RunGatewayServerWithJWT(cfg, rdb, nil, nil, l, ctx, jwtw, CircuitScopeWiring{})
+		done <- RunGatewayServerWithJWT(cfg, rdb, pool, nil, l, ctx, jwtw, CircuitScopeWiring{})
 	}()
 	bs := &f02BootServer{
 		baseURL: "http://" + cfg.ListenAddr,
@@ -315,7 +427,7 @@ func f02Chat(t *testing.T, baseURL, auth, requestID, orgSpoof string) (*http.Res
 
 // --- generated-input behavior --------------------------------------------------------
 
-func f02BootGenFixture(t testing.TB) (string, JWTWiring) {
+func f02BootGenFixture(t testing.TB, org string) (string, JWTWiring) {
 	t.Helper()
 	k := mustRSAJWK(t, "boot-gen-kid")
 	srv := newJWKSServer(t, k)
@@ -326,13 +438,13 @@ func f02BootGenFixture(t testing.TB) (string, JWTWiring) {
 		OrgClaim:      "org_id",
 		KeyLabelClaim: "key_labels",
 	}
-	claims := f02OrgClaims(w.Issuer, w.Audience, "org-42")
+	claims := f02OrgClaims(w.Issuer, w.Audience, org)
 	return signToken(t, k, claims), w
 }
 
 // f02BootGenerated derives the expected outcome independently and drives one
 // full boot per execution: mode 0 static key, 1 valid JWT, 2 unauthenticated.
-func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring) {
+func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring, db *f02BootDB) {
 	t.Helper()
 	p := data
 	if len(p) < 6 {
@@ -342,7 +454,7 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring)
 	spoof, rid, traceOn := int(p[2])%2 == 1, int(p[3])%2 == 1, int(p[4])%2 == 1
 
 	up := f02UpstreamRecorder(t)
-	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "f02-gen-key")
+	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02GenStaticKey)
 	if adminOn {
 		cfg.AdminListen = f02FreeAddr(t)
 		cfg.MetricsEnabled = int(p[5])%2 == 1
@@ -358,7 +470,7 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring)
 	case 1:
 		jwtw, auth = wiring, "Bearer "+token
 	}
-	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw)
+	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw, db.pool)
 
 	ridVal := ""
 	if rid {
@@ -388,12 +500,30 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring)
 		t.Fatalf("F02 gen boot: upstream X-Request-ID %q, want exact f02-gen-rid",
 			up.lastHeader().Get("X-Request-ID"))
 	}
-	if wantHits == 1 && spoof {
-		if mode == 1 && up.lastHeader().Get("X-Org-Id") != "org-42" {
-			t.Fatalf("F02 gen boot: jwt upstream org %q, want org-42", up.lastHeader().Get("X-Org-Id"))
+	if wantHits == 1 {
+		// Exact outbound identity contract (upstream.Client forwards only
+		// X-Request-ID): the org identity hop is exactly absent in every
+		// mode — client-sent spoofs and claim orgs alike.
+		if got := up.lastHeader().Get("X-Org-Id"); got != "" {
+			t.Fatalf("F02 gen boot: unexpected upstream org identity hop (len %d), want none", len(got))
 		}
-		if mode == 0 && up.lastHeader().Get("X-Org-Id") == "org-spoof" {
-			t.Fatal("F02 gen boot: spoofed X-Org-Id reached the upstream")
+		// Successful requests repeat against the same seed keys and
+		// database: client_request_id-style state must not swallow the
+		// replay, so the identical call dispatches again.
+		resp2, _ := f02Chat(t, bs.baseURL, auth, ridVal, spoofVal)
+		if resp2.StatusCode != http.StatusOK {
+			t.Fatalf("F02 gen boot: mode=%d repeat = %d, want 200", mode, resp2.StatusCode)
+		}
+		if got := up.count(); got != 2 {
+			t.Fatalf("F02 gen boot: mode=%d repeat: upstream hits %d, want exactly 2", mode, got)
+		}
+		if rid && up.lastHeader().Get("X-Request-ID") != "f02-gen-rid" {
+			t.Fatalf("F02 gen boot: mode=%d repeat: upstream X-Request-ID %q, want exact f02-gen-rid",
+				mode, up.lastHeader().Get("X-Request-ID"))
+		}
+		if got := up.lastHeader().Get("X-Org-Id"); got != "" {
+			t.Fatalf("F02 gen boot: mode=%d repeat: unexpected upstream org identity hop (len %d), want none",
+				mode, len(got))
 		}
 	}
 }
@@ -403,11 +533,11 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring)
 // F02-19 lifecycle: boot, health, unauthenticated denial, clean shutdown,
 // closed listener. The one nil-redis boot (no completed inference -> no
 // publish, so the nil client is never dereferenced).
-func fuzzF0219(t *testing.T) {
+func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	t.Helper()
 	up := f02UpstreamRecorder(t)
-	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "f02-boot-key")
-	bs := f02BootGateway(t, cfg, nil, JWTWiring{})
+	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
+	bs := f02BootGateway(t, cfg, nil, JWTWiring{}, nil)
 
 	code, m, hdr := f02HealthJSON(t, bs.baseURL)
 	if code != http.StatusOK || m["status"] != "ok" || m["redis"] != "skipped" {
@@ -448,11 +578,11 @@ func fuzzF0219(t *testing.T) {
 
 // F02-20 authorized chain through the booted server, with exact request-ID
 // receipt, identity hygiene, and the zero-side-effect upstream oracle.
-func fuzzF0220(t *testing.T) {
+func fuzzF0220(t *testing.T, db *f02BootDB) {
 	t.Helper()
 	up := f02UpstreamRecorder(t)
-	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "f02-boot-key")
-	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{})
+	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
+	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{}, db.pool)
 
 	// Dead redis is visible in health but must not block serving.
 	code, m, _ := f02HealthJSON(t, bs.baseURL)
@@ -492,17 +622,78 @@ func fuzzF0220(t *testing.T) {
 	if got := h.Get("X-Org-Id"); got == "org-hacker" {
 		t.Fatal("F02-20: spoofed X-Org-Id reached the upstream")
 	}
-	if auth := h.Get("Authorization"); strings.Contains(auth, "f02-boot-key") {
-		t.Fatalf("F02-20: gateway key leaked upstream: %q", auth)
+	// Upstream credential contract (gateway.go newGatewayWiring): an empty
+	// encryption key disables per-model keys, and the gateway falls back to
+	// cfg.APIKey as the upstream credential — the static gateway key is by
+	// contract the same secret, so the pinned posture is the EXACT fallback
+	// credential (any drift, e.g. client-passthrough of a different bearer,
+	// fails this pin).
+	if auth := h.Get("Authorization"); auth != "Bearer "+f02BootStaticKey {
+		t.Fatal("F02-20: upstream credential is not the exact documented cfg.APIKey fallback credential")
 	}
 	if b := up.lastBody(); !strings.Contains(b, "f02 boot") {
 		t.Fatalf("F02-20: upstream body %q missing request content", b)
+	}
+
+	// Durable admission contract (0028): the paid call was durably admitted
+	// BEFORE dispatch and finalized with terminal facts bound to the same
+	// (invocation, org) identity. Correlating on the client request id keeps
+	// this exact even though the target-wide database accumulates rows from
+	// sibling seeds.
+	var state, kind, org string
+	err := db.pool.QueryRow(t.Context(),
+		`SELECT state, kind, org_id FROM request_admissions WHERE client_request_id = $1`,
+		"f02-boot-req-42",
+	).Scan(&state, &kind, &org)
+	if err != nil {
+		t.Fatalf("F02-20: admitted start missing for f02-boot-req-42: %v", err)
+	}
+	if state != "admitted" || kind != "chat" || org != db.loginOrg {
+		t.Fatalf("F02-20: admission state=%s kind=%s org=%s, want admitted/chat/%s",
+			state, kind, org, db.loginOrg)
+	}
+	var facts int
+	if err := db.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM request_terminal_facts f
+		  JOIN request_admissions a USING (invocation_id, org_id)
+		 WHERE a.client_request_id = $1`,
+		"f02-boot-req-42",
+	).Scan(&facts); err != nil || facts != 1 {
+		t.Fatalf("F02-20: bound terminal facts = %d (err %v), want exactly 1", facts, err)
+	}
+
+	// Duplicate-correlation repeat: 0028 keeps client_request_id correlation-
+	// only ("never an identity"), so replaying the identical request must
+	// admit a SECOND invocation instead of being swallowed by state-dependent
+	// dedupe. The exact-1 checks above catch a double insert per call; the
+	// exact-2 checks below catch a repeat that silently dedupes.
+	resp2, body2 := f02Chat(t, bs.baseURL, "Bearer f02-boot-key", "f02-boot-req-42", "org-hacker")
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("F02-20: duplicate-correlation repeat = %d body %s", resp2.StatusCode, body2)
+	}
+	if got := up.count(); got != 2 {
+		t.Fatalf("F02-20: repeat: upstream hits = %d, want exactly 2 (every accepted call dispatches)", got)
+	}
+	var adm2, facts2 int
+	if err := db.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM request_admissions WHERE client_request_id = $1`,
+		"f02-boot-req-42",
+	).Scan(&adm2); err != nil || adm2 != 2 {
+		t.Fatalf("F02-20: repeat: admissions for f02-boot-req-42 = %d (err %v), want exactly 2", adm2, err)
+	}
+	if err := db.pool.QueryRow(t.Context(),
+		`SELECT count(*) FROM request_terminal_facts f
+		  JOIN request_admissions a USING (invocation_id, org_id)
+		 WHERE a.client_request_id = $1`,
+		"f02-boot-req-42",
+	).Scan(&facts2); err != nil || facts2 != 2 {
+		t.Fatalf("F02-20: repeat: bound terminal facts = %d (err %v), want exactly 2", facts2, err)
 	}
 }
 
 // F02-21 startup negatives: every configuration class fails loudly, with
 // the documented error shapes and no skip path.
-func fuzzF0221(t *testing.T) {
+func fuzzF0221(t *testing.T, _ *f02BootDB) {
 	t.Helper()
 	f02BootEnv(t)
 	up := f02UpstreamRecorder(t)
@@ -562,7 +753,7 @@ func fuzzF0221(t *testing.T) {
 // F02-22 admin surface: metrics, debug vars, CORS, shadow registration, and
 // tracing mounts — all observable without completing an inference (so the
 // upstream stays untouched and the shadow mirror never samples).
-func fuzzF0222(t *testing.T) {
+func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	t.Helper()
 	up := f02UpstreamRecorder(t)
 	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "f02-admin-key")
@@ -573,7 +764,7 @@ func fuzzF0222(t *testing.T) {
 	cfg.Shadow.SampleRate = 0
 	cfg.DebugPprof = true
 	cfg.OTELTracingEndpoint = "http://127.0.0.1:4317"
-	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{})
+	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{}, nil)
 	admin := "http://" + cfg.AdminListen
 
 	// /debug/vars: localhost + Bearer cfg.APIKey, config echo.
@@ -645,7 +836,7 @@ func fuzzF0222(t *testing.T) {
 
 // F02-23 JWT boot: service-account tokens through the real server, dual mode
 // with the static key, org identity to the upstream, rejections at the gate.
-func fuzzF0223(t *testing.T) {
+func fuzzF0223(t *testing.T, db *f02BootDB) {
 	t.Helper()
 	up := f02UpstreamRecorder(t)
 	k := mustRSAJWK(t, "f02-boot-kid")
@@ -657,10 +848,10 @@ func fuzzF0223(t *testing.T) {
 		OrgClaim:      "org_id",
 		KeyLabelClaim: "key_labels",
 	}
-	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "f02-boot-key")
-	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw)
+	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
+	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw, db.pool)
 
-	valid := signToken(t, k, f02OrgClaims(jwtw.Issuer, jwtw.Audience, "org-42"))
+	valid := signToken(t, k, f02OrgClaims(jwtw.Issuer, jwtw.Audience, db.loginOrg))
 	resp, body := f02Chat(t, bs.baseURL, "Bearer "+valid, "f02-jwt-rid", "")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("F02-23: jwt chat = %d body %s", resp.StatusCode, body)
@@ -669,11 +860,29 @@ func fuzzF0223(t *testing.T) {
 		t.Fatalf("F02-23: upstream hits = %d, want exactly 1", got)
 	}
 	h := up.lastHeader()
-	if got := h.Get("X-Org-Id"); got != "org-42" {
-		t.Fatalf("F02-23: upstream X-Org-Id %q, want org-42", got)
+	// Exact outbound identity contract (upstream.Client forwards only
+	// X-Request-ID; provider.PrepareRequest sets Content-Type,
+	// Authorization, Accept): the org identity hop is exactly absent and
+	// the X-Request-ID receipt is exact. Failures never echo credential
+	// material.
+	if got := h.Get("X-Org-Id"); got != "" {
+		t.Fatalf("F02-23: unexpected upstream org identity hop (len %d), want none", len(got))
 	}
 	if got := h.Get("X-Request-ID"); got != "f02-jwt-rid" {
 		t.Fatalf("F02-23: upstream X-Request-ID %q, want f02-jwt-rid", got)
+	}
+	if auth := h.Get("Authorization"); auth != "Bearer "+f02BootStaticKey {
+		t.Fatal("F02-23: upstream credential is not the exact documented fallback credential (presented JWT must never ride upstream)")
+	}
+	// Independent durable tenant identity (0028): the token org is durably
+	// accounted even though the identity hop never crosses the egress.
+	var state, kind, org string
+	if err := db.pool.QueryRow(t.Context(),
+		`SELECT state, kind, org_id FROM request_admissions WHERE client_request_id = $1`,
+		"f02-jwt-rid",
+	).Scan(&state, &kind, &org); err != nil || state != "admitted" || kind != "chat" || org != db.loginOrg {
+		t.Fatalf("F02-23: durable admission for f02-jwt-rid: state=%s kind=%s token-org-match=%v (err %v), want admitted/chat/true",
+			state, kind, org == db.loginOrg, err)
 	}
 
 	// Dual mode: the static gateway key still authenticates.
@@ -683,7 +892,7 @@ func fuzzF0223(t *testing.T) {
 	}
 
 	// Expired and garbage tokens never reach the upstream.
-	expiredClaims := f02OrgClaims(jwtw.Issuer, jwtw.Audience, "org-42")
+	expiredClaims := f02OrgClaims(jwtw.Issuer, jwtw.Audience, db.loginOrg)
 	expiredClaims["exp"] = time.Now().Add(-2 * time.Minute).Unix()
 	expired := signToken(t, k, expiredClaims)
 	respExp, _ := f02Chat(t, bs.baseURL, "Bearer "+expired, "", "")
@@ -710,17 +919,18 @@ func FuzzFamily02BootLifecycle(f *testing.F) {
 	f.Add([]byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00})
 	f.Add([]byte{0x01, 0x01, 0x01, 0x01, 0x01, 0x01})
 	f.Add([]byte{0x02, 0x00, 0x01, 0x00, 0x01, 0x00})
-	token, wiring := f02BootGenFixture(f)
+	db := startF02BootDB(f)
+	token, wiring := f02BootGenFixture(f, db.loginOrg)
 	f.Fuzz(func(t *testing.T, data []byte) {
 		if len(data) == 1 && data[0] >= 19 && data[0] <= 23 {
-			fuzzF02BootCases[int(data[0])](t)
+			fuzzF02BootCases[int(data[0])](t, db)
 			return
 		}
-		f02BootGenerated(t, data, token, wiring)
+		f02BootGenerated(t, data, token, wiring, db)
 	})
 }
 
-var fuzzF02BootCases = map[int]func(*testing.T){
+var fuzzF02BootCases = map[int]func(*testing.T, *f02BootDB){
 	19: fuzzF0219,
 	20: fuzzF0220,
 	21: fuzzF0221,
@@ -735,10 +945,10 @@ func TestFamily02BootRefusesPaidCallsWithoutAccounting(t *testing.T) {
 
 func checkBootAdmissionWithoutStore(t *testing.T, rdb *redis.Client) {
 	t.Helper()
-	token, wiring := f02BootGenFixture(t)
+	token, wiring := f02BootGenFixture(t, "org-boot-check")
 	up := f02UpstreamRecorder(t)
 	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, "test-static")
-	server := f02BootGateway(t, cfg, rdb, wiring)
+	server := f02BootGateway(t, cfg, rdb, wiring, nil)
 	for _, tc := range []struct {
 		name, credential string
 		wantStatus       int

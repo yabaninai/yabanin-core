@@ -198,7 +198,7 @@ func seedPolicyAvailabilityPolicy(t *testing.T, ctx context.Context, store *admi
 	}
 }
 
-func startPolicyAvailabilityPostgres(t *testing.T, ctx context.Context) string {
+func startPolicyAvailabilityPostgres(t testing.TB, ctx context.Context) string {
 	t.Helper()
 	pg, err := testpostgres.Run(ctx, "pgvector/pgvector:pg16",
 		testpostgres.WithDatabase("yabanin"),
