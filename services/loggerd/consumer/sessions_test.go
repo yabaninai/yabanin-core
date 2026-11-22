@@ -71,7 +71,7 @@ func TestResolveSessionID_UpsertArgsAndFailureFailsDelivery(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, qargs, 3)
-	wantID := uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID + "\x00" + "ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String()
+	wantID := uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID+"\x00"+"ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String()
 	assert.Equal(t, wantID, qargs[0], "registry id is the org-scoped deterministic v5 mapping")
 	assert.Equal(t, testOrgUUID, qargs[1])
 	assert.Equal(t, "ses_f7c8cea03ffeQF8w3WLp7oRA9w", qargs[2], "client_session keeps the raw id")

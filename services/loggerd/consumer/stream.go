@@ -1162,21 +1162,7 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 	if ev.invocationIDValue != nil && result.RowsAffected() == 0 {
 		// Duplicate invocation: the mirror row is already durable — enrich
 		// the shadow policy decision only when absent, never anything else.
-		if err := c.enrichPolicyDecisionIfAbsent(ctx, tx, ev); err != nil {
-			return err
-		}
-		if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
-			return err
-		}
-		if err := tx.Commit(ctx); err != nil {
-			return fmt.Errorf("commit delivery transaction: %w", err)
-		}
-		c.logger.Info("duplicate shadow invocation delivery — policy decision guarded, no recharge",
-			slog.String("invocation_id", ev.invocationID),
-			slog.String("request_id", ev.requestID),
-			slog.String("org_id", ev.orgID),
-		)
-		return nil
+		return c.finishDuplicateShadowInvocation(ctx, tx, ev, policy)
 	}
 
 	// OP-9: shadow decisions are the whole point of shadow mode ("what would
@@ -1204,6 +1190,29 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 	// intent here — see the double-charge guard in the processMessage
 	// comment. Shadow cost is never charged.
 
+	return nil
+}
+
+// finishDuplicateShadowInvocation finalizes a redelivered shadow invocation:
+// the mirror row is already durable, so the delivery only enriches the
+// shadow policy decision when absent, re-runs the guarded admission
+// transition and commits. Nothing is charged — the shadow plan has no
+// wallet path at all, matching the first delivery exactly.
+func (c *StreamConsumer) finishDuplicateShadowInvocation(ctx context.Context, tx InboxTx, ev requestEvent, policy deliveryPolicy) error {
+	if err := c.enrichPolicyDecisionIfAbsent(ctx, tx, ev); err != nil {
+		return err
+	}
+	if err := c.transitionAdmissionDelivered(ctx, tx, ev, policy); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delivery transaction: %w", err)
+	}
+	c.logger.Info("duplicate shadow invocation delivery — policy decision guarded, no recharge",
+		slog.String("invocation_id", ev.invocationID),
+		slog.String("request_id", ev.requestID),
+		slog.String("org_id", ev.orgID),
+	)
 	return nil
 }
 
