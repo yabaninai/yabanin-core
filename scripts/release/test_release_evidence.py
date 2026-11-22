@@ -193,8 +193,12 @@ def _generator_tree(root):
     man.write_text(json.dumps({"base_index_digest": ALPINE_DIGEST}) + "\n")
 
 
+_UNSET = object()
+
+
 def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64", omit_subject=False,
-                  image_schema=2, attestation_schema=2, omit_config=False, conflicting_inline=False, bases=(GO_DIGEST, ALPINE_DIGEST)):
+                  image_schema=2, attestation_schema=2, omit_config=False, conflicting_inline=False, bases=(GO_DIGEST, ALPINE_DIGEST),
+                  wrong_subject_digest=False, wrong_att_subject=False, subject_override=_UNSET):
     # Build the content graph independently from the implementation under test.
     store = td / "artifacts/release-evidence/build-receipts" / role
     store.mkdir(parents=True, exist_ok=True)
@@ -217,7 +221,10 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
     build = {"externalParameters": request, "internalParameters": {"targetPlatform": "linux/" + selected_platform},
              "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
              "resolvedDependencies": [{"uri": "pkg:docker/base", "digest": {"sha256": p[7:]}} for p in bases]}
-    subjects = [] if omit_subject else [{"digest": {"sha256": child["digest"][7:]}}]
+    subjects = [] if omit_subject else [
+        {"digest": {"sha256": "f" * 64 if wrong_subject_digest else child["digest"][7:]}}]
+    if subject_override is not _UNSET:
+        subjects = subject_override
     statement = write({"_type": "https://in-toto.io/Statement/v1", "predicateType": slsa,
                        "subject": subjects, "predicate": {"buildDefinition": build, "runDetails": {
                            "metadata": {"buildkit_metadata": {"vcs": source}}}}}, "application/vnd.in-toto+json")
@@ -227,7 +234,8 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
         content = b"!" + content[1:]
     statement["data"] = base64.b64encode(content).decode("ascii")
     attestation = {"schemaVersion": attestation_schema, "mediaType": manifest_type,
-                   "subject": child, "layers": [statement]}
+                   "subject": {**child, "digest": "sha256:" + "f" * 64} if wrong_att_subject else child,
+                   "layers": [statement]}
     if not omit_config:
         attestation["config"] = {"digest": "sha256:" + hashlib.sha256(b"{}").hexdigest(), "size": 2,
                                  "mediaType": "application/vnd.oci.empty.v1+json", "data": "e30="}
@@ -1981,7 +1989,12 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
                 ("wrong attestation manifest schema", {"attestation_schema": 1}, "invalid OCI image manifest"),
                 ("conflicting inline provenance bytes", {"conflicting_inline": True}, "inline descriptor digest mismatch"),
                 ("missing attestation config", {"omit_config": True}, "invalid OCI descriptor media type"),
-                ("missing in-toto subject", {"omit_subject": True}, "in-toto subject"),
+                ("wrong in-toto subject digest", {"wrong_subject_digest": True}, "in-toto subject mismatch"),
+                ("attestation manifest subject mismatch", {"wrong_att_subject": True}, "OCI attestation subject mismatch"),
+                ("null in-toto subject", {"subject_override": None}, "invalid in-toto subject list"),
+                ("false in-toto subject", {"subject_override": False}, "invalid in-toto subject list"),
+                ("object in-toto subject", {"subject_override": {}}, "invalid in-toto subject list"),
+                ("empty string in-toto subject", {"subject_override": ""}, "invalid in-toto subject list"),
                 ("different pinned base", {"bases": (GO_DIGEST,)}, "pinned base images"),
             ):
                 with self.subTest(label):
@@ -2942,6 +2955,30 @@ class QuickstartBuildCollectionTest(unittest.TestCase):
             self.assertEqual(predicate["buildDefinition"]["internalParameters"]
                              ["targetPlatform"], "linux/amd64")
             # generate output passes the real verifier gap unchanged
+            self.assertEqual(self._gap(td, collected, head), [])
+
+    def test_real_engine_statement_binds_without_in_toto_subject(self):
+        # real buildx mode=max output (dockerfile.v0) leaves the in-toto
+        # statement subject empty; the image binding rides on the attestation
+        # manifest's OCI subject, matched by the verifier before the layer walk
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            images = {
+                "core": fixture_image(td, "core", head, ".", "Dockerfile",
+                                      omit_subject=True),
+                "mock-provider": fixture_image(td, "mock-provider", head,
+                                               "deploy/mock-provider",
+                                               "deploy/mock-provider/Dockerfile",
+                                               omit_subject=True),
+                "dashboard": fixture_image(td, "dashboard", head, ".",
+                                           "web/dashboard/Dockerfile",
+                                           omit_subject=True)}
+            collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_build"]["subjects"], images)
             self.assertEqual(self._gap(td, collected, head), [])
 
     def test_absent_store_stays_pending(self):

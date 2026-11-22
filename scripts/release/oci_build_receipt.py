@@ -119,8 +119,13 @@ def statement(root, role, index, child):
     st = descriptor(root, role, layer, IN_TOTO)
     require(st["_type"] == "https://in-toto.io/Statement/v1" and st["predicateType"] == SLSA,
             "invalid in-toto statement type")
-    subject = only(st["subject"], "missing or ambiguous in-toto subject")
-    require(subject["digest"]["sha256"] == child["digest"][7:], "in-toto subject mismatch")
+    # The subject must be a list and nothing else: BuildKit leaves it empty
+    # when the attestation manifest's OCI subject (matched above) already
+    # binds the image, so only a real list may carry that meaning.
+    require(isinstance(st["subject"], list), "invalid in-toto subject list")
+    if st["subject"]:
+        subject = only(st["subject"], "missing or ambiguous in-toto subject")
+        require(subject["digest"]["sha256"] == child["digest"][7:], "in-toto subject mismatch")
     return st["predicate"]
 
 
