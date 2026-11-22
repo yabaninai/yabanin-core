@@ -145,8 +145,8 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	gw.relayCompletionsJSON(completionsJSONDispatch{
-		r: r, rctx: rctx, w: w, l: l, gate: gate, admitted: admitted,
+	gw.relayCompletionsJSON(rctx, completionsJSONDispatch{
+		r: r, w: w, l: l, gate: gate, admitted: admitted,
 		client: client, upstreamBody: upstreamBody, apiKey: apiKey,
 		body: body, providerName: providerName, upstreamURL: upstreamURL,
 		started: started,
@@ -157,7 +157,6 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 // outlive the shared pipeline stages.
 type completionsJSONDispatch struct {
 	r            *http.Request
-	rctx         context.Context
 	w            http.ResponseWriter
 	l            *slog.Logger
 	gate         *reservationGate
@@ -175,12 +174,12 @@ type completionsJSONDispatch struct {
 // dispatch and settle: bounded read, adapter usage parsing, the OP-8
 // post-upstream policy hook (a deny answers 400 with the settle already
 // run), the durable finishCompletion settle and the byte-honest reply.
-func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
+func (gw *gateway) relayCompletionsJSON(rctx context.Context, d completionsJSONDispatch) {
 	timeout := d.admitted.Info.UpstreamTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
-	ctx, cancel := context.WithTimeout(d.rctx, timeout)
+	ctx, cancel := context.WithTimeout(rctx, timeout)
 	defer cancel()
 	resp, err := d.client.Do(ctx, "/v1/completions", d.upstreamBody, d.apiKey, false, nil)
 	if err != nil {
@@ -214,10 +213,10 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 	if gw.policyRuntime != nil {
 		masked, postEvent, denied := gw.policyPostUpstream(d.r, "completions", d.admitted.Info.ModelName, d.admitted.Info.Provider, limited)
 		if postEvent != "" {
-			d.rctx = withPolicyEvent(d.rctx, appendPolicyEvents(policyEventFrom(d.rctx), postEvent))
+			rctx = withPolicyEvent(rctx, appendPolicyEvents(policyEventFrom(rctx), postEvent))
 		}
 		if denied {
-			if ferr := gw.finishCompletion(d.w, d.rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusBadRequest, d.started, resp); ferr != nil {
+			if ferr := gw.finishCompletion(d.w, rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusBadRequest, d.started, resp); ferr != nil {
 				// The client envelope is already the policy denial; the
 				// withheld event is logged loudly (finishRequestLogged
 				// canon).
@@ -229,7 +228,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 		}
 		limited = masked
 	}
-	if ferr := gw.finishCompletion(d.w, d.rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusOK, d.started, resp); ferr != nil {
+	if ferr := gw.finishCompletion(d.w, rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusOK, d.started, resp); ferr != nil {
 		// Central binding: usage was dispatched but its durable record did
 		// not commit — the client must not see the upstream body as a
 		// payable success (never a re-dispatch; support reconciles).

@@ -360,9 +360,12 @@ func checkCompletionCacheBilling(t *testing.T, stream bool) {
 				}
 				if stream {
 					w.Header().Set("Content-Type", "text/event-stream")
-					fmt.Fprintf(w, "data: {\"choices\":[{\"text\":\"hi\"}]}\n\ndata: {\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n", tc.usage)
+					_, err = fmt.Fprintf(w, "data: {\"choices\":[{\"text\":\"hi\"}]}\n\ndata: {\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n", tc.usage)
 				} else {
-					fmt.Fprintf(w, `{"id":"cmpl","choices":[{"text":"hi"}],"usage":%s}`, tc.usage)
+					_, err = fmt.Fprintf(w, `{"id":"cmpl","choices":[{"text":"hi"}],"usage":%s}`, tc.usage)
+				}
+				if err != nil {
+					t.Errorf("writing provider response: %v", err)
 				}
 			}))
 			defer server.Close()
