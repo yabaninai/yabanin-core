@@ -788,7 +788,7 @@ func (s *stand) classifyBogusMultipartRefused(t *testing.T) {
 // the multipart codec: a 200 reply whose usage block cannot parse as
 // token counts still relays byte-identically, but the durable outcome is
 // trusted 0/0 with usage_source none and cost_status no_usage — no
-// invented tokens, no fabricated price, no charge, no settlement.
+// wallet debits stay at zero and the requesting team records one request.
 func (s *stand) classifyMalformedUsageFailClosed(t *testing.T) {
 	t.Helper()
 	ledgerBefore := s.teamLedgerSnapshot(t)
