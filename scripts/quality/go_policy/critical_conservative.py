@@ -741,10 +741,12 @@ def note_removed_function(row, previous, current, selection):
     if dispatch_reference(row['name'], previous, current):
         selection.widen('removed function in dynamic-dispatch package: ' + label)
         return
-    files = referencing_files(row['name'], previous, current)
+    files, uncertain = referencing_files(row, previous, current)
     if files:
         selection.widen('removed function still referenced: ' + label +
                         ' (' + ', '.join(files) + ')')
+        if uncertain:
+            selection.mark_cross('removed function: ' + label)
         return
     selection.widen('removed production function without visible consumers: ' + label)
     selection.mark_cross('removed function: ' + label)
@@ -757,11 +759,48 @@ def dispatch_reference(name, previous, current):
     return name in previous.dispatch_names or name in current.dispatch_names
 
 
-def referencing_files(name, previous, current):
-    """Baseline files referencing name that still mention it now."""
-    return [path for path in sorted(previous.files)
-            if path in current.files and name in unit_refs(previous.files[path]['units'])
-            and mentions(current, path, name)]
+def referencing_files(row, previous, current):
+    """Find surviving textual consumers without merging method twins."""
+    name = row['name']
+    recv = row.get('recv', '')
+    key = identity_key(row)
+    files = []
+    uncertain = False
+    for path in sorted(previous.files):
+        if path not in current.files:
+            continue
+        before = previous.files[path]['units']
+        now = current.files[path]['units']
+        if recv:
+            if key not in unit_refs(before):
+                continue
+            exact = key in unit_refs(now)
+            fallback = unchanged_receiver_consumer(before, now, key, name)
+            if exact or fallback:
+                files.append(path)
+                uncertain = uncertain or (fallback and not exact)
+        elif name in unit_refs(before) and mentions(current, path, name):
+            files.append(path)
+    return files, uncertain
+
+
+def unchanged_receiver_consumer(before, now, key, name):
+    """Keep a baseline receiver binding only when its whole unit survives.
+
+    After a removed method makes package type checking fail, the unit analyzer
+    may retain only a bare selector floor. Pairing the unchanged declaration
+    by its AST fingerprint proves that the baseline receiver-qualified call
+    remains in that unit without treating comments, strings, or sibling
+    receivers as evidence.
+    """
+    old_bindings = {(item['name'], item['hash'])
+                    for item in before
+                    if key in set(item.get('refs', [])) |
+                    set(item.get('selrefs', []))}
+    if not old_bindings:
+        return False
+    return any((item['name'], item['hash']) in old_bindings and
+               name in item.get('floor_refs', []) for item in now)
 
 
 def unit_refs(units):
