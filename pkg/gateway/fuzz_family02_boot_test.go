@@ -363,17 +363,21 @@ func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JW
 		t.Cleanup(func() { _ = r.Close() })
 	}
 
+	f02WaitBootReadiness(t, bs, done)
+	t.Cleanup(func() {
+		if err := bs.stop(); err != nil {
+			t.Errorf("F02 boot: shutdown error: %v", err)
+		}
+	})
+	return bs
+}
+
+func f02WaitBootReadiness(t *testing.T, bs *f02BootServer, done <-chan error) {
+	t.Helper()
 	client := &http.Client{Timeout: 200 * time.Millisecond}
 	deadline := time.Now().Add(5 * time.Second)
 	for {
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("F02 boot: server exited before readiness: %v", err)
-			}
-			t.Fatal("F02 boot: server returned nil before readiness")
-		default:
-		}
+		f02CheckBootServerPending(t, done)
 		req, reqErr := http.NewRequestWithContext(t.Context(), http.MethodGet, bs.baseURL+"/healthz", nil)
 		if reqErr != nil {
 			t.Fatalf("F02 boot: readiness request: %v", reqErr)
@@ -382,18 +386,25 @@ func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JW
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
-			t.Cleanup(func() {
-				if err := bs.stop(); err != nil {
-					t.Errorf("F02 boot: shutdown error: %v", err)
-				}
-			})
-			return bs
+			return
 		}
 		if time.Now().After(deadline) {
-			cancel()
+			bs.cancel()
 			t.Fatalf("F02 boot: %s never became ready: %v", bs.baseURL, err)
 		}
 		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+func f02CheckBootServerPending(t *testing.T, done <-chan error) {
+	t.Helper()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("F02 boot: server exited before readiness: %v", err)
+		}
+		t.Fatal("F02 boot: server returned nil before readiness")
+	default:
 	}
 }
 
@@ -583,7 +594,14 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	up := f02UpstreamRecorder(t)
 	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
 	bs := f02BootGateway(t, cfg, nil, JWTWiring{}, nil)
+	f02CheckBootHealthOK(t, bs)
+	f02CheckBootPublicHello(t, bs)
+	f02CheckBootDeniedCredentials(t, bs, up)
+	f02CheckBootShutdown(t, bs)
+}
 
+func f02CheckBootHealthOK(t *testing.T, bs *f02BootServer) {
+	t.Helper()
 	code, m, hdr := f02HealthJSON(t, bs.baseURL)
 	if code != http.StatusOK || m["status"] != "ok" || m["redis"] != "skipped" {
 		t.Fatalf("F02-19: healthz %d %v, want 200 ok/skipped", code, m)
@@ -591,8 +609,11 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	if hdr.Get("X-Yabanin-Build") == "" {
 		t.Fatal("F02-19: missing X-Yabanin-Build header")
 	}
+}
 
-	// Unauthenticated surface: the health route and the public hello.
+func f02CheckBootPublicHello(t *testing.T, bs *f02BootServer) {
+	t.Helper()
+	// The unauthenticated public hello route remains available.
 	helloReq, err := http.NewRequestWithContext(t.Context(), http.MethodHead, bs.baseURL+"/api/hello", nil)
 	if err != nil {
 		t.Fatalf("F02-19: /api/hello request: %v", err)
@@ -606,7 +627,10 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	if hello.StatusCode != http.StatusOK {
 		t.Fatalf("F02-19: HEAD /api/hello = %d, want 200", hello.StatusCode)
 	}
+}
 
+func f02CheckBootDeniedCredentials(t *testing.T, bs *f02BootServer, up *f02Upstream) {
+	t.Helper()
 	for _, auth := range []string{"", "Bearer wrong-key"} {
 		resp, _ := f02Chat(t, bs.baseURL, auth, "", "")
 		if resp.StatusCode != http.StatusUnauthorized {
@@ -616,7 +640,10 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	if got := up.count(); got != 0 {
 		t.Fatalf("F02-19: denied requests reached upstream %d times", got)
 	}
+}
 
+func f02CheckBootShutdown(t *testing.T, bs *f02BootServer) {
+	t.Helper()
 	if err := bs.stop(); err != nil {
 		t.Fatalf("F02-19: shutdown error: %v", err)
 	}
@@ -969,7 +996,12 @@ func fuzzF0223(t *testing.T, db *f02BootDB) {
 	}
 	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
 	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw, db.pool)
+	f02CheckBootValidJWT(t, bs, db, up, k, jwtw)
+	f02CheckBootStaticAndRejectedJWTs(t, bs, db, up, k, jwtw)
+}
 
+func f02CheckBootValidJWT(t *testing.T, bs *f02BootServer, db *f02BootDB, up *f02Upstream, k jwkPair, jwtw JWTWiring) {
+	t.Helper()
 	valid := signToken(t, k, f02OrgClaims(jwtw.Issuer, jwtw.Audience, db.loginOrg))
 	resp, body := f02Chat(t, bs.baseURL, "Bearer "+valid, "f02-jwt-rid", "")
 	if resp.StatusCode != http.StatusOK {
@@ -1003,7 +1035,10 @@ func fuzzF0223(t *testing.T, db *f02BootDB) {
 		t.Fatalf("F02-23: durable admission for f02-jwt-rid: state=%s kind=%s token-org-match=%v (err %v), want admitted/chat/true",
 			state, kind, org == db.loginOrg, err)
 	}
+}
 
+func f02CheckBootStaticAndRejectedJWTs(t *testing.T, bs *f02BootServer, db *f02BootDB, up *f02Upstream, k jwkPair, jwtw JWTWiring) {
+	t.Helper()
 	// Dual mode: the static gateway key still authenticates.
 	respKey, _ := f02Chat(t, bs.baseURL, "Bearer f02-boot-key", "", "")
 	if respKey.StatusCode != http.StatusOK {
