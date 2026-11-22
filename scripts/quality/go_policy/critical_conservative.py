@@ -766,9 +766,7 @@ def referencing_files(row, previous, current):
     key = identity_key(row)
     files = []
     uncertain = False
-    for path in sorted(previous.files):
-        if path not in current.files:
-            continue
+    for path in sorted(previous.files.keys() & current.files.keys()):
         before = previous.files[path]['units']
         now = current.files[path]['units']
         if recv:
@@ -785,13 +783,11 @@ def referencing_files(row, previous, current):
 
 
 def unchanged_receiver_consumer(before, now, key, name):
-    """Keep a baseline receiver binding only when its whole unit survives.
+    """Find a possible surviving call when type checking loses the receiver.
 
-    After a removed method makes package type checking fail, the unit analyzer
-    may retain only a bare selector floor. Pairing the unchanged declaration
-    by its AST fingerprint proves that the baseline receiver-qualified call
-    remains in that unit without treating comments, strings, or sibling
-    receivers as evidence.
+    Match the previous unit's receiver binding to an unchanged declaration
+    with an unresolved reference to this method. Its receiver type can still
+    change elsewhere, so the caller keeps cross-package coverage.
     """
     old_bindings = {(item['name'], item['hash'])
                     for item in before
