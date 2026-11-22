@@ -98,7 +98,7 @@ func newR018OrgJudgeStand(t *testing.T, ctx context.Context) *r018OrgJudgeStand 
 			"r018-model": {ModelName: "r018-model", Provider: "openai", Enabled: true},
 		}},
 	}
-	runtime, err := NewPolicyRuntime(store, nil, PolicyModeEnforce, nil, slog.New(slog.DiscardHandler))
+	runtime, err := NewPolicyRuntime(store, nil, PolicyModeEnforce, nil, slog.New(slog.DiscardHandler)) //nolint:contextcheck // Policy compilation has no context parameter, as in buildPolicyRuntime.
 	if err != nil {
 		t.Fatalf("construct real policy runtime: %v", err)
 	}

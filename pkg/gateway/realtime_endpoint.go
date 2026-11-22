@@ -200,7 +200,7 @@ func dialRealtimeSSE(w http.ResponseWriter, rctx context.Context, l *slog.Logger
 		return nil, nil, false
 	}
 	if resp.StatusCode != http.StatusOK {
-		resp.Body.Close()
+		closeUpstream(l, resp)
 		cancelStream()
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)

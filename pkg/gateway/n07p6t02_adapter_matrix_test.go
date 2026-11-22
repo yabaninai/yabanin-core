@@ -128,7 +128,9 @@ func TestN07P6T02_SupportedAdapterMatrix(t *testing.T) {
 			gw.eventNote = func(e *eventpub.Event) { ev = e }
 			rec := postR105(t, gw, "/v1/rerank", `{"model":"rr","query":"q","documents":["a","b"]}`, nil)
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-			require.Equal(t, []byte(rerankResponse), rec.Body.Bytes())
+			if rec.Body.String() != rerankResponse {
+				t.Fatalf("provider response bytes changed: got %q, want %q", rec.Body.String(), rerankResponse)
+			}
 			require.EqualValues(t, 1, rerankCalls.Load())
 			require.JSONEq(t, `{"model":"rr-canon","query":"q","documents":["a","b"]}`, rerankUpstreamBody.Load().(string))
 			require.NotNil(t, ev)
@@ -148,7 +150,9 @@ func TestN07P6T02_SupportedAdapterMatrix(t *testing.T) {
 			ev = nil
 			rec = postR105(t, gw, "/v1/moderations", `{"model":"mod","input":"classify me"}`, nil)
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-			require.Equal(t, []byte(moderationsResponse), rec.Body.Bytes())
+			if rec.Body.String() != moderationsResponse {
+				t.Fatalf("provider response bytes changed: got %q, want %q", rec.Body.String(), moderationsResponse)
+			}
 			require.EqualValues(t, 1, moderationsCalls.Load())
 			require.JSONEq(t, `{"model":"mod-canon","input":"classify me"}`, moderationsUpstreamBody.Load().(string))
 			require.NotNil(t, ev)

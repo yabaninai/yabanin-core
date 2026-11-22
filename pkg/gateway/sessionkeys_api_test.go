@@ -391,7 +391,9 @@ func TestOwnUsagePassesEncodedLabelToTotals(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code)
 	require.Len(t, db.usageArgs, 5)
 	require.Equal(t, []any{"org-1", "parent-1"}, db.usageArgs[:2])
-	require.Equal(t, []byte(`{"team":"50%"}`), db.usageArgs[4])
+	labels, ok := db.usageArgs[4].([]byte)
+	require.True(t, ok, "label filter must bind a JSON byte slice")
+	require.JSONEq(t, `{"team":"50%"}`, string(labels))
 }
 
 type usageOutageDB struct {
