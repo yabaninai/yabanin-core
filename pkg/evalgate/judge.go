@@ -123,11 +123,7 @@ Return ONLY valid JSON with these exact fields:
 
 	call.Status = resp.StatusCode
 	if resp.StatusCode != http.StatusOK {
-		const maxErrorBody = 64 << 10
-		raw, readErr := io.ReadAll(io.LimitReader(resp.Body, maxErrorBody+1))
-		if readErr == nil && len(raw) <= maxErrorBody && json.Valid(raw) {
-			call.Usage = provider.OpenAI{}.ParseUsage(raw)
-		}
+		call.Usage = judgeErrorUsage(resp.Body)
 		return nil, call, fmt.Errorf("judge returned status %d", resp.StatusCode)
 	}
 
@@ -142,6 +138,16 @@ Return ONLY valid JSON with these exact fields:
 			"should_upgrade", verdict.ShouldUpgrade, "latency_ms", time.Since(start).Milliseconds())
 	}
 	return verdict, call, err
+}
+
+// Error responses may report billable usage even when they have no verdict.
+func judgeErrorUsage(body io.Reader) provider.Usage {
+	const maxErrorBody = 64 << 10
+	raw, err := io.ReadAll(io.LimitReader(body, maxErrorBody+1))
+	if err != nil || len(raw) > maxErrorBody || !json.Valid(raw) {
+		return provider.Usage{}
+	}
+	return provider.OpenAI{}.ParseUsage(raw)
 }
 
 func parseVerdict(raw json.RawMessage) (*Verdict, error) {
@@ -159,12 +165,12 @@ func parseVerdict(raw json.RawMessage) (*Verdict, error) {
 		return nil, fmt.Errorf("judge returned empty choices")
 	}
 
-	// TP-03: the verdict feeds the calibration refresher, so a malformed or
-	// incomplete verdict must surface as an explicit error instead of being
-	// persisted as a defaulted measurement. The map pass enforces a single
-	// JSON document (trailing garbage is rejected); the typed pass enforces
-	// field types; unknown extra keys stay tolerated.
-	content := []byte(judgeOut.Choices[0].Message.Content)
+	return parseVerdictContent([]byte(judgeOut.Choices[0].Message.Content))
+}
+
+// Reject missing, null and incorrectly typed fields before persisting a
+// calibration measurement. Additional fields are allowed.
+func parseVerdictContent(content []byte) (*Verdict, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(content, &fields); err != nil {
 		return nil, fmt.Errorf("judge returned invalid JSON: %w", err)
