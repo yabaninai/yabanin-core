@@ -15,6 +15,7 @@ import (
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/upstream"
+	"github.com/stretchr/testify/require"
 )
 
 func postCompletions(t *testing.T, gw *gateway, body string) *httptest.ResponseRecorder {
@@ -326,167 +327,68 @@ func TestCompletions_JSON_CachedTokensHitHeader(t *testing.T) {
 // request.
 
 func TestCompletions_JSON_ClientHint_BillFollowsProviderCacheOnly(t *testing.T) {
-	const hint = `"cache_control":{"type":"ephemeral"}`
-	fullInput := (100*2.5 + 5*10.0) / 1e6 // gpt-4o input+output at list rates
-
-	t.Run("provider reports no cache → miss and full rate", func(t *testing.T) {
-		var sentUpstream []byte
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, _ := io.ReadAll(r.Body)
-			sentUpstream = append([]byte(nil), raw...)
-			_, _ = w.Write([]byte(`{"id":"cmpl","choices":[{"text":"hi"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}}`))
-		}))
-		defer server.Close()
-
-		gw := &gateway{
-			cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-			log:         slog.Default(),
-			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
-			res:         stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-			pool:        upstream.NewPool(upstream.Options{}),
-			invocations: &fakeInvocationStore{},
-		}
-		var ev *eventpub.Event
-		gw.eventNote = func(e *eventpub.Event) { ev = e }
-
-		rec := postCompletions(t, gw, `{"model":"m","prompt":"abc",`+hint+`}`)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-		}
-		if got := strings.Count(string(sentUpstream), "cache_control"); got > 1 {
-			t.Fatalf("the gateway manufactured cache markers beyond the client's one hint: %d in %s", got, sentUpstream)
-		}
-		if got := rec.Header().Get(PromptCacheHeader); got != "miss" {
-			t.Fatalf("prompt-cache header %q, want miss — a client hint is not a provider-reported hit", got)
-		}
-		if ev == nil || ev.CacheReadTokens != 0 {
-			t.Fatalf("event must carry zero cache reads: %+v", ev)
-		}
-		want := provider.ComputeCost(provider.Usage{
-			PromptTokens: 100, CompletionTokens: 5, TotalTokens: 105, Source: provider.UsageSourceProvider,
-		}, "openai", "gpt-4o").EstimatedCostUSD
-		if d := ev.EstimatedCostUSD - want; d < -1e-12 || d > 1e-12 {
-			t.Fatalf("billed %.3e, want the full list-rate %.3e — the hint must not reduce the bill", ev.EstimatedCostUSD, want)
-		}
-		if d := ev.EstimatedCostUSD - fullInput; d < -1e-9 || d > 1e-9 {
-			t.Fatalf("billed %.3e, want full list rate %.3e", ev.EstimatedCostUSD, fullInput)
-		}
-	})
-
-	t.Run("provider reports cache → hit and honest discount", func(t *testing.T) {
-		server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			_, _ = w.Write([]byte(`{"id":"cmpl","choices":[{"text":"hi"}],"usage":{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":30}}}`))
-		}))
-		defer server.Close()
-
-		gw := &gateway{
-			cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-			log:         slog.Default(),
-			auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
-			res:         stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-			pool:        upstream.NewPool(upstream.Options{}),
-			invocations: &fakeInvocationStore{},
-		}
-		var ev *eventpub.Event
-		gw.eventNote = func(e *eventpub.Event) { ev = e }
-
-		rec := postCompletions(t, gw, `{"model":"m","prompt":"abc",`+hint+`}`)
-		if rec.Code != http.StatusOK {
-			t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-		}
-		if got := rec.Header().Get(PromptCacheHeader); got != "hit" {
-			t.Fatalf("prompt-cache header %q, want hit from the provider usage", got)
-		}
-		if ev == nil || ev.CacheReadTokens != 30 {
-			t.Fatalf("event must carry exactly the provider-reported cache reads: %+v", ev)
-		}
-		want := provider.ComputeCost(provider.Usage{
-			PromptTokens: 100, CompletionTokens: 5, TotalTokens: 105,
-			CacheReadTokens: 30, Source: provider.UsageSourceProvider,
-		}, "openai", "gpt-4o").EstimatedCostUSD
-		if d := ev.EstimatedCostUSD - want; d < -1e-12 || d > 1e-12 {
-			t.Fatalf("billed %.3e, want the provider-usage discount %.3e", ev.EstimatedCostUSD, want)
-		}
-		if ev.EstimatedCostUSD >= fullInput-1e-12 {
-			t.Fatalf("a provider-reported cache read must produce a real discount: %.3e >= full %.3e", ev.EstimatedCostUSD, fullInput)
-		}
-	})
+	checkCompletionCacheBilling(t, false)
 }
 
 func TestCompletions_Stream_ClientHint_TrailerAndBillFollowProviderCacheOnly(t *testing.T) {
-	const hint = `"cache_control":{"type":"ephemeral"}`
-	fullInput := (100*2.5 + 5*10.0) / 1e6
+	checkCompletionCacheBilling(t, true)
+}
 
+func checkCompletionCacheBilling(t *testing.T, stream bool) {
+	t.Helper()
+	// The gateway test tariff is $2.50/M input, $1.25/M cached input and $10/M output.
 	for _, tc := range []struct {
-		name        string
-		usageChunk  string
-		wantTrailer string
-		wantCached  int64
+		header    string
+		usage     string
+		cacheRead int64
+		costUSD   float64
 	}{
-		{
-			name:        "no provider cache → miss trailer, full rate",
-			usageChunk:  `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}`,
-			wantTrailer: "miss",
-			wantCached:  0,
-		},
-		{
-			name:        "provider cache → hit trailer, honest discount",
-			usageChunk:  `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":30}}`,
-			wantTrailer: "hit",
-			wantCached:  30,
-		},
+		{"miss", `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105}`, 0, (100*2.5 + 5*10) / 1e6},
+		{"hit", `{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":30}}`, 30, (70*2.5 + 30*1.25 + 5*10) / 1e6},
 	} {
-		t.Run(tc.name, func(t *testing.T) {
-			const content = "data: {\"choices\":[{\"text\":\"hi\"}]}\n\n"
-			const done = "data: [DONE]\n\n"
-			usage := "data: {\"choices\":[],\"usage\":" + tc.usageChunk + "}\n\n"
+		t.Run(tc.header, func(t *testing.T) {
 			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-				raw, _ := io.ReadAll(r.Body)
-				if got := strings.Count(string(raw), "cache_control"); got > 1 {
-					t.Errorf("the gateway manufactured cache markers beyond the client's one hint: %d in %s", got, raw)
+				raw, err := io.ReadAll(r.Body)
+				if err != nil {
+					t.Errorf("reading provider request: %v", err)
+					return
 				}
-				w.Header().Set("Content-Type", "text/event-stream")
-				_, _ = w.Write([]byte(content + usage + done))
+				if n := strings.Count(string(raw), "cache_control"); n > 1 {
+					t.Errorf("provider received %d cache markers for one client hint", n)
+				}
+				if stream {
+					w.Header().Set("Content-Type", "text/event-stream")
+					fmt.Fprintf(w, "data: {\"choices\":[{\"text\":\"hi\"}]}\n\ndata: {\"choices\":[],\"usage\":%s}\n\ndata: [DONE]\n\n", tc.usage)
+				} else {
+					fmt.Fprintf(w, `{"id":"cmpl","choices":[{"text":"hi"}],"usage":%s}`, tc.usage)
+				}
 			}))
 			defer server.Close()
-
+			cfg := config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL}
+			store := &fakeInvocationStore{}
 			gw := &gateway{
-				cfg:                  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-				log:                  slog.Default(),
-				auth:                 NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
-				res:                  stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
-				pool:                 upstream.NewPool(upstream.Options{}),
-				invocations:          &fakeInvocationStore{},
+				cfg: cfg, log: slog.Default(), auth: NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
+				res:  stubModelResolver{"m": {ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
+				pool: upstream.NewPool(upstream.Options{}), invocations: store,
 				streamUsageProviders: map[string]bool{"openai": true},
-				streamIdleTimeout:    0,
 			}
 			var ev *eventpub.Event
 			gw.eventNote = func(e *eventpub.Event) { ev = e }
-
-			rec := postCompletions(t, gw, `{"model":"m","prompt":"abc","stream":true,`+hint+`}`)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("status %d %s", rec.Code, rec.Body.String())
+			rec := postCompletions(t, gw, fmt.Sprintf(`{"model":"m","prompt":"abc","stream":%t,"cache_control":{"type":"ephemeral"}}`, stream))
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			header := PromptCacheHeader
+			if stream {
+				header = promptCacheTrailerKey
 			}
-			if got := rec.Header().Get(promptCacheTrailerKey); got != tc.wantTrailer {
-				t.Fatalf("prompt-cache trailer %q, want %q", got, tc.wantTrailer)
-			}
-			if ev == nil || ev.CacheReadTokens != tc.wantCached {
-				t.Fatalf("event must carry exactly the provider-reported cache reads: %+v", ev)
-			}
-			want := provider.ComputeCost(provider.Usage{
-				PromptTokens: 100, CompletionTokens: 5, TotalTokens: 105,
-				CacheReadTokens: tc.wantCached, Source: provider.UsageSourceProvider,
-			}, "openai", "gpt-4o").EstimatedCostUSD
-			if d := ev.EstimatedCostUSD - want; d < -1e-12 || d > 1e-12 {
-				t.Fatalf("billed %.3e, want %.3e computed from the provider usage", ev.EstimatedCostUSD, want)
-			}
-			if tc.wantCached == 0 {
-				if ev.EstimatedCostUSD < fullInput-1e-12 || ev.EstimatedCostUSD > fullInput+1e-12 {
-					t.Fatalf("billed %.3e, want the full list rate %.3e — the hint must not reduce the bill", ev.EstimatedCostUSD, fullInput)
-				}
-			} else if ev.EstimatedCostUSD >= fullInput-1e-12 {
-				t.Fatalf("a provider-reported cache read must produce a real discount: %.3e >= full %.3e", ev.EstimatedCostUSD, fullInput)
-			}
+			require.Equal(t, tc.header, rec.Header().Get(header))
+			require.NotNil(t, ev)
+			require.EqualValues(t, 100, ev.TokensIn)
+			require.EqualValues(t, 5, ev.TokensOut)
+			require.Equal(t, tc.cacheRead, ev.CacheReadTokens)
+			require.InDelta(t, tc.costUSD, ev.EstimatedCostUSD, 1e-12)
+			require.Len(t, store.admitted, 1)
+			require.Len(t, store.facts, 1)
+			require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
 		})
 	}
 }
