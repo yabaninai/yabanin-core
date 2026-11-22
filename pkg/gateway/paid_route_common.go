@@ -208,6 +208,13 @@ func (gw *gateway) finishBufferedJSONRoute(f bufferedJSONFinish) {
 	_, _ = f.w.Write(f.payload)
 }
 
+func bufferedUpstreamContext(parent context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	if timeout <= 0 {
+		timeout = time.Minute
+	}
+	return context.WithTimeout(parent, timeout)
+}
+
 // A provider has already answered. Repeating the paid request can incur another charge.
 func writePaidBodyError(w http.ResponseWriter, message string) {
 	w.Header().Set("X-Should-Retry", "false")

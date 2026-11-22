@@ -76,31 +76,39 @@ func parseRealtimeRequest(w http.ResponseWriter, r *http.Request) (realtimeReque
 	return req, body, true
 }
 
-func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
+func (gw *gateway) admitRealtime(w http.ResponseWriter, r *http.Request) (admitted, bool) {
 	// D4 (ratified SSE-only): a WebSocket upgrade is explicitly refused
 	// before any admission or upstream work (upstream call count stays 0).
 	if isWebSocketUpgrade(r) {
 		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 			"websocket is not supported; realtime is SSE-only", apierrors.CodeUnsupportedFeature)
-		return
+		return admitted{}, false
 	}
 	req, body, ok := parseRealtimeRequest(w, r)
 	if !ok {
-		return
+		return admitted{}, false
 	}
 
-	admitted, ok := gw.admit(w, r, admitInput{
+	request, ok := gw.admit(w, r, admitInput{
 		Endpoint: "realtime",
 		Model:    req.Model,
 		Body:     body,
 		NoRemap:  true,
 	})
 	if !ok {
-		return
+		return admitted{}, false
 	}
-	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "realtime", "realtime is not supported for this provider") {
+	if !gw.openAICompatRouteReady(w, request.Info.Provider, "realtime", "realtime is not supported for this provider") {
+		return admitted{}, false
+	}
+	return request, true
+}
+
+func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	admitted, ok := gw.admitRealtime(w, r)
+	if !ok {
 		return
 	}
 

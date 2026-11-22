@@ -175,11 +175,7 @@ type completionsJSONDispatch struct {
 // post-upstream policy hook (a deny answers 400 with the settle already
 // run), the durable finishCompletion settle and the byte-honest reply.
 func (gw *gateway) relayCompletionsJSON(rctx context.Context, d completionsJSONDispatch) {
-	timeout := d.admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
+	ctx, cancel := bufferedUpstreamContext(rctx, d.admitted.Info.UpstreamTimeout)
 	defer cancel()
 	resp, err := d.client.Do(ctx, "/v1/completions", d.upstreamBody, d.apiKey, false, nil)
 	if err != nil {

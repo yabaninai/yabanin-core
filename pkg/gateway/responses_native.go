@@ -52,13 +52,12 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 		return
 	}
 	admitted.Body = guarded
-	// Serving provider of the single-candidate client pool (hoisted for the
+	// The native route uses OpenAI when the model omits its provider.
 	prov := admitted.Info.Provider
 	if prov == "" {
 		prov = "openai"
 	}
-	// hint foreign to the serving provider refuses here, before any
-	// reservation.
+	// Validate the route hint before reserving.
 	if !gw.enforceSingularRouteHint(w, r, prov) {
 		return
 	}
@@ -90,11 +89,7 @@ func (gw *gateway) responsesNative(w http.ResponseWriter, r *http.Request, body 
 // before the client sees a payable success, and the byte-identical
 // forward.
 func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, upstreamURL string, started time.Time, l *slog.Logger) {
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
+	ctx, cancel := bufferedUpstreamContext(rctx, admitted.Info.UpstreamTimeout)
 	defer cancel()
 	resp, err := client.Do(ctx, "/v1/responses", upstreamBody, apiKey, false, nil)
 	if err != nil {
@@ -104,12 +99,12 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 	defer closeUpstream(l, resp)
-	limited, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
-	if !ok {
+	if resp.StatusCode != http.StatusOK {
+		gw.forwardResponsesError(w, rctx, l, gate, admitted, resp, upstreamURL, started)
 		return
 	}
-	if resp.StatusCode != http.StatusOK {
-		gw.forwardResponsesError(w, rctx, l, admitted, resp, limited, upstreamURL, started)
+	limited, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
+	if !ok {
 		return
 	}
 	usage := parseResponsesUsage(limited)
@@ -149,7 +144,11 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 	_, _ = w.Write(limited)
 }
 
-func (gw *gateway) forwardResponsesError(w http.ResponseWriter, ctx context.Context, l *slog.Logger, admitted admitted, resp *http.Response, body []byte, upstreamURL string, started time.Time) {
+func (gw *gateway) forwardResponsesError(w http.ResponseWriter, ctx context.Context, l *slog.Logger, gate *reservationGate, admitted admitted, resp *http.Response, upstreamURL string, started time.Time) {
+	body, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
+	if !ok {
+		return
+	}
 	if err := gw.finishResponsesNative(w, ctx, admitted, provider.Usage{}, upstreamURL, resp.StatusCode, started, resp, "request.failed", "upstream request failed", ""); err != nil {
 		l.Error("terminal facts commit failed; event withheld from consumer", "error", err)
 	}
@@ -171,11 +170,7 @@ func (gw *gateway) responsesNativeStream(w http.ResponseWriter, r *http.Request,
 	}
 	defer closeUpstream(l, resp)
 	if resp.StatusCode != http.StatusOK {
-		limited, ok := readNativeBufferedBody(w, gate, resp, responsesBodyLimit)
-		if !ok {
-			return
-		}
-		gw.forwardResponsesError(w, rctx, l, admitted, resp, limited, upstreamURL, started)
+		gw.forwardResponsesError(w, rctx, l, gate, admitted, resp, upstreamURL, started)
 		return
 	}
 	copyResponsesPassthrough(w.Header(), resp.Header)
