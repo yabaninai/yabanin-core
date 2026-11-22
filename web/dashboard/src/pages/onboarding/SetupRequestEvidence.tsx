@@ -9,7 +9,9 @@ interface SetupRequestEvidenceProps {
   requestEntry: string
   setRequestEntry: (value: string) => void
   entryState: SetupRequestEntryState
+  requestIdParam: string
   setRequestIdParam: (id: string) => void
+  retryCheck: () => void
 }
 
 // CUI-02: the ONE operator action for the setup-request identity -
@@ -19,7 +21,8 @@ interface SetupRequestEvidenceProps {
 // carried; the exact org-scoped persisted read validates it; the
 // confirmed id rides the onboarding URL (`request` param) so
 // reload/resume keeps it. Never derived from list position or
-// timestamps.
+// timestamps. A failed lookup is not a no-match: the unavailable state
+// offers an honest retry through this same control.
 export function SetupRequestEvidence(props: SetupRequestEvidenceProps): ReactNode {
   const { t } = useTranslation()
   return (
@@ -29,7 +32,13 @@ export function SetupRequestEvidence(props: SetupRequestEvidenceProps): ReactNod
         onSubmit={(e) => {
           e.preventDefault()
           const id = props.requestEntry.trim()
-          if (id) props.setRequestIdParam(id)
+          if (!id) return
+          // A changed id rides the URL param (the reload/resume contract).
+          // Re-verifying the SAME id must still re-run the org-scoped
+          // lookup — an unchanged param alone would not re-trigger the
+          // effect — so it takes the explicit retry path.
+          if (id === props.requestIdParam.trim()) props.retryCheck()
+          else props.setRequestIdParam(id)
         }}
       >
         <label htmlFor="welcome-setup-request-input" className="sr-only">
@@ -52,6 +61,11 @@ export function SetupRequestEvidence(props: SetupRequestEvidenceProps): ReactNod
       {props.entryState === 'invalid' && (
         <p className="text-sm" role="alert" data-testid="welcome-setup-request-invalid">
           {t('welcome.setupRequestNotFound')}
+        </p>
+      )}
+      {props.entryState === 'unavailable' && (
+        <p className="text-sm" role="alert" data-testid="welcome-setup-request-unavailable">
+          {t('welcome.setupRequestUnavailable')}
         </p>
       )}
       {props.evidenceRequest && (

@@ -67,6 +67,10 @@ const FAILURE_KEYS = [
   'guardrails.requiresPerm',
   'guardrails.lockedHint',
   'guardrails.noneVisible',
+  // Onboarding setup-request identity (verified no-match vs lookup
+  // unavailable — a failed read must never render the not-found claim)
+  'welcome.setupRequestNotFound',
+  'welcome.setupRequestUnavailable',
   // Shared failure furniture these screens render
   'common.retry',
   'states.failedToLoad',

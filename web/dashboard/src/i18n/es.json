@@ -1137,6 +1137,7 @@
     "setupRequestIdPlaceholder": "Pega el X-Request-ID que envió tu cliente",
     "setupRequestIdVerify": "Verificar",
     "setupRequestNotFound": "No hay ninguna solicitud con ese ID en esta organización.",
+    "setupRequestUnavailable": "No se pudo comprobar ese ID en este momento: el historial de solicitudes no está disponible temporalmente. Pulsa Verificar para reintentar.",
     "skippedNote": "Este flujo se omitió para esta organización. Los pasos siguientes siguen reflejando el estado real.",
     "flagUnavailable": "El progreso no se puede guardar en este despliegue; el flujo sigue funcionando y se vuelve a comprobar en tu próxima visita.",
     "stateChecking": "Comprobando…",
