@@ -3,6 +3,8 @@ package consumer
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"testing"
@@ -91,36 +93,127 @@ func invocationCacheHitMsg(id string) redis.XMessage {
 	return msg
 }
 
-// admissionRow routes the mock QueryRow surface: the schema probe (0028+ =
-// 1 / pre-0028 = 0), the admission lookup (row or no-rows) and the
-// terminal-facts lookup (jsonb of the canonical map, or no-rows).
+// errUnexpectedMockLookup marks a lookup the scenario never configured. It
+// is deliberately distinct from pgx.ErrNoRows: a query under the wrong key
+// must fail the delivery loudly instead of passing as a legitimate domain
+// miss (the false-pass the previous loose helper allowed by ignoring bind
+// arguments entirely).
+var errUnexpectedMockLookup = errors.New("unexpected mock lookup")
+
+// fixtureIdentity names the three wire identities the lookup queries bind.
+// The canonical fixture event fixes them; a scenario that delivers under a
+// different identity configures its own.
+type fixtureIdentity struct{ invocation, org, request string }
+
+// canonicalIdentity is the identity of chargedProducerEvent.
+func canonicalIdentity() fixtureIdentity {
+	ev := chargedProducerEvent()
+	return fixtureIdentity{invocation: ev.InvocationID, org: ev.OrgID, request: ev.RequestID}
+}
+
+// identityFromFacts derives the expected lookup identities from the
+// configured facts scenario, falling back to the canonical fixture per
+// field. Facts fixtures may diverge from the wire in content (that is what
+// the verification tests exercise), but their identity fields always match
+// the delivery under test; scenarios without a facts row deliver the
+// canonical wire identity.
+func identityFromFacts(facts map[string]any) fixtureIdentity {
+	id := canonicalIdentity()
+	if facts == nil {
+		return id
+	}
+	if v, ok := facts["invocation_id"].(string); ok && v != "" {
+		id.invocation = v
+	}
+	if v, ok := facts["org_id"].(string); ok && v != "" {
+		id.org = v
+	}
+	if v, ok := facts["request_id"].(string); ok && v != "" {
+		id.request = v
+	}
+	return id
+}
+
+// sameMockArgs compares bind arguments by rendered value: every production
+// bind on these routes is a string, where rendered equality is identity.
+func sameMockArgs(got, want []any) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range want {
+		if fmt.Sprint(got[i]) != fmt.Sprint(want[i]) {
+			return false
+		}
+	}
+	return true
+}
+
+// unexpectedBind fails the lookup with the distinct wrong-key error.
+func unexpectedBind(route string, got, want []any) errRow {
+	return errRow{err: fmt.Errorf("%w: %s binds %v, want %v", errUnexpectedMockLookup, route, got, want)}
+}
+
+// admissionRow routes the mock QueryRow surface under strict lookup
+// expectations:
+//
+//   - the schema probe (0028+ = 1 / pre-0028 = 0);
+//   - the reservations mode read ("off" by default — partial-usage billing
+//     of failed events stays inert unless a test overrides this route);
+//   - the admission lookup, which must bind exactly the scenario's
+//     invocation identity (configured row, or configured no-rows);
+//   - the terminal-facts lookup, which must bind exactly the scenario's
+//     invocation AND org (jsonb payload of the configured map, or
+//     configured no-rows);
+//   - the optional enrichment probes (tool_calls, policy_decisions),
+//     which must bind their production (request, org) / (org, request)
+//     identities and answer no-rows — every scenario here starts from an
+//     empty ledger;
+//   - anything else fails with errUnexpectedMockLookup, never ErrNoRows.
 func admissionRow(schemaCols int, admission *fakeRow, facts map[string]any) func(context.Context, string, ...any) pgx.Row {
-	return func(_ context.Context, query string, _ ...any) pgx.Row {
-		if strings.Contains(query, "information_schema.columns") {
+	id := identityFromFacts(facts)
+	factsJSON := ""
+	if facts != nil {
+		raw, err := json.Marshal(facts)
+		if err != nil {
+			panic(err) // the canonical fixture must always marshal
+		}
+		factsJSON = string(raw)
+	}
+	return func(_ context.Context, query string, args ...any) pgx.Row {
+		switch {
+		case strings.Contains(query, "information_schema.columns"):
 			return &fakeRow{vals: []any{schemaCols}}
-		}
-		if strings.Contains(query, "FROM organizations") {
-			// reservations mode: off by default — partial-usage billing of
-			// failed events stays inert unless a test overrides this route.
+		case strings.Contains(query, "FROM organizations"):
 			return &fakeRow{vals: []any{"off"}}
-		}
-		if strings.Contains(query, "FROM request_admissions") {
+		case strings.Contains(query, "FROM request_admissions"):
+			if want := []any{id.invocation}; !sameMockArgs(args, want) {
+				return unexpectedBind("request_admissions", args, want)
+			}
 			if admission == nil {
 				return errRow{err: pgx.ErrNoRows}
 			}
 			return admission
-		}
-		if strings.Contains(query, "FROM request_terminal_facts") {
+		case strings.Contains(query, "FROM request_terminal_facts"):
+			if want := []any{id.invocation, id.org}; !sameMockArgs(args, want) {
+				return unexpectedBind("request_terminal_facts", args, want)
+			}
 			if facts == nil {
 				return errRow{err: pgx.ErrNoRows}
 			}
-			raw, err := json.Marshal(facts)
-			if err != nil {
-				return errRow{err: err}
+			return &fakeRow{vals: []any{factsJSON}}
+		case strings.Contains(query, "FROM tool_calls") && strings.Contains(query, "LIMIT 1"):
+			if want := []any{id.request, id.org}; !sameMockArgs(args, want) {
+				return unexpectedBind("tool_calls probe", args, want)
 			}
-			return &fakeRow{vals: []any{string(raw)}}
+			return errRow{err: pgx.ErrNoRows}
+		case strings.Contains(query, "FROM policy_decisions"):
+			if want := []any{id.org, id.request}; !sameMockArgs(args, want) {
+				return unexpectedBind("policy_decisions probe", args, want)
+			}
+			return errRow{err: pgx.ErrNoRows}
+		default:
+			return errRow{err: fmt.Errorf("%w: %q binds %v", errUnexpectedMockLookup, query, args)}
 		}
-		return errRow{err: pgx.ErrNoRows}
 	}
 }
 
@@ -398,4 +491,36 @@ func TestFailedEventAdmissionBindingMirrorsComplete(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	assert.False(t, wroteLog, "the failed handler parks before its row write too")
+}
+
+// Wrong-key control: a delivery whose invocation differs from the
+// configured lookup expectations must fail with the distinct router error
+// instead of passing as a domain miss. Under the previous loose helper the
+// sibling invocation silently reused the canonical fixture's rows (the
+// helper ignored bind arguments and mapped every unrecognized lookup to
+// ErrNoRows), so tenant-binding assertions could pass against the wrong
+// identity.
+func TestWrongKeyLookupFailsInsteadOfPassing(t *testing.T) {
+	db := &mockDB{
+		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}, chargedTerminalFacts()),
+	}
+	c := NewWithCreditStore(&mockRedis{}, db, "events:queue", silentLogger(), credits.NewStore(nil, silentLogger()))
+
+	msg := invocationChargedMsg("37-1")
+	msg.Values["invocation_id"] = "11111111-2222-4333-8444-555555555555" // sibling invocation
+	err := c.processMessage(context.Background(), msg)
+	require.ErrorIs(t, err, errUnexpectedMockLookup)
+
+	// A wrong-org delivery whose admission row agrees with the sibling org
+	// passes binding and must then fail the strict facts bind: the facts
+	// lookup binds the event's org, which differs from the configured
+	// scenario identity.
+	siblingDB := &mockDB{
+		QueryRowFn: admissionRow(1, &fakeRow{vals: []any{"org-sibling", "admitted"}}, chargedTerminalFacts()),
+	}
+	siblingConsumer := NewWithCreditStore(&mockRedis{}, siblingDB, "events:queue", silentLogger(), credits.NewStore(nil, silentLogger()))
+	sibling := invocationChargedMsg("37-2")
+	sibling.Values["org_id"] = "org-sibling"
+	err = siblingConsumer.processMessage(context.Background(), sibling)
+	require.ErrorIs(t, err, errUnexpectedMockLookup, "a wrong-org delivery fails the strict facts bind too")
 }
