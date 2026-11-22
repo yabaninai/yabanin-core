@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"strings"
@@ -18,6 +19,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/logctx"
 	"github.com/reireirei/yabanin/pkg/metrics"
 	"github.com/reireirei/yabanin/pkg/provider"
+	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
@@ -40,6 +42,41 @@ const realtimeDefaultTimeout = 5 * time.Minute
 // (top-level usage or response.usage) is billed; a client disconnect settles
 // the consumed prefix with TerminationClientCancel — usage is never lost
 // (G3 parity with the chat stream drain contract).
+// realtimeRequest is the validated client shape of the realtime route.
+type realtimeRequest struct {
+	Model string `json:"model"`
+}
+
+// parseRealtimeRequest reads and validates the client request. Every
+// refusal lands BEFORE admission, so a rejected request leaves no durable
+// trace; a client that walked away mid-body gets no envelope at all (N3,
+// audio parity — the response target is gone, and writing it would race
+// the server's conn teardown).
+func parseRealtimeRequest(w http.ResponseWriter, r *http.Request) (realtimeRequest, []byte, bool) {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		if r.Context().Err() != nil {
+			return realtimeRequest{}, nil, false
+		}
+		if httpmw.IsMaxBytesError(err) {
+			apierrors.Write(w, http.StatusRequestEntityTooLarge, apierrors.ErrorCodeInvalidRequest, "request body too large")
+			return realtimeRequest{}, nil, false
+		}
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "request body too large or malformed")
+		return realtimeRequest{}, nil, false
+	}
+	var req realtimeRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
+		return realtimeRequest{}, nil, false
+	}
+	if req.Model == "" {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+		return realtimeRequest{}, nil, false
+	}
+	return req, body, true
+}
+
 func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	l := logctx.From(r.Context(), gw.log)
@@ -50,30 +87,8 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 			"websocket is not supported; realtime is SSE-only", apierrors.CodeUnsupportedFeature)
 		return
 	}
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		// N3 (audio parity): the client walked away mid-body — the
-		// response target is gone; writing the envelope would race the
-		// server's conn teardown.
-		if r.Context().Err() != nil {
-			return
-		}
-		if httpmw.IsMaxBytesError(err) {
-			apierrors.Write(w, http.StatusRequestEntityTooLarge, apierrors.ErrorCodeInvalidRequest, "request body too large")
-			return
-		}
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "request body too large or malformed")
-		return
-	}
-	var req struct {
-		Model string `json:"model"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
-		return
-	}
-	if req.Model == "" {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+	req, body, ok := parseRealtimeRequest(w, r)
+	if !ok {
 		return
 	}
 
@@ -86,112 +101,40 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"realtime is not supported for this provider", "realtime_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "realtime", "realtime is not supported for this provider") {
 		return
 	}
 
 	// NEXT-18c (ADR-0001 §5.1) + ratified D3: reservation rides the input
 	// pre-estimate (chat-shaped bound — realtime sessions generate output,
-	// so the org default out cap applies; MaxTokens stays nil). The minted
-	// invocation identity rides the same context so the confirmed start and
-	// the terminal facts bind to this request's admission row.
-	rctx := withInvocationIdentity(r.Context(), admitted.Invocation)
-	gate, ok := gw.reservationPlan(w, r, "realtime",
-		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
-			admitted.Info, admitted.Body, nil, false))
+	// so the org default out cap applies; MaxTokens stays nil).
+	rctx, gate, ok := gw.reservePaidDispatch(r.Context(), w, r, "realtime", admitted, nil, false)
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
+
+	client, upstreamBody, apiKey, providerName, upstreamURL, ok := gw.paidUpstreamClient(l, w, gate, admitted, admitted.Info.Provider)
+	if !ok {
 		return
 	}
-
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = realtimeDefaultTimeout
-	}
-	// The stream gets its own cancel so the idle watchdog can abort a
-	// stalled upstream without touching the parent request context; the
-	// parent deadline (the session ceiling) still applies (stream.go
-	// parity).
-	streamCtx, cancelStream := context.WithTimeout(rctx, timeout)
-	defer cancelStream()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
-		return
-	}
-	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
 	// Stream capability precedes the durable start: a writer that cannot
 	// flush must fail BEFORE the admission commits and before any paid
 	// dispatch — the old post-dispatch 501 both wasted paid work and
 	// stranded the admitted row without terminal facts (chat
 	// streamRun.admit canon — fail before anything durable, with zero
 	// provider arrivals).
-	if _, ok := w.(http.Flusher); !ok {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
+	if !requireStreamFlusher(w, gate, true) {
 		return
 	}
-	// Preview2 durable accounting: the confirmed start commits immediately
-	// BEFORE the first paid provider dispatch — after every fallible local
-	// setup step above (pool wiring, model remap, stream capability), so a
-	// local failure never strands a durable admission for a request that
-	// never dispatched. The kind binds to the only transport this surface
-	// dispatches (SSE). Fail closed: an unwritten start (write error,
-	// timeout or lost ACK — outcome unknown) refuses the request with ZERO
-	// provider arrivals under the history_unavailable envelope, and the
-	// escrow is released. The structured 503 precedes the SSE commit point
-	// below, so it can never land after client success headers.
-	if err := gw.confirmPaidInvocation(rctx, invocationKindStream); err != nil {
-		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
-		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
-		writeInvocationStartRefusal(w, err)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindStream) {
 		return
 	}
-	resp, err := client.Do(streamCtx, "/v1/realtime", upstreamBody, apiKey, true, nil)
-	if err != nil {
-		closeUpstream(l, resp)
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
+	resp, cancelStream, ok := dialRealtimeSSE(w, rctx, l, gate, client, upstreamBody, apiKey, admitted.Info)
+	if !ok {
 		return
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
-		return
-	}
-
-	// SSE commit point: headers go out only after the upstream answered
-	// 200, so every pre-stream failure above keeps the JSON error envelope.
-	// The stream capability was checked before the durable start; the
-	// writer is a Flusher by construction.
-	w.Header().Set("Content-Type", "text/event-stream")
-	w.Header().Set("Cache-Control", "no-cache")
-	w.Header().Set("Connection", "keep-alive")
-	w.Header().Set("X-Accel-Buffering", "no")
-	w.Header().Set("Proxy-Cache", "bypass")
+	defer cancelStream()
 
 	// The raw-chunk relay writes through the tail tracker so a torn last
 	// event is closed before the terminal error frame composes (chat F2
@@ -210,127 +153,199 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 		metrics.UpstreamFirstTokenSeconds.WithLabelValues(providerName, admitted.Info.ModelName).
 			Observe(float64(ttftMs) / 1000)
 	}
-
 	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
+	settle := realtimeSettle{
+		rctx:         rctx,
+		w:            w,
+		l:            l,
+		admitted:     admitted,
+		usage:        usage,
+		tee:          tee,
+		ext:          ext,
+		ttftMs:       ttftMs,
+		hasTTFT:      hasTTFT,
+		started:      started,
+		providerName: providerName,
+		upstreamURL:  upstreamURL,
+		region:       gw.cfg.Region,
+		resp:         resp,
+	}
 	if drainErr != nil {
-		// Best-effort terminal error frame (contained when the client is
-		// already gone — stream.go writeSSEError parity); partial usage was
-		// consumed upstream, so it still bills (G3). The torn tail closes
-		// first so the error frame starts at an event boundary, and a held
-		// successful terminal is dropped — the client must NOT observe a
-		// success terminator for a session that ended abnormally (chat
-		// failDoneHold canon).
-		hold.drop()
-		tail.complete()
-		switch term {
-		case budget.TerminationIdleTimeout:
-			writeSSEError(w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
-		default:
-			writeSSEError(w, apierrors.ErrorCodeAPI, "realtime stream interrupted")
-		}
-		gw.accountUsage(rctx, w, usageRecord{
-			orgID:         admitted.OrgID,
-			taskID:        admitted.TaskID,
-			sessionID:     admitted.SessionID,
-			affinityModel: admitted.Info.ModelName,
-			usage:         usage,
-		})
-		_, ferr := gw.finishRequest(rctx, requestFinish{
-			base: eventBase{
-				EventType:                  "request.failed",
-				RequestID:                  admitted.RequestID,
-				SessionID:                  admitted.SessionID,
-				Payload:                    string(admitted.Body),
-				UpstreamResponse:           tee.String(),
-				OrgID:                      admitted.OrgID,
-				TeamID:                     admitted.TeamID,
-				AgentID:                    admitted.AgentID,
-				UserID:                     admitted.UserID,
-				APIKeyID:                   admitted.APIKeyID,
-				SessionKeyID:               admitted.SessionKeyID,
-				TaskID:                     admitted.TaskID,
-				ModelRequested:             admitted.RequestedModel,
-				ModelUsed:                  admitted.Info.ModelName,
-				UpstreamURL:                upstreamURL,
-				StatusCode:                 http.StatusOK, // the stream was live; the failure is in-band
-				DurationMs:                 time.Since(started).Milliseconds(),
-				TokensIn:                   usage.PromptTokens,
-				TokensOut:                  usage.CompletionTokens,
-				CacheReadTokens:            usage.CacheReadTokens,
-				EstimatedCostUSD:           ext.EstimatedCostUSD,
-				Endpoint:                   "realtime",
-				UsageSource:                usageSourceOrNone(usage.Source),
-				CostStatus:                 costStatus(false, usage.Source, ext.PriceKnown),
-				Method:                     http.MethodPost,
-				Error:                      "realtime stream ended abnormally: " + drainErr.Error(),
-				FirstTokenMs:               firstTokenMsOrZero(ttftMs, hasTTFT),
-				InferenceRegion:            admitted.Info.Region,
-				ModelOriginCountry:         admitted.Info.Provider,
-				LogStorageRegion:           gw.cfg.Region,
-				ProviderEntityJurisdiction: admitted.Info.Provider,
-				Labels:                     labelsFrom(rctx),
-			},
-			info:        admitted.Info,
-			resp:        resp,
-			termination: term,
-			eventNote:   true,
-		}, nil)
-		if ferr != nil {
-			// The client's stream already ended in the SSE error frame; the
-			// withheld event is logged loudly (finishRequestLogged canon).
-			l.Error("terminal facts commit failed after errored stream; event withheld from consumer", "error", ferr)
-		}
+		gw.finishRealtimeDrainError(settle, tail, hold, term, drainErr)
 		return
 	}
+	gw.finishRealtimeSession(settle, hold)
+}
 
-	gw.accountUsage(rctx, w, usageRecord{
-		orgID:         admitted.OrgID,
-		taskID:        admitted.TaskID,
-		sessionID:     admitted.SessionID,
-		affinityModel: admitted.Info.ModelName,
-		usage:         usage,
-		costUSD:       ext.EstimatedCostUSD,
-		priceKnown:    ext.PriceKnown,
+// dialRealtimeSSE opens the paid /v1/realtime SSE session: the stream
+// context with its own cancel (the idle watchdog can abort a stalled
+// upstream without touching the parent request context; the parent
+// deadline — the session ceiling from the model's upstream timeout, with
+// the realtime default when the registry entry carries none — still
+// applies, stream.go parity), the POST through the pool client, the
+// upstream status refusal, and — only after a 200 — the SSE commit point
+// headers. The structured 503 precedes that commit point, so it can never
+// land after client success headers.
+func dialRealtimeSSE(w http.ResponseWriter, rctx context.Context, l *slog.Logger, gate *reservationGate, client *upstream.Client, upstreamBody []byte, apiKey string, info resolver.ModelInfo) (*http.Response, context.CancelFunc, bool) {
+	timeout := info.UpstreamTimeout
+	if timeout <= 0 {
+		timeout = realtimeDefaultTimeout
+	}
+	streamCtx, cancelStream := context.WithTimeout(rctx, timeout)
+	resp, err := client.Do(streamCtx, "/v1/realtime", upstreamBody, apiKey, true, nil)
+	if err != nil {
+		cancelStream()
+		closeUpstream(l, resp)
+		gate.finalizeNoEvent(mediaTermination(rctx))
+		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
+		return nil, nil, false
+	}
+	if resp.StatusCode != http.StatusOK {
+		resp.Body.Close()
+		cancelStream()
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
+		apierrors.Write(w, status, errType, "upstream request failed")
+		return nil, nil, false
+	}
+	// SSE commit point: headers go out only after the upstream answered
+	// 200, so every pre-stream failure above keeps the JSON error envelope.
+	// The stream capability was checked before the durable start; the
+	// writer is a Flusher by construction.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+	w.Header().Set("X-Accel-Buffering", "no")
+	w.Header().Set("Proxy-Cache", "bypass")
+	return resp, cancelStream, true
+}
+
+// realtimeSettle carries the inputs shared by the two realtime settle
+// paths (abnormal drain and healthy completion): both stamp the same
+// analytics facts from the relay's outcome and differ only in the event
+// type, the terminal class and the cost/hold handling.
+type realtimeSettle struct {
+	rctx         context.Context
+	w            http.ResponseWriter
+	l            *slog.Logger
+	admitted     admitted
+	usage        provider.Usage
+	tee          *boundedBuffer
+	ext          provider.ExtendedUsage
+	ttftMs       int64
+	hasTTFT      bool
+	started      time.Time
+	providerName string
+	upstreamURL  string
+	region       string
+	resp         *http.Response
+}
+
+// realtimeEventBase assembles the analytics event both realtime settle
+// paths stamp. The stream was live when a drain error struck, so even
+// that settle carries Status 200 — the failure is in-band.
+func realtimeEventBase(s realtimeSettle, eventType, errMsg string) eventBase {
+	admitted := s.admitted
+	base := eventBase{
+		EventType:                  eventType,
+		RequestID:                  admitted.RequestID,
+		SessionID:                  admitted.SessionID,
+		Payload:                    string(admitted.Body),
+		UpstreamResponse:           s.tee.String(),
+		OrgID:                      admitted.OrgID,
+		TeamID:                     admitted.TeamID,
+		AgentID:                    admitted.AgentID,
+		UserID:                     admitted.UserID,
+		APIKeyID:                   admitted.APIKeyID,
+		SessionKeyID:               admitted.SessionKeyID,
+		TaskID:                     admitted.TaskID,
+		ModelRequested:             admitted.RequestedModel,
+		ModelUsed:                  admitted.Info.ModelName,
+		UpstreamURL:                s.upstreamURL,
+		StatusCode:                 http.StatusOK,
+		DurationMs:                 time.Since(s.started).Milliseconds(),
+		TokensIn:                   s.usage.PromptTokens,
+		TokensOut:                  s.usage.CompletionTokens,
+		CacheReadTokens:            s.usage.CacheReadTokens,
+		EstimatedCostUSD:           s.ext.EstimatedCostUSD,
+		Endpoint:                   "realtime",
+		UsageSource:                usageSourceOrNone(s.usage.Source),
+		CostStatus:                 costStatus(false, s.usage.Source, s.ext.PriceKnown),
+		Method:                     http.MethodPost,
+		FirstTokenMs:               firstTokenMsOrZero(s.ttftMs, s.hasTTFT),
+		InferenceRegion:            admitted.Info.Region,
+		ModelOriginCountry:         admitted.Info.Provider,
+		LogStorageRegion:           s.region,
+		ProviderEntityJurisdiction: admitted.Info.Provider,
+		Labels:                     labelsFrom(s.rctx),
+	}
+	if errMsg != "" {
+		base.Error = errMsg
+	}
+	return base
+}
+
+// finishRealtimeDrainError settles an abnormally-ended session: the torn
+// tail closes first so the error frame starts at an event boundary, and a
+// held successful terminal is dropped — the client must NOT observe a
+// success terminator for a session that ended abnormally (chat
+// failDoneHold canon). The best-effort terminal error frame is contained
+// when the client is already gone (stream.go writeSSEError parity);
+// partial usage was consumed upstream, so it still bills (G3). The
+// withheld event is logged loudly when the terminal facts commit fails
+// (finishRequestLogged canon).
+func (gw *gateway) finishRealtimeDrainError(s realtimeSettle, tail *ssePassthroughTail, hold *realtimeTerminalHold, term budget.Termination, drainErr error) {
+	hold.drop()
+	tail.complete()
+	switch term {
+	case budget.TerminationIdleTimeout:
+		writeSSEError(s.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
+	default:
+		writeSSEError(s.w, apierrors.ErrorCodeAPI, "realtime stream interrupted")
+	}
+	gw.accountUsage(s.rctx, s.w, usageRecord{
+		orgID:         s.admitted.OrgID,
+		taskID:        s.admitted.TaskID,
+		sessionID:     s.admitted.SessionID,
+		affinityModel: s.admitted.Info.ModelName,
+		usage:         s.usage,
 	})
-	_, ferr := gw.finishRequest(rctx, requestFinish{
-		base: eventBase{
-			EventType:                  "request.completed",
-			RequestID:                  admitted.RequestID,
-			SessionID:                  admitted.SessionID,
-			Payload:                    string(admitted.Body),
-			UpstreamResponse:           tee.String(),
-			OrgID:                      admitted.OrgID,
-			TeamID:                     admitted.TeamID,
-			AgentID:                    admitted.AgentID,
-			UserID:                     admitted.UserID,
-			APIKeyID:                   admitted.APIKeyID,
-			SessionKeyID:               admitted.SessionKeyID,
-			TaskID:                     admitted.TaskID,
-			ModelRequested:             admitted.RequestedModel,
-			ModelUsed:                  admitted.Info.ModelName,
-			UpstreamURL:                upstreamURL,
-			StatusCode:                 http.StatusOK,
-			DurationMs:                 time.Since(started).Milliseconds(),
-			TokensIn:                   usage.PromptTokens,
-			TokensOut:                  usage.CompletionTokens,
-			CacheReadTokens:            usage.CacheReadTokens,
-			EstimatedCostUSD:           ext.EstimatedCostUSD,
-			Endpoint:                   "realtime",
-			UsageSource:                usageSourceOrNone(usage.Source),
-			CostStatus:                 costStatus(false, usage.Source, ext.PriceKnown),
-			Method:                     http.MethodPost,
-			FirstTokenMs:               firstTokenMsOrZero(ttftMs, hasTTFT),
-			InferenceRegion:            admitted.Info.Region,
-			ModelOriginCountry:         admitted.Info.Provider,
-			LogStorageRegion:           gw.cfg.Region,
-			ProviderEntityJurisdiction: admitted.Info.Provider,
-			Labels:                     labelsFrom(rctx),
-		},
-		info: admitted.Info,
-		resp: resp,
-		// NEXT-18c: settle the reservation with the actual spend (§5.3
-		// Finalize); the termination class tells the consumer how the
-		// session ended.
+	_, ferr := gw.finishRequest(s.rctx, requestFinish{
+		base:        realtimeEventBase(s, "request.failed", "realtime stream ended abnormally: "+drainErr.Error()),
+		info:        s.admitted.Info,
+		resp:        s.resp,
+		termination: term,
+		eventNote:   true,
+	}, nil)
+	if ferr != nil {
+		s.l.Error("terminal facts commit failed after errored stream; event withheld from consumer", "error", ferr)
+	}
+}
+
+// finishRealtimeSession settles the healthy session: usage accounting
+// with the computed cost, then the terminal request.completed facts and
+// the reservation (NEXT-18c §5.3 Finalize — the termination class tells
+// the consumer how the session ended). A failed terminal-facts commit
+// discards the deferred successful suffix and closes the live stream
+// with the accounting_commit_failed error frame — deliberately NO
+// safe-retry language: the work already ran under this invocation
+// identity (chat stream canon); the withheld event never reaches the
+// consumer. On success the suffix is replayed after the durable write,
+// byte-for-byte and in order.
+func (gw *gateway) finishRealtimeSession(s realtimeSettle, hold *realtimeTerminalHold) {
+	gw.accountUsage(s.rctx, s.w, usageRecord{
+		orgID:         s.admitted.OrgID,
+		taskID:        s.admitted.TaskID,
+		sessionID:     s.admitted.SessionID,
+		affinityModel: s.admitted.Info.ModelName,
+		usage:         s.usage,
+		costUSD:       s.ext.EstimatedCostUSD,
+		priceKnown:    s.ext.PriceKnown,
+	})
+	_, ferr := gw.finishRequest(s.rctx, requestFinish{
+		base:        realtimeEventBase(s, "request.completed", ""),
+		info:        s.admitted.Info,
+		resp:        s.resp,
 		termination: budget.TerminationCompleted,
 		eventNote:   true,
 	}, nil)
@@ -339,19 +354,16 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 			// Defensive only: an unarmed stream never dispatches under
 			// Preview2 (the durable start fails closed), and nothing was
 			// withheld — never append a terminal after a live stream.
-			l.Error("terminal facts commit failed on unarmed stream", "error", ferr)
+			s.l.Error("terminal facts commit failed on unarmed stream", "error", ferr)
 			return
 		}
 		// Central binding: SSE 200 headers are already committed, so the
 		// client keeps the live prefix bytes; the deferred successful
 		// suffix is discarded and the terminal accounting failure closes
-		// the stream with the error frame carrying accounting_commit_failed
-		// — deliberately NO safe-retry language: the work already ran under
-		// this invocation identity (chat stream canon). The withheld event
-		// never reaches the consumer.
+		// the stream with the error frame carrying accounting_commit_failed.
 		hold.drop()
-		l.Error("terminal facts commit failed after streamed dispatch", "error", ferr)
-		writeSSEErrorWithCode(w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+		s.l.Error("terminal facts commit failed after streamed dispatch", "error", ferr)
+		writeSSEErrorWithCode(s.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
 			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
 		return
 	}
@@ -359,7 +371,7 @@ func (gw *gateway) realtime(w http.ResponseWriter, r *http.Request) {
 	// stream is delivered byte-for-byte and in order.
 	hold.release()
 	if hold.replayErr != nil {
-		l.Error("terminal hold suffix replay failed after committed facts", "error", hold.replayErr)
+		s.l.Error("terminal hold suffix replay failed after committed facts", "error", hold.replayErr)
 	}
 }
 
@@ -402,44 +414,13 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 	term = budget.TerminationUpstreamErr
 	var relayed int64
 	buf := make([]byte, 32*1024)
-	sink := &realtimeRelaySink{}
-	sink.write = func(blob []byte) {
-		if len(blob) == 0 || sink.werr != nil {
-			return
-		}
-		if _, e := w.Write(blob); e != nil {
-			sink.werr = e // first client-write failure; writes stop and no further provider bytes are pulled
-			return
-		}
-		flusher.Flush()
-	}
+	sink := newRealtimeRelaySink(w, flusher)
 	// Central binding (Preview2 durable accounting, chat [DONE] hold canon):
 	// an admitted invocation holds the session's last successful terminal —
 	// response.done with response.status completed — until the caller's
 	// terminal facts commit succeeds. Unarmed streams (no admission) pass
 	// straight through.
-	sink.hold = &realtimeTerminalHold{
-		write: sink.write,
-		armed: gw.invocations != nil && invocationIdentityFrom(rctx) != nil && invocationIdentityFrom(rctx).Admitted(),
-	}
-	// lineAbort ends the drain for a line-processing error: an oversized
-	// line/frame and a spool exhaustion are upstream aborts; any other
-	// error is a failed client write — the client walked away
-	// mid-session, and the consumed prefix is billed by the caller (G3
-	// cancel-settle parity).
-	lineAbort := func(lerr error) (provider.Usage, *boundedBuffer, budget.Termination, *realtimeTerminalHold, error) {
-		abortTerm := budget.TerminationClientCancel
-		var tooLarge errRealtimeLineTooLarge
-		var holdIO errRealtimeHoldIO
-		if errors.As(lerr, &tooLarge) || errors.As(lerr, &holdIO) {
-			// Bounded memory: the relay aborts as an upstream error, and a
-			// spool exhaustion happened BEFORE any suffix byte was
-			// delivered — no successful terminal was seen, so the drain
-			// error path stays terminal-safe.
-			abortTerm = budget.TerminationUpstreamErr
-		}
-		return sink.usage, tee, abortTerm, sink.hold, lerr
-	}
+	sink.hold.armed = gw.realtimeHoldArmed(rctx)
 	for {
 		n, rerr := reader.Read(buf)
 		if n > 0 {
@@ -452,12 +433,14 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			}
 			_, _ = capture.Write(chunk)
 			if lerr := sink.feedChunk(chunk); lerr != nil {
-				return lineAbort(lerr)
+				term, drainErr = sink.lineAbortResult(lerr)
+				return sink.usage, tee, term, sink.hold, drainErr
 			}
 			if sink.lines.Pending() > apiformat.SSEStreamLineLimit {
 				// An unterminated line grew past the buffering limit: the
 				// relay aborts as an upstream error (bounded memory).
-				return sink.usage, tee, budget.TerminationUpstreamErr, sink.hold, errRealtimeLineTooLarge{}
+				term, drainErr = sink.lineAbortResult(errRealtimeLineTooLarge{})
+				return sink.usage, tee, term, sink.hold, drainErr
 			}
 		}
 		if sink.werr != nil {
@@ -468,31 +451,13 @@ func (gw *gateway) realtimeRelay(rctx context.Context, w http.ResponseWriter, fl
 			// already covers what was paid for.
 			return sink.usage, tee, budget.TerminationClientCancel, sink.hold, sink.werr
 		}
-		if rerr == io.EOF {
-			// Clean end: EOF is not a drain failure; the tail settles with
-			// the same boundary-aligned salvage rule. A recorded client
-			// write failure still settles as a cancel — the client never
-			// saw the stream through.
-			if lerr := sink.settleTail(); lerr != nil {
-				return lineAbort(lerr)
-			}
-			if sink.werr != nil {
-				return sink.usage, tee, budget.TerminationClientCancel, sink.hold, sink.werr
-			}
-			return sink.usage, tee, budget.TerminationCompleted, sink.hold, nil
-		}
 		if rerr != nil {
-			// Broken upstream: same boundary-aligned salvage as EOF — the
-			// closed frame keeps the client stream and the settlement on
-			// the same event — then the termination class and the read
-			// error return.
-			if lerr := sink.settleTail(); lerr != nil {
-				return lineAbort(lerr)
-			}
-			if sink.werr != nil {
-				return sink.usage, tee, budget.TerminationClientCancel, sink.hold, sink.werr
-			}
-			return sink.usage, tee, realtimeBreakTerm(rctx, idle), sink.hold, rerr
+			// Clean EOF or a broken upstream read: the tail settles with
+			// the same boundary-aligned salvage rule, a recorded write
+			// failure settles as a cancel, and a live client stream gets
+			// the read error and its termination class.
+			term, drainErr = sink.settleEnd(rctx, idle, rerr)
+			return sink.usage, tee, term, sink.hold, drainErr
 		}
 	}
 }
@@ -508,6 +473,74 @@ func realtimeBreakTerm(rctx context.Context, idle *idleReader) budget.Terminatio
 		return budget.TerminationClientCancel
 	}
 	return budget.TerminationUpstreamErr
+}
+
+// newRealtimeRelaySink wires a sink's client write path: a write stops for
+// good at the first failure (the error latches; no further provider bytes
+// are pulled), every delivered unit flushes, and the terminal hold rides
+// the same writer so a replayed suffix records failures and flushes
+// identically.
+func newRealtimeRelaySink(w http.ResponseWriter, flusher http.Flusher) *realtimeRelaySink {
+	s := &realtimeRelaySink{}
+	s.write = func(blob []byte) {
+		if len(blob) == 0 || s.werr != nil {
+			return
+		}
+		if _, e := w.Write(blob); e != nil {
+			s.werr = e // first client-write failure; writes stop and no further provider bytes are pulled
+			return
+		}
+		flusher.Flush()
+	}
+	s.hold = &realtimeTerminalHold{write: s.write}
+	return s
+}
+
+// lineAbortResult ends the drain for a line-processing error: an oversized
+// line/frame and a spool exhaustion are upstream aborts; any other
+// error is a failed client write — the client walked away
+// mid-session, and the consumed prefix is billed by the caller (G3
+// cancel-settle parity).
+func (s *realtimeRelaySink) lineAbortResult(lerr error) (budget.Termination, error) {
+	abortTerm := budget.TerminationClientCancel
+	var tooLarge errRealtimeLineTooLarge
+	var holdIO errRealtimeHoldIO
+	if errors.As(lerr, &tooLarge) || errors.As(lerr, &holdIO) {
+		// Bounded memory: the relay aborts as an upstream error, and a
+		// spool exhaustion happened BEFORE any suffix byte was
+		// delivered — no successful terminal was seen, so the drain
+		// error path stays terminal-safe.
+		abortTerm = budget.TerminationUpstreamErr
+	}
+	return abortTerm, lerr
+}
+
+// settleEnd finishes the relay at the upstream's end. Clean EOF is not a
+// drain failure; a broken read gets the same boundary-aligned salvage as
+// EOF — the closed frame keeps the client stream and the settlement on
+// the same event — and then returns the read error with its Finalize
+// termination class (§5.3). A settle/line error classifies through
+// lineAbortResult; a recorded client write failure still settles as a
+// cancel — the client never saw the stream through.
+func (s *realtimeRelaySink) settleEnd(rctx context.Context, idle *idleReader, rerr error) (budget.Termination, error) {
+	if lerr := s.settleTail(); lerr != nil {
+		return s.lineAbortResult(lerr)
+	}
+	if s.werr != nil {
+		return budget.TerminationClientCancel, s.werr
+	}
+	if rerr == io.EOF {
+		return budget.TerminationCompleted, nil
+	}
+	return realtimeBreakTerm(rctx, idle), rerr
+}
+
+// realtimeHoldArmed reports whether the request context carries an
+// admission-backed invocation identity: only such streams hold their
+// successful terminal for the caller's terminal facts commit.
+func (gw *gateway) realtimeHoldArmed(rctx context.Context) bool {
+	id := invocationIdentityFrom(rctx)
+	return gw.invocations != nil && id != nil && id.Admitted()
 }
 
 // realtimeRelaySink owns the per-session framing state of one realtime
