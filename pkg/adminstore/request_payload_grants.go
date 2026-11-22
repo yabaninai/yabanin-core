@@ -121,7 +121,8 @@ func resolveRequestPayloadGrantTarget(ctx context.Context, tx auditTx, orgID, re
 // CreateRequestPayloadGrantScope issues a durable single-request bearer
 // grant bound to exactly one physical request_logs row. Issuance refuses
 // fail-closed when the target is gone or ambiguous rather than minting an
-// addressable-wider grant.
+// addressable-wider grant. The grant row and its mandatory issue audit share
+// ONE transaction (single-commit atomicity): a lost audit leaves no grant.
 func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope string, ttl time.Duration, now time.Time) (RequestPayloadGrant, error) {
 	if err := validateRequestPayloadGrantIssue(orgID, requestID, rootID, scope, ttl); err != nil {
 		return RequestPayloadGrant{}, err
@@ -153,12 +154,16 @@ func (s *Store) CreateRequestPayloadGrantScope(orgID, requestID, rootID, scope s
 	if _, err = tx.Exec(ctx, `INSERT INTO request_payload_grants (id, token_hash, grantor_root, grantee, org_id, request_id, request_row_key, scope, expires_at, created_at) VALUES ($1::uuid, $2, $3::uuid, $3::uuid, $4::uuid, $5, $6::bigint, $7, $8, $9)`, grant.ID, hash[:], rootID, orgID, requestID, grant.RowKey, grant.Scope, grant.ExpiresAt, now); err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("persist payload grant: %w", err)
 	}
+	// The mandatory issue-audit row joins the issuance in ONE transaction: a
+	// failed or lost audit rolls the grant back too, so no active grant can
+	// ever outlive its failed issuance (nor count against the issuer's cap) —
+	// the same single-commit contract the consume couples its use-audit
+	// under. The token is only returned after a committed, audited issuance.
+	if err := appendRequestPayloadGrantAudit(ctx, tx, "request_payload.grant_issued", grant, now); err != nil {
+		return RequestPayloadGrant{}, fmt.Errorf("audit payload grant issue: %w", err)
+	}
 	if err := tx.Commit(ctx); err != nil {
 		return RequestPayloadGrant{}, fmt.Errorf("commit payload grant: %w", err)
-	}
-	if err := s.auditRequestPayloadGrant(ctx, "request_payload.grant_issued", grant, now); err != nil {
-		_, _ = s.db.Exec(ctx, `UPDATE request_payload_grants SET revoked_at=$2 WHERE id=$1::uuid AND revoked_at IS NULL`, grant.ID, now)
-		return RequestPayloadGrant{}, fmt.Errorf("audit payload grant: %w", err)
 	}
 	s.cacheRequestPayloadGrant(hash, grant.ExpiresAt, now)
 	return grant, nil
@@ -378,9 +383,10 @@ func requestPayloadGrantAuditDetails(grant RequestPayloadGrant) (string, error) 
 }
 
 // auditRequestPayloadGrant journals a grant lifecycle entry through the
-// standalone synchronous append (own transaction). Issuance uses it after
-// commit with a compensating revoke on failure; consume instead appends via
-// appendRequestPayloadGrantAudit inside the consume transaction.
+// standalone synchronous append (own transaction). Only revocation uses it —
+// issuance and consume instead append via appendRequestPayloadGrantAudit
+// inside the transaction that performs the state change, so the journal row
+// and the state row commit atomically or not at all.
 func (s *Store) auditRequestPayloadGrant(ctx context.Context, action string, grant RequestPayloadGrant, now time.Time) error {
 	details, err := requestPayloadGrantAuditDetails(grant)
 	if err != nil {

@@ -497,43 +497,39 @@ func TestRequestPayloadDenyOwnHistoryPolicy(t *testing.T) {
 	}
 }
 
-// TestRequestPayloadGrantAuditInterruptionCompensatesAndRetryConverges pins
-// the T08 interruption seam: grant issuance commits the grant row first and
-// writes the mandatory audit second. When the audit write fails after the
-// commit, the compensating revoke must retire the grant (an unaudited grant
-// must never be redeemable), and the retry must converge to exactly one
-// usable grant — no double grant, no cap consumed by the compensated row.
-func TestRequestPayloadGrantAuditInterruptionCompensatesAndRetryConverges(t *testing.T) {
+// TestRequestPayloadGrant_IssuanceJournalFailureLeavesNoGrantOrEvent pins
+// single-commit issuance atomicity: the grant row and its mandatory issue
+// audit share ONE transaction, so a journal outage rolls the grant back too —
+// zero grant rows and zero issue events survive the failed issuance (no
+// unaudited token left behind, no quota consumed by a grant the caller saw
+// fail), and the retry converges to exactly one audited, redeemable grant.
+// The physical PostgreSQL counterpart is
+// TestIntegration_GrantIssuanceAuditFailureRollsBackFully.
+func TestRequestPayloadGrant_IssuanceJournalFailureLeavesNoGrantOrEvent(t *testing.T) {
 	now := time.Date(2026, 10, 21, 9, 0, 0, 0, time.UTC)
 	db := newPayloadGrantFakeDB()
 	store := newForTest(db, newTestLogger(), nil)
 
-	// Attempt 1: the audit write fails after the grant row committed.
+	// Attempt 1: the issue-audit write fails and the whole issuance rolls back.
 	db.auditErr = errors.New("audit journal unavailable")
 	interrupted, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now)
-	require.ErrorContains(t, err, "audit payload grant")
-	require.Empty(t, interrupted.Token)
-	require.Empty(t, db.audited)
-	require.Len(t, db.grants, 1)
-	var retiredHash [32]byte
-	var retired RequestPayloadGrant
-	for retiredHash, retired = range db.grants {
-		require.True(t, grantRevoked(retired), "the committed row must be revoked after the journal write fails")
-	}
-	t.Run("retry converges to one usable grant", func(t *testing.T) {
+	require.ErrorContains(t, err, "audit payload grant issue")
+	require.Empty(t, interrupted.Token, "the bearer token of a rolled-back issuance must never escape the failed call")
+	require.Empty(t, db.grants, "a failed issuance must leave zero grant rows — nothing active, nothing revoked")
+	require.Empty(t, db.audited, "a failed issuance must leave zero issue events")
+
+	t.Run("retry converges to one audited grant", func(t *testing.T) {
 		db.auditErr = nil
 		retried, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now.Add(time.Second))
 		require.NoError(t, err)
-		require.NotEqual(t, retired.ID, retried.ID)
 		require.NotEmpty(t, retried.Token)
-		require.Len(t, db.grants, 2)
-		require.True(t, grantRevoked(db.grants[retiredHash]))
+		require.Len(t, db.grants, 1, "recovery converges to exactly one grant row")
+		require.Equal(t, []string{"request_payload.grant_issued"}, db.audited, "exactly one issue event after recovery")
 		require.True(t, store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)))
 		require.False(t, store.ConsumeRequestPayloadGrant(retried.Token, "org-a", "request-a", "root-a", now.Add(2*time.Second)))
-		require.Equal(t, []string{"request_payload.grant_issued", "request_payload.grant_used"}, db.audited)
 	})
 
-	t.Run("compensated row does not consume the active cap", func(t *testing.T) {
+	t.Run("failed issuance consumed no cap", func(t *testing.T) {
 		// The retried grant was consumed above, so the quota is free again:
 		// root-a can still fill the full quota and the next grant over it
 		// is rejected.
