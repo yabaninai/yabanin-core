@@ -786,9 +786,9 @@ func (s *stand) classifyBogusMultipartRefused(t *testing.T) {
 
 // classifyMalformedUsageFailClosed proves the fail-closed usage rule of
 // the multipart codec: a 200 reply whose usage block cannot parse as
-// token counts still relays byte-identically, but the durable outcome is
-// trusted 0/0 with usage_source none and cost_status no_usage — no
-// wallet debits stay at zero and the requesting team records one request.
+// token counts still relays byte-identically, but the producer classifies
+// it as 0/0 with usage_source none and cost_status no_usage. No wallet
+// charge is allowed; team attribution remains count-only at zero.
 func (s *stand) classifyMalformedUsageFailClosed(t *testing.T) {
 	t.Helper()
 	ledgerBefore := s.teamLedgerSnapshot(t)
@@ -826,7 +826,7 @@ func (s *stand) classifyMalformedUsageFailClosed(t *testing.T) {
 			c.UsageRows+c.TopupRows, c)
 	}
 	s.requireUnpricedSettlementEvidence(t, failClosed, "malformed usage", rid, invocationID, ledgerBefore)
-	t.Logf("product: transcription malformed-usage reply classified: fail-closed 0/0, no invented tokens, no fabricated price (request id %s)", rid)
+	t.Logf("product: transcription malformed-usage reply classified: fail-closed 0/0, no invented tokens or wallet charge; team count-only settled at zero (request id %s)", rid)
 }
 
 // TestAccountingMediaDisconnectedAfterDispatch is the media-codec
