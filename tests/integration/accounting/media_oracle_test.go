@@ -4,14 +4,19 @@ package accounting
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"io"
 	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // Media acceptance validators are pure functions over the binary-safe
@@ -210,41 +215,20 @@ func TestMediaFixtureSelfCheck(t *testing.T) {
 	before := f.Snapshot()
 	status, body, contentType, err := httpPostSpeech(5*time.Second, f.baseURL()+"/v1/audio/speech",
 		"unit-token", "unit-speech", "m", fixtureSpeechInput, fixtureSpeechVoice)
-	if err != nil || status != httpOK {
-		t.Fatalf("fixture self-check: speech status=%d err=%v, want 200", status, err)
-	}
-	if contentType != fixtureSpeechContentType {
-		t.Fatalf("fixture self-check: speech content type %q, want %q", contentType, fixtureSpeechContentType)
-	}
-	if !bytes.Equal(body, fixtureWAVBytes()) {
-		t.Fatalf("fixture self-check: speech bytes differ from the fixture artifact (%d bytes)", len(body))
-	}
-	if delta := f.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("fixture self-check: speech delta arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1",
-			delta.arrivals, delta.dispatches, delta.receipts)
-	}
-	if paths := f.ArrivalPaths("unit-speech"); len(paths) != 1 || paths[0] != "/v1/audio/speech" {
-		t.Fatalf("fixture self-check: speech arrival paths %v, want [/v1/audio/speech]", paths)
-	}
+	require.NoError(t, healthySpeechArtifact(mediaReply{status: status, body: body, contentType: contentType, err: err}))
+	// Independently encoded mono PCM, 8 kHz, 16 bits, sample[i] = 103 + 251*i.
+	require.Equal(t, "f0728b4aa854f8958860c15b8cc9d3c420b52d916a82070806cb986ec7c40a87", fmt.Sprintf("%x", sha256.Sum256(body)))
+	require.Equal(t, fixtureTotals{1, 1, 1}, f.Since(before))
+	require.Equal(t, []string{"/v1/audio/speech"}, f.ArrivalPaths("unit-speech"))
 
 	// Healthy multipart round trip: byte-identical reply, one contact.
 	before = f.Snapshot()
 	audio := multipartFile{filename: fixtureTranscribeAudioFile, contentType: fixtureTranscribeAudioContentType, data: fixtureWAVBytes()}
 	status, reply, contentType, err := httpPostMultipart(5*time.Second, f.baseURL()+"/v1/audio/transcriptions",
 		"unit-token", "unit-tr", "m", nil, audio)
-	if err != nil || status != httpOK {
-		t.Fatalf("fixture self-check: transcription status=%d err=%v, want 200", status, err)
-	}
-	if reply != fixtureTranscribeReply() {
-		t.Fatalf("fixture self-check: transcription reply %s, want the known healthy reply %s", reply, fixtureTranscribeReply())
-	}
-	if !strings.HasPrefix(contentType, "application/json") {
-		t.Fatalf("fixture self-check: transcription content type %q, want application/json", contentType)
-	}
-	if delta := f.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("fixture self-check: transcription delta arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1",
-			delta.arrivals, delta.dispatches, delta.receipts)
-	}
+	require.NoError(t, healthyTranscriptionReply(mediaReply{status: status, body: []byte(reply), contentType: contentType, err: err}))
+	require.Equal(t, fixtureTotals{1, 1, 1}, f.Since(before))
+	require.Equal(t, []string{"/v1/audio/transcriptions"}, f.ArrivalPaths("unit-tr"))
 
 	// Corrupted-usage mode keyed by filename: byte-identical corrupted
 	// reply, still a full round trip.
@@ -252,16 +236,10 @@ func TestMediaFixtureSelfCheck(t *testing.T) {
 	badUsage := multipartFile{filename: fixtureTranscribeBadUsageFile, contentType: fixtureTranscribeAudioContentType, data: fixtureWAVBytes()}
 	status, reply, _, err = httpPostMultipart(5*time.Second, f.baseURL()+"/v1/audio/transcriptions",
 		"unit-token", "unit-tr-bad", "m", nil, badUsage)
-	if err != nil || status != httpOK {
-		t.Fatalf("fixture self-check: corrupted-usage transcription status=%d err=%v, want 200", status, err)
-	}
-	if reply != fixtureTranscribeBadUsageReply {
-		t.Fatalf("fixture self-check: corrupted-usage transcription reply %s, want %s", reply, fixtureTranscribeBadUsageReply)
-	}
-	if delta := f.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("fixture self-check: corrupted-usage transcription delta arrivals/dispatches/receipts = %d/%d/%d, want 1/1/1",
-			delta.arrivals, delta.dispatches, delta.receipts)
-	}
+	require.NoError(t, err)
+	require.Equal(t, httpOK, status)
+	require.Equal(t, fixtureTranscribeBadUsageReply, reply)
+	require.Equal(t, fixtureTotals{1, 1, 1}, f.Since(before))
 
 	// Codec pre-admission 400s: arrivals only, never dispatches.
 	bad := []struct {
@@ -288,12 +266,43 @@ func TestMediaFixtureSelfCheck(t *testing.T) {
 		before := f.Snapshot()
 		rid := "unit-bad-" + strings.NewReplacer(" ", "-").Replace(c.name)
 		status, reply, err := c.request(rid)
-		if err != nil || status != http.StatusBadRequest {
-			t.Fatalf("fixture self-check: %s: status=%d err=%v (body %s), want 400", c.name, status, err, reply)
-		}
-		if delta := f.Since(before); delta.arrivals != 1 || delta.dispatches != 0 || delta.receipts != 0 {
-			t.Fatalf("fixture self-check: %s: delta arrivals/dispatches/receipts = %d/%d/%d, want 1/0/0",
-				c.name, delta.arrivals, delta.dispatches, delta.receipts)
-		}
+		require.NoError(t, err, c.name)
+		require.Equal(t, http.StatusBadRequest, status, "%s: %s", c.name, reply)
+		require.Equal(t, fixtureTotals{arrivals: 1}, f.Since(before), c.name)
+	}
+	f.VerifyEvidence()
+}
+
+type interruptedMediaWriter struct {
+	*httptest.ResponseRecorder
+}
+
+func (w interruptedMediaWriter) Write(body []byte) (int, error) {
+	n, _ := w.ResponseRecorder.Write(body[:1])
+	return n, io.ErrClosedPipe
+}
+
+func TestInterruptedMediaResponseHasNoReceipt(t *testing.T) {
+	f := startFixture(t, t.TempDir(), "unit-token")
+	t.Cleanup(f.stop)
+	audio := multipartFile{filename: fixtureTranscribeAudioFile, contentType: fixtureTranscribeAudioContentType, data: fixtureWAVBytes()}
+	multipartBody, contentType, err := buildTranscriptionBody("m", nil, []multipartFile{audio})
+	require.NoError(t, err)
+	for _, tc := range []struct{ path, body, contentType string }{
+		{"/v1/audio/speech", `{"model":"m","input":"hello"}`, "application/json"},
+		{"/v1/audio/transcriptions", multipartBody.String(), contentType},
+	} {
+		t.Run(tc.path, func(t *testing.T) {
+			before := f.Snapshot()
+			req := httptest.NewRequest(http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req.Header.Set("Content-Type", tc.contentType)
+			req.Header.Set("Authorization", "Bearer unit-token")
+			req.Header.Set("X-Request-ID", "partial-write")
+			w := interruptedMediaWriter{httptest.NewRecorder()}
+			f.serve(w, req)
+			require.Equal(t, http.StatusOK, w.Code)
+			require.Equal(t, 1, w.Body.Len())
+			require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1}, f.Since(before))
+		})
 	}
 }

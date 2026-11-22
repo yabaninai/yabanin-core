@@ -123,8 +123,7 @@ func (f *fixture) serveAudioSpeech(w http.ResponseWriter, rid, model, path strin
 	w.Header().Set("Content-Type", fixtureSpeechContentType)
 	w.Header().Set("Content-Length", strconv.Itoa(len(artifact)))
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(artifact)
-	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
+	f.writeMediaResponse(w, rid, path, artifact)
 }
 
 // serveTranscriptionRequest parses and serves the multipart codec,
@@ -167,8 +166,16 @@ func (f *fixture) serveTranscriptionRequest(w http.ResponseWriter, r *http.Reque
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(reply))
-	f.append("receipts", fixtureRecord{RequestID: rid, Path: r.URL.Path, AuthOK: true})
+	f.writeMediaResponse(w, rid, r.URL.Path, []byte(reply))
+}
+
+func (f *fixture) writeMediaResponse(w http.ResponseWriter, rid, path string, payload []byte) {
+	n, err := w.Write(payload)
+	if err != nil || n != len(payload) {
+		f.t.Logf("fixture: media response %s wrote %d of %d bytes: %v", rid, n, len(payload), err)
+		return
+	}
+	f.append("receipts", fixtureRecord{RequestID: rid, Path: path, AuthOK: true})
 }
 
 // scanTranscriptionParts walks a multipart upload once, collecting the
