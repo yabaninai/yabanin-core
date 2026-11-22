@@ -30,8 +30,15 @@ func refusalAdmissionsClosed(admitted []admissionRecord, voided []string, health
 
 func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 	for name, scope := range map[string]circuit.Scope{"global": circuit.ScopeGlobal, "per_endpoint": circuit.ScopePerEndpoint} {
-		for _, transport := range []string{"buffered", "stream"} {
-			t.Run(name+"/"+transport, func(t *testing.T) {
+		for _, transport := range []struct {
+			name   string
+			body   string
+			status int
+		}{
+			{"buffered", rt03ChatBody, http.StatusServiceUnavailable},
+			{"stream", strings.Replace(rt03ChatBody, "{", `{"stream":true,`, 1), http.StatusOK},
+		} {
+			t.Run(name+"/"+transport.name, func(t *testing.T) {
 				upstream := newRT03Upstream(t, nil)
 				models := stubModelResolver{
 					"m1": {ModelName: "m1", Provider: "openai", UpstreamURL: upstream.srv.URL, Enabled: true},
@@ -50,16 +57,10 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 					key = circuit.EndpointKey(upstream.srv.URL)
 				}
 				gw.circuits.RecordFailure(key)
-				probe := rt03ChatBody
-				if transport == "stream" {
-					probe = strings.Replace(probe, "{", `{"stream":true,`, 1)
-				}
-				rec = rt02Post(t, gw, probe, nil)
-				if transport == "stream" {
-					require.Equal(t, http.StatusOK, rec.Code)
+				rec = rt02Post(t, gw, transport.body, nil)
+				require.Equal(t, transport.status, rec.Code, rec.Body.String())
+				if transport.name == "stream" {
 					require.Contains(t, rec.Body.String(), "service_unavailable_error")
-				} else {
-					require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
 				}
 				require.Equal(t, 1, upstream.totalCalls(), "entry refusal contacted provider")
 				require.Len(t, store.facts, 1, "entry refusal added a terminal charge")
