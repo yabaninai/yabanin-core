@@ -46,6 +46,20 @@ func writeOrStop(w http.ResponseWriter, p []byte) bool {
 	return true
 }
 
+// bodyOf drains the response body with checked errors and returns it, so
+// streaming regressions can assert on the exact bytes that reached the wire.
+func bodyOf(t *testing.T, resp *http.Response) string {
+	t.Helper()
+	b, err := io.ReadAll(resp.Body)
+	if err != nil {
+		t.Fatalf("read body: %v", err)
+	}
+	if err := resp.Body.Close(); err != nil {
+		t.Errorf("close body: %v", err)
+	}
+	return string(b)
+}
+
 // hammerLateHeaders mutates the (possibly still exposed) response header map
 // after the middleware has latched, mirroring a handler that ignores its
 // canceled context and keeps decorating the response — the exact pattern of
@@ -165,7 +179,9 @@ func TestTimeout_HeaderBeforeFlushReachesTheWire(t *testing.T) {
 	srv := httptest.NewServer(h)
 	defer srv.Close()
 	resp := httpGet(t, srv.Client(), srv.URL)
-	closeBody(t, resp)
+	if body := bodyOf(t, resp); body != "chunk" {
+		t.Fatalf("body = %q, want chunk", body)
+	}
 	if got := resp.Header.Get("X-Pre-Flush"); got != "yes" {
 		t.Fatalf("X-Pre-Flush = %q, want yes", got)
 	}
