@@ -15,6 +15,13 @@
 // Run via (from the repo root):
 //   go test -tags integration -run TestCV02RequestJourneyBrowserAcceptance \
 //     ./services/admin/handlers/ -count=1 -timeout 15m
+//
+// Preview 2 UI acceptance is DESKTOP-ONLY: the two archived mobile (390px)
+// specs in journey.spec.ts are retained archived fixtures, excluded from
+// this registered desktop config by anchored match on their two frozen IDs
+// (the specs sit at the top level, so the full title starts with the ID).
+// The Go verifier independently fails the gate if an archived case ever
+// records an executed verdict.
 import { defineConfig } from '@playwright/test'
 
 const baseURL = process.env.CV02_BASE_URL
@@ -34,6 +41,13 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
+  // Archived mobile (390px) fixtures are never collected by this desktop
+  // config. The grep subject is the project/file-prefixed full title (not
+  // verified to start at the spec title), so match the two frozen IDs as
+  // word-delimited tokens anywhere in it. A changed or new ID containing
+  // these tokens verbatim stays excluded only if it keeps the exact token;
+  // any other AC-* ID is an unknown case for the Go verifier and fails.
+  grepInvert: [/\bAC-NARROW-(SERVED|BLOCKED)\b/],
   reporter: [['list']],
   outputDir: artifacts,
   use: {
