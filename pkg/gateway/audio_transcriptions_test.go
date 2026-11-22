@@ -667,41 +667,42 @@ func TestAudioTranscriptions_BodyLimitExactBoundary(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			calls.Store(0)
-			gw := newAudioGateway(t, audioTranscriptionModel(server.URL))
-			// MaxBody chain without the auth middleware (which strips the
-			// client identity headers the durable terminal facts need).
-			r := chi.NewRouter()
-			r.Use(httpmw.MaxBody(10 * 1024 * 1024))
-			r.Post("/v1/audio/transcriptions", gw.audioTranscriptions)
-
-			body, contentType := buildAudioMultipartExact(t, tc.size, wav)
-			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
-			req.Header.Set("Authorization", "Bearer test-key")
-			req.Header.Set("Content-Type", contentType)
-			goldenIdentity(req)
-			rec := httptest.NewRecorder()
-			r.ServeHTTP(rec, req)
-
-			if rec.Code != tc.wantStatus {
-				t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
-			}
-			if tc.wantStatus == http.StatusOK {
-				if rec.Body.String() != `{"text":"ok"}` {
-					t.Fatalf("response body %q", rec.Body.String())
-				}
-				if calls.Load() != 1 {
-					t.Fatalf("upstream calls %d, want 1 at exact cap", calls.Load())
-				}
-				return
-			}
-			if errorType(t, rec) != "invalid_request_error" {
-				t.Fatalf("envelope %s", rec.Body.String())
-			}
-			if calls.Load() != 0 {
-				t.Fatalf("upstream called %d times on oversized body", calls.Load())
-			}
+			assertAudioTranscriptionBodyLimit(t, server.URL, &calls, wav, tc.size, tc.wantStatus)
 		})
+	}
+}
+
+func assertAudioTranscriptionBodyLimit(t *testing.T, upstreamURL string, calls *atomic.Int64, wav []byte, size, wantStatus int) {
+	t.Helper()
+	calls.Store(0)
+	gw := newAudioGateway(t, audioTranscriptionModel(upstreamURL))
+	// MaxBody chain without auth, which strips durable terminal identity headers.
+	r := chi.NewRouter()
+	r.Use(httpmw.MaxBody(10 * 1024 * 1024))
+	r.Post("/v1/audio/transcriptions", gw.audioTranscriptions)
+	body, contentType := buildAudioMultipartExact(t, size, wav)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(body))
+	req.Header.Set("Authorization", "Bearer test-key")
+	req.Header.Set("Content-Type", contentType)
+	goldenIdentity(req)
+	rec := httptest.NewRecorder()
+	r.ServeHTTP(rec, req)
+	assertAudioBodyLimitResponse(t, rec, calls, wantStatus)
+}
+
+func assertAudioBodyLimitResponse(t *testing.T, rec *httptest.ResponseRecorder, calls *atomic.Int64, wantStatus int) {
+	t.Helper()
+	if rec.Code != wantStatus {
+		t.Fatalf("status %d body %s", rec.Code, rec.Body.String())
+	}
+	if wantStatus == http.StatusOK {
+		if rec.Body.String() != `{"text":"ok"}` || calls.Load() != 1 {
+			t.Fatalf("exact-cap result body=%q upstream calls=%d", rec.Body.String(), calls.Load())
+		}
+		return
+	}
+	if errorType(t, rec) != "invalid_request_error" || calls.Load() != 0 {
+		t.Fatalf("oversized result envelope=%s upstream calls=%d", rec.Body.String(), calls.Load())
 	}
 }
 

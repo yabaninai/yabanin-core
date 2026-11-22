@@ -30,6 +30,11 @@ func (s *nativeTerminalOrderStore) RecordTerminalFacts(ctx context.Context, rec 
 	return s.fakeInvocationStore.RecordTerminalFacts(ctx, rec)
 }
 
+type nativeTerminalOrderCase struct {
+	family, path, body, prefix, terminal string
+	upstream                             func(w io.Writer)
+}
+
 // TestNativeTerminalOrder pins the Preview2 central binding on the real
 // native stream handlers: the client must never see the stream's success
 // terminal before the durable terminal-facts commit succeeds, a failed
@@ -40,10 +45,7 @@ func (s *nativeTerminalOrderStore) RecordTerminalFacts(ctx context.Context, rec 
 // for /v1/responses — so nonterminal frames are proven to flush through
 // the seam while the terminal waits.
 func TestNativeTerminalOrder(t *testing.T) {
-	for _, tc := range []struct {
-		family, path, body, prefix, terminal string
-		upstream                             func(w io.Writer)
-	}{
+	for _, tc := range []nativeTerminalOrderCase{
 		{
 			family: "messages", path: "/v1/messages",
 			body:   `{"model":"claude-3-5-sonnet","max_tokens":8,"messages":[{"role":"user","content":"hi"}],"stream":true}`,
@@ -73,56 +75,66 @@ func TestNativeTerminalOrder(t *testing.T) {
 				mode = "facts_failure"
 			}
 			t.Run(tc.family+"/"+mode, func(t *testing.T) {
-				var calls atomic.Int32
-				upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					calls.Add(1)
-					w.Header().Set("Content-Type", "text/event-stream")
-					tc.upstream(w)
-				}))
-				defer upstream.Close()
-
-				rec := httptest.NewRecorder()
-				commitChecks := 0
-				store := &nativeTerminalOrderStore{before: func() {
-					commitChecks++
-					// Nonterminal traffic is already client-visible while
-					// the facts commit is in flight…
-					assert.Contains(t, rec.Body.String(), "event: "+tc.prefix)
-					// …and the success terminal is not.
-					assert.NotContains(t, rec.Body.String(), "event: "+tc.terminal, "success terminal reached the client before the durable facts commit")
-				}}
-				if fail {
-					store.factsErr = errors.New("permanent accounting storage failure")
-				}
-
-				req := httptest.NewRequestWithContext(t.Context(), "POST", tc.path, strings.NewReader(tc.body))
-				goldenIdentity(req)
-				if tc.family == "messages" {
-					gw := nativeMessagesGateway(t, upstream.URL)
-					gw.invocations = store
-					gw.messagesNative(rec, req, []byte(tc.body), "claude-3-5-sonnet")
-				} else {
-					gw := responsesTestGateway(t, upstream.URL)
-					gw.invocations = store
-					gw.responsesNative(rec, req, []byte(tc.body))
-				}
-
-				require.EqualValues(t, 1, calls.Load(), "single provider invocation")
-				require.Equal(t, 1, commitChecks)
-				result := rec.Body.String()
-				if fail {
-					assert.Contains(t, result, "accounting_commit_failed")
-					assert.Contains(t, result, "NOT safe to retry")
-					assert.NotContains(t, result, "event: "+tc.terminal)
-				} else {
-					assert.Equal(t, 1, strings.Count(result, "event: "+tc.terminal), "exactly one success terminal")
-					assert.NotContains(t, result, "accounting_commit_failed")
-				}
-				// Nonterminal traffic survives every end.
-				assert.Contains(t, result, "event: "+tc.prefix)
+				runNativeTerminalOrderCase(t, tc, fail)
 			})
 		}
 	}
+}
+
+func runNativeTerminalOrderCase(t *testing.T, tc nativeTerminalOrderCase, fail bool) {
+	t.Helper()
+	var calls atomic.Int32
+	upstream := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls.Add(1)
+		w.Header().Set("Content-Type", "text/event-stream")
+		tc.upstream(w)
+	}))
+	defer upstream.Close()
+
+	rec := httptest.NewRecorder()
+	commitChecks := 0
+	store := &nativeTerminalOrderStore{before: func() {
+		commitChecks++
+		assert.Contains(t, rec.Body.String(), "event: "+tc.prefix)
+		assert.NotContains(t, rec.Body.String(), "event: "+tc.terminal,
+			"success terminal reached the client before the durable facts commit")
+	}}
+	if fail {
+		store.factsErr = errors.New("permanent accounting storage failure")
+	}
+
+	req := httptest.NewRequestWithContext(t.Context(), "POST", tc.path, strings.NewReader(tc.body))
+	goldenIdentity(req)
+	invokeNativeTerminalOrderHandler(t, tc, upstream.URL, store, rec, req)
+	assertNativeTerminalOrderResult(t, tc, fail, calls.Load(), commitChecks, rec.Body.String())
+}
+
+func invokeNativeTerminalOrderHandler(t *testing.T, tc nativeTerminalOrderCase, upstreamURL string, store *nativeTerminalOrderStore, rec *httptest.ResponseRecorder, req *http.Request) {
+	t.Helper()
+	if tc.family == "messages" {
+		gw := nativeMessagesGateway(t, upstreamURL)
+		gw.invocations = store
+		gw.messagesNative(rec, req, []byte(tc.body), "claude-3-5-sonnet")
+		return
+	}
+	gw := responsesTestGateway(t, upstreamURL)
+	gw.invocations = store
+	gw.responsesNative(rec, req, []byte(tc.body))
+}
+
+func assertNativeTerminalOrderResult(t *testing.T, tc nativeTerminalOrderCase, fail bool, calls int32, commitChecks int, result string) {
+	t.Helper()
+	require.EqualValues(t, 1, calls, "single provider invocation")
+	require.Equal(t, 1, commitChecks)
+	assert.Contains(t, result, "event: "+tc.prefix, "nonterminal traffic survives every end")
+	if fail {
+		assert.Contains(t, result, "accounting_commit_failed")
+		assert.Contains(t, result, "NOT safe to retry")
+		assert.NotContains(t, result, "event: "+tc.terminal)
+		return
+	}
+	assert.Equal(t, 1, strings.Count(result, "event: "+tc.terminal), "exactly one success terminal")
+	assert.NotContains(t, result, "accounting_commit_failed")
 }
 
 // TestNativeTerminalOrderUsageAndTrailer pins usage transparency past
