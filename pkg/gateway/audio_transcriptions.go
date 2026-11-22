@@ -110,13 +110,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"transcriptions are not supported for this provider", "transcriptions_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "transcriptions", "transcriptions are not supported for this provider") {
 		return
 	}
 
@@ -128,15 +122,9 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	// refused in enforce mode as unpriced (fail-closed, I3).
 	breq := gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 		admitted.Info, admitted.Body, nil, true)
-	if file := audioFilePart(parts); file != nil {
-		breq = withUnitDemand(breq, pricing.UnitPerAudioSecond, transcriptionReservationSeconds(len(file.data)))
-	}
-	gate, ok := gw.reservationPlan(w, r, "audio.transcriptions", breq)
+	breq = withUnitDemand(breq, pricing.UnitPerAudioSecond, transcriptionReservationSeconds(len(filePart.data)))
+	rctx, gate, ok := gw.reservePlannedRequest(rctx, w, r, "audio.transcriptions", breq)
 	if !ok {
-		return
-	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
 		return
 	}
 
@@ -151,20 +139,10 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to encode upstream request")
 		return
 	}
-	// Preview2 durable accounting: the confirmed start commits immediately
-	// BEFORE the first paid provider dispatch — after every fallible local
-	// setup step above (pool wiring, multipart rebuild), so a local failure
-	// never strands a durable admission for a request that never
-	// dispatched. Fail closed: an unwritten start (write error, timeout or
-	// lost ACK — outcome unknown) refuses the request with ZERO provider
-	// arrivals under the history_unavailable envelope, and the escrow is
-	// released.
-	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
-		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
-		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
-		writeInvocationStartRefusal(w, err)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
 		return
 	}
+
 	resp, err := client.Do(ctx, "/v1/audio/transcriptions", rebuilt, apiKey, false, extra)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -174,21 +152,8 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	limited, over, err := readAudioResponse(resp.Body)
-	if err != nil {
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		writePaidBodyError(w, "failed to read upstream response")
-		return
-	}
-	if over {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		writePaidBodyError(w, "upstream response exceeds the audio size limit")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
+	limited, ok := readMediaResponse(w, rctx, gate, resp, audioResponseLimit, "upstream response exceeds the audio size limit")
+	if !ok {
 		return
 	}
 	gw.finishAudioTranscription(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, limited)

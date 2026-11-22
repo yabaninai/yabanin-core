@@ -103,13 +103,7 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"speech is not supported for this provider", "speech_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "speech", "speech is not supported for this provider") {
 		return
 	}
 
@@ -120,16 +114,12 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	// mode as unpriced (fail-closed, I3).
 	rctx := r.Context()
 	rctx = withInvocationIdentity(rctx, admitted.Invocation)
-	gate, ok := gw.reservationPlan(w, r, "audio.speech",
+	rctx, gate, ok := gw.reservePlannedRequest(rctx, w, r, "audio.speech",
 		withUnitDemand(
 			gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 				admitted.Info, admitted.Body, nil, true),
 			pricing.UnitPerCharacter, float64(utf8.RuneCountInString(req.Input))))
 	if !ok {
-		return
-	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
 		return
 	}
 
@@ -139,19 +129,10 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cancel()
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
-	// Preview2 durable accounting: the confirmed start commits immediately
-	// BEFORE the first paid provider dispatch — after every fallible local
-	// setup step above (pool wiring, model remap), so a local failure never
-	// strands a durable admission for a request that never dispatched.
-	// Fail closed: an unwritten start (write error, timeout or lost ACK —
-	// outcome unknown) refuses the request with ZERO provider arrivals
-	// under the history_unavailable envelope, and the escrow is released.
-	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
-		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
-		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
-		writeInvocationStartRefusal(w, err)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
 		return
 	}
+
 	resp, err := client.Do(ctx, "/v1/audio/speech", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -161,21 +142,8 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	audio, over, err := readAudioResponse(resp.Body)
-	if err != nil {
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		writePaidBodyError(w, "failed to read upstream response")
-		return
-	}
-	if over {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		writePaidBodyError(w, "upstream response exceeds the audio size limit")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
+	audio, ok := readMediaResponse(w, rctx, gate, resp, audioResponseLimit, "upstream response exceeds the audio size limit")
+	if !ok {
 		return
 	}
 	gw.finishAudioSpeech(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, req.Input, audio)
@@ -342,17 +310,26 @@ func audioUsage(body []byte) (int64, int64, string) {
 	return in, out, provider.UsageSourceProvider
 }
 
-// readAudioResponse reads up to audioResponseLimit bytes and reports whether
-// the upstream payload exceeds the cap (one extra byte is read to detect it).
-func readAudioResponse(body io.Reader) (data []byte, over bool, err error) {
-	data, err = io.ReadAll(io.LimitReader(body, audioResponseLimit+1))
+// Read one extra byte so a truncated upstream response cannot be served as a success.
+func readMediaResponse(w http.ResponseWriter, rctx context.Context, gate *reservationGate, resp *http.Response, limit int64, oversizedMessage string) ([]byte, bool) {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, false, err
+		gate.finalizeNoEvent(mediaTermination(rctx))
+		writePaidBodyError(w, "failed to read upstream response")
+		return nil, false
 	}
-	if len(data) > audioResponseLimit {
-		return nil, true, nil
+	if int64(len(data)) > limit {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, oversizedMessage)
+		return nil, false
 	}
-	return data, false, nil
+	if resp.StatusCode != http.StatusOK {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
+		apierrors.Write(w, status, errType, "upstream request failed")
+		return nil, false
+	}
+	return data, true
 }
 
 // writeAudioBodyError maps a request-body read failure: the 10 MiB gateway

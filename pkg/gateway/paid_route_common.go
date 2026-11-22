@@ -65,9 +65,13 @@ func (gw *gateway) openAICompatRouteReady(w http.ResponseWriter, providerName, e
 // non-generating routes reserve embeddings-style with out_cap = 0.
 func (gw *gateway) reservePaidDispatch(ctx context.Context, w http.ResponseWriter, r *http.Request, endpoint string, admitted admitted, maxTokens *int64, embeddingsBound bool) (context.Context, *reservationGate, bool) {
 	rctx := withInvocationIdentity(ctx, admitted.Invocation)
-	gate, ok := gw.reservationPlan(w, r, endpoint,
-		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
-			admitted.Info, admitted.Body, maxTokens, embeddingsBound))
+	req := gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
+		admitted.Info, admitted.Body, maxTokens, embeddingsBound)
+	return gw.reservePlannedRequest(rctx, w, r, endpoint, req)
+}
+
+func (gw *gateway) reservePlannedRequest(rctx context.Context, w http.ResponseWriter, r *http.Request, endpoint string, req budget.Request) (context.Context, *reservationGate, bool) {
+	gate, ok := gw.reservationPlan(w, r, endpoint, req)
 	if !ok {
 		return nil, nil, false
 	}

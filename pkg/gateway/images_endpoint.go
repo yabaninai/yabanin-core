@@ -8,7 +8,6 @@ import (
 	"net/http"
 	"time"
 
-	"github.com/reireirei/yabanin/pkg/budget"
 	apierrors "github.com/reireirei/yabanin/pkg/errors"
 	"github.com/reireirei/yabanin/pkg/httpmw"
 	"github.com/reireirei/yabanin/pkg/logctx"
@@ -83,13 +82,7 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"images are not supported for this provider", "images_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "images", "images are not supported for this provider") {
 		return
 	}
 
@@ -103,16 +96,12 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	// enforce mode as unpriced (fail-closed, I3).
 	rctx := r.Context()
 	rctx = withInvocationIdentity(rctx, admitted.Invocation)
-	gate, ok := gw.reservationPlan(w, r, "images.generation",
+	rctx, gate, ok := gw.reservePlannedRequest(rctx, w, r, "images.generation",
 		withUnitDemand(
 			gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 				admitted.Info, admitted.Body, nil, false),
 			pricing.UnitPerImage, imagesRequestCount(req.N)))
 	if !ok {
-		return
-	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
 		return
 	}
 
@@ -122,19 +111,10 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	defer cancel()
 	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
-	// Preview2 durable accounting: the confirmed start commits immediately
-	// BEFORE the first paid provider dispatch — after every fallible local
-	// setup step above (pool wiring, model remap), so a local failure never
-	// strands a durable admission for a request that never dispatched.
-	// Fail closed: an unwritten start (write error, timeout or lost ACK —
-	// outcome unknown) refuses the request with ZERO provider arrivals
-	// under the history_unavailable envelope, and the escrow is released.
-	if err := gw.confirmPaidInvocation(rctx, invocationKindChat); err != nil {
-		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
-		l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
-		writeInvocationStartRefusal(w, err)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
 		return
 	}
+
 	resp, err := client.Do(ctx, "/v1/images/generations", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -144,24 +124,8 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	// Read one byte past the limit so an oversized upstream body is refused
-	// as an upstream error instead of being silently truncated (the gateway
-	// never delivers a partial image payload).
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, imagesResponseLimit+1))
-	if err != nil {
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		writePaidBodyError(w, "failed to read upstream response")
-		return
-	}
-	if len(limited) > imagesResponseLimit {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		writePaidBodyError(w, "upstream response too large")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
+	limited, ok := readMediaResponse(w, rctx, gate, resp, imagesResponseLimit, "upstream response too large")
+	if !ok {
 		return
 	}
 	gw.finishImagesGeneration(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, req, limited)
