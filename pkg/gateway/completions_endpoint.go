@@ -175,8 +175,7 @@ type completionsJSONDispatch struct {
 // dispatch and settle: bounded read, adapter usage parsing, the OP-8
 // post-upstream policy hook (a deny answers 400 with the settle already
 // run), the durable finishCompletion settle and the byte-honest reply.
-// False is returned once the response was written.
-func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) bool {
+func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 	timeout := d.admitted.Info.UpstreamTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
@@ -188,20 +187,26 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) bool {
 		closeUpstream(d.l, resp)
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
-		return false
+		return
 	}
 	defer resp.Body.Close()
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit))
+	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit+1))
 	if err != nil {
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
-		return false
+		return
 	}
 	if resp.StatusCode != http.StatusOK {
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
 		apierrors.Write(d.w, status, errType, "upstream request failed")
-		return false
+		return
+	}
+	if len(limited) > embeddingsResponseLimit {
+		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		d.w.Header().Set("X-Should-Retry", "false")
+		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
+		return
 	}
 	usage := completionsUsage(limited, d.body, d.client.Adapter())
 	// OP-8: post-upstream policy hook. Usage was parsed from the ORIGINAL
@@ -221,7 +226,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) bool {
 			}
 			apierrors.WriteWithCode(d.w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"response blocked by organization policy", policyDenyErrorCode)
-			return false
+			return
 		}
 		limited = masked
 	}
@@ -231,7 +236,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) bool {
 		// payable success (never a re-dispatch; support reconciles).
 		d.l.Error("terminal facts commit failed; withholding reply", "error", ferr)
 		writeTerminalAccountingFailure(d.w)
-		return false
+		return
 	}
 	// N03-P06-T02: provider prompt-cache transparency on the legacy
 	// completions JSON path (absent for estimated usage — never fabricated).
@@ -239,7 +244,6 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) bool {
 	d.w.Header().Set("Content-Type", "application/json")
 	d.w.WriteHeader(http.StatusOK)
 	_, _ = d.w.Write(limited)
-	return true
 }
 
 func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, providerName, upstreamURL string, started time.Time, l *slog.Logger) {

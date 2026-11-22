@@ -7,6 +7,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -14,6 +15,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/config"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/provider"
+	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
 	"github.com/stretchr/testify/require"
 )
@@ -389,6 +391,42 @@ func checkCompletionCacheBilling(t *testing.T, stream bool) {
 			require.Len(t, store.admitted, 1)
 			require.Len(t, store.facts, 1)
 			require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
+		})
+	}
+}
+
+func TestCompletionsBufferedResponseLimit(t *testing.T) {
+	const document = `{"id":"bounded","choices":[{"text":"ok"}],"usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10}}`
+	for _, tc := range []struct {
+		name       string
+		size       int
+		wantStatus int
+	}{{"at limit", embeddingsResponseLimit, http.StatusOK}, {"over limit", embeddingsResponseLimit + 1, http.StatusBadGateway}} {
+		t.Run(tc.name, func(t *testing.T) {
+			payload := strings.Repeat(" ", tc.size-len(document)) + document
+			var hits atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				hits.Add(1)
+				_, _ = io.WriteString(w, payload)
+			}))
+			defer server.Close()
+			gw := r105TestGateway(t, resolver.ModelInfo{ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true})
+			store := &fakeInvocationStore{}
+			gw.invocations = store
+			rec := postCompletions(t, gw, `{"model":"m","prompt":"hello"}`)
+			require.Equal(t, tc.wantStatus, rec.Code)
+			require.EqualValues(t, 1, hits.Load())
+			require.Len(t, store.admitted, 1)
+			if tc.wantStatus == http.StatusOK {
+				require.True(t, rec.Body.String() == payload, "at-limit completion changed")
+				require.Len(t, store.facts, 1)
+				require.Equal(t, "7", store.facts[0].Fields["tokens_in"])
+				require.Equal(t, "3", store.facts[0].Fields["tokens_out"])
+				return
+			}
+			require.Empty(t, store.facts, "truncated input cannot establish completed usage")
+			require.Contains(t, rec.Body.String(), "upstream response too large")
+			require.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
 		})
 	}
 }
