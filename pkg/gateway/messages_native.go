@@ -486,63 +486,67 @@ func (rl *anthStreamRelay) writeFrame(blob []byte) {
 func (rl *anthStreamRelay) drain(lr *apiformat.SSELineReader) {
 	// After a client write fails, finish accounting for buffered bytes only.
 	for rl.werr == nil || lr.Buffered() {
-		line, err := lr.ReadLine()
-		if errors.Is(err, apiformat.ErrSSELineLimit) {
-			// Oversized upstream line: drop it and the held frame, stop
-			// relaying. The synthesis below closes the client stream (no
-			// stop was seen); the caller's deferred upstream body close
-			// aborts the provider connection, so the tail is never
-			// produced.
-			slog.Debug("native relay dropped oversized upstream line", "limit_bytes", apiformat.SSEStreamLineLimit)
-			break
+		line, ok := rl.readUpstreamLine(lr)
+		if !ok {
+			return
 		}
-		if err != nil {
-			// Upstream ended mid-line (transport cut, or EOF without the
-			// terminator): the unterminated partial is withheld, and the
-			// held frame is dispatched only when the end aligned to a
-			// line boundary (no partial followed it — observing a cut
-			// partial proves the event was still being written, so
-			// salvaging a valid-JSON prefix of it would fabricate a
-			// shorter event) AND it is a decodable event missing just
-			// the separator — closed with its CRLF blank separator so
-			// the parser emits it here, delivered or not. Otherwise it
-			// is dropped so the synthesis below composes at an event
-			// boundary.
-			if len(line) == 0 && rl.frames.Salvageable() {
-				rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
-			}
-			break
-		}
-		if apiformat.SSECommentLine(line) {
-			// Keepalive comments ride no event: forward them immediately
-			// instead of frame-batching them; the buffer holds only
-			// field lines.
-			rl.writeFrame(line)
-			continue
-		}
-		blank, overflow := rl.frames.Add(line, apiformat.SSEStreamLineLimit)
-		if overflow {
-			slog.Debug("native relay dropped oversized upstream frame", "limit_bytes", apiformat.SSEStreamLineLimit)
-			break
-		}
-		if blank {
-			// Blank separator: the frame is complete — dispatch it whole,
-			// verbatim, separator included.
-			rl.writeFrame(append(rl.frames.Take(), line...))
-			if rl.lifecycle.terminal() {
-				// The provider declared the authoritative terminal
-				// (message_stop ends the message; an error event closes
-				// the stream in-protocol): settle the known usage and
-				// stop pulling upstream bytes — a provider that holds
-				// the connection open after the final event must not
-				// delay the client's terminal or the facts commit on
-				// physical EOF. Post-terminal bytes are not part of the
-				// message, there is no re-dispatch, and the caller's
-				// deferred body close aborts the connection.
-				break
-			}
+		if rl.deliverLine(line) {
+			return
 		}
 	}
+}
+
+// readUpstreamLine reads one upstream line and resolves the transport ends,
+// reporting whether the drain continues. An oversized line is dropped: the
+// synthesized close below ends the client stream (no stop was seen) and the
+// caller's deferred body close aborts the provider connection, so the tail
+// is never produced. An upstream end dispatches the held frame only when
+// the end aligned to a line boundary (observing a cut partial proves the
+// event was still being written — salvaging a valid-JSON prefix of it would
+// fabricate a shorter event) and the frame is decodable missing just its
+// separator; the unterminated partial is always withheld so the synthesis
+// composes at an event boundary.
+func (rl *anthStreamRelay) readUpstreamLine(lr *apiformat.SSELineReader) ([]byte, bool) {
+	line, err := lr.ReadLine()
+	switch {
+	case errors.Is(err, apiformat.ErrSSELineLimit):
+		slog.Debug("native relay dropped oversized upstream line", "limit_bytes", apiformat.SSEStreamLineLimit)
+		return nil, false
+	case err != nil:
+		if len(line) == 0 && rl.frames.Salvageable() {
+			rl.writeFrame(append(rl.frames.Take(), '\r', '\n'))
+		}
+		return nil, false
+	}
+	return line, true
+}
+
+// deliverLine routes one complete upstream line, reporting whether the
+// authoritative delivered terminal ended the drain (message_stop ends the
+// message; an error event closes the stream in-protocol): usage and
+// lifecycle then settle without waiting on physical EOF — a provider that
+// holds the connection open after the final event must not delay the
+// client's terminal or the facts commit, and post-terminal bytes are not
+// part of the message.
+func (rl *anthStreamRelay) deliverLine(line []byte) bool {
+	if apiformat.SSECommentLine(line) {
+		// Keepalive comments ride no event: forward them immediately
+		// instead of frame-batching them; the buffer holds only field lines.
+		rl.writeFrame(line)
+		return false
+	}
+	blank, overflow := rl.frames.Add(line, apiformat.SSEStreamLineLimit)
+	if overflow {
+		slog.Debug("native relay dropped oversized upstream frame", "limit_bytes", apiformat.SSEStreamLineLimit)
+		return true
+	}
+	if !blank {
+		return false
+	}
+	// Blank separator: the frame is complete — dispatch it whole,
+	// verbatim, separator included.
+	rl.writeFrame(append(rl.frames.Take(), line...))
+	return rl.lifecycle.terminal()
 }
 
 // settle applies the drain's end: the parser's pending event (a blob
