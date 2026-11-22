@@ -3,10 +3,10 @@
 package accounting
 
 import (
-	"fmt"
-	"strings"
 	"testing"
 	"time"
+
+	"github.com/stretchr/testify/require"
 )
 
 // TestAccountingRedisEventRedeliveryIdempotent: EVENT REDELIVERY semantics
@@ -28,8 +28,7 @@ import (
 //     empty and no retry/dead-letter/parking stream carries a copy;
 //  5. idempotence: still exactly ONE billed request_logs row, ONE signed
 //     wallet usage debit (-32 micro-USD), the EXACT per-kind settlement
-//     intent set the original produced (not a possibly-vacuous "unchanged
-//     total"), one admission still 'reconciled'/'event_delivered', and an
+//     intent set for the seeded team key, one admission still 'reconciled'/'event_delivered', and an
 //     UNCHANGED provider ledger (1/1/1 — no re-dispatch).
 func TestAccountingRedisEventRedeliveryIdempotent(t *testing.T) {
 	s := startStand(t)
@@ -42,61 +41,25 @@ func TestAccountingRedisEventRedeliveryIdempotent(t *testing.T) {
 
 	// Original committed invocation: the client must have succeeded.
 	status, body, err := s.chat(t, rid, 30*time.Second)
-	if err != nil || status != httpOK {
-		t.Fatalf("replay: original client invocation failed (status=%d err=%v body=%s)", status, err, body)
-	}
-	if !strings.Contains(body, fixtureAssistantContent) {
-		t.Fatalf("replay: original client body %q does not contain the assistant content", body)
-	}
-	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("replay: original ledger delta = %d/%d/%d, want 1/1/1", delta.arrivals, delta.dispatches, delta.receipts)
-	}
+	require.NoError(t, err)
+	require.Equal(t, httpOK, status, body)
+	validateChatReply(t, s, body)
+	require.Equal(t, fixtureTotals{arrivals: 1, dispatches: 1, receipts: 1}, s.fixture.Since(before))
 
-	// Wait until the original event is fully consumed (billed + charged).
-	pollUntil(t, 3*time.Minute, "original event consumed", func() error {
-		if s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 0 {
-			return fmt.Errorf("no request_logs row yet")
-		}
-		if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows == 0 {
-			return fmt.Errorf("no wallet usage row yet")
-		}
-		return nil
-	})
-	s.requireBilledRow(t, rid, s.oracleDB.orgID, "replay original")
-	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "replay original")
-	// Non-vacuity anchor: the wallet intent kind the consumer always plans
-	// for a positive quote must exist exactly once. Any additional scoped
-	// kinds the event's attribution produces are captured and must survive
-	// the replays unchanged.
-	wantKinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "replay original")
-	t.Logf("replay: original settlement intent set: %v", wantKinds)
-
+	s.waitForRecoveredBilling(t, rid, 3*time.Minute)
+	original := s.requireReplayAccounting(t, rid, "original")
 	rdb := s.redisClient(t)
 
 	// Locate the original committed event entries for the target.
 	entries := s.findStreamEntries(t, rdb, rid)
-	if len(entries) == 0 {
-		t.Fatalf("replay: no event entries found in %s for %s (consumer may have trimmed the stream — pre-condition unmet)", s.eventStream, rid)
-	}
-	originalIDs := make([]string, 0, len(entries))
-	for _, e := range entries {
-		originalIDs = append(originalIDs, e.ID)
-	}
-	t.Logf("replay: original event entries for %s: %v", rid, originalIDs)
-
-	// Replay each original entry twice under fresh Redis-minted IDs.
-	var replayIDs []string
-	for _, e := range entries {
-		id1 := s.replayEntryUnderFreshID(t, rdb, e)
-		id2 := s.replayEntryUnderFreshID(t, rdb, e)
-		for _, orig := range originalIDs {
-			if id1 == orig || id2 == orig || id1 == id2 {
-				t.Fatalf("replay: fresh IDs not distinct (orig=%s id1=%s id2=%s)", orig, id1, id2)
-			}
-		}
-		replayIDs = append(replayIDs, id1, id2)
-	}
-	t.Logf("replay: replayed under fresh entry IDs: %v", replayIDs)
+	require.Len(t, entries, 1, "expected one original stream notification for %s", rid)
+	entry := entries[0]
+	first := s.replayEntryUnderFreshID(t, rdb, entry)
+	second := s.replayEntryUnderFreshID(t, rdb, entry)
+	require.NotEqual(t, entry.ID, first)
+	require.NotEqual(t, entry.ID, second)
+	require.NotEqual(t, first, second)
+	replayIDs := []string{first, second}
 
 	// Processing proof per replay: a committed event_inbox claim row for
 	// every fresh entry id (correct stream source and consumer group),
@@ -106,20 +69,7 @@ func TestAccountingRedisEventRedeliveryIdempotent(t *testing.T) {
 	s.requireGroupDrained(t, rdb)
 	s.assertNoRetryCarrier(t, rdb, rid)
 
-	// Idempotence: the exact intent set the original produced, still.
-	s.requireSettlementIntents(t, rid, s.oracleDB.orgID, "replay after", wantKinds)
-	s.requireBilledRow(t, rid, s.oracleDB.orgID, "replay after")
-	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "replay after")
-	s.requireExactlyOneBilledRow(t, rid, s.oracleDB.orgID, "replay after")
-	if adms := s.oracleAdmissions(t, rid, s.oracleDB.orgID); len(adms) > 1 {
-		t.Fatalf("replay: admissions = %d (%s), want the single original", len(adms), fmtAdmissions(adms))
-	} else if len(adms) == 1 {
-		a := adms[0]
-		requireAdmissionVocabulary(t, a)
-		if a.State != "reconciled" || a.ResolveReason.String != reasonEventLive {
-			t.Fatalf("replay: admission changed to %s (want reconciled/%s)", fmtAdmissions(adms), reasonEventLive)
-		}
-	}
+	require.Equal(t, original, s.requireReplayAccounting(t, rid, "after redelivery"))
 
 	// Provider ledger unchanged: redelivery is a pure consumer-side event.
 	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
@@ -127,4 +77,26 @@ func TestAccountingRedisEventRedeliveryIdempotent(t *testing.T) {
 	}
 
 	s.controlRequest(t, "replay-post")
+}
+
+func (s *stand) requireReplayAccounting(t *testing.T, rid, phase string) string {
+	t.Helper()
+	org := s.oracleDB.orgID
+	s.requireDurableControlEvidence(t, "chat", phase, rid, fixtureCompletionTokens)
+	s.requireBilledRow(t, rid, org, phase)
+	s.requireExactlyOneBilledRow(t, rid, org, phase)
+	s.requireWalletChargedExactlyOnce(t, rid, org, phase)
+	s.requireSettlementIntents(t, rid, org, phase, map[string]int{"resale_deduction": 1, "team_spend": 1})
+	rows := s.oracleAdmissions(t, rid, org)
+	require.Len(t, rows, 1, phase)
+	a := rows[0]
+	require.Equal(t, "reconciled", a.State, phase)
+	require.True(t, a.ResolvedAt.Valid, phase)
+	require.True(t, a.ResolveReason.Valid, phase)
+	require.Equal(t, reasonEventLive, a.ResolveReason.String, phase)
+	charge := s.oracleUsageByInvocation(t, a.InvocationID, org)
+	require.EqualValues(t, 1, charge.UsageRows, phase)
+	require.EqualValues(t, -fixtureMicroUSDCost, charge.SumMicroUSD, phase)
+	require.Equal(t, 2, s.oracleCount(t, "SELECT count(*) FROM settlement_jobs WHERE org_id=$1 AND request_id=$2 AND invocation_id=$3::uuid", org, rid, a.InvocationID), phase)
+	return a.InvocationID
 }
