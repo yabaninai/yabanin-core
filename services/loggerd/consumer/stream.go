@@ -817,7 +817,10 @@ func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context,
 		}
 	}
 
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return err
+	}
 	row := budgetRequestLogRow(ev, sessionIDStr, errorMsg)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	// Budget-refused requests carry no gateway-minted invocation today; the
@@ -957,7 +960,10 @@ func (c *StreamConsumer) billablePlanForMode(ctx context.Context, ev requestEven
 // code; the completed shape binds the defaulted status and an optional
 // error.
 func (c *StreamConsumer) insertTerminalRequestLog(ctx context.Context, tx InboxTx, msg redis.XMessage, ev requestEvent, errorValue any, statusCode int64) (pgconn.CommandTag, error) {
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return pgconn.CommandTag{}, err
+	}
 	row := fullRequestLogRow(ev, sessionIDStr, errorValue, statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)
@@ -1140,7 +1146,10 @@ func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context,
 		return err
 	}
 
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return err
+	}
 	row := shadowRequestLogRow(ev, sessionIDStr, statusCode)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)

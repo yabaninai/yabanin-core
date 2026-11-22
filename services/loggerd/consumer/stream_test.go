@@ -656,7 +656,7 @@ func TestHandleRequestComplete_AllFieldsForwarded(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43)                                          // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0])                         // session_id
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
 	assert.Equal(t, testOrgUUID, values[1])                             // org_id
 	assert.Equal(t, "claude-3", values[2])                              // model_requested
 	assert.Equal(t, "claude-3-opus", values[3])                         // model_used
@@ -953,7 +953,7 @@ func TestHandleRequestComplete_StringFields(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43)                  // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0]) // session_id
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
 	assert.Equal(t, testOrgUUID, values[1])     // org_id
 	assert.Equal(t, int64(200), values[6])      // status_code from string "200"
 	assert.Equal(t, int64(2500), values[7])     // duration_ms from string "2500"

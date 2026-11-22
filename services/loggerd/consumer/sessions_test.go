@@ -20,8 +20,12 @@ func TestResolveSessionID_EmptyInputsAreNil(t *testing.T) {
 	consumer := New(nil, &mockDB{}, "events:queue", slog.Default())
 	tx, err := consumer.dbPool.BeginTx(context.Background())
 	require.NoError(t, err)
-	assert.Nil(t, consumer.resolveSessionID(context.Background(), tx, testOrgUUID, ""))
-	assert.Nil(t, consumer.resolveSessionID(context.Background(), tx, "", "ses_x"))
+	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, "")
+	require.NoError(t, err, "statement-free guards must not fail the delivery")
+	assert.Nil(t, out)
+	out, err = consumer.resolveSessionID(context.Background(), tx, "", "ses_x")
+	require.NoError(t, err)
+	assert.Nil(t, out)
 }
 
 func TestResolveSessionID_InvalidOrgFailsOpenToNil(t *testing.T) {
@@ -36,12 +40,13 @@ func TestResolveSessionID_InvalidOrgFailsOpenToNil(t *testing.T) {
 	tx, err := db.BeginTx(context.Background())
 	require.NoError(t, err)
 
-	out := consumer.resolveSessionID(context.Background(), tx, "org-abc", "ses_x")
+	out, err := consumer.resolveSessionID(context.Background(), tx, "org-abc", "ses_x")
+	require.NoError(t, err, "statement-free guards must not fail the delivery")
 	assert.Nil(t, out, "org without a valid uuid can never satisfy sessions_org_id_fkey")
 	assert.False(t, queried, "registry must not be consulted for an invalid org")
 }
 
-func TestResolveSessionID_UpsertArgsAndFailureFailsOpen(t *testing.T) {
+func TestResolveSessionID_UpsertArgsAndFailureFailsDelivery(t *testing.T) {
 	var mu sync.Mutex
 	var sql string
 	var qargs []any
@@ -58,8 +63,10 @@ func TestResolveSessionID_UpsertArgsAndFailureFailsOpen(t *testing.T) {
 	tx, err := db.BeginTx(context.Background())
 	require.NoError(t, err)
 
-	out := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, "ses_f7c8cea03ffeQF8w3WLp7oRA9w")
-	assert.Nil(t, out, "upsert failure must not fail the log write")
+	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, "ses_f7c8cea03ffeQF8w3WLp7oRA9w")
+	assert.Nil(t, out)
+	require.Error(t, err, "a failed upsert statement aborts the delivery transaction (PostgreSQL 25P02 on the next statement), so swallowing the error would fake a success the commit cannot deliver")
+	assert.ErrorContains(t, err, "session registry upsert")
 
 	mu.Lock()
 	defer mu.Unlock()
@@ -86,37 +93,58 @@ func TestSessionRegistryUUIDIsOrgScoped(t *testing.T) {
 	assert.NotEqual(t, idA, idB, "the same raw id maps to distinct registry rows per org")
 	assert.Equal(t, idA, sessionRegistryUUID(orgA, raw), "the mapping is deterministic for the same org")
 
-	// A client-supplied valid UUID keeps its exact value (the pre-0032
-	// contract); the one cross-org collision on the primary key fails the
-	// upsert and resolves to the documented fail-open.
+	// A client-supplied valid UUID is org-scoped like any other shape: a
+	// verbatim shared id would collide across orgs on the sessions primary
+	// key, and that statement error aborts the whole delivery transaction
+	// instead of staying contained to one registry row. Same-tenant
+	// preexisting rows keep their original ids through the arbiter.
 	clientUUID := "3f2b8a4c-9d1e-4f5a-8b7c-6e5d4c3b2a10"
-	assert.Equal(t, clientUUID, sessionRegistryUUID(orgA, clientUUID))
-	assert.Equal(t, clientUUID, sessionRegistryUUID(orgB, clientUUID))
+	idAUUID := sessionRegistryUUID(orgA, clientUUID)
+	idBUUID := sessionRegistryUUID(orgB, clientUUID)
+	assert.Equal(t, uuid.NewSHA1(nsRequestLogsUUID, []byte(orgA+"\x00"+clientUUID)).String(), idAUUID)
+	assert.Equal(t, uuid.NewSHA1(nsRequestLogsUUID, []byte(orgB+"\x00"+clientUUID)).String(), idBUUID)
+	assert.NotEqual(t, idAUUID, idBUUID, "two orgs sharing one UUID get distinct registry rows")
+	assert.NotEqual(t, clientUUID, idAUUID, "the verbatim-value branch is gone")
 }
 
-func TestResolveSessionID_ValidClientUUIDKeepsValue(t *testing.T) {
-	db := &mockDB{}
+// A valid client UUID offered by a NEW (org, raw) pair maps to the org-
+// scoped registry id, not the verbatim value — the verbatim branch is what
+// made two orgs sharing one UUID collide on the sessions primary key.
+func TestResolveSessionID_ValidClientUUIDIsOrgScoped(t *testing.T) {
+	var qargs []any
+	db := &mockDB{
+		QueryRowFn: func(ctx context.Context, query string, args ...any) pgx.Row {
+			qargs = args
+			return &fakeRow{vals: []any{args[0]}}
+		},
+	}
 	consumer := New(nil, db, "events:queue", slog.Default())
 	tx, err := db.BeginTx(context.Background())
 	require.NoError(t, err)
-	out := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, testSessionUUID)
+
+	out, err := consumer.resolveSessionID(context.Background(), tx, testOrgUUID, testSessionUUID)
+	require.NoError(t, err)
 	require.IsType(t, "", out)
-	assert.Equal(t, testSessionUUID, out.(string))
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), out.(string))
+	require.Len(t, qargs, 3)
+	assert.Equal(t, testSessionUUID, qargs[2], "client_session still carries the raw UUID")
 }
 
-// TestConsumer_FKViolationMessageStillLogged pins the end-to-end invariant:
-// even when the session registry insert fails, the request_logs row is
-// written (with a NULL session) instead of the event being dropped to DLQ.
-func TestConsumer_FKViolationMessageStillLogged(t *testing.T) {
-	var inserted bool
+// TestConsumer_SessionRegistryFailureFailsDelivery pins the fail-closed
+// contract: a failed registry upsert statement aborts the delivery
+// transaction (PostgreSQL rejects every later statement with 25P02), so the
+// delivery must return the error for redelivery instead of pretending the
+// request_logs row was written. Guard-path nils (absent session/org) are
+// statement-free and still log with a NULL session.
+func TestConsumer_SessionRegistryFailureFailsDelivery(t *testing.T) {
+	var requestLogInserts int
 	db := &mockDB{
 		QueryRowFn: func(ctx context.Context, query string, args ...any) pgx.Row {
 			return &errorRow{}
 		},
 		ExecFn: func(ctx context.Context, q string, args ...any) (pgconn.CommandTag, error) {
 			if strings.Contains(q, "INSERT INTO request_logs") {
-				inserted = true
-				assert.Nil(t, args[0], "unresolvable session falls back to NULL")
+				requestLogInserts++
 			}
 			return pgconn.NewCommandTag("INSERT 0 1"), nil
 		},
@@ -137,8 +165,10 @@ func TestConsumer_FKViolationMessageStillLogged(t *testing.T) {
 			"method":          "POST",
 		},
 	}
-	require.NoError(t, consumer.handleRequestComplete(context.Background(), msg))
-	assert.True(t, inserted, "the request_logs row must be persisted")
+	err := consumer.handleRequestComplete(context.Background(), msg)
+	require.Error(t, err, "the aborted transaction cannot commit; the delivery must report failure for redelivery")
+	assert.ErrorContains(t, err, "session registry upsert")
+	assert.Zero(t, requestLogInserts, "no request_logs write follows a poisoned transaction")
 }
 
 type errorRow struct{}

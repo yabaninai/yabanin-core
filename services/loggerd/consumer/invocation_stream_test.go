@@ -388,6 +388,51 @@ func TestDuplicateInvocationEnrichesWithoutRecharge(t *testing.T) {
 	assert.GreaterOrEqual(t, transitions, 2, "both deliveries run the guarded admission transition")
 }
 
+// A policy-probe failure is never mistaken for absence (B9): on the
+// duplicate arm the probe's non-ErrNoRows error fails the delivery for
+// redelivery instead of inserting a second decision row. The first
+// delivery's decision is the only one that ever landed.
+func TestDuplicateInvocationProbeFailureFailsDelivery(t *testing.T) {
+	var mu sync.Mutex
+	var logInsertCount int
+	var decisionInserts int
+	db := &mockDB{
+		QueryRowFn: func(ctx context.Context, q string, args ...any) pgx.Row {
+			if strings.Contains(q, "FROM policy_decisions") {
+				return &errorRow{} // a generic failure, NOT ErrNoRows
+			}
+			return admissionRow(1, &fakeRow{vals: []any{"org-abc", "admitted"}}, chargedTerminalFacts())(ctx, q, args...)
+		},
+		ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case strings.Contains(q, "INSERT INTO request_logs"):
+				logInsertCount++
+				if logInsertCount > 1 {
+					return pgconn.NewCommandTag("INSERT 0 0"), nil // duplicate invocation
+				}
+			case strings.Contains(q, "INSERT INTO policy_decisions"):
+				decisionInserts++
+			}
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	}
+	c := NewWithCreditStore(&mockRedis{}, db, "events:queue", silentLogger(), credits.NewStore(nil, silentLogger()))
+
+	values := invocationChargedMsg("35-0").Values
+	values["policy"] = `{"policy_id":"7c1e2a30-0000-4000-8000-00000000b001","version":1,"mode":"enforce","verdict":"allow","duration_ms":2,"findings":[]}`
+	require.NoError(t, c.processMessage(context.Background(), redis.XMessage{ID: "35-1", Values: values}))
+	err := c.processMessage(context.Background(), redis.XMessage{ID: "35-2", Values: values})
+
+	mu.Lock()
+	defer mu.Unlock()
+	require.Error(t, err, "the probe failure must fail the delivery for redelivery, never pass as absence")
+	assert.ErrorContains(t, err, "probe policy decision enrichment")
+	assert.Equal(t, 2, logInsertCount, "the duplicate arm was actually reached")
+	assert.Equal(t, 1, decisionInserts, "the failed enrichment inserts nothing on top of the first decision")
+}
+
 // The first live delivery of a charged, admitted invocation commits the
 // invocation-domain intent bytes and the guarded admission transition.
 func TestChargedInvocationDeliversWithAdmissionTransition(t *testing.T) {
