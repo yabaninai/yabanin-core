@@ -107,6 +107,8 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -115,6 +117,7 @@ sys.path.insert(0, str(ROOT / "scripts/quality"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import license_check  # noqa: E402  (reuse: FORBIDDEN, source_files, source_fingerprint)
 import oci_build_receipt
+import mock_release_receipt
 import dashboard_evidence  # noqa: E402  (single recorded token equivalence)
 
 EVIDENCE_REL = "artifacts/release-evidence/release-evidence.json"
@@ -2228,37 +2231,54 @@ def _mock_alpine_version(root: Path):
     return m.group(1) if m else None
 
 
+def _mock_alpine_proof_failures(root: Path, ev: dict) -> list:
+    try:
+        if not mock_release_receipt.present(root):
+            return ["PENDING gap: mock-provider alpine package, license and source "
+                    "proof missing for the final image"]
+        rows = (ev.get("distribution") or {}).get("quickstart_images") or []
+        row = oci_build_receipt.only(
+            (row for row in rows if isinstance(row, dict) and row.get("name") == "mock-provider"),
+            "missing or ambiguous mock-provider quickstart image",
+        )
+        head = (ev.get("freshness") or {}).get("head")
+        oci_build_receipt.check_image(
+            root, "mock-provider", row["image_id"], row["platform"], head, pinned_builders(root),
+        )
+        mock_release_receipt.verify(root, row["image_id"], row["platform"])
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, EOFError,
+            tarfile.TarError, zlib.error, RuntimeError) as error:
+        return [f"containers: mock-provider alpine proof: {error}"]
+    return []
+
+
+def _mock_alpine_record_failures(root, ev, records, mock_version):
+    matches = [row for row in records if row.get("role") == _ALPINE_MOCK_ROLE]
+    if not matches and not (root / mock_release_receipt.MANIFEST).is_file():
+        return []
+    if len(matches) != 1:
+        return ["containers: missing or ambiguous mock-provider Alpine base record"]
+    version = str(matches[0].get("version") or "")
+    if mock_version is not None and version != mock_version:
+        return [f"containers: mock-provider alpine record version {version!r} "
+                f"is not the Dockerfile pin alpine:{mock_version}"]
+    return _mock_alpine_proof_failures(root, ev)
+
+
 def _container_gaps(root: Path, ev: dict) -> list:
-    fails = []
-    mock_from = _mock_alpine_version(root)
-    for r in ev.get("containers", []):
-        # R2: the mock-image blocker fires on the RECORD ROLE, not on a
-        # filename substring -- renaming the apk inventory artifact must
-        # not clear the gap
-        if str(r.get("role") or "") == _ALPINE_MOCK_ROLE:
-            # R3: the record must match the Dockerfile's own alpine pin
-            # and keep the role text -- editing the version or laundering
-            # the role to dodge the mock gap is a hard failure, not a
-            # silently narrowed blocker
-            if mock_from is not None and str(r.get("version") or "") != mock_from:
-                fails.append(f"containers: mock-provider alpine record version "
-                             f"{r.get('version')!r} is not the Dockerfile pin "
-                             f"alpine:{mock_from}")
-            fails.append("PENDING gap: mock-provider alpine 3.21 base has only an apk "
-                         "inventory, no license text corpus; closing requires mapping "
-                         "the installed Alpine package versions to delivered "
-                         "licenses and the matching source companion")
-        elif (mock_from is not None
-              and str(r.get("version") or "") == mock_from
-              and "alpine" in str(r.get("repo_ref") or "")
-              and str(r.get("index_digest") or "").startswith("sha256:")):
-            # R3: the mock alpine at the Dockerfile's pin wearing a
-            # DIFFERENT role is the blocker laundered, not a different
-            # base image
-            fails.append(f"containers: alpine {mock_from} record evades the "
+    mock_version = _mock_alpine_version(root)
+    records = ev.get("containers", [])
+    fails = _mock_alpine_record_failures(root, ev, records, mock_version)
+    for row in records:
+        if (mock_version is not None
+            and row.get("role") != _ALPINE_MOCK_ROLE
+            and row.get("version") == mock_version
+            and "alpine" in str(row.get("repo_ref") or "")
+            and str(row.get("index_digest") or "").startswith("sha256:")):
+            fails.append(f"containers: alpine {mock_version} record evades the "
                          f"mock-provider role binding ({_ALPINE_MOCK_ROLE!r} "
                          "expected for the apk inventory blocker)")
-        fails.extend(_revision_gap_lines(root, r, ev))
+        fails.extend(_revision_gap_lines(root, row, ev))
     return fails
 
 
@@ -2590,7 +2610,7 @@ def collect_containers() -> list:
     base(cfg["alpine-mock-runtime"], "alpine", "runtime base (mock image)",
          "Alpine 3.21 packages per apk inventory",
          "artifacts/release-evidence/apk-mock.txt",
-         {"note": "full 3.21 text corpus not assembled; recorded as a pending gap"})
+         {"note": "verified against final image layers and the Alpine source companion when retained"})
     base(cfg["node-dashboard-builder"], "node", "build stage (not retained)", "MIT (Node)",
          "artifacts/release-evidence/upstream/node/LICENSE",
          {"notice_forbidden_contexts": [
