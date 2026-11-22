@@ -4,7 +4,12 @@ package accounting
 
 import (
 	"bytes"
+	"database/sql"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sort"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -30,12 +35,19 @@ import (
 //     set one), so the durable outcome is the explicit unpriced status —
 //     usage_source none, cost_status no_usage, zero cost, zero charge.
 //     A priced zero would be a fabricated price, not an observation.
+//     Its only settlement evidence is the provisioned team scope's
+//     count-only attribution at exactly zero: the seed binds the key to
+//     the default team, and the consumer's plan keeps a team-attributed
+//     request visible as a zero-cost counting entry. Any wallet charge
+//     or other settlement kind remains a product defect.
 //   - transcription relays the known JSON reply byte-identically with
 //     the family-distinct provider usage (11/0 — different from chat's
 //     7/3 and embeddings' 7/0) billed exactly once under the minted
-//     invocation as the signed 22 micro-USD zero-markup debit, and the
-//     persisted payload is the metadata-only projection (D3 — audio
-//     bytes never reach the event stream).
+//     invocation as the signed 22 micro-USD zero-markup debit. The
+//     published stream event bound to the minted identity carries the
+//     metadata-only projection (D3 — audio bytes never reach the event
+//     stream) while the durable terminal fact carries no capture keys
+//     at all.
 //
 // Codec-specific negative controls run live on the same stand:
 // streaming speech requests are refused 400 unsupported_feature with
@@ -170,6 +182,7 @@ func requestTranscription(s *stand, rid string) mediaReply {
 func (s *stand) mediaControl(t *testing.T, fam mediaFamily, phase string) {
 	t.Helper()
 	before := s.fixture.Snapshot()
+	ledgerBefore := s.teamLedgerSnapshot(t)
 	rid := familyRequestID(s, "ctl-"+phase+"-", fam.name)
 	rep := fam.request(s, rid)
 	requireNoMediaArtifactError(t, fam.name, phase, fam.validate(rep))
@@ -191,7 +204,7 @@ func (s *stand) mediaControl(t *testing.T, fam mediaFamily, phase string) {
 	if fam.upstream == "/v1/audio/transcriptions" {
 		s.requireTranscriptionMetadataPayload(t, phase, rid, invocationID, fixtureTranscribeAudioFile)
 	}
-	s.requireMediaChargeEvidence(t, fam, phase, rid)
+	s.requireMediaChargeEvidence(t, fam, phase, rid, invocationID, ledgerBefore)
 	s.requireMediaTenantBound(t, fam, phase, rid)
 	t.Logf("harness: %s control %s ok (request id %s)", fam.name, phase, rid)
 }
@@ -237,33 +250,163 @@ func (s *stand) requireMediaDurableEvidence(t *testing.T, fam mediaFamily, phase
 	return a.InvocationID
 }
 
-// requireTranscriptionMetadataPayload asserts D3 for the multipart
-// codec: the persisted event payload is the metadata-only projection —
-// the file entry with filename, size and content type — and carries no
-// raw audio bytes under any retention class.
+// captureKeys are the content classes the publisher owns: they may ride
+// the Redis stream behind the retention gates, but they must never
+// appear on the durable terminal fact.
+var captureKeys = [...]string{"payload", "upstream_payload", "upstream_response", "processed_response"}
+
+// sortedKeys lists a map's keys in sorted order — diagnostics name
+// fields, never raw values, so no content bytes leak into test logs.
+func sortedKeys[V any](m map[string]V) []string {
+	keys := make([]string, 0, len(m))
+	for k := range m {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	return keys
+}
+
+// requireTranscriptionMetadataPayload asserts D3 for the multipart codec
+// on both persistence surfaces: the identity-bound stream event carries
+// the metadata-only projection and no audio bytes anywhere, while the
+// durable terminal fact carries no capture keys at all.
 func (s *stand) requireTranscriptionMetadataPayload(t *testing.T, phase, rid, invocationID, filename string) {
 	t.Helper()
-	const payload = `SELECT f.event->>'payload' FROM request_terminal_facts f
-		WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3`
-	var body string
-	if err := s.oracleDB.db.QueryRow(payload, invocationID, s.oracleDB.orgID, rid).Scan(&body); err != nil {
-		t.Fatalf("product: transcription %s: terminal fact carries no payload to inspect: %v", phase, err)
+	s.requireTranscriptionStreamProjection(t, phase, rid, invocationID, filename)
+	s.requireTerminalFactNoCaptureKeys(t, phase, rid, invocationID)
+}
+
+// requireTranscriptionStreamProjection asserts the published Redis event
+// bound to the exact invocation, request and tenant identity: the
+// payload is the metadata-only projection — the client text fields plus
+// the file entry with filename, true upload size and content type — and
+// no raw audio bytes ride the stream under any field, whatever the
+// retention class holds back elsewhere.
+func (s *stand) requireTranscriptionStreamProjection(t *testing.T, phase, rid, invocationID, filename string) {
+	t.Helper()
+	entry := s.boundTranscriptionStreamEntry(t, phase, rid, invocationID)
+	s.requireNoAudioInStreamEntry(t, phase, entry)
+	raw, ok := entry.Values["payload"].(string)
+	if !ok {
+		t.Fatalf("product: transcription %s: identity-bound stream entry %s carries no payload field (fields %v)", phase, entry.ID, sortedKeys(entry.Values))
 	}
-	if !strings.Contains(body, `"file"`) || !strings.Contains(body, filename) {
-		t.Fatalf("product: transcription %s: payload %s is not the metadata projection (want the file entry naming %s)", phase, clip(body), filename)
+	var meta map[string]any
+	s.requireProjectionFileEntry(t, phase, raw, filename, &meta)
+	if meta["model"] != s.model {
+		t.Fatalf("product: transcription %s: payload model %v, want the client-sent form value %q (payload %s)", phase, meta["model"], s.model, clip(raw))
 	}
-	if bytes.Contains([]byte(body), []byte("RIFF")) || strings.Contains(body, "data:audio") {
-		t.Fatalf("product: transcription %s: payload carries raw audio bytes — D3 violation (payload %s)", phase, clip(body))
+	if len(meta) != 2 {
+		t.Fatalf("product: transcription %s: published payload carries extraneous fields %v — the projection is exactly the client text fields plus the file entry", phase, sortedKeys(meta))
+	}
+	t.Logf("product: transcription %s: metadata projection verified on stream entry %s (%d top-level fields)", phase, entry.ID, len(meta))
+}
+
+// boundTranscriptionStreamEntry returns the one stream entry bound to
+// the exact invocation, request and tenant identity, and fails with the
+// observed candidates when the projection is missing or duplicated.
+func (s *stand) boundTranscriptionStreamEntry(t *testing.T, phase, rid, invocationID string) streamEntry {
+	t.Helper()
+	rdb := s.redisClient(t)
+	entries := s.findStreamEntries(t, rdb, rid)
+	bound := -1
+	for i, e := range entries {
+		if e.Values["request_id"] != rid || e.Values["org_id"] != s.oracleDB.orgID ||
+			e.Values["invocation_id"] != invocationID {
+			continue
+		}
+		if bound >= 0 {
+			t.Fatalf("product: transcription %s: multiple stream entries bound to invocation %s request %s org %s — the metadata projection must ride exactly one identity-bound event", phase, invocationID, rid, s.oracleDB.orgID)
+		}
+		bound = i
+	}
+	if bound < 0 {
+		t.Fatalf("product: transcription %s: no stream entry bound to invocation %s request %s org %s among %d rid-matching entries — the metadata projection was never published", phase, invocationID, rid, s.oracleDB.orgID, len(entries))
+	}
+	return entries[bound]
+}
+
+// requireNoAudioInStreamEntry scans every stream field of the bound
+// entry for raw audio byte signatures — a D3 violation under any
+// retention class.
+func (s *stand) requireNoAudioInStreamEntry(t *testing.T, phase string, entry streamEntry) {
+	t.Helper()
+	for k, v := range entry.Values {
+		if bytes.Contains([]byte(fmt.Sprint(v)), []byte("RIFF")) || strings.Contains(fmt.Sprint(v), "data:audio") {
+			t.Fatalf("product: transcription %s: stream field %q carries raw audio bytes — D3 violation", phase, k)
+		}
 	}
 }
 
+// requireProjectionFileEntry decodes the published payload and asserts
+// the file metadata object: filename, true upload size and content type
+// exactly as uploaded. The decoded projection is returned to the caller
+// for the remaining exact-keyset checks.
+func (s *stand) requireProjectionFileEntry(t *testing.T, phase, raw, filename string, meta *map[string]any) {
+	t.Helper()
+	if err := json.Unmarshal([]byte(raw), meta); err != nil {
+		t.Fatalf("product: transcription %s: published payload is not metadata JSON: %v (payload of %d bytes)", phase, err, len(raw))
+	}
+	wantSize := len(fixtureWAVBytes())
+	fileMeta, ok := (*meta)["file"].(map[string]any)
+	if !ok {
+		t.Fatalf("product: transcription %s: published payload has no file metadata object (top-level fields %v; want filename %s, size %d, content type %s)", phase, sortedKeys(*meta), filename, wantSize, fixtureTranscribeAudioContentType)
+	}
+	if fileMeta["filename"] != filename || fileMeta["content_type"] != fixtureTranscribeAudioContentType {
+		t.Fatalf("product: transcription %s: file metadata %v, want filename %s and content type %s — the projection must name the true upload", phase, fileMeta, filename, fixtureTranscribeAudioContentType)
+	}
+	if size, ok := fileMeta["size"].(float64); !ok || int(size) != wantSize {
+		t.Fatalf("product: transcription %s: file size %v, want exactly %d — the projection must carry the true upload size", phase, fileMeta["size"], wantSize)
+	}
+}
+
+// requireTerminalFactNoCaptureKeys independently asserts the durable
+// surface: the terminal fact row bound to the same invocation carries
+// none of the capture keys — durable facts are the content-free
+// projection, and the payload belongs to the stream event only.
+func (s *stand) requireTerminalFactNoCaptureKeys(t *testing.T, phase, rid, invocationID string) {
+	t.Helper()
+	const keysQuery = `SELECT DISTINCT k FROM request_terminal_facts f, jsonb_object_keys(f.event) AS k
+		WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3`
+	rows, err := s.oracleDB.db.Query(keysQuery, invocationID, s.oracleDB.orgID, rid)
+	if err != nil {
+		t.Fatalf("harness: terminal fact key scan: %v", err)
+	}
+	defer rows.Close()
+	keys := map[string]bool{}
+	for rows.Next() {
+		var k string
+		if err := rows.Scan(&k); err != nil {
+			t.Fatalf("harness: terminal fact key scan: %v", err)
+		}
+		keys[k] = true
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("harness: terminal fact key scan: %v", err)
+	}
+	if len(keys) == 0 {
+		t.Fatalf("product: transcription %s: no durable terminal fact for invocation %s request %s org %s to inspect", phase, invocationID, rid, s.oracleDB.orgID)
+	}
+	for _, forbidden := range captureKeys {
+		if keys[forbidden] {
+			t.Fatalf("product: transcription %s: durable terminal fact carries capture key %q (keys %v) — durable facts are the content-free projection; the payload belongs to the stream event only", phase, forbidden, keys)
+		}
+	}
+	t.Logf("product: transcription %s: durable terminal fact carries no capture keys (%d distinct content-free fields)", phase, len(keys))
+}
+
 // requireMediaChargeEvidence asserts the wallet/settlement outcome of a
-// healthy media control. A priced family bills exactly once under its
-// minted invocation as the signed debit with at least one settlement
-// job and no legacy-keyed duplicate; an unpriced family charges nothing
-// anywhere — the explicit no_usage outcome must never surface as a
-// zero-valued charge row or settlement job.
-func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase, rid string) {
+// healthy media control against the pre-request ledger snapshot. A
+// priced family bills exactly once under its minted invocation as the
+// signed debit with at least one settlement job and no legacy-keyed
+// duplicate. An unpriced family charges no money anywhere: the explicit
+// no_usage outcome must never surface as a charge row, and its only
+// settlement evidence is the request's own team scope's count-only
+// attribution — exactly one settled team_spend intent bound to the
+// minted invocation at exactly zero, worth exactly one ledger counting
+// request on the producer month and nothing else. Any wallet charge,
+// other settlement kind or extra ledger movement is a product defect,
+// not a waived observation.
+func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase, rid, invocationID string, ledgerBefore teamLedgerBaseline) {
 	t.Helper()
 	rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
 	if len(rows) != 1 {
@@ -273,12 +416,208 @@ func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase,
 		s.requirePricedMediaCharge(t, fam, phase, rid, rows[0].InvocationID)
 		return
 	}
-	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows+c.TopupRows != 0 {
+	c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID)
+	if c.UsageRows+c.TopupRows != 0 {
 		t.Fatalf("product: %s control %s: %d credit transaction(s) for an unpriced codec (usage_source none, cost_status no_usage) — zero cost must never surface as a charge row (%+v)",
 			fam.name, phase, c.UsageRows+c.TopupRows, c)
 	}
-	if n := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); n != 0 {
-		t.Fatalf("product: %s control %s: %d settlement job(s) for an unpriced codec — no settlement may be scheduled for a request that never priced", fam.name, phase, n)
+	s.requireUnpricedSettlementEvidence(t, fam, phase, rid, invocationID, ledgerBefore)
+}
+
+// requireUnpricedSettlementEvidence waits boundedly for the
+// independently observable settled state — exactly one invocation-bound
+// team_spend intent whose ledger counting row gained exactly one
+// request — then hard-asserts the intent set and the amounts.
+func (s *stand) requireUnpricedSettlementEvidence(t *testing.T, fam mediaFamily, phase, rid, invocationID string, ledgerBefore teamLedgerBaseline) {
+	t.Helper()
+	keyTeam, month := s.unpricedRequestScope(t, phase, rid, invocationID)
+	const teamRow = `SELECT count(*), coalesce(min(amount_cents), 0), coalesce(min(amount_micro_usd), 0), coalesce(min(status), '')
+		FROM settlement_jobs
+		WHERE request_id=$1 AND org_id=$2 AND charge_kind='team_spend' AND invocation_id=$3::uuid`
+	var n, cents, micro int64
+	var status string
+	requireEventually(t, 60*time.Second, 500*time.Millisecond, func() bool {
+		if err := s.oracleDB.db.QueryRow(teamRow, rid, s.oracleDB.orgID, invocationID).Scan(&n, &cents, &micro, &status); err != nil {
+			t.Fatalf("harness: settlement team row query: %v", err)
+		}
+		want := ledgerBefore[keyTeam][month].requests + 1
+		return n == 1 && status == "settled" && s.teamLedgerCell(t, keyTeam, month).requests == want
+	}, "product: %s control %s: settlement for the unpriced codec never converged to exactly one settled team_spend intent under invocation %s with one counting request for team %s month %s", fam.name, phase, invocationID, keyTeam, month)
+	kinds := s.oracleSettlementKinds(t, rid, s.oracleDB.orgID)
+	if len(kinds) != 1 || kinds["team_spend"] != 1 {
+		t.Fatalf("product: %s control %s: settlement intent set %v for an unpriced codec — want exactly one team_spend counting intent; a wallet or any other scope charge on a never-priced request is a product defect", fam.name, phase, kinds)
+	}
+	if cents != 0 || micro != 0 || status != "settled" {
+		t.Fatalf("product: %s control %s: team_spend intent under invocation %s is amount %d/%d µUSD status %s, want exactly 0/0 settled — the counting attribution must never carry an amount", fam.name, phase, invocationID, cents, micro, status)
+	}
+	s.requireTeamCountingIntent(t, fam, phase, rid, invocationID, keyTeam, month, ledgerBefore, kinds, status, cents, micro)
+}
+
+// unpricedRequestScope resolves the identity the counting intent must
+// bind, read independently of the settlement row: the request's own
+// terminal fact names the API key that sent it, the key row names its
+// provisioned team, and the fact's producer timestamp names the UTC
+// month.
+func (s *stand) unpricedRequestScope(t *testing.T, phase, rid, invocationID string) (keyTeam, month string) {
+	t.Helper()
+	apiKeyID := s.oracleTerminalFactField(t, invocationID, rid, "api_key_id")
+	ts := s.oracleTerminalFactField(t, invocationID, rid, "ts")
+	ms, err := strconv.ParseInt(ts, 10, 64)
+	if err != nil || ms <= 0 {
+		t.Fatalf("harness: %s control %s: terminal fact producer ts %q is not a usable millisecond clock", phase, rid, ts)
+	}
+	if err := s.oracleDB.db.QueryRow(
+		`SELECT team_id::text FROM api_keys WHERE id=$1::uuid AND org_id=$2`, apiKeyID, s.oracleDB.orgID).Scan(&keyTeam); err != nil || keyTeam == "" {
+		t.Fatalf("harness: %s control %s: the requesting API key %s has no provisioned team on org %s (err %v) — the count-only team attribution proof requires the request's own key to be team-bound", phase, rid, apiKeyID, s.oracleDB.orgID, err)
+	}
+	return keyTeam, time.UnixMilli(ms).UTC().Format("2006-01")
+}
+
+// oracleTerminalFactField reads one scalar field of the terminal fact
+// linked to the request identity.
+func (s *stand) oracleTerminalFactField(t *testing.T, invocationID, rid, field string) string {
+	t.Helper()
+	var v string
+	err := s.oracleDB.db.QueryRow(`SELECT f.event->>$4 FROM request_terminal_facts f
+		WHERE f.invocation_id=$1::uuid AND f.org_id=$2 AND f.client_request_id=$3`,
+		invocationID, s.oracleDB.orgID, rid, field).Scan(&v)
+	if err != nil || v == "" {
+		t.Fatalf("harness: terminal fact field %q for invocation %s request %s: %v", field, invocationID, rid, err)
+	}
+	return v
+}
+
+// teamLedgerCell is one (team, period) cell of the team spend ledger.
+type teamLedgerCell struct {
+	spend    int64
+	requests int64
+}
+
+// teamLedgerBaseline captures the pre-request state of every team spend
+// ledger cell of the stand's organization, keyed by team and period.
+type teamLedgerBaseline map[string]map[string]teamLedgerCell
+
+// teamLedgerSnapshot reads the organization's team spend ledger cells.
+func (s *stand) teamLedgerSnapshot(t *testing.T) teamLedgerBaseline {
+	t.Helper()
+	rows, err := s.oracleDB.db.Query(`SELECT ot.id::text, l.period, l.spend_micro_usd, l.request_count
+		FROM team_spend_monthly l JOIN organizations_teams ot ON ot.id = l.team_id
+		WHERE ot.org_id = $1`, s.oracleDB.orgID)
+	if err != nil {
+		t.Fatalf("harness: team ledger snapshot query: %v", err)
+	}
+	defer rows.Close()
+	snap := teamLedgerBaseline{}
+	for rows.Next() {
+		var team, period string
+		var cell teamLedgerCell
+		if err := rows.Scan(&team, &period, &cell.spend, &cell.requests); err != nil {
+			t.Fatalf("harness: team ledger snapshot scan: %v", err)
+		}
+		if snap[team] == nil {
+			snap[team] = map[string]teamLedgerCell{}
+		}
+		snap[team][period] = cell
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatalf("harness: team ledger snapshot rows: %v", err)
+	}
+	return snap
+}
+
+// teamLedgerCell reads one ledger cell; a missing row reads as zero.
+func (s *stand) teamLedgerCell(t *testing.T, team, period string) teamLedgerCell {
+	t.Helper()
+	var cell teamLedgerCell
+	err := s.oracleDB.db.QueryRow(
+		`SELECT spend_micro_usd, request_count FROM team_spend_monthly WHERE team_id=$1::uuid AND period=$2`,
+		team, period).Scan(&cell.spend, &cell.requests)
+	if err == nil {
+		return cell
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		return teamLedgerCell{}
+	}
+	t.Fatalf("harness: team ledger cell query for team %s period %s: %v", team, period, err)
+	return teamLedgerCell{}
+}
+
+// requireTeamCountingIntent binds the zero-amount team_spend intent to
+// the request's own proven scope — the requesting key's team and the
+// producer month read from the terminal fact — and proves the ledger
+// effect from the independent pre-request snapshot.
+func (s *stand) requireTeamCountingIntent(t *testing.T, fam mediaFamily, phase, rid, invocationID, keyTeam, month string, ledgerBefore teamLedgerBaseline, kinds map[string]int, status string, cents, micro int64) {
+	t.Helper()
+	var payload string
+	if err := s.oracleDB.db.QueryRow(
+		`SELECT payload FROM settlement_jobs WHERE request_id=$1 AND org_id=$2 AND charge_kind='team_spend' AND invocation_id=$3::uuid`,
+		rid, s.oracleDB.orgID, invocationID).Scan(&payload); err != nil {
+		t.Fatalf("harness: settlement team payload query: %v", err)
+	}
+	var intent struct {
+		TeamID string `json:"team_id"`
+		Period string `json:"period"`
+	}
+	if err := json.Unmarshal([]byte(payload), &intent); err != nil || intent.TeamID != keyTeam || intent.Period != month {
+		t.Fatalf("product: %s control %s: team_spend intent payload (%d bytes) decodes to team %q period %q, want exactly the requesting key's team %s and the producer month %s — the counting entry must bind the request's own proven scope",
+			fam.name, phase, len(payload), intent.TeamID, intent.Period, keyTeam, month)
+	}
+	s.requireTeamLedgerDelta(t, fam, phase, ledgerBefore, keyTeam, month)
+	t.Logf("product: %s control %s: unpriced settlement evidence — kinds %v; team_spend status=%s amount=%d cents/%d µUSD invocation=%s key team=%s producer month=%s",
+		fam.name, phase, kinds, status, cents, micro, invocationID, keyTeam, month)
+}
+
+// requireTeamLedgerDelta proves the request's whole ledger effect from
+// the independent pre-request snapshot: the producer month cell of the
+// requesting key's team gains exactly one counting request at unchanged
+// spend, and every unrelated cell is unchanged.
+func (s *stand) requireTeamLedgerDelta(t *testing.T, fam mediaFamily, phase string, before teamLedgerBaseline, keyTeam, month string) {
+	t.Helper()
+	after := s.teamLedgerSnapshot(t)
+	s.requireUnchangedTeamLedgerCells(t, fam, phase, before, after, keyTeam, month)
+	s.requireNoUnexpectedNewCells(t, fam, phase, before, after, keyTeam, month)
+}
+
+// requireUnchangedTeamLedgerCells compares every pre-request cell
+// against the post-settlement ledger: only the producer month cell of
+// the requesting key's team may differ.
+func (s *stand) requireUnchangedTeamLedgerCells(t *testing.T, fam mediaFamily, phase string, before, after teamLedgerBaseline, keyTeam, month string) {
+	t.Helper()
+	for team, periods := range before {
+		for period, was := range periods {
+			now, ok := after[team][period]
+			if team == keyTeam && period == month {
+				s.requireCountingLedgerDelta(t, fam, phase, team, period, was, now, ok)
+				continue
+			}
+			if !ok || now != was {
+				t.Fatalf("product: %s control %s: unrelated team ledger cell %s/%s changed %+v → %+v — an unpriced control must not move any other ledger", fam.name, phase, team, period, was, now)
+			}
+		}
+	}
+}
+
+// requireNoUnexpectedNewCells proves no ledger cell appeared for any
+// other team or month: the counting intent's whole ledger footprint is
+// the producer month cell of the requesting key's team.
+func (s *stand) requireNoUnexpectedNewCells(t *testing.T, fam mediaFamily, phase string, before, after teamLedgerBaseline, keyTeam, month string) {
+	t.Helper()
+	for team, periods := range after {
+		for period, now := range periods {
+			if _, seen := before[team][period]; !seen && !(team == keyTeam && period == month) {
+				t.Fatalf("product: %s control %s: unexpected new ledger cell %s/%s (%+v) — an unpriced control may only create the requesting team's producer month cell", fam.name, phase, team, period, now)
+			}
+		}
+	}
+}
+
+// requireCountingLedgerDelta asserts the producer month cell gained
+// exactly one counting request at exactly unchanged spend.
+func (s *stand) requireCountingLedgerDelta(t *testing.T, fam mediaFamily, phase, team, period string, was, now teamLedgerCell, ok bool) {
+	t.Helper()
+	if !ok || now.spend != was.spend || now.requests != was.requests+1 {
+		t.Fatalf("product: %s control %s: counting ledger cell %s/%s %+v → %+v (present %v), want spend unchanged and exactly one new counting request",
+			fam.name, phase, team, period, was, now, ok)
 	}
 }
 
@@ -288,6 +627,14 @@ func (s *stand) requireMediaChargeEvidence(t *testing.T, fam mediaFamily, phase,
 // legacy correlation-keyed duplicates of either.
 func (s *stand) requirePricedMediaCharge(t *testing.T, fam mediaFamily, phase, rid, invocationID string) {
 	t.Helper()
+	// Wallet transactions are written asynchronously. Read the independent
+	// ledger only after settlement for this tenant and invocation completes.
+	requireEventually(t, time.Minute, 100*time.Millisecond, func() bool {
+		return s.oracleCount(t, `SELECT count(*) FROM settlement_jobs
+			WHERE org_id=$1 AND invocation_id=$2::uuid AND request_id=$3
+			AND charge_kind='resale_deduction' AND status='settled'`,
+			s.oracleDB.orgID, invocationID, rid) == 1
+	}, "priced media resale deduction must settle before reading the wallet")
 	c := s.oracleUsageByInvocation(t, invocationID, s.oracleDB.orgID)
 	if c.UsageRows != 1 || c.SumMicroUSD != fam.walletMicro {
 		t.Fatalf("product: %s control %s: invocation %s has %d usage rows summing to %d micro-USD, want exactly 1 signed debit of %d (zero-markup resale of the family-distinct usage at the seeded rates)",
