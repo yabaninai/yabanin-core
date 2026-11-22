@@ -112,7 +112,13 @@ def snapshot(root):
         if path.is_symlink():
             digest.update(b"link\0" + os.fsencode(os.readlink(path)))
         elif path.is_file():
-            digest.update(str(path.stat().st_mode & 0o777).encode() + b"\0")
+            # Git tracks only the executable bit; every other permission bit
+            # comes from the umask of whoever checked out the tree (CI umask
+            # 022 vs a local 002). Fingerprint Git's semantic so source
+            # identity is checkout-independent, not the raw working-tree
+            # mode that umask noise would alter.
+            executable = path.stat().st_mode & 0o111
+            digest.update((b"x" if executable else b"-") + b"\0")
             # Assets, archives and WASM can change delivered behavior too.
             # Generated QA output belongs in ignored artifacts, not outside
             # the source fingerprint. Stream bytes to bound memory usage.
@@ -733,22 +739,41 @@ def evidence_chain(root, manifest):
         path = rerun_prior_path(root, report, path.parent)
 
 
-def verify_evidence(root, manifest, required):
-    """Validate a quality manifest as evidence for the required gates.
-
-    QR-1: a manifest may extend a rerun chain (rerun_of links). The chain is
-    valid when every link binds to the current source snapshot, every
-    recorded log hash matches in the directory of the run that actually
-    executed the gate (carried records resolve through the chain to that
-    run), the gate set is identical along the chain and carried records are
-    verbatim copies of their prior records, the effective gate set (union
-    along the chain, newest record per gate) passes, and the newest manifest
-    is passed while older links are failed or interrupted."""
-    try:
-        chain = evidence_chain(root, manifest)
-    except ValueError:
-        # A broken link or a cycle means the chain itself cannot be trusted.
+def base_binding_failure(chain, expected_base):
+    """A verification request that resolved --base R accepts only evidence
+    recorded against exactly R. Reruns inherit the prior manifest's base, so
+    a legitimate chain is uniform; any divergence is evidence for a
+    different request."""
+    if expected_base is None:
         return False
+    for _path, report in chain:
+        recorded = report.get("base")
+        if recorded != expected_base:
+            print(f"Evidence base differs: manifest records {recorded!r}, "
+                  f"requested base resolves to {expected_base!r}", file=sys.stderr)
+            return True
+    return False
+
+
+def registry_tampered(root, report):
+    """NEXT-10 tamper evidence: a v2 manifest that records a command
+    registry hash must re-derive to that value, and an unreadable registry
+    counts as tampered. An absent registry record is explicit and accepted
+    — the run recorded its absence (absent_reason), so there is nothing to
+    re-derive."""
+    rec = (report.get("evidence") or {}).get("command_registry")
+    if rec is None:
+        return False
+    try:
+        return command_registry.registry_sha256(root / rec.get("path", "")) != rec.get("sha256")
+    except (OSError, command_registry.RegistryError):
+        return True
+
+
+def load_links(root, chain):
+    """Load every chain link for verification: schema gate, v2 registry
+    re-derivation and source identity. Returns (path, report,
+    gates-by-name) links, or None when a link fails integrity."""
     current = snapshot(root)
     links = []
     for path, report in chain:
@@ -758,110 +783,144 @@ def verify_evidence(root, manifest, required):
         # registry hash. A v2 manifest whose registry changed since the run
         # is stale — exactly the tamper case the card demands to catch.
         if version not in (1, 2) or not report.get("gates"):
-            return False
-        if version == 2:
-            ev = report.get("evidence") or {}
-            rec = ev.get("command_registry")
-            if rec is not None:
-                try:
-                    if command_registry.registry_sha256(root / rec.get("path", "")) != rec.get("sha256"):
-                        return False
-                except (OSError, command_registry.RegistryError):
-                    return False
+            return None
+        if version == 2 and registry_tampered(root, report):
+            return None
         # Source identity: a chain is evidence only for this exact tree.
         if report.get("source") != current or report.get("source_after") != current:
-            return False
+            return None
         links.append((path, report, {gate["name"]: gate for gate in report["gates"]}))
-    # The gate set is fixed by the original run: a rerun must neither add,
-    # drop nor rename gates.
+    return links
+
+
+def gate_records_consistent(links, required):
+    """The gate set is fixed by the original run: a rerun must neither add,
+    drop nor rename gates, and the request must be within that set. A
+    carried record must be a verbatim copy of the same gate's record in
+    the link it references, plus the log_source marker — inventing or
+    editing carried evidence is a tamper, not a carry."""
     names = set(links[0][2])
     for _path, _report, by_name in links[1:]:
         if set(by_name) != names:
             return False
     if not set(required) <= names:
         return False
-    # A carried record must be a verbatim copy of the same gate's record in
-    # the link it references, plus the log_source marker — inventing or
-    # editing carried evidence is a tamper, not a carry.
     for index in range(len(links) - 1):
         for name, gate in links[index][2].items():
             prior = links[index + 1][2].get(name)
             if gate.get("log_source") == "prior" and gate != dict(prior, log_source="prior"):
                 return False
+    return True
 
-    def log_dir(index, name):
-        """Directory holding a gate's log: this link's own directory unless
-        the record was carried from an older run; carried records resolve
-        through the chain to the run that executed the gate."""
-        for j in range(index, len(links)):
-            if links[j][2][name].get("log_source") != "prior":
-                return links[j][0].parent
-        return None
 
-    # Only passed and skipped records are evidence claims; every one of them
-    # must hash-match where it lives. Failed, interrupted and pending records
-    # of older links are superseded diagnostics — their logs may not even
-    # exist (a gate killed before writing output) and prove nothing.
+def log_directory(links, index, name):
+    """Directory holding a gate's log: this link's own directory unless the
+    record was carried from an older run; carried records resolve through
+    the chain to the run that executed the gate."""
+    for j in range(index, len(links)):
+        if links[j][2][name].get("log_source") != "prior":
+            return links[j][0].parent
+    return None
+
+
+def gate_log_intact(links, index, name, gate):
+    """One claimed record: the gate's log must live at the gate's own log
+    name inside a leaf run directory and hash-match in the directory of
+    the run that executed it."""
+    if name not in LEAVES or gate.get("log") != name + ".log":
+        return False
+    directory = log_directory(links, index, name)
+    if directory is None:
+        return False
+    try:
+        log_bytes = (directory / gate["log"]).read_bytes()
+    except OSError:
+        # A deleted or unreadable log invalidates the evidence; it must
+        # not crash the validator into a generic error exit.
+        return False
+    return hashlib.sha256(log_bytes).hexdigest() == gate.get("log_sha256")
+
+
+def claimed_records_intact(links):
+    """Only passed and skipped records are evidence claims; every one must
+    hash-match where it lives. Failed, interrupted and pending records of
+    older links are superseded diagnostics — their logs may not even exist
+    (a gate killed before writing output) and prove nothing."""
     for index, (_path, _report, by_name) in enumerate(links):
         for name, gate in by_name.items():
-            if gate.get("status") not in ("passed", "skipped"):
-                continue
-            if name not in LEAVES or gate.get("log") != name + ".log":
+            if gate.get("status") in ("passed", "skipped") and not gate_log_intact(links, index, name, gate):
                 return False
-            directory = log_dir(index, name)
-            if directory is None:
-                return False
-            try:
-                log_bytes = (directory / gate["log"]).read_bytes()
-            except OSError:
-                # A deleted or unreadable log invalidates the evidence; it
-                # must not crash the validator into a generic error exit.
-                return False
-            if hashlib.sha256(log_bytes).hexdigest() != gate.get("log_sha256"):
-                return False
-    # Status semantics apply to the effective records only: older links
-    # legitimately carry failed records superseded by the rerun.
+    return True
+
+
+def record_acceptable(links, index, name, gate):
+    """A gate is either passed (exit 0), or an explicit skip: exit 77 with
+    a recorded reason, or the make wrapper's collapsed exit 2 which counts
+    only with the same "Error 77" log-tail marker the runner accepted at
+    gate_status time (NEXT-07 adds the registry that restricts which skips
+    are legitimate; the skip must stay explicit and self-describing so it
+    can never masquerade as a pass)."""
+    status, code = gate.get("status"), gate.get("exit_code")
+    if status == "passed":
+        return code == 0
+    if status != "skipped":
+        return False
+    if code == 2:
+        directory = log_directory(links, index, name)
+        lines = log_tail_lines(directory / gate.get("log", "")) if directory else []
+        return bool(lines) and bool(MAKE_SKIP_RE.search(lines[-1])) and bool(gate.get("skip_reason"))
+    return code == 77 and bool(gate.get("skip_reason"))
+
+
+def effective_records_pass(links):
+    """Status semantics apply to the effective records only: older links
+    legitimately carry failed records superseded by the rerun. The
+    effective record of a gate is its newest record along the chain."""
     effective = {}
     for index, (_path, _report, by_name) in enumerate(links):
         for name, gate in by_name.items():
             effective.setdefault(name, (index, gate))
-    for name, (index, gate) in effective.items():
-        status, code = gate.get("status"), gate.get("exit_code")
-        # A gate is either passed, or an explicit skip (exit 77 with a
-        # recorded reason). Anything else is a failure. NEXT-07 adds the
-        # registry that restricts which skips are legitimate; here we require
-        # the skip to be explicit and self-describing so it can never
-        # masquerade as a pass.
-        if status == "passed":
-            if code != 0:
-                return False
-        elif status == "skipped":
-            # 77 = the gate process itself skipped; 2 = the make wrapper
-            # collapsed a recipe-level `exit 77` (GNU make exits 2 on any
-            # recipe failure, printing the same "Error 77" marker the runner
-            # accepts at gate_status time). Either way the skip must carry a
-            # recorded reason.
-            if code == 2:
-                directory = log_dir(index, name)
-                lines = log_tail_lines(directory / gate.get("log", "")) if directory else []
-                wrapper_skip = bool(lines) and bool(MAKE_SKIP_RE.search(lines[-1]))
-            else:
-                wrapper_skip = False
-            if code != 77 and not (code == 2 and wrapper_skip):
-                return False
-            if not gate.get("skip_reason"):
-                return False
-        else:
-            return False
-    # Chain verdict: the newest manifest carries the run's outcome, and a
-    # passed manifest is never rerun — so older links must be failed or
-    # interrupted.
+    return all(record_acceptable(links, index, name, gate)
+               for name, (index, gate) in effective.items())
+
+
+def chain_verdict_ok(chain):
+    """The newest manifest carries the run's outcome, and a passed manifest
+    is never rerun — so older links must be failed or interrupted."""
     if chain[0][1].get("status") != "passed":
         return False
-    for _path, report in chain[1:]:
-        if report.get("status") not in ("failed", "interrupted"):
-            return False
-    return True
+    return all(report.get("status") in ("failed", "interrupted")
+               for _path, report in chain[1:])
+
+
+def verify_evidence(root, manifest, required, expected_base=None):
+    """Validate a quality manifest as evidence for the required gates.
+
+    QR-1: a manifest may extend a rerun chain (rerun_of links). The chain is
+    valid when every link binds to the current source snapshot, every
+    recorded log hash matches in the directory of the run that actually
+    executed the gate (carried records resolve through the chain to that
+    run), the gate set is identical along the chain and carried records are
+    verbatim copies of their prior records, the effective gate set (union
+    along the chain, newest record per gate) passes, and the newest manifest
+    is passed while older links are failed or interrupted.
+
+    expected_base, when given, is the resolved revision of the requester's
+    explicit --base; every link must have recorded exactly that base."""
+    try:
+        chain = evidence_chain(root, manifest)
+    except ValueError:
+        # A broken link or a cycle means the chain itself cannot be trusted.
+        return False
+    if base_binding_failure(chain, expected_base):
+        return False
+    links = load_links(root, chain)
+    if links is None:
+        return False
+    return (gate_records_consistent(links, required)
+            and claimed_records_intact(links)
+            and effective_records_pass(links)
+            and chain_verdict_ok(chain))
 
 
 def execute_gate(gate, command, root, log_path, timeout, report, directory,
@@ -1192,6 +1251,40 @@ def execute_report(root, report, directory, before, timeout, jobs=1):
     return 0 if report["status"] == "passed" else 1
 
 
+def apply_quality_base_default(args):
+    """QBASE1 (2026-11-02): the Makefile exports QUALITY_BASE for every
+    recipe, but only quality-changed passes --base explicitly — without
+    this default a full-profile manifest records base=HEAD and loses the
+    union's committed scope. Empty/unset keeps the HEAD behavior, an
+    explicit --base flag always wins, and a --rerun-failed run keeps
+    binding to its prior manifest's recorded base."""
+    if args.action in ("run", "changed") and args.base is None \
+            and not getattr(args, "rerun_failed", None):
+        args.base = os.environ.get("QUALITY_BASE") or None
+
+
+def evidence_command(parser, root, args):
+    """Evidence subcommand: resolve the required gate set — and the base
+    binding of an explicit --base request — verify the manifest and
+    report; returns the process exit code."""
+    if args.base and args.require != "changed":
+        parser.error("evidence --base requires --require changed")
+    expected_base = None
+    if args.require == "changed":
+        paths, revision = changed_paths(root, args.base)
+        required = list(classify(paths))
+        if args.base:
+            # Only an explicit --base request binds the evidence to that
+            # resolved base; without the flag the manifest's recorded
+            # base is not part of the request.
+            expected_base = revision
+    else:
+        required = expand([args.require])
+    valid = verify_evidence(root, args.manifest, required, expected_base)
+    print("Evidence matches current source and logs" if valid else "Evidence failed, stale or modified")
+    return 0 if valid else 1
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     sub = parser.add_subparsers(dest="action", required=True)
@@ -1211,29 +1304,12 @@ def main():
     verify.add_argument("manifest", type=Path)
     verify.add_argument("--require", choices=sorted(set(PROFILES) | {"changed"}), default="full",
                         help="Required profile, or gates inferred from the current diff; defaults to full")
-    verify.add_argument("--base", help="With --require changed: include committed changes since merge-base")
+    verify.add_argument("--base", help="With --require changed: include committed changes since merge-base; the manifest must record exactly this resolved base")
     args = parser.parse_args()
     root = repository()
-    if args.action in ("run", "changed") and args.base is None \
-            and not getattr(args, "rerun_failed", None):
-        # QBASE1 (2026-11-02): the Makefile exports QUALITY_BASE for every
-        # recipe, but only quality-changed passes --base explicitly — without
-        # this default a full-profile manifest records base=HEAD and loses the
-        # union's committed scope. Empty/unset keeps the HEAD behavior, an
-        # explicit --base flag always wins, and a --rerun-failed run keeps
-        # binding to its prior manifest's recorded base.
-        args.base = os.environ.get("QUALITY_BASE") or None
+    apply_quality_base_default(args)
     if args.action == "evidence":
-        if args.base and args.require != "changed":
-            parser.error("evidence --base requires --require changed")
-        if args.require == "changed":
-            paths, _ = changed_paths(root, args.base)
-            required = list(classify(paths))
-        else:
-            required = expand([args.require])
-        valid = verify_evidence(root, args.manifest, required)
-        print("Evidence matches current source and logs" if valid else "Evidence failed, stale or modified")
-        return 0 if valid else 1
+        return evidence_command(parser, root, args)
     if args.timeout <= 0:
         parser.error("--timeout must be positive")
     if args.action == "run" and args.rerun_failed:
