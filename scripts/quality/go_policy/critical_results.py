@@ -10,6 +10,45 @@ def same_file(actual, expected):
     return actual == expected or actual.endswith('/' + expected)
 
 
+class ProfileIndex:
+    """Precomputed per-file index over one coverage profile's blocks.
+
+    Same-block verdicts, same semantics: queries that previously scanned
+    every profile row now scan only the rows of files matching the same
+    same_file rule, and the naive row iteration stays available so no
+    consumer's result can change.
+    """
+
+    __slots__ = ('rows', '_by_file', '_matched')
+
+    def __init__(self, rows):
+        self.rows = list(rows)
+        by_file = {}
+        for file, line, count, _ in self.rows:
+            by_file.setdefault(Path(file).as_posix(), []).append((line, count))
+        self._by_file = by_file
+        self._matched = {}
+
+    def __iter__(self):
+        return iter(self.rows)
+
+    def matched(self, expected):
+        """(line, count) rows of every profile file matching expected."""
+        entries = self._matched.get(expected)
+        if entries is None:
+            entries = []
+            for actual, rows in self._by_file.items():
+                if same_file(actual, expected):
+                    entries.extend(rows)
+            self._matched[expected] = entries
+        return entries
+
+    def covered(self, start, end, expected):
+        """Whether any matching file has an executed block inside the span."""
+        return any(start <= line <= end and count > 0
+                   for line, count in self.matched(expected))
+
+
 def hits(row, file, line):
     return same_file(file, row['file']) and row['start'] <= line <= row['end']
 

@@ -1850,7 +1850,7 @@ def current_mode_owner_coverage(root, package, obligations, side, index,
         'skipped': result['skipped'],
         'coverprofile_sha256': result['sha256'],
         'consumers': witnessed_consumer_entries(consumers, result['blocks']),
-        'rows': result['blocks'],
+        'rows': critical_results.ProfileIndex(result['blocks']),
     }
 
 
@@ -2333,7 +2333,8 @@ def covered_functions(root, package, mode, origin='current tree', config=None):
             raise ValueError('lost_unit_coverage: unit suite failed for ' + package +
                              ' (mode "' + mode + '", ' + origin + '): ' +
                              output_tail(output))
-        return critical_results.coverage_blocks(profile)
+        return critical_results.ProfileIndex(
+            critical_results.coverage_blocks(profile))
 
 
 def output_tail(output):
@@ -2370,6 +2371,8 @@ def mode_applies(side, path, index, modes):
 
 def block_covered(row, rows):
     """Whether any executed block lies inside the function's span."""
+    if isinstance(rows, critical_results.ProfileIndex):
+        return rows.covered(row['start'], row['end'], row['file'])
     return any(critical_results.same_file(file, row['file'])
                and row['start'] <= line <= row['end'] and count > 0
                for file, line, count, _ in rows)
