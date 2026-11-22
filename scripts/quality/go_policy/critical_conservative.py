@@ -1756,7 +1756,8 @@ def verify_package_baseline(root, base, config, package, selection, side,
                                           config)
                         for mode in modes]
     probe, covered_now = bounded_current_side(
-        probe, root, package, selection, covered_base, previous, side, modes)
+        probe, root, package, config, selection, covered_base, previous,
+        side, modes)
     rebaselined, unit_lost, block_lost = [], [], []
     for name, consumers in sorted(selection.lost_baseline,
                                   key=lambda record:
@@ -1780,8 +1781,8 @@ def verify_package_baseline(root, base, config, package, selection, side,
             evidence['baseline_independent_coverage'] = probe['modes']
 
 
-def bounded_current_side(probe, root, package, selection, covered_base,
-                         previous, side, modes):
+def bounded_current_side(probe, root, package, config, selection,
+                         covered_base, previous, side, modes):
     """Current-side profiles: focused rows when witnessed, full runs else.
 
     The focused probe bounds only the current side: the base archive
