@@ -791,6 +791,7 @@ func (s *stand) classifyBogusMultipartRefused(t *testing.T) {
 // invented tokens, no fabricated price, no charge, no settlement.
 func (s *stand) classifyMalformedUsageFailClosed(t *testing.T) {
 	t.Helper()
+	ledgerBefore := s.teamLedgerSnapshot(t)
 	before := s.fixture.Snapshot()
 	rid := familyRequestID(s, "cls-media-", "transcription malformed usage")
 	status, body, contentType, err := httpPostMultipart(45*time.Second, s.gatewayURL+"/v1/audio/transcriptions",
@@ -824,9 +825,7 @@ func (s *stand) classifyMalformedUsageFailClosed(t *testing.T) {
 		t.Fatalf("product: transcription malformed usage: %d credit transaction(s) — uninterpretable usage must never be charged (%+v)",
 			c.UsageRows+c.TopupRows, c)
 	}
-	if n := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); n != 0 {
-		t.Fatalf("product: transcription malformed usage: %d settlement job(s) — uninterpretable usage must never be settled", n)
-	}
+	s.requireUnpricedSettlementEvidence(t, failClosed, "malformed usage", rid, invocationID, ledgerBefore)
 	t.Logf("product: transcription malformed-usage reply classified: fail-closed 0/0, no invented tokens, no fabricated price (request id %s)", rid)
 }
 
