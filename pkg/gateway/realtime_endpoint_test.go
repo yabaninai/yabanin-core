@@ -476,7 +476,9 @@ func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
 					require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"))
 					return
 				}
-				require.True(t, body == wire, "healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+				if body != wire {
+					t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+				}
 				require.Len(t, store.facts, 1)
 				f := store.facts[0]
 				require.Equal(t, store.admitted[0].InvocationID, f.InvocationID)

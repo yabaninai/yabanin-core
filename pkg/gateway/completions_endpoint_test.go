@@ -418,7 +418,9 @@ func TestCompletionsBufferedResponseLimit(t *testing.T) {
 			require.EqualValues(t, 1, hits.Load())
 			require.Len(t, store.admitted, 1)
 			if tc.wantStatus == http.StatusOK {
-				require.True(t, rec.Body.String() == payload, "at-limit completion changed")
+				if rec.Body.String() != payload {
+					t.Fatalf("at-limit completion changed: got %d bytes, want %d", rec.Body.Len(), len(payload))
+				}
 				require.Len(t, store.facts, 1)
 				require.Equal(t, "7", store.facts[0].Fields["tokens_in"])
 				require.Equal(t, "3", store.facts[0].Fields["tokens_out"])
