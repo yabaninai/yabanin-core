@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"regexp"
 	"strings"
 	"time"
@@ -385,30 +386,18 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, http.StatusForbidden, "usage_read_not_allowed", "this key cannot read usage")
 		return
 	}
-	to := time.Now().UTC()
-	from := to.Add(-24 * time.Hour)
-	if raw := r.URL.Query().Get("from"); raw != "" {
-		parsed, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			apierrors.Write(w, http.StatusBadRequest, "invalid_request", "from must be RFC3339")
-			return
-		}
-		from = parsed.UTC()
+	query, err := url.ParseQuery(r.URL.RawQuery)
+	if err != nil {
+		apierrors.Write(w, http.StatusBadRequest, "invalid_request", "invalid usage query encoding")
+		return
 	}
-	if raw := r.URL.Query().Get("to"); raw != "" {
-		parsed, err := time.Parse(time.RFC3339, raw)
-		if err != nil {
-			apierrors.Write(w, http.StatusBadRequest, "invalid_request", "to must be RFC3339")
-			return
-		}
-		to = parsed.UTC()
-	}
-	if !to.After(from) || to.Sub(from) > sessionUsageMaxSpan {
-		apierrors.Write(w, http.StatusBadRequest, "invalid_request", "range must be at most 31 days")
+	from, to, err := ownUsageTimeRange(query)
+	if err != nil {
+		apierrors.Write(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
 	filter := map[string]string{}
-	for key, values := range r.URL.Query() {
+	for key, values := range query {
 		name, ok := strings.CutPrefix(key, "label.")
 		if !ok || name == "" || len(values) == 0 {
 			continue
@@ -439,7 +428,7 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 		    AND COALESCE(ab_group,'') <> 'shadow' AND labels @> $5::jsonb
 		  GROUP BY model_used`,
 		orgID, p.APIKeyID, from, to, rawFilter)
-	if group := r.URL.Query().Get("group_by"); group != "" {
+	if group := query.Get("group_by"); group != "" {
 		groups, gerr := gw.queryUsageGroups(r.Context(), db, group, orgID, p.APIKeyID, from, to, rawFilter)
 		if gerr != nil {
 			apierrors.Write(w, http.StatusBadRequest, "invalid_request", gerr.Error())
@@ -449,6 +438,29 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	totals.Complete = !to.After(time.Now().Add(-10 * time.Second))
 	writeJSONCode(w, http.StatusOK, totals)
+}
+
+func ownUsageTimeRange(query url.Values) (time.Time, time.Time, error) {
+	to := time.Now().UTC()
+	from := to.Add(-24 * time.Hour)
+	if raw := query.Get("from"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return time.Time{}, time.Time{}, errors.New("from must be RFC3339")
+		}
+		from = parsed.UTC()
+	}
+	if raw := query.Get("to"); raw != "" {
+		parsed, err := time.Parse(time.RFC3339, raw)
+		if err != nil {
+			return time.Time{}, time.Time{}, errors.New("to must be RFC3339")
+		}
+		to = parsed.UTC()
+	}
+	if !to.After(from) || to.Sub(from) > sessionUsageMaxSpan {
+		return time.Time{}, time.Time{}, errors.New("range must be at most 31 days")
+	}
+	return from, to, nil
 }
 
 func (gw *gateway) queryUsage(ctx context.Context, db sessionQuerier, sql string, args ...any) usageTotals {

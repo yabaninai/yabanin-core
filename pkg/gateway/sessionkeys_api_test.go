@@ -67,9 +67,10 @@ func (m *memSessionKV) Del(_ context.Context, keys ...string) *redis.IntCmd {
 }
 
 type scriptDB struct {
-	inserts [][]any
-	loads   map[string]sessionRow
-	usage   []any
+	inserts   [][]any
+	loads     map[string]sessionRow
+	usage     []any
+	usageArgs []any
 }
 
 func (s *scriptDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
@@ -85,6 +86,7 @@ func (s *scriptDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 		}
 		return scanRow{vals: []any{row.id, row.parentID, row.keyHash, row.orgID, row.revokedAt, row.finishedAt}}
 	case strings.Contains(sql, "count(*)"):
+		s.usageArgs = args
 		if s.usage == nil {
 			s.usage = []any{int64(2), int64(10), int64(4), int64(1), 0.5, int64(0)}
 		}
@@ -354,4 +356,36 @@ func TestMintSessionKey_CapsAtParentKeyExpiry(t *testing.T) {
 	stored, ok := db.inserts[0][8].(time.Time)
 	require.True(t, ok, "expires_at insert arg = %T", db.inserts[0][8])
 	assert.False(t, stored.After(parentExpires))
+}
+
+func TestOwnUsageRejectsPartiallyParsedFilters(t *testing.T) {
+	db := &scriptDB{}
+	gw := mintGW(db, nil, nil)
+	for _, query := range []string{"label.team=finance&label.project=50%", "from=%GG", "group_by=model;label.team=finance"} {
+		t.Run(query, func(t *testing.T) {
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?"+query, nil)
+			req = req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "parent-1", CanReadUsage: true}))
+			req.Header.Set("X-Org-Id", "org-1")
+			rec := httptest.NewRecorder()
+			gw.ownUsage(rec, req)
+			require.Equal(t, http.StatusBadRequest, rec.Code)
+			require.Contains(t, rec.Body.String(), "invalid_request")
+			require.NotContains(t, rec.Body.String(), `"requests"`)
+			require.Empty(t, db.usageArgs)
+		})
+	}
+}
+
+func TestOwnUsagePassesEncodedLabelToTotals(t *testing.T) {
+	db := &scriptDB{}
+	gw := mintGW(db, nil, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?label.team=50%25", nil)
+	req = req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "parent-1", CanReadUsage: true}))
+	req.Header.Set("X-Org-Id", "org-1")
+	rec := httptest.NewRecorder()
+	gw.ownUsage(rec, req)
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Len(t, db.usageArgs, 5)
+	require.Equal(t, []any{"org-1", "parent-1"}, db.usageArgs[:2])
+	require.Equal(t, []byte(`{"team":"50%"}`), db.usageArgs[4])
 }
