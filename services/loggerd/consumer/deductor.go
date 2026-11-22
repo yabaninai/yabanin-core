@@ -72,10 +72,32 @@ func (d *Deductor) ProcessDeductionInvocation(ctx context.Context, orgID, modelU
 	if d == nil || d.store == nil || orgID == "" {
 		return fmt.Errorf("%w: store=%v org=%q", ErrNoChargeTarget, d != nil && d.store != nil, orgID)
 	}
+	if d.skipUnchargeableQuote(orgID, modelUsed, requestID, state) {
+		return nil
+	}
+	if requestID == "" || amount <= 0 {
+		// An intent that claims a positive quote but carries no request id or
+		// no positive amount violates the contract — a poison job for the
+		// settlement worker, never a transient condition.
+		return fmt.Errorf("%w: invalid resale deduction charge: request_id=%q amount=%d", ErrPoisonJob, requestID, int64(amount))
+	}
+	if err := d.deductInvocation(ctx, orgID, modelUsed, requestID,
+		invocationID, amount, tokensIn, tokensOut); err != nil {
+		return err
+	}
+	d.logger.Info("credit deducted",
+		slog.String("org_id", orgID),
+		slog.String("request_id", requestID),
+		slog.Int64("amount_micro_usd", int64(amount)),
+		slog.Int64("compat_cents", amount.Cents()),
+	)
+	return nil
+}
 
+func (d *Deductor) skipUnchargeableQuote(orgID, modelUsed, requestID string, state money.QuoteState) bool {
 	switch state {
 	case money.QuotePositive:
-		// chargeable — fall through to the deduction below.
+		return false
 	case money.QuoteZero:
 		metrics.CreditDeductionSkippedTotal.WithLabelValues("zero_quote").Inc()
 		d.logger.Warn("credit deduction skipped — zero-cost event",
@@ -83,7 +105,6 @@ func (d *Deductor) ProcessDeductionInvocation(ctx context.Context, orgID, modelU
 			slog.String("request_id", requestID),
 			slog.String("model", modelUsed),
 		)
-		return nil
 	default: // money.QuoteUnknown
 		metrics.CreditDeductionSkippedTotal.WithLabelValues("unknown_quote").Inc()
 		d.logger.Warn("credit deduction skipped — unknown price/usage (distinct from zero)",
@@ -92,55 +113,43 @@ func (d *Deductor) ProcessDeductionInvocation(ctx context.Context, orgID, modelU
 			slog.String("model", modelUsed),
 			slog.String("quote_state", state.String()),
 		)
-		return nil
 	}
+	return true
+}
 
-	if requestID == "" || amount <= 0 {
-		// An intent that claims a positive quote but carries no request id or
-		// no positive amount violates the contract — a poison job for the
-		// settlement worker, never a transient condition.
-		return fmt.Errorf("%w: invalid resale deduction charge: request_id=%q amount=%d", ErrPoisonJob, requestID, int64(amount))
-	}
-
+func (d *Deductor) deductInvocation(ctx context.Context, orgID, modelUsed, requestID, invocationID string, amount money.MicroUSD, tokensIn, tokensOut int64) error {
 	err := d.store.DeductMicroInvocation(ctx, orgID, amount, requestID, invocationID, map[string]interface{}{
 		"model":            modelUsed,
 		"tokens":           tokensIn + tokensOut,
 		"amount_micro_usd": int64(amount),
 	})
 	if err != nil {
-		// Observability at the deduction layer: the disposition (retry vs
-		// terminal debt) belongs to the settlement worker, but the failed
-		// charge attempt must be visible here too. No-wallet must be
-		// classified FIRST: IsInsufficientCredits also matches ErrNoWallet,
-		// and folding a missing wallet into the insufficient-balance voice
-		// hides the setup problem from operators.
-		if credits.IsNoWallet(err) {
-			d.logger.Warn("credit deduction skipped — no wallet",
-				slog.String("org_id", orgID),
-				slog.String("request_id", requestID),
-				slog.Int64("amount_micro_usd", int64(amount)),
-			)
-		} else if credits.IsInsufficientCredits(err) {
-			d.logger.Warn("credit deduction blocked — insufficient balance",
-				slog.String("org_id", orgID),
-				slog.String("request_id", requestID),
-				slog.Int64("amount_micro_usd", int64(amount)),
-			)
-		} else {
-			d.logger.Warn("credit deduction failed (settlement worker will retry)",
-				slog.String("org_id", orgID),
-				slog.String("request_id", requestID),
-				slog.String("error", err.Error()),
-			)
-		}
+		d.logDeductionFailure(err, orgID, requestID, amount)
 		return fmt.Errorf("credit deduction failed: %w", err)
 	}
-
-	d.logger.Info("credit deducted",
-		slog.String("org_id", orgID),
-		slog.String("request_id", requestID),
-		slog.Int64("amount_micro_usd", int64(amount)),
-		slog.Int64("compat_cents", amount.Cents()),
-	)
 	return nil
+}
+
+func (d *Deductor) logDeductionFailure(err error, orgID, requestID string, amount money.MicroUSD) {
+	// No-wallet must be classified first: IsInsufficientCredits also matches
+	// ErrNoWallet, and would hide a missing wallet from operators.
+	if credits.IsNoWallet(err) {
+		d.logger.Warn("credit deduction skipped — no wallet",
+			slog.String("org_id", orgID),
+			slog.String("request_id", requestID),
+			slog.Int64("amount_micro_usd", int64(amount)),
+		)
+	} else if credits.IsInsufficientCredits(err) {
+		d.logger.Warn("credit deduction blocked — insufficient balance",
+			slog.String("org_id", orgID),
+			slog.String("request_id", requestID),
+			slog.Int64("amount_micro_usd", int64(amount)),
+		)
+	} else {
+		d.logger.Warn("credit deduction failed (settlement worker will retry)",
+			slog.String("org_id", orgID),
+			slog.String("request_id", requestID),
+			slog.String("error", err.Error()),
+		)
+	}
 }

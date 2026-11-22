@@ -594,110 +594,118 @@ const (
 // durable outcome is unobservable and the group must be left to fenced
 // lease recovery instead of any re-execution.
 func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) orgBatchResult {
+	entries := settlementBatchEntries(group)
+	dispositions, err := budget.SettleOrgBatch(ctx, w.db, group[0].OrgID,
+		w.batchWalletFloorCents(), entries,
+		budget.BatchSpenders{Agent: w.agentSpender})
+	if err != nil {
+		return w.classifyOrgBatchFailure(group, err)
+	}
+	metrics.SettlementBatchSize.Observe(float64(len(entries)))
+	w.logOrgBatchDispositions(group, dispositions)
+	return orgBatchCommitted
+}
+
+func settlementBatchEntries(group []settlementJob) []budget.SettleEntry {
 	entries := make([]budget.SettleEntry, 0, len(group))
 	for _, job := range group {
 		link := decodeSettleAllowanceLink(job.Payload)
 		invocation := ""
 		if job.InvocationID != nil {
-			// The billed invocation identity (0028+ claims project it;
-			// NULL = legacy-domain row): the batch keys the resale
-			// deduction's idempotency and ledger dedupe on it instead of
-			// the shared client request id — the same identity split as
-			// the per-job ProcessDeductionInvocation path.
+			// NULL remains in the legacy request-keyed domain; a present
+			// claim identity keys both deduction idempotency and ledger dedupe.
 			invocation = *job.InvocationID
 		}
 		entries = append(entries, budget.SettleEntry{
 			JobID: job.ID,
-			// The claim's post-increment attempts value IS the fencing
-			// token: a newer claim of the same job bumps it, and the batch
-			// refuses to settle under a stale token (SettleEntry doc).
+			// The claim's post-increment attempts value fences stale workers.
 			FencingToken: job.Attempts,
-			RequestID:    job.RequestID,
-			InvocationID: invocation,
-			Kind:         job.ChargeKind,
-			Amount:       job.AmountMicro,
-			Payload:      job.Payload,
-			AllowanceID:  link.AllowanceID,
-			Bound:        money.MicroUSD(link.BoundMicroUSD),
+			RequestID:    job.RequestID, InvocationID: invocation,
+			Kind: job.ChargeKind, Amount: job.AmountMicro, Payload: job.Payload,
+			AllowanceID: link.AllowanceID,
+			Bound:       money.MicroUSD(link.BoundMicroUSD),
 		})
 	}
+	return entries
+}
 
-	// The wallet floor is the credit store's — the exact floor the per-job
-	// DeductMicro path enforces; the config field only covers deployments
-	// without a configured store.
-	floorCents := w.cfg.WalletFloorCents
+func (w *SettlementWorker) batchWalletFloorCents() int64 {
+	// Match the per-job deduction floor whenever a credit store is present.
 	if w.creditStore != nil {
-		floorCents = w.creditStore.GracePeriodCents()
+		return w.creditStore.GracePeriodCents()
 	}
+	return w.cfg.WalletFloorCents
+}
 
-	dispositions, err := budget.SettleOrgBatch(ctx, w.db, group[0].OrgID, floorCents, entries, budget.BatchSpenders{Agent: w.agentSpender})
-	if err != nil {
-		if errors.Is(err, budget.ErrStaleSettlementToken) {
-			// Ownership lost mid-batch: a newer worker holds the claims.
-			// Never retry here and never fall through to per-job writes —
-			// the rightful owner (or lease expiry for jobs it did not
-			// re-claim) is the only writer allowed to touch this group.
-			w.logger.Warn("settlement org batch abandoned — claim lost to a newer worker",
-				slog.String("org_id", group[0].OrgID),
-				slog.Int("jobs", len(group)),
-				slog.String("error", err.Error()),
-			)
-			return orgBatchStale
-		}
-		if errors.Is(err, budget.ErrCommitUncertain) {
-			// Response-loss window: the commit may or may not have
-			// landed. Neither a batch retry nor a per-job fallback is
-			// safe — a landed commit is already terminal, and a
-			// re-execution would re-charge a wallet the ledger may have
-			// just recorded as uncollectable debt. Fenced lease recovery
-			// decides: committed jobs no-op, rolled-back ones re-run.
-			w.logger.Error("settlement org batch commit uncertain — no fallback, lease recovery decides",
-				slog.String("org_id", group[0].OrgID),
-				slog.Int("jobs", len(group)),
-				slog.String("error", err.Error()),
-			)
-			return orgBatchUncertain
-		}
-		w.logger.Warn("settlement org batch failed — falling back to per-job execution",
+func (w *SettlementWorker) classifyOrgBatchFailure(group []settlementJob, err error) orgBatchResult {
+	if errors.Is(err, budget.ErrStaleSettlementToken) {
+		// A newer owner holds the claims; only that owner may settle them.
+		w.logger.Warn("settlement org batch abandoned — claim lost to a newer worker",
 			slog.String("org_id", group[0].OrgID),
 			slog.Int("jobs", len(group)),
 			slog.String("error", err.Error()),
 		)
-		return orgBatchFallback
+		return orgBatchStale
 	}
-	metrics.SettlementBatchSize.Observe(float64(len(entries)))
+	if errors.Is(err, budget.ErrCommitUncertain) {
+		// The commit may have landed. Never re-run the group or fall back to
+		// per-job writes; fenced lease recovery resolves the outcome.
+		w.logger.Error("settlement org batch commit uncertain — no fallback, lease recovery decides",
+			slog.String("org_id", group[0].OrgID),
+			slog.Int("jobs", len(group)),
+			slog.String("error", err.Error()),
+		)
+		return orgBatchUncertain
+	}
+	// Every other batch error is pre-commit, so rollback makes per-job
+	// fallback safe.
+	w.logger.Warn("settlement org batch failed — falling back to per-job execution",
+		slog.String("org_id", group[0].OrgID),
+		slog.Int("jobs", len(group)),
+		slog.String("error", err.Error()),
+	)
+	return orgBatchFallback
+}
 
+func (w *SettlementWorker) logOrgBatchDispositions(group []settlementJob, dispositions map[int64]budget.BatchDisposition) {
 	for _, job := range group {
 		d := dispositions[job.ID]
 		if d.Settled {
-			metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "settled").Inc()
-			w.logger.Info("settlement job settled (batch)",
-				slog.Int64("job_id", job.ID),
-				slog.String("charge_kind", job.ChargeKind),
-				slog.String("org_id", job.OrgID),
-				slog.String("request_id", job.RequestID),
-				slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-				slog.Int64("reserve_decrement_micro_usd", d.DecrementMicroUSD),
-			)
+			logOrgBatchSettled(w.logger, job, d)
 			continue
 		}
-		if d.Reason == budget.ReasonInsufficientCredits {
-			metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
-		}
-		if d.Reason == budget.ReasonNoWallet {
-			metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet").Inc()
-		}
-		metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "requires_attention").Inc()
-		w.logger.Error("settlement job requires attention (batch) — parked as durable debt/diagnostic",
-			slog.Int64("job_id", job.ID),
-			slog.String("charge_kind", job.ChargeKind),
-			slog.String("org_id", job.OrgID),
-			slog.String("request_id", job.RequestID),
-			slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-			slog.String("reason", d.Reason),
-		)
+		logOrgBatchAttention(w.logger, job, d)
 	}
-	return orgBatchCommitted
+}
+
+func logOrgBatchSettled(logger *slog.Logger, job settlementJob, d budget.BatchDisposition) {
+	metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "settled").Inc()
+	logger.Info("settlement job settled (batch)",
+		slog.Int64("job_id", job.ID),
+		slog.String("charge_kind", job.ChargeKind),
+		slog.String("org_id", job.OrgID),
+		slog.String("request_id", job.RequestID),
+		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
+		slog.Int64("reserve_decrement_micro_usd", d.DecrementMicroUSD),
+	)
+}
+
+func logOrgBatchAttention(logger *slog.Logger, job settlementJob, d budget.BatchDisposition) {
+	if d.Reason == budget.ReasonInsufficientCredits {
+		metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
+	}
+	if d.Reason == budget.ReasonNoWallet {
+		metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet").Inc()
+	}
+	metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "requires_attention").Inc()
+	logger.Error("settlement job requires attention (batch) — parked as durable debt/diagnostic",
+		slog.Int64("job_id", job.ID),
+		slog.String("charge_kind", job.ChargeKind),
+		slog.String("org_id", job.OrgID),
+		slog.String("request_id", job.RequestID),
+		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
+		slog.String("reason", d.Reason),
+	)
 }
 
 func (w *SettlementWorker) recoverExpiredLeases(ctx context.Context) error {
