@@ -41,6 +41,7 @@ func TestLoggerdE2E_RequestCompletedToPostgres(t *testing.T) {
 	payload := events.Payload{
 		EventType:      "request.completed",
 		Source:         "gateway-test",
+		RequestID:      "loggerd-e2e-completed",
 		SessionID:      "3f2b8a4c-9d1e-4f5a-8b7c-6e5d4c3b2a10",
 		Payload:        `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`,
 		OrgID:          testLoggerdOrgID,
@@ -69,7 +70,7 @@ func TestLoggerdE2E_RequestCompletedToPostgres(t *testing.T) {
 
 	row := logs[0]
 
-	assertEq(t, row["session_id"], "3f2b8a4c-9d1e-4f5a-8b7c-6e5d4c3b2a10")
+	assertRequestSession(t, db, payload, "e8837e64-52b7-5115-8fc5-2e5e078db6f8")
 	assertEq(t, row["org_id"], testLoggerdOrgID)
 	assertEq(t, row["model_requested"], "gpt-4")
 	assertEq(t, row["model_used"], "gpt-4-turbo")
@@ -106,6 +107,7 @@ func TestLoggerdE2E_RequestCompletedWithError(t *testing.T) {
 	payload := events.Payload{
 		EventType:      "request.completed",
 		Source:         "gateway-test",
+		RequestID:      "loggerd-e2e-upstream-error",
 		SessionID:      "4c1d9b7a-2e3f-4a5b-8c9d-6e5f4a3b2c10",
 		Payload:        `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`,
 		OrgID:          testLoggerdOrgID,
@@ -134,7 +136,7 @@ func TestLoggerdE2E_RequestCompletedWithError(t *testing.T) {
 
 	row := logs[0]
 
-	assertEq(t, row["session_id"], "4c1d9b7a-2e3f-4a5b-8c9d-6e5f4a3b2c10")
+	assertRequestSession(t, db, payload, "1469aaab-901c-5284-9769-0699de33804e")
 	assertEq(t, row["status_code"], int64(503))
 	assertEq(t, row["error"], "upstream timeout")
 	assertEq(t, row["duration_ms"], int64(5000))
@@ -217,6 +219,7 @@ func TestLoggerdE2E_NonUUIDSessionIDInserted(t *testing.T) {
 	payload := events.Payload{
 		EventType:      "request.completed",
 		Source:         "gateway-test",
+		RequestID:      "loggerd-e2e-client-session",
 		SessionID:      "ses_f7c8cea03ffeQF8w3WLp7oRA9w",
 		Payload:        `{"model":"gpt-4","messages":[{"role":"user","content":"hello"}]}`,
 		OrgID:          testLoggerdOrgID,
@@ -230,22 +233,48 @@ func TestLoggerdE2E_NonUUIDSessionIDInserted(t *testing.T) {
 		Method:         "POST",
 	}
 
+	const otherOrg = "e1a2b3c4-d5f6-7a8b-9c0d-1e2f3a4b5c6e"
+	if _, err := db.Exec(ctx, `
+		INSERT INTO organizations (id, name, slug)
+		VALUES ($1, 'loggerd-e2e-peer', 'loggerd-e2e-peer')
+		ON CONFLICT (id) DO NOTHING`, otherOrg); err != nil {
+		t.Fatal(err)
+	}
+	peer := payload
+	peer.OrgID = otherOrg
+	peer.RequestID = "loggerd-e2e-peer-client-session"
+
 	PublishEventToStream(ctx, t, rdb, streamName, payload)
-
-	waitForRequestLogCount(ctx, t, db, 1)
-
+	PublishEventToStream(ctx, t, rdb, streamName, peer)
+	waitForRequestLogCount(ctx, t, db, 2)
 	consumerInst.Stop()
 
 	logs := GetRequestLogs(ctx, t, db)
-
-	if len(logs) != 1 {
-		t.Fatalf("expected 1 log row, got %d", len(logs))
+	if len(logs) != 2 {
+		t.Fatalf("expected 2 request logs across the two orgs, got %d", len(logs))
 	}
+	for _, row := range logs {
+		assertEq(t, row["model_requested"], "gpt-4")
+	}
+	assertRequestSession(t, db, payload, "e595069f-2334-5e07-b382-0ac43a127c01")
+	assertRequestSession(t, db, peer, "0d7ed3bf-a1db-57e3-9378-e216faf699bb")
+}
 
-	// Deterministic v5 UUID of "ses_f7c8cea03ffeQF8w3WLp7oRA9w" under the
-	// frozen nsRequestLogs namespace — same golden vector as the unit test.
-	assertEq(t, logs[0]["session_id"], "4dbfc67b-6ed9-5942-a9b6-53770ac48875")
-	assertEq(t, logs[0]["model_requested"], "gpt-4")
+// For new sessions the fixture UUIDs are RFC 4122 v5 vectors over org + NUL + raw client ID.
+func assertRequestSession(t *testing.T, db *pgxpool.Pool, event events.Payload, wantRegistryID string) {
+	t.Helper()
+	var registryID, owner, clientSession string
+	err := db.QueryRow(t.Context(), `
+		SELECT r.session_id::text, s.org_id::text, s.client_session
+		FROM request_logs AS r JOIN sessions AS s ON s.id = r.session_id
+		WHERE r.org_id = $1 AND r.request_id = $2`, event.OrgID, event.RequestID).
+		Scan(&registryID, &owner, &clientSession)
+	if err != nil {
+		t.Fatalf("request %q in org %q has no readable session link: %v", event.RequestID, event.OrgID, err)
+	}
+	assertEq(t, registryID, wantRegistryID)
+	assertEq(t, owner, event.OrgID)
+	assertEq(t, clientSession, event.SessionID)
 }
 
 func TestLoggerdE2E_Deduplication(t *testing.T) {
