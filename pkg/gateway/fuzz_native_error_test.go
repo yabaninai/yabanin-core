@@ -56,6 +56,7 @@ func FuzzNativeProviderError(f *testing.F) {
 		}
 		require.EqualValues(t, 1, contacts.Load())
 		require.Equal(t, status, rec.Code)
+		require.Equal(t, "application/json", rec.Result().Header.Get("Content-Type"))
 		require.Equal(t, body, rec.Body.String())
 		require.Empty(t, rec.Header().Get("X-Private-Fixture"))
 		wantHint := ""

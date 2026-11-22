@@ -1,7 +1,9 @@
 package cli
 
 import (
+	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -148,4 +150,50 @@ func (tc paidRouteControl) serve(t *testing.T, store *fakeInvocationStore) (*htt
 	r.ServeHTTP(rec, req)
 
 	return rec, hits.Load()
+}
+
+func TestNativePaidStartRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		setup func(*testing.T, string, *fakeInvocationStore, *bodyBoundsEvents) *gateway
+		post  func(*testing.T, *gateway, string) *httptest.ResponseRecorder
+		body  string
+	}{
+		{"messages", bodyBoundsMessagesGateway, postMessages, `{"model":"claude-3-5-sonnet","messages":[{"role":"user","content":"hello"}],"max_tokens":8,"stream":%t}`},
+		{"responses", bodyBoundsResponsesGateway, postResponses, `{"model":"m","input":"hello","stream":%t}`},
+	} {
+		for _, stream := range []bool{false, true} {
+			t.Run(fmt.Sprintf("%s/stream=%t", tc.name, stream), func(t *testing.T) {
+				var contacts atomic.Int32
+				provider := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					contacts.Add(1)
+					w.WriteHeader(http.StatusTeapot)
+				}))
+				defer provider.Close()
+				store := &fakeInvocationStore{admitErr: errors.New("start unavailable")}
+				capture := &bodyBoundsEvents{}
+				gw := tc.setup(t, provider.URL, store, capture)
+				rec := tc.post(t, gw, fmt.Sprintf(tc.body, stream))
+				require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+				var reply struct {
+					Error struct {
+						Code    string `json:"code"`
+						Message string `json:"message"`
+						Type    string `json:"type"`
+					} `json:"error"`
+				}
+				require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &reply))
+				if tc.name == "messages" {
+					require.Equal(t, "overloaded_error", reply.Error.Type)
+					require.True(t, strings.HasPrefix(reply.Error.Message, "[history_unavailable] "), "%s", reply.Error.Message)
+				} else {
+					require.Equal(t, "history_unavailable", reply.Error.Code)
+				}
+				require.Zero(t, contacts.Load())
+				require.Empty(t, store.admitted)
+				require.Empty(t, store.facts)
+				require.Zero(t, capture.len())
+			})
+		}
+	}
 }

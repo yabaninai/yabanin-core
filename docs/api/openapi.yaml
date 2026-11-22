@@ -558,6 +558,8 @@ paths:
             Upstream overloaded_error passthrough.
             If Core cannot confirm the durable start of a paid request, it returns
             history_unavailable before contacting the provider.
+            The Anthropic error has type overloaded_error and its message starts
+            with [history_unavailable] for this gateway refusal.
           content:
             application/json:
               schema:

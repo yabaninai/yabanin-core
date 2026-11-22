@@ -152,9 +152,6 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 			l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
 		}
 		copyResponsesPassthrough(w.Header(), resp.Header)
-		if ct := resp.Header.Get("Content-Type"); ct != "" {
-			w.Header().Set("Content-Type", ct)
-		}
 		w.WriteHeader(resp.StatusCode)
 		_, _ = w.Write(limited)
 		return
@@ -194,9 +191,7 @@ func (gw *gateway) responsesNativeJSON(w http.ResponseWriter, r *http.Request, r
 	// JSON path reports (finalizeChatJSON); before WriteHeader below.
 	setPromptCacheHeader(w, usage)
 	copyResponsesPassthrough(w.Header(), resp.Header)
-	if ct := resp.Header.Get("Content-Type"); ct != "" {
-		w.Header().Set("Content-Type", ct)
-	} else {
+	if resp.Header.Get("Content-Type") == "" {
 		w.Header().Set("Content-Type", "application/json")
 	}
 	w.WriteHeader(http.StatusOK)
@@ -603,7 +598,7 @@ func copyResponsesPassthrough(dst, src http.Header) {
 	if src.Get("X-Should-Retry") == "false" {
 		dst.Set("X-Should-Retry", "false")
 	}
-	for _, key := range []string{"Retry-After", "X-Request-Id"} {
+	for _, key := range []string{"Content-Type", "Retry-After", "X-Request-Id"} {
 		if value := src.Get(key); value != "" {
 			dst.Set(key, value)
 		}
