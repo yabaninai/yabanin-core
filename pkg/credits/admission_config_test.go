@@ -66,31 +66,23 @@ func TestConfig_NegativeGracePeriodPreserved(t *testing.T) {
 // fixture stand instead. The AF-01 regression intent is unchanged.
 func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 	ctx := context.Background()
-	pool := setupFixtureDB(t)
+	pool := setupTestDB(t)
 
 	const floor = int64(-100)
 	cases := []struct {
 		name      string
-		org       string
 		balance   int64
 		wantAdmit bool
 	}{
-		{"floor_minus_1", "org-fl-m1", floor - 1, false},
-		{"floor", "org-fl-0", floor, false},
-		{"floor_plus_1", "org-fl-p1", floor + 1, true},
+		{"floor_minus_1", floor - 1, false},
+		{"floor", floor, false},
+		{"floor_plus_1", floor + 1, true},
 	}
-	for _, tc := range cases {
-		if _, err := pool.Exec(ctx,
-			`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, $2, NULL)`,
-			tc.org, tc.balance); err != nil {
-			t.Fatalf("seed %s: %v", tc.org, err)
-		}
-	}
-
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			bal, err := s.CheckBalance(ctx, tc.org)
+			org := seedAdmissionWallet(t, pool, tc.balance, nil)
+			bal, err := s.CheckBalance(ctx, org)
 			if tc.wantAdmit {
 				if err != nil {
 					t.Fatalf("balance %d must be admissible, got err=%v", tc.balance, err)

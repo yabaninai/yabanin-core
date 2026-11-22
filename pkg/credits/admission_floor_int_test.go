@@ -1,64 +1,61 @@
 package credits
 
-// Physical §8 admission contract on the migrated stand (PostgresOwnedSchema,
-// same posture as sqlcontract_int_test.go): the production wallet snapshot
-// SQL carries the persisted grace_floor_cents column, the override is
-// row-keyed, denials write nothing, and admission is authoritative — a fresh
-// snapshot per decision, never the display cache, so a floor change decides
-// the next admission without any invalidation, even across distinct store
-// instances (gateway and admin hold separate Stores over one pool).
-
+// Admission tests read the production wallet schema after migrations.
 import (
 	"context"
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/require"
 )
+
+// seedAdmissionWallet creates one private wallet in the migrated schema.
+func seedAdmissionWallet(t *testing.T, pool *pgxpool.Pool, balance int64, floor *int64) string {
+	t.Helper()
+	org := uuid.NewString()
+	_, err := pool.Exec(t.Context(), `INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents)
+		VALUES ($1, $2, $3)`, org, balance, floor)
+	require.NoError(t, err)
+	t.Cleanup(func() {
+		_, err := pool.Exec(context.Background(), `DELETE FROM credit_transactions WHERE org_id = $1`, org)
+		require.NoError(t, err)
+		_, err = pool.Exec(context.Background(), `DELETE FROM org_credits WHERE org_id = $1`, org)
+		require.NoError(t, err)
+	})
+	return org
+}
 
 // TestCheckBalance_PersistedGraceFloorContract: persisted floors decide —
 // an explicit 0 rejects a wallet the platform floor admits, NULL keeps the
 // platform fallback, and a deep floor admits a wallet the platform floor
 // rejects. The override never leaks across org rows.
 func TestCheckBalance_PersistedGraceFloorContract(t *testing.T) {
-	pool := setupFixtureDB(t)
+	pool := setupTestDB(t)
 	ctx := context.Background()
 
-	type wallet struct {
-		org     string
-		balance int64
-		floor   *int64 // nil = NULL (platform default)
-	}
-	zero := int64(0)
-	deep := int64(-10000)
-	wallets := []wallet{
-		{org: "gf-zero", balance: -50, floor: &zero},
-		{org: "gf-null", balance: -50, floor: nil},
-		{org: "gf-deep", balance: -500, floor: &deep},
-		{org: "gf-null-deep-wallet", balance: -500, floor: nil},
-	}
-	for _, w := range wallets {
-		_, err := pool.Exec(ctx,
-			`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, $2, $3)`,
-			w.org, w.balance, w.floor)
-		require.NoError(t, err, "seed %s", w.org)
-	}
+	zero, deep := int64(0), int64(-10000)
+	zeroOrg := seedAdmissionWallet(t, pool, -50, &zero)
+	defaultOrg := seedAdmissionWallet(t, pool, -50, nil)
+	deepOrg := seedAdmissionWallet(t, pool, -500, &deep)
+	deepDefaultOrg := seedAdmissionWallet(t, pool, -500, nil)
 
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 
-	_, err := s.CheckBalance(ctx, "gf-zero")
+	_, err := s.CheckBalance(ctx, zeroOrg)
 	require.ErrorIs(t, err, ErrInsufficientCredits,
 		"explicit persisted zero floor must reject a negative wallet even under a negative platform floor")
 
-	_, err = s.CheckBalance(ctx, "gf-null")
+	_, err = s.CheckBalance(ctx, defaultOrg)
 	require.NoError(t, err,
 		"NULL floor falls back to the platform floor: wallet -50 admits under -100")
 
-	_, err = s.CheckBalance(ctx, "gf-deep")
+	_, err = s.CheckBalance(ctx, deepOrg)
 	require.NoError(t, err,
 		"persisted deep floor admits a wallet the platform floor rejects")
 
-	_, err = s.CheckBalance(ctx, "gf-null-deep-wallet")
+	_, err = s.CheckBalance(ctx, deepDefaultOrg)
 	require.ErrorIs(t, err, ErrInsufficientCredits,
 		"gf-deep's floor override must not leak: a null-floor org rejects at -500")
 
@@ -66,15 +63,14 @@ func TestCheckBalance_PersistedGraceFloorContract(t *testing.T) {
 	// wallet mutation for the rejected orgs.
 	var usageRows int64
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*) FROM credit_transactions WHERE org_id IN ('gf-zero', 'gf-null-deep-wallet') AND type = 'usage'`,
+		`SELECT count(*) FROM credit_transactions WHERE org_id IN ($1, $2) AND type = 'usage'`, zeroOrg, deepDefaultOrg,
 	).Scan(&usageRows))
 	require.Zero(t, usageRows, "denied admission must leave zero usage rows")
 
-	var balances int64
-	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*) FROM org_credits WHERE org_id IN ('gf-zero', 'gf-null-deep-wallet') AND balance_cents NOT IN (-50, -500)`,
-	).Scan(&balances))
-	require.Zero(t, balances, "denied admission must not touch the wallet rows")
+	zeroBalance, _ := walletRow(ctx, t, pool, zeroOrg)
+	deepBalance, _ := walletRow(ctx, t, pool, deepDefaultOrg)
+	require.Equal(t, int64(-50), zeroBalance)
+	require.Equal(t, int64(-500), deepBalance)
 }
 
 // TestCheckBalance_FloorChangeIsAuthoritativeOnAdmission: the display cache
@@ -83,12 +79,9 @@ func TestCheckBalance_PersistedGraceFloorContract(t *testing.T) {
 // — with NO invalidation at all — reads the fresh floor and balance and
 // decides on them. InvalidateOrg refreshes only the display view.
 func TestCheckBalance_FloorChangeIsAuthoritativeOnAdmission(t *testing.T) {
-	pool := setupFixtureDB(t)
+	pool := setupTestDB(t)
 	ctx := context.Background()
-	const org = "gf-authoritative"
-	_, err := pool.Exec(ctx,
-		`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, -50, NULL)`, org)
-	require.NoError(t, err, "seed wallet")
+	org := seedAdmissionWallet(t, pool, -50, nil)
 
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 
@@ -137,19 +130,16 @@ func TestCheckBalance_FloorChangeIsAuthoritativeOnAdmission(t *testing.T) {
 // gateway display view stays stale until invalidated, the admission view is
 // fresh on every call.
 func TestCheckBalance_TwoStoresFreshAdmissionExactContacts(t *testing.T) {
-	pool := setupFixtureDB(t)
+	pool := setupTestDB(t)
 	ctx := context.Background()
-	const org = "gf-two-stores"
-	_, err := pool.Exec(ctx,
-		`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, -50, NULL)`, org)
-	require.NoError(t, err, "seed wallet")
+	org := seedAdmissionWallet(t, pool, -50, nil)
 
 	gw := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 	admin := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 
 	// Gateway-side admission and display view warm up under the platform
 	// floor; the admin instance's display view warms on its own instance.
-	_, err = gw.CheckBalance(ctx, org)
+	_, err := gw.CheckBalance(ctx, org)
 	require.NoError(t, err, "gateway admits under the platform floor before the change")
 	_, err = gw.GetBalance(ctx, org)
 	require.NoError(t, err, "gateway display view warms")
