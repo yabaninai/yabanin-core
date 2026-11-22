@@ -1286,25 +1286,20 @@ func TestRelayResponsesSSE_TornMultilineTerminalWithByteCarryingError(t *testing
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			w := httptest.NewRecorder()
-			usage, terminal, err := relayResponsesSSE(w, tc.body)
-			if tc.wantErr == nil {
-				if err != nil {
-					t.Fatalf("EOF is a clean end, not a relay error: %v", err)
-				}
-			} else if !errors.Is(err, tc.wantErr) {
-				t.Fatalf("read shape %T must surface its error, got %v", tc.body, err)
-			}
-			if got := w.Body.String(); strings.Contains(got, "response.completed") {
-				t.Fatalf("read shape %T salvaged a torn multiline into a delivered terminal:\n%s", tc.body, got)
-			}
-			if usage.PromptTokens != 0 || usage.CompletionTokens != 0 {
-				t.Fatalf("a torn terminal settles no usage: %+v", usage)
-			}
-			if terminal != "" {
-				t.Fatalf("a torn terminal is not delivered, got %q", terminal)
-			}
+			assertResponsesTornTerminalRejected(t, tc.body, tc.wantErr)
 		})
+	}
+}
+
+func assertResponsesTornTerminalRejected(t *testing.T, body io.Reader, wantErr error) {
+	t.Helper()
+	w := httptest.NewRecorder()
+	usage, terminal, err := relayResponsesSSE(w, body)
+	if wantErr == nil && err != nil || wantErr != nil && !errors.Is(err, wantErr) {
+		t.Fatalf("read shape %T error = %v, want %v", body, err, wantErr)
+	}
+	if strings.Contains(w.Body.String(), "response.completed") || usage.PromptTokens != 0 || usage.CompletionTokens != 0 || terminal != "" {
+		t.Fatalf("torn terminal was accepted: body=%q usage=%+v terminal=%q", w.Body.String(), usage, terminal)
 	}
 }
 
