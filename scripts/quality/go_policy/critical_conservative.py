@@ -217,6 +217,7 @@ class Side:
         self.dispatch_names, self.dispatch_unresolved = dispatch_state(self)
         self._indexes = None
         self._prodindex = None
+        self._reverse_edges = None
 
     def functions(self):
         """All production function units with their file, in stable order."""
@@ -245,6 +246,18 @@ class Side:
         if self._prodindex is None:
             self._prodindex = production_index(self)
         return self._prodindex
+
+
+    def reverse_edges(self):
+        """Cached reverse helper graph; see build_reverse_edges.
+
+        The side is an immutable snapshot, so the graph is materialized
+        once per side instance and owned by it, the same contract as the
+        closure and production indexes; a new snapshot rebuilds.
+        """
+        if self._reverse_edges is None:
+            self._reverse_edges = build_reverse_edges(self)
+        return self._reverse_edges
 
 
 def dispatch_state(side):
@@ -1074,7 +1087,7 @@ def bind_helper_change(unit, current, state_vars, selection, previous):
                         obligate=True)
 
 
-def reverse_edges(side):
+def build_reverse_edges(side):
     """Caller edges of the test-file helper graph, keyed by dependency.
 
     The forward closure resolves a unit's references — exact bare and
@@ -1114,7 +1127,7 @@ def helper_callers(unit, current):
     targets are reported, never expanded: the walk returns the affected
     suite, not the suite's own callees.
     """
-    edges = reverse_edges(current)
+    edges = current.reverse_edges()
     affected = set()
     frontier, seen = list(helper_keys(unit)), set()
     while frontier:
