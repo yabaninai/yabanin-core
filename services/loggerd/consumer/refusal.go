@@ -74,7 +74,10 @@ func (c *StreamConsumer) persistRefusalHistory(ctx context.Context, msg redis.XM
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
 
 	// assembly: resolveSessionID moves to (value, error) — propagate here.
-	sessionIDStr := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	sessionIDStr, err := c.resolveSessionID(ctx, tx, ev.orgID, ev.sessionID)
+	if err != nil {
+		return err
+	}
 	row := refusalRequestLogRow(ev, sessionIDStr, ev.statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 
