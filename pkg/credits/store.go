@@ -221,6 +221,7 @@ type cachedBalance struct {
 	walletCents       int64
 	remainderMicroUSD int64
 	walletUpdatedAt   time.Time
+	graceFloorCents   *int64 // persisted per-org grace_floor_cents (§8); nil = platform default
 	cachedAt          time.Time
 }
 
@@ -250,51 +251,112 @@ func NewStoreWithConfig(db *pgxpool.Pool, log *slog.Logger, cfg Config) *Store {
 	}
 }
 
-// GetBalance returns the current balance for an org. The returned value is
-// remainder-aware: BalanceCents is the effective whole-cent balance and
-// BalanceMicroUSD the exact µUSD figure.
-func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) {
+// readWalletRow performs one authoritative wallet snapshot read: raw wallet
+// cents, the sub-cent remainder, the row's updated_at and the persisted
+// per-org grace floor override (nil when the column is NULL). The boolean
+// reports whether a real snapshot exists — no org id, no DB or a missing
+// wallet row yields (nil, ok=false) plus the caller-mapped error, so callers
+// keep their historical zero-balance / no-wallet handling. It never touches
+// the cache; callers decide whether the snapshot fills the display cache.
+func (s *Store) readWalletRow(ctx context.Context, orgID string) (*cachedBalance, bool, error) {
 	if orgID == "" || s.db == nil {
-		return &Balance{OrgID: orgID}, nil // no org or no DB → zero balance
+		return nil, false, nil
+	}
+
+	var walletCents int64
+	var remainder int64
+	var updatedAt time.Time
+	var floorOverride *int64
+	err := s.db.QueryRow(ctx,
+		`SELECT balance_cents, remainder_micro_usd, updated_at, grace_floor_cents FROM org_credits WHERE org_id = $1`,
+		orgID,
+	).Scan(&walletCents, &remainder, &updatedAt, &floorOverride)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, ErrNoWallet
+		}
+		return nil, false, fmt.Errorf("get balance: %w", err)
+	}
+
+	return &cachedBalance{
+		walletCents: walletCents, remainderMicroUSD: remainder,
+		walletUpdatedAt: updatedAt, graceFloorCents: floorOverride,
+	}, true, nil
+}
+
+// loadBalance serves the display view of an org's wallet: cache-first for
+// CacheTTL, refilled from an authoritative readWalletRow on a miss. Only
+// successful reads are cached. Admission must not come through here —
+// CheckBalance reads fresh per decision, so a display snapshot can never
+// gate paid dispatch and a load racing an invalidation can never
+// repopulate a floor that then decides admission.
+func (s *Store) loadBalance(ctx context.Context, orgID string) (*cachedBalance, bool, error) {
+	if orgID == "" || s.db == nil {
+		return nil, false, nil
 	}
 
 	// Try cache first.
 	s.mu.RLock()
 	if cb, ok := s.cache[orgID]; ok && time.Since(cb.cachedAt) < s.cfg.CacheTTL {
 		s.mu.RUnlock()
-		return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
+		return cb, true, nil
 	}
 	s.mu.RUnlock()
 
-	// Query DB.
-	var walletCents int64
-	var remainder int64
-	var updatedAt time.Time
-	err := s.db.QueryRow(ctx,
-		`SELECT balance_cents, remainder_micro_usd, updated_at FROM org_credits WHERE org_id = $1`,
-		orgID,
-	).Scan(&walletCents, &remainder, &updatedAt)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNoWallet
-		}
-		return nil, fmt.Errorf("get balance: %w", err)
+	cb, ok, err := s.readWalletRow(ctx, orgID)
+	if err != nil || !ok {
+		return cb, ok, err
 	}
 
-	// Update cache.
+	// Update the display cache.
+	cb.cachedAt = time.Now()
 	s.mu.Lock()
-	s.cache[orgID] = &cachedBalance{
-		walletCents: walletCents, remainderMicroUSD: remainder,
-		walletUpdatedAt: updatedAt, cachedAt: time.Now(),
-	}
+	s.cache[orgID] = cb
 	s.mu.Unlock()
 
-	return effectiveBalance(orgID, walletCents, remainder, updatedAt)
+	return cb, true, nil
+}
+
+// GetBalance returns the current balance for an org. The returned value is
+// remainder-aware: BalanceCents is the effective whole-cent balance and
+// BalanceMicroUSD the exact µUSD figure.
+func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) {
+	cb, ok, err := s.loadBalance(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return &Balance{OrgID: orgID}, nil // no org or no DB → zero balance
+	}
+
+	return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
+}
+
+// effectiveFloorCents resolves the admission floor for one wallet snapshot:
+// the persisted per-org grace_floor_cents (ADR-0001 §8) wins when set — an
+// explicit 0 is a real value (no overdraft for that org, AF-01) — and the
+// store-level GracePeriodCents is the platform fallback for NULL.
+func effectiveFloorCents(storeFloorCents int64, override *int64) int64 {
+	if override != nil {
+		return *override
+	}
+	return storeFloorCents
 }
 
 // CheckBalance verifies whether an org can proceed. Returns the current balance.
 // Admission is rejected with ErrInsufficientCredits when the effective balance
-// is at or below the grace period threshold.
+// is at or below the effective grace floor: the org's persisted
+// grace_floor_cents (ADR-0001 §8) wins over the store's GracePeriodCents,
+// NULL falls back to the platform floor.
+//
+// The decision is authoritative: a fresh wallet snapshot (balance plus the
+// persisted §8 floor override) is read per decision and never served from —
+// or written to — the display cache. Gateway and admin hold distinct store
+// instances, and an in-flight display-cache fill could repopulate an
+// evicted entry, so no cached view may gate paid dispatch: a concurrent
+// floor change decides the very next admission. The cost is one
+// primary-key SELECT per admission; GetBalance keeps the CacheTTL display
+// cache and is never consulted on this path.
 //
 // Exact µUSD admission rule: admit iff (walletCents − floor)*10000 >
 // remainder. Because the remainder is always < 10000 µUSD (one cent), this
@@ -302,22 +364,51 @@ func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) 
 // can never exceed the floor (matching the AF-01 inclusive rejection), and a
 // full cent of headroom always admits regardless of the sub-cent remainder.
 // The check therefore stays in overflow-free cent space — it compares the
-// reconstructed raw wallet cents, not the floored display value, so a
-// pending remainder never rejects a request one cent early.
+// raw wallet cents on the fresh snapshot, not the floored display value, so
+// a pending remainder never rejects a request one cent early.
 func (s *Store) CheckBalance(ctx context.Context, orgID string) (*Balance, error) {
-	balance, err := s.GetBalance(ctx, orgID)
+	cb, ok, err := s.readWalletRow(ctx, orgID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Reconstruct the raw wallet cents from the effective view:
-	// wallet = effCents + ceil(remainder / 10000), ceil ∈ {0, 1}.
-	walletCents := balance.BalanceCents + (balance.RemainderMicroUSD+int64(money.MicroPerCent)-1)/int64(money.MicroPerCent)
-	if walletCents <= s.cfg.GracePeriodCents {
+	floor := s.cfg.GracePeriodCents
+	var balance *Balance
+	var walletCents int64
+	if ok {
+		var ferr error
+		balance, ferr = effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
+		if ferr != nil {
+			return nil, ferr
+		}
+		walletCents = cb.walletCents
+		floor = effectiveFloorCents(floor, cb.graceFloorCents)
+	} else {
+		// No wallet row or no DB: keep the historical zero-balance view.
+		balance = &Balance{OrgID: orgID}
+	}
+
+	if walletCents <= floor {
 		return balance, ErrInsufficientCredits
 	}
 
 	return balance, nil
+}
+
+// InvalidateOrg drops the cached display snapshot for orgID so the next
+// GetBalance re-queries org_credits. Writers inside this store invalidate
+// inline; call this after a mutation committed outside the store's write
+// paths — the admin per-org grace floor change (§8) is the current case, so
+// admin balance views show the new state immediately. Admission never reads
+// this cache: CheckBalance reads a fresh snapshot per decision, so this is
+// a display-freshness aid, not a correctness gate for paid dispatch.
+func (s *Store) InvalidateOrg(orgID string) {
+	if orgID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.cache, orgID)
+	s.mu.Unlock()
 }
 
 // TopUp adds credits to an org's wallet. This is a manual admin action.
