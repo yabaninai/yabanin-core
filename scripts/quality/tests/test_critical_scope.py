@@ -2418,6 +2418,115 @@ class ConservativeGateControls(unittest.TestCase):
         evidence = report['selector']['evidence'][self.package]
         self.assertIsNone(evidence['widened'])
         self.assertEqual(evidence['rebaselined'], ['TestAllowed → Allowed'])
+        owner_proof = evidence['baseline_independent_coverage']
+        self.assertEqual(owner_proof[0]['tests'], ['TestAllowed'])
+        self.assertEqual(owner_proof[0]['passed'], ['TestAllowed'])
+        self.assertRegex(owner_proof[0]['coverprofile_sha256'], r'^[0-9a-f]{64}$')
+        self.assertTrue(owner_proof[0]['consumers'][0]['blocks'])
+
+    def test_indirect_replacement_owner_proves_full_body(self):
+        # The rewritten old test no longer calls Allowed. A new test reaches
+        # it through a helper, so owner discovery must follow the real call
+        # chain before accepting its complete positive coverprofile.
+        (self.pkg / 'gw_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func TestAllowed(t *testing.T) { t.Log("rewritten") }\n\n'
+            'func allowedByHelper() bool { return Allowed(1) }\n\n'
+            'func TestOther(t *testing.T) { if !allowedByHelper() { t.Fatal("denied") } }\n')
+        outbox = tempfile.TemporaryDirectory(prefix='critical-gate-out-')
+        self.addCleanup(outbox.cleanup)
+        out = Path(outbox.name) / 'gate'
+        args = argparse.Namespace(root=self.root, base=self.base,
+                                  gremlins=gremlins_binary(), output=out)
+        self.assertEqual(critical.run(args), 0)
+        report = json.loads((out / 'report.json').read_text())
+        evidence = report['selector']['evidence'][self.package]
+        owner_proof = evidence['baseline_independent_coverage'][0]
+        self.assertEqual(owner_proof['tests'], ['TestOther'])
+        self.assertEqual(owner_proof['passed'], ['TestOther'])
+        self.assertEqual(evidence['rebaselined'],
+                         ['TestAllowed → Allowed', 'TestOther → Allowed'])
+
+    def test_skipped_owner_is_not_a_positive_coverage_witness(self):
+        # Package init covers Allowed, but the mapped test owner itself skips.
+        # Its focused profile must not be treated as an owner pass; complete
+        # base/current profiles remain the authority for this ambiguous case.
+        (self.pkg / 'gw_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func init() { _ = Allowed(1) }\n\n'
+            'func TestAllowed(t *testing.T) { t.Log("rewritten") }\n\n'
+            'func TestOther(t *testing.T) { t.Skip("fixture skip"); _ = Allowed(1) }\n')
+        from unittest import mock
+        real_run = critical_conservative.run_until_deadline
+        commands = []
+
+        def observe(argv, root, deadline):
+            commands.append(list(argv))
+            return real_run(argv, root, deadline)
+
+        outbox = tempfile.TemporaryDirectory(prefix='critical-gate-out-')
+        self.addCleanup(outbox.cleanup)
+        out = Path(outbox.name) / 'gate'
+        args = argparse.Namespace(root=self.root, base=self.base,
+                                  gremlins=gremlins_binary(), output=out)
+        with mock.patch.object(critical_conservative, 'run_until_deadline',
+                               side_effect=observe):
+            self.assertEqual(critical.run(args), 0)
+        self.assertEqual(len(commands), 3)
+        self.assertIn('-run=^(TestOther)$', commands[0])
+        report = json.loads((out / 'report.json').read_text())
+        evidence = report['selector']['evidence'][self.package]
+        self.assertNotIn('baseline_independent_coverage', evidence)
+
+    def test_incomplete_indirect_owner_profile_falls_back_to_full_profiles(self):
+        # The changed test stops reaching Allowed; another test reaches it
+        # indirectly, but only covers the base-executed branch. A focused
+        # profile cannot prove the new branch's absence, so the complete base
+        # and current profiles must still decide the verdict.
+        production = self.pkg / 'gw.go'
+        production.write_text(production.read_text().replace(
+            'func Allowed(n int) bool { return n > 0 }',
+            'func Allowed(n int) bool { if n > 0 { return true }; return false }'))
+        subprocess.run(['git', 'add', '.'], cwd=self.root, check=True,
+                       capture_output=True)
+        subprocess.run(['git', '-c', 'user.name=Fixture',
+                        '-c', 'user.email=fixture@example.invalid',
+                        'commit', '-qm', 'base branch body'], cwd=self.root,
+                       check=True, capture_output=True)
+        self.base = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
+                                            cwd=self.root, text=True).strip()
+        (self.pkg / 'gw_test.go').write_text(
+            'package auth\n\nimport "testing"\n\n'
+            'func TestAllowed(t *testing.T) { t.Log("rewritten") }\n\n'
+            'func allowedByHelper() bool { return Allowed(1) }\n\n'
+            'func TestOther(t *testing.T) { if !allowedByHelper() { t.Fatal("denied") } }\n')
+
+        from unittest import mock
+        real_run = critical_conservative.run_until_deadline
+        commands = []
+
+        def observe(argv, root, deadline):
+            commands.append(list(argv))
+            return real_run(argv, root, deadline)
+
+        outbox = tempfile.TemporaryDirectory(prefix='critical-gate-out-')
+        self.addCleanup(outbox.cleanup)
+        out = Path(outbox.name) / 'gate'
+        args = argparse.Namespace(root=self.root, base=self.base,
+                                  gremlins=gremlins_binary(), output=out)
+        with mock.patch.object(critical_conservative, 'run_until_deadline',
+                               side_effect=observe):
+            self.assertEqual(critical.run(args), 0)
+        self.assertEqual(len(commands), 3)
+        self.assertIn('-json', commands[0])
+        self.assertIn('-run=^(TestOther)$', commands[0])
+        self.assertNotIn('-run=^(TestOther)$', commands[1])
+        self.assertNotIn('-run=^(TestOther)$', commands[2])
+        report = json.loads((out / 'report.json').read_text())
+        evidence = report['selector']['evidence'][self.package]
+        self.assertNotIn('baseline_independent_coverage', evidence)
+        self.assertEqual(evidence['rebaselined'],
+                         ['TestAllowed → Allowed', 'TestOther → Allowed'])
 
 
 class CrossPackageConservativeControls(unittest.TestCase):
@@ -2855,7 +2964,13 @@ class G7AuditRepairControls(unittest.TestCase):
         # subprocess starting over with a fresh budget.
         root, base = self.write_repo(G7_POLICY_BLOCKS, G7_TESTS_BOTH)
         (root / 'pkg/auth/slow_test.go').write_text(
-            'package auth\nimport "testing"\nimport "time"\n'
+            'package auth\nimport "reflect"\nimport "testing"\nimport "time"\n'
+            'type runner struct{}\n'
+            'func (runner) Run() bool { return Allowed(7) }\n'
+            'func TestOther(t *testing.T) {\n'
+            '\tv := reflect.ValueOf(runner{}).MethodByName("Run")\n'
+            '\tif !v.IsValid() || v.Call(nil)[0].Bool() { t.Fatal("denial bypass") }\n'
+            '}\n'
             'func TestSlow(t *testing.T) { time.Sleep(' +
             str(G7_A3_SLOW_SECONDS) + '*time.Second) }\n')
         for argv in (['add', '.'],
@@ -2866,7 +2981,10 @@ class G7AuditRepairControls(unittest.TestCase):
                            capture_output=True)
         base = subprocess.check_output(['git', 'rev-parse', 'HEAD'],
                                        cwd=root, text=True).strip()
-        (root / 'pkg/auth/policy_test.go').write_text(G7_TESTS_SWAPPED)
+        # The direct owner now covers only the allowed branch. A separate
+        # reflective owner covers denial in the complete suite but is not a
+        # focused static owner; its missing block must force full fallback.
+        (root / 'pkg/auth/policy_test.go').write_text(G7_TESTS_ALLOW_ONLY)
         code = (
             'import sys\n'
             'from pathlib import Path\n'

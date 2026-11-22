@@ -30,6 +30,7 @@ resolvable base counterpart stay bound instead of silently disappearing.
 """
 from collections import Counter, defaultdict
 import contextlib
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -45,6 +46,7 @@ import source
 
 # The approved unit budget also bounds baseline-coverage verification runs.
 UNIT_VERIFY_SECONDS = 300
+OWNER_COVERAGE_PROBE_SECONDS = 20
 
 # Live per-package unit deadlines: every baseline-coverage verification
 # run and the normal unit phase of the same package draw down one budget.
@@ -1705,6 +1707,11 @@ def verify_package_baseline(root, base, config, package, selection, side,
     # The approved package/kind budget covers startup too: the deadline
     # starts before archive/materialization, not at the first go test.
     shared_deadline(package, unit_budget(config))
+    focused = current_owner_coverage(root, package, selection, side, modes,
+                                     config)
+    if focused is not None:
+        record_owner_coverage_proof(package, selection, focused)
+        return
     with tempfile.TemporaryDirectory(prefix='yabanin-baseline-') as workspace:
         base_root = Path(workspace) / 'base'
         base_root.mkdir()
@@ -1733,7 +1740,182 @@ def verify_package_baseline(root, base, config, package, selection, side,
     evidence = EVIDENCE['packages'].get(package)
     if evidence is not None:
         evidence['rebaselined'] = sorted(rebaselined)
-    pause_unit_budget(package)
+
+
+def record_owner_coverage_proof(package, selection, proof):
+    """Persist the current-only proof after it makes base evidence irrelevant."""
+    selection.lost_baseline = []
+    evidence = EVIDENCE['packages'].get(package)
+    if evidence is None:
+        return
+    evidence['rebaselined'] = sorted(
+        name + ' → ' + ', '.join(sorted({row['name'] for row in consumers}))
+        for name, consumers in proof['obligations'])
+    evidence['baseline_independent_coverage'] = proof['modes']
+
+
+def current_owner_coverage(root, package, selection, side, modes, config):
+    """Prove an unchanged verdict from complete current blocks alone.
+
+    A focused positive is sufficient: if every mapped consumer's current
+    blocks run, baseline coverage and counterpart identity cannot change the
+    result of baseline_record. Missing owners, skipped/failed top-level owners,
+    or any uncovered block fall back to the original complete profiles.
+    Skipped subtests are recorded; they are not evidence for any covered block.
+    The probe shares the existing package deadline and has a short ceiling.
+    """
+    obligations = list(selection.lost_baseline)
+    if not obligations:
+        return None
+    proof = {'obligations': obligations, 'modes': []}
+    probe_deadline = min(shared_deadline(package, unit_budget(config)),
+                         time.monotonic() + OWNER_COVERAGE_PROBE_SECONDS)
+    for index, mode in enumerate(modes):
+        mode_proof = current_mode_owner_coverage(
+            root, package, obligations, side, index, mode, modes, probe_deadline)
+        if mode_proof is None:
+            return None
+        if mode_proof:
+            proof['modes'].append(mode_proof)
+    if not proof['modes']:
+        return None
+    return proof
+
+
+def current_mode_owner_coverage(root, package, obligations, side, index,
+                                mode, modes, deadline):
+    """Prove complete current blocks for one build mode, or request fallback."""
+    consumers = unique_rows(row for _, rows in obligations for row in rows
+                            if mode_applies(side, row['file'], index, modes))
+    if not consumers:
+        return {}
+    tests = owner_tests(consumers, side, index, modes)
+    if not tests:
+        return None
+    result = focused_coverage(root, package, mode, tests, deadline)
+    if result is None or set(result['passed']) != set(tests):
+        return None
+    witnessed = covered_consumer_rows(consumers, result['blocks'])
+    if witnessed is None:
+        return None
+    return {
+        'mode': mode, 'tests': tests, 'passed': result['passed'],
+        'skipped': result['skipped'],
+        'coverprofile_sha256': result['sha256'],
+        'consumers': witnessed,
+    }
+
+
+def covered_consumer_rows(consumers, profile):
+    """Profile rows proving every current block for each mapped consumer."""
+    witnessed = []
+    for row in consumers:
+        blocks = in_span(profile, row)
+        if not blocks or any(block[2] == 0 for block in blocks):
+            return None
+        witnessed.append({
+            'file': row['file'], 'function': row['name'],
+            'body_sha256': row['hash'],
+            'blocks': [{'span': block[3], 'count': block[2]}
+                       for block in blocks],
+        })
+    return witnessed
+
+
+def unique_rows(rows):
+    """Keep stable, unique current consumers across queued obligations."""
+    result, seen = [], set()
+    for row in rows:
+        key = (row['file'], row['name'], row['hash'], row['start'], row['end'])
+        if key not in seen:
+            seen.add(key)
+            result.append(row)
+    return result
+
+
+def owner_tests(consumers, side, index, modes):
+    """Runnable test owners reachable from the mapped production consumers."""
+    candidates = set()
+    edges = owner_edges(side)
+    for row in consumers:
+        candidates.update(owner_callers(row, edges))
+    return sorted({unit['name'] for unit in side.test_units()
+                   if unit['name'] in candidates
+                   and unit['name'].startswith(('Test', 'Fuzz'))
+                   and mode_applies(side, unit['file'], index, modes)})
+
+
+def owner_edges(side):
+    """Reverse production and test-helper references for owner discovery."""
+    sources = [(unit, (identity_key(unit),)) for unit in
+               side.functions() + side.test_units()]
+    for path in side.tests:
+        sources.extend((unit, tuple(unit.get('symbols', [])))
+                       for unit in side.declarations(path)
+                       if unit.get('kind') == 'var')
+    edges = {}
+    helpers = side.indexes()
+    for unit, callers in sources:
+        refs, floors = unit.get('refs', []), set(unit.get('floor_refs', []))
+        dependencies = {dep for _row, dep in resolve_rows(refs, floors, helpers)}
+        dependencies.update(resolve_production(refs, floors, [side]))
+        for dep in dependencies:
+            edges.setdefault(dep, set()).update(callers)
+    return edges
+
+
+def owner_callers(row, edges):
+    """Test owners and production helpers that can reach one consumer."""
+    owners, seen, frontier = set(), set(), [identity_key(row)]
+    while frontier:
+        key = frontier.pop()
+        if key in seen:
+            continue
+        seen.add(key)
+        for caller in edges.get(key, ()):
+            if parse_key(caller)[1].startswith(('Test', 'Fuzz')):
+                owners.add(parse_key(caller)[1])
+            else:
+                frontier.append(caller)
+    return owners
+
+
+def focused_coverage(root, package, mode, tests, deadline):
+    """A bounded real coverprofile for named owner tests, or no shortcut."""
+    pattern = '^(' + '|'.join(tests) + ')$'
+    if len(pattern) > 32768:
+        return None
+    with tempfile.TemporaryDirectory(prefix='yabanin-owner-cover-') as tmp:
+        profile = Path(tmp) / 'owners.cover'
+        argv = ['go', 'test', '-json', '-count=1', '-coverprofile=' + str(profile),
+                '-run=' + pattern]
+        if mode:
+            argv.append('-tags=' + mode)
+        argv.append('./' + package)
+        code, output = run_until_deadline(argv, root, deadline)
+        if code != 0 or not profile.is_file():
+            return None
+        data = profile.read_bytes()
+        passed, skipped = coverage_test_events(output, tests)
+        return {'blocks': critical_results.coverage_blocks(profile),
+                'sha256': hashlib.sha256(data).hexdigest(),
+                'passed': sorted(passed), 'skipped': sorted(skipped)}
+
+
+def coverage_test_events(output, expected):
+    """Named top-level pass events and every skipped test/subtest event."""
+    passed, skipped = set(), set()
+    for line in output.splitlines():
+        try:
+            event = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        name, action = event.get('Test'), event.get('Action')
+        if name in expected and action == 'pass':
+            passed.add(name)
+        if name and action == 'skip':
+            skipped.add(name)
+    return passed, skipped
 
 
 def raise_baseline_loss(package, unit_lost, block_lost):
