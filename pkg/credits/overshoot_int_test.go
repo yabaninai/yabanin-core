@@ -149,8 +149,18 @@ func TestOvershoot_ConcurrentAdmissionRace(t *testing.T) {
 				t.Errorf("overshoot accounting: debits=%d (want %d), wallet=%d (want %d), usage rows=%d (want %d)",
 					debits, tc.debits, walletCents, tc.finalCents, usageRows, tc.debits)
 			}
+			// Derived diagnostics (review fix): uncollected notional is the
+			// served-but-never-collected remainder — rejections × cost, NOT
+			// a wallet-arithmetic difference (which double-counts what
+			// settlement did collect); overshoot exists only while the
+			// wallet is negative.
+			uncollected := (tc.admitted - debits) * costCents
+			overshoot := int64(0)
+			if walletCents < 0 {
+				overshoot = -walletCents
+			}
 			t.Logf("concurrency=%3d: admitted=%3d debits=%3d final_wallet=%d cents (overshoot beyond $0 = %d cents, uncollected = %d cents)",
-				tc.concurrency, tc.admitted, debits, walletCents, -walletCents, tc.admitted*costCents-100-walletCents)
+				tc.concurrency, tc.admitted, debits, walletCents, overshoot, uncollected)
 		})
 	}
 }
