@@ -124,12 +124,11 @@ func TestReviewMediaInterruptedReadNoFabricatedUsage(t *testing.T) {
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				_, _ = io.Copy(io.Discard, r.Body)
 				calls.Add(1)
-				// Announce an 11-byte body, deliver 4 bytes, slam the
-				// connection shut: the gateway's read fails mid-body.
+				// Flush a partial response so the client observes 200 before the short read.
 				w.Header().Set("Content-Length", "11")
 				w.WriteHeader(http.StatusOK)
 				_, _ = w.Write([]byte(`{"te`))
-				panic(http.ErrAbortHandler)
+				w.(http.Flusher).Flush()
 			}))
 			defer srv.Close()
 
@@ -171,6 +170,8 @@ func TestReviewMediaInterruptedReadNoFabricatedUsage(t *testing.T) {
 			require.Equal(t, http.StatusBadGateway, rec.Code, "interrupted provider read must surface 502, got body %s", rec.Body.String())
 			require.Len(t, store.admitted, 1, "the confirmed start existed — the reconciler sweep owns the admitted-without-facts row")
 			require.Empty(t, store.facts, "an interrupted read must not fabricate usage into durable accounting")
+			require.Contains(t, rec.Body.String(), "failed to read upstream response")
+			require.Equal(t, "false", rec.Result().Header.Get("X-Should-Retry"))
 		})
 	}
 }

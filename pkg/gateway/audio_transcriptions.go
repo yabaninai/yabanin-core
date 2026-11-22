@@ -177,12 +177,12 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	limited, over, err := readAudioResponse(resp.Body)
 	if err != nil {
 		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return
 	}
 	if over {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response exceeds the audio size limit")
+		writePaidBodyError(w, "upstream response exceeds the audio size limit")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {

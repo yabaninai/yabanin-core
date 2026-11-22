@@ -129,17 +129,16 @@ func relayEmbeddingsResponse(rctx context.Context, w http.ResponseWriter, l *slo
 	}
 
 	// Read one byte past the limit so an oversized upstream body is refused
-	// as an upstream error instead of being silently truncated (parity with
-	// images; the gateway never delivers a partial embeddings payload —
+	// instead of returning a partial embeddings payload.
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return resp, nil, false
 	}
 	if len(limited) > embeddingsResponseLimit {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
+		writePaidBodyError(w, "upstream response too large")
 		return resp, nil, false
 	}
 	if resp.StatusCode != http.StatusOK {

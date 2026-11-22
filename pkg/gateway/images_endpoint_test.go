@@ -206,6 +206,9 @@ func TestImagesGenerations_OversizedResponse(t *testing.T) {
 	if errorType(t, rec) != "api_error" {
 		t.Fatalf("body %s", rec.Body.String())
 	}
+	if hint := rec.Result().Header.Get("X-Should-Retry"); hint != "false" {
+		t.Fatalf("retry hint %q after oversized provider response", hint)
+	}
 }
 
 // Unsupported surface is explicitly not promised: no edits route (404) and

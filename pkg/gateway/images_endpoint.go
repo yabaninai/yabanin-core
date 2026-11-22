@@ -150,12 +150,12 @@ func (gw *gateway) imagesGenerations(w http.ResponseWriter, r *http.Request) {
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, imagesResponseLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return
 	}
 	if len(limited) > imagesResponseLimit {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
+		writePaidBodyError(w, "upstream response too large")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {

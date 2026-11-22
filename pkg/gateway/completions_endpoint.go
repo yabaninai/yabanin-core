@@ -193,8 +193,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit+1))
 	if err != nil {
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		d.w.Header().Set("X-Should-Retry", "false")
-		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(d.w, "failed to read upstream response")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
@@ -205,8 +204,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 	}
 	if len(limited) > embeddingsResponseLimit {
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		d.w.Header().Set("X-Should-Retry", "false")
-		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
+		writePaidBodyError(d.w, "upstream response too large")
 		return
 	}
 	usage := completionsUsage(limited, d.body, d.client.Adapter())

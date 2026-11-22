@@ -202,3 +202,9 @@ func (gw *gateway) finishBufferedJSONRoute(f bufferedJSONFinish) {
 	f.w.WriteHeader(http.StatusOK)
 	_, _ = f.w.Write(f.payload)
 }
+
+// A provider has already answered. Repeating the paid request can incur another charge.
+func writePaidBodyError(w http.ResponseWriter, message string) {
+	w.Header().Set("X-Should-Retry", "false")
+	apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, message)
+}

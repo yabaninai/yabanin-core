@@ -224,6 +224,9 @@ func TestEmbeddings_OversizedResponse(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "upstream response too large") {
 		t.Fatalf("body %s", rec.Body.String())
 	}
+	if hint := rec.Result().Header.Get("X-Should-Retry"); hint != "false" {
+		t.Fatalf("retry hint %q after oversized provider response", hint)
+	}
 }
 
 // At-cap upstream bodies still pass verbatim: the limit+1 probe must not

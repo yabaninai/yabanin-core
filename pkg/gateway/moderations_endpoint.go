@@ -136,12 +136,12 @@ func relayModerationsResponse(rctx context.Context, w http.ResponseWriter, l *sl
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, moderationsResponseLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		writePaidBodyError(w, "failed to read upstream response")
 		return resp, provider.Usage{}, nil, false
 	}
 	if len(limited) > moderationsResponseLimit {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
+		writePaidBodyError(w, "upstream response too large")
 		return resp, provider.Usage{}, nil, false
 	}
 	if resp.StatusCode != http.StatusOK {
