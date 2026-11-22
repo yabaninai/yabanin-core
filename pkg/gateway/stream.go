@@ -1525,44 +1525,9 @@ func (r *streamRun) writeStreamCacheAsync(usage provider.Usage) {
 // delivery: client notification, budget accounting for the consumed prefix,
 // and the request.failed event with the actual (partial) usage.
 func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttftMs int64, hasTTFT bool) {
-	// N03-P06-T02: the partial usage parsed before the break is still the
-	// real upstream usage, so the prompt-cache trailer reports it the same
-	// way accountUsage records it below. Best-effort transparency — no-ops
-	// on wrapper writers; absent when no provider usage was parsed.
 	setPromptCacheTrailer(r.w, usage)
-	// Best-effort: notify the client that the stream ended abnormally.
-	// writeSSEError emits an error frame + [DONE] terminator. An idle
-	// watchdog abort is reported distinctly so clients (and logs) can
-	// tell a stalled upstream from a mid-flight transport failure.
-	idleAbort := r.streamIdle != nil && r.streamIdle.Fired()
-	errDetail := fmt.Sprintf("stream drain failed: %v", drainErr)
-	if idleAbort {
-		errDetail = "upstream stream idle timeout"
-	}
-	r.l.Warn("stream drain ended with error",
-		"error", drainErr, "model", r.finalInfo.ModelName, "idle_abort", idleAbort)
-	// Drop any held terminator FIRST: the drain failed, so the client's
-	// terminal is the error frame below, and with the watch innermost
-	// that frame's own trailing [DONE] must pass a disarmed hold (an
-	// armed hold would absorb it and leave the client stream unterminated).
-	// N03-P01: when the client already received the [DONE] terminator, the
-	// stream is over on the wire — a late failure must not emit a second
-	// terminal event (an error frame + duplicate [DONE] after [DONE] is an
-	// invalid stream per pkg/apiformat.ValidateChatStream). The failure is
-	// still logged here and reported as request.failed below.
-	r.doneWatch.failDoneHold()
-	if !r.clientTerminalDelivered() {
-		if idleAbort {
-			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
-		} else {
-			writeSSEError(r.w, apierrors.ErrorCodeAPI, "stream interrupted")
-		}
-	}
-
-	// G3: record final token usage against task/session budgets even on
-	// drain error — the prefix was consumed, so it counts. No settled
-	// price exists for a partial stream: the session spend reports
-	// (0, false) like the pre-consolidation path.
+	idleAbort, errDetail := r.notifyDrainFailure(drainErr)
+	// Count the delivered prefix in budgets without settling a partial price.
 	r.gw.accountUsage(r.ctx, r.w, usageRecord{
 		orgID:         r.orgID,
 		taskID:        r.taskID,
@@ -1570,19 +1535,158 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		affinityModel: r.finalInfo.ModelName,
 		usage:         usage,
 	})
-
 	ext := provider.ComputeCost(usage, r.finalInfo.Provider, r.finalInfo.ModelName)
-
-	// Compute resale cost for streaming error path.
 	drainResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
+	base := r.drainFailureEvent(usage, ext, drainResale, errDetail, idleAbort, ttftMs, hasTTFT)
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
+		base:        base,
+		info:        r.finalInfo,
+		resp:        r.streamResp,
+		termination: r.drainFailureTermination(idleAbort),
+	}, nil)
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
+}
 
-	// Observability parity with the non-stream path: the counterfactual
-	// baseline is premium-pool cost for tier-routed requests, actual
-	// spend otherwise. Leaving it 0 collapsed SUM(counterfactual) to ~0
-	// and made the savings percentage explode negative on
-	// streaming-heavy traffic.
-	drainBase := eventBase{
-		EventType:             "request.failed",
+func (r *streamRun) notifyDrainFailure(drainErr error) (bool, string) {
+	idleAbort := r.streamIdle != nil && r.streamIdle.Fired()
+	errDetail := fmt.Sprintf("stream drain failed: %v", drainErr)
+	if idleAbort {
+		errDetail = "upstream stream idle timeout"
+	}
+	r.l.Warn("stream drain ended with error",
+		"error", drainErr, "model", r.finalInfo.ModelName, "idle_abort", idleAbort)
+	// Disarm the held terminator before writing an error frame that ends with DONE.
+	r.doneWatch.failDoneHold()
+	// Skip a replacement terminal if DONE already reached the client.
+	if !r.clientTerminalDelivered() {
+		if idleAbort {
+			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
+		} else {
+			writeSSEError(r.w, apierrors.ErrorCodeAPI, "stream interrupted")
+		}
+	}
+	return idleAbort, errDetail
+}
+
+func (r *streamRun) drainFailureEvent(usage provider.Usage, ext provider.ExtendedUsage, resale float64, errDetail string, idleAbort bool, ttftMs int64, hasTTFT bool) eventBase {
+	base := eventBase{
+		EventType:           "request.failed",
+		RequestID:           r.reqID,
+		SessionID:           r.sessionID,
+		UpstreamPayload:     boundedSample(r.sentBody, upstreamCaptureLimit),
+		UpstreamResponse:    r.sseTee.String(),
+		OrgID:               r.orgID,
+		TeamID:              r.teamID,
+		APIKeyID:            eventKeyID(r.ctx),
+		SessionKeyID:        eventSessionID(r.ctx),
+		ModelRequested:      r.dec.From, // client request, before routing
+		ModelUsed:           r.finalInfo.ModelName,
+		UpstreamURL:         r.gw.upstreamURL(r.finalInfo),
+		StatusCode:          http.StatusOK,
+		DurationMs:          eventpub.ComputeDurationMs(r.start),
+		TokensIn:            usage.PromptTokens,
+		TokensOut:           usage.CompletionTokens,
+		CacheReadTokens:     usage.CacheReadTokens,
+		CacheCreationTokens: usage.CacheCreationTokens,
+		EstimatedCostUSD:    ext.EstimatedCostUSD,
+		Endpoint:            endpointFrom(r.ctx, "chat.completions"),
+		UsageSource:         usageSourceOrNone(usage.Source),
+		CostStatus:          costStatus(false, usage.Source, ext.PriceKnown),
+		// Use the same premium-pool baseline as successful tier-routed requests.
+		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
+		ResaleCostUSD:         resale,
+		Method:                "POST",
+		Error:                 errDetail,
+		TierUsed:              r.tierUsed,
+		ClassifierClass:       r.classifierClass,
+		ClassifierConfidence:  r.classifierConfidence,
+		ClassifierSource:      r.classifierSource,
+		RoutingDecision:       r.gw.decisionJSON(r.dec.Source, r.dec),
+		AttemptCount:          len(r.attempts),
+		RetryCount:            r.totalRetries,
+		Labels:                labelsFrom(r.ctx),
+		Policy:                r.streamPolicyJSON(),
+	}
+	if hasTTFT {
+		base.FirstTokenMs = ttftMs
+	}
+	if r.history != nil {
+		// Preserve the interruption cause in the partial response record.
+		reason := responseHistoryReasonUpstreamError
+		switch {
+		case idleAbort:
+			reason = responseHistoryReasonIdleTimeout
+		case r.ctx.Err() != nil:
+			reason = responseHistoryReasonClientCancel
+		}
+		base.ProcessedResponse = r.history.finishEnvelope(responseHistoryStatusPartial, reason).marshal()
+	}
+	return base
+}
+
+func (r *streamRun) drainFailureTermination(idleAbort bool) budget.Termination {
+	if idleAbort {
+		return budget.TerminationIdleTimeout
+	}
+	if r.ctx.Err() != nil {
+		return budget.TerminationClientCancel
+	}
+	return budget.TerminationUpstreamErr
+}
+
+// finishSuccess finalizes a fully drained stream: breaker success, budget
+// accounting, and the request.completed event.
+func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsage, ttftMs int64, hasTTFT bool) {
+	r.gw.recordBreakerSuccess()
+	setPromptCacheTrailer(r.w, usage)
+	r.recordStreamEvalgateSkip()
+	r.gw.accountUsage(r.ctx, r.w, usageRecord{
+		orgID:         r.orgID,
+		taskID:        r.taskID,
+		sessionID:     r.sessionID,
+		affinityModel: r.finalInfo.ModelName,
+		usage:         usage,
+		costUSD:       ext.EstimatedCostUSD,
+		priceKnown:    ext.PriceKnown,
+	})
+	streamResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
+	base := r.successEvent(usage, ext, streamResale, ttftMs, hasTTFT)
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
+		base:        base,
+		info:        r.finalInfo,
+		resp:        r.streamResp,
+		termination: budget.TerminationCompleted,
+	}, nil)
+	// Release the held DONE only after the durable terminal record commits.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		writeSSEErrorWithCode(r.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		r.l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
+}
+
+func (r *streamRun) recordStreamEvalgateSkip() {
+	// A bounded SSE capture is not a complete judgeable cheap response.
+	if r.gw.judge == nil || r.gw.evalStore == nil || r.orgID == "" {
+		return
+	}
+	if r.classifierClass != "medium" || !(r.classifierConfidence < 0.7) || !(r.gw.cfg.EvalgateSampleRate > 0) {
+		return
+	}
+	r.l.Debug("evalgate: full cheap response unavailable for streaming request, judge skipped",
+		"org_id", r.orgID, "request_id", r.reqID)
+}
+
+func (r *streamRun) successEvent(usage provider.Usage, ext provider.ExtendedUsage, resale float64, ttftMs int64, hasTTFT bool) eventBase {
+	base := eventBase{
+		EventType:             "request.completed",
 		RequestID:             r.reqID,
 		SessionID:             r.sessionID,
 		UpstreamPayload:       boundedSample(r.sentBody, upstreamCaptureLimit),
@@ -1591,7 +1695,7 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		TeamID:                r.teamID,
 		APIKeyID:              eventKeyID(r.ctx),
 		SessionKeyID:          eventSessionID(r.ctx),
-		ModelRequested:        r.dec.From, // the client's original request, not the routed model
+		ModelRequested:        r.dec.From, // client request, before routing
 		ModelUsed:             r.finalInfo.ModelName,
 		UpstreamURL:           r.gw.upstreamURL(r.finalInfo),
 		StatusCode:            http.StatusOK,
@@ -1605,126 +1709,7 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		UsageSource:           usageSourceOrNone(usage.Source),
 		CostStatus:            costStatus(false, usage.Source, ext.PriceKnown),
 		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
-		ResaleCostUSD:         drainResale,
-		Method:                "POST",
-		Error:                 errDetail,
-		TierUsed:              r.tierUsed,
-		ClassifierClass:       r.classifierClass,
-
-		ClassifierConfidence: r.classifierConfidence,
-		ClassifierSource:     r.classifierSource,
-		RoutingDecision:      r.gw.decisionJSON(r.dec.Source, r.dec),
-		AttemptCount:         len(r.attempts),
-		RetryCount:           r.totalRetries,
-		Labels:               labelsFrom(r.ctx),
-		Policy:               r.streamPolicyJSON(),
-	}
-	if hasTTFT {
-		drainBase.FirstTokenMs = ttftMs
-	}
-	// FIX-20: the partial capture still becomes the envelope — the client
-	// DID receive a prefix, and the contract demands an explicit status with
-	// the interrupt reason. Reason mapping mirrors the termination class
-	// below: idle timeout, client cancel, upstream error otherwise. A
-	// budget-truncated capture sets truncated=true independently.
-	if r.history != nil {
-		reason := responseHistoryReasonUpstreamError
-		switch {
-		case idleAbort:
-			reason = responseHistoryReasonIdleTimeout
-		case r.ctx.Err() != nil:
-			reason = responseHistoryReasonClientCancel
-		}
-		drainBase.ProcessedResponse = r.history.finishEnvelope(responseHistoryStatusPartial, reason).marshal()
-	}
-	// NEXT-18c (§5.3 Finalize): partial usage bills under the reserve
-	// tuples (enforce mode, ADR §6/D5); the termination class tells the
-	// consumer whether the interrupt was client-driven or upstream.
-	term := budget.TerminationUpstreamErr
-	switch {
-	case idleAbort:
-		term = budget.TerminationIdleTimeout
-	case r.ctx.Err() != nil:
-		term = budget.TerminationClientCancel
-	}
-	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
-		base:        drainBase,
-		info:        r.finalInfo,
-		resp:        r.streamResp,
-		termination: term,
-	}, nil)
-	// The held [DONE] (if any) was already dropped above, before the
-	// client's error frame; a facts failure here only withholds the event.
-	if ferr != nil {
-		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
-			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
-	}
-}
-
-// finishSuccess finalizes a fully drained stream: breaker success, budget
-// accounting, and the request.completed event.
-func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsage, ttftMs int64, hasTTFT bool) {
-	r.gw.recordBreakerSuccess()
-
-	// N03-P06-T02: SSE headers were committed with the first relayed byte,
-	// but the prompt-cache outcome derives from the trailing usage chunk —
-	// deliver it as an HTTP trailer, mirroring the JSON header
-	// (finalizeChatJSON). Usage is final here; absent when none was parsed.
-	setPromptCacheTrailer(r.w, usage)
-
-	// P5.9/TP-04: Evalgate sampling for streaming. The cheap response was
-	// relayed straight to the client and the SSE tee is a bounded capture,
-	// so no full comparable cheap answer exists here. Never fabricate a
-	// judge pair from placeholder text: skip judging and record the reason.
-	if r.gw.judge != nil && r.gw.evalStore != nil && r.orgID != "" {
-		isMediumLowConf := r.classifierClass == "medium" && r.classifierConfidence < 0.7
-		if isMediumLowConf && r.gw.cfg.EvalgateSampleRate > 0 {
-			r.l.Debug("evalgate: full cheap response unavailable for streaming request, judge skipped",
-				"org_id", r.orgID, "request_id", r.reqID)
-		}
-	}
-
-	// G3: record final token usage against task/session budgets (success
-	// path), correct the TPM reservation and warm the session affinity.
-	r.gw.accountUsage(r.ctx, r.w, usageRecord{
-		orgID:         r.orgID,
-		taskID:        r.taskID,
-		sessionID:     r.sessionID,
-		affinityModel: r.finalInfo.ModelName,
-		usage:         usage,
-		costUSD:       ext.EstimatedCostUSD,
-		priceKnown:    ext.PriceKnown,
-	})
-
-	// Compute resale cost for streaming success path.
-	streamResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
-
-	successBase := eventBase{
-		EventType:           "request.completed",
-		RequestID:           r.reqID,
-		SessionID:           r.sessionID,
-		UpstreamPayload:     boundedSample(r.sentBody, upstreamCaptureLimit),
-		UpstreamResponse:    r.sseTee.String(),
-		OrgID:               r.orgID,
-		TeamID:              r.teamID,
-		APIKeyID:            eventKeyID(r.ctx),
-		SessionKeyID:        eventSessionID(r.ctx),
-		ModelRequested:      r.dec.From, // the client's original request, not the routed model
-		ModelUsed:           r.finalInfo.ModelName,
-		UpstreamURL:         r.gw.upstreamURL(r.finalInfo),
-		StatusCode:          http.StatusOK,
-		DurationMs:          eventpub.ComputeDurationMs(r.start),
-		TokensIn:            usage.PromptTokens,
-		TokensOut:           usage.CompletionTokens,
-		CacheReadTokens:     usage.CacheReadTokens,
-		CacheCreationTokens: usage.CacheCreationTokens,
-		EstimatedCostUSD:    ext.EstimatedCostUSD,
-		Endpoint:            endpointFrom(r.ctx, "chat.completions"),
-		UsageSource:         usageSourceOrNone(usage.Source),
-		CostStatus:          costStatus(false, usage.Source, ext.PriceKnown),
-		// Savings baseline: premium-pool cost when tier-routed, actual otherwise.
-		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
-		ResaleCostUSD:         streamResale,
+		ResaleCostUSD:         resale,
 		Method:                "POST",
 		TierUsed:              r.tierUsed,
 		ClassifierClass:       r.classifierClass,
@@ -1733,49 +1718,23 @@ func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsa
 		RoutingDecision:       r.gw.decisionJSON(r.dec.Source, r.dec),
 		AttemptCount:          len(r.attempts),
 		RetryCount:            r.totalRetries,
-		UsedOrgKey:            r.usedOrgKey, // W-BYOK-CORE: BYOK attribution (no secret material)
+		UsedOrgKey:            r.usedOrgKey, // attribution only; no credential material
 		OrgCredentialRef:      r.orgCredRef,
 		Labels:                labelsFrom(r.ctx),
 		Policy:                r.streamPolicyJSON(),
 	}
 	if hasTTFT {
-		successBase.FirstTokenMs = ttftMs
+		base.FirstTokenMs = ttftMs
 	}
-	// FIX-20: the processed-response envelope of what the client received.
-	// A stream that ended cleanly without the [DONE] terminator is honest
-	// about it: partial + missing_done_frame. A budget-truncated capture is
-	// upgraded to partial + capture_limit inside finishEnvelope. A
-	// terminator still in the facts-ordered hold counts as delivered: its
-	// release is this path's very next durable step (ferr handling below
-	// drops it instead, and withholds this event).
 	if r.history != nil {
 		status, reason := responseHistoryStatusComplete, ""
+		// A terminal held for accounting is still part of the delivered stream.
 		if !r.clientTerminalDelivered() && !r.doneWatch.doneHoldPending() {
 			status, reason = responseHistoryStatusPartial, responseHistoryReasonMissingDoneFram
 		}
-		successBase.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
+		base.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
 	}
-	// NEXT-18c: settle the reservation with the actual spend (§5.3
-	// Finalize) and stamp the tuples + completed termination on the event.
-	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
-		base:        successBase,
-		info:        r.finalInfo,
-		resp:        r.streamResp,
-		termination: budget.TerminationCompleted,
-	}, nil)
-	// Central binding: the held terminator is released only after the
-	// durable record committed. On failure it is dropped and replaced by
-	// the accounting error frame — deliberately NO safe-retry language:
-	// the work already ran under this invocation identity.
-	if ferr != nil {
-		r.doneWatch.failDoneHold()
-		writeSSEErrorWithCode(r.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
-			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
-		r.l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
-			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
-		return
-	}
-	r.doneWatch.releaseDoneHold()
+	return base
 }
 
 // cachedCompletion is the minimal shape of a chat.completion document stored
