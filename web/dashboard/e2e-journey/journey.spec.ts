@@ -20,9 +20,12 @@
 //                      switch produces zero protected effects (stand barrier)
 //   AC-IDOR            unauthorized deep link to another tenant is refused, no leak
 //   AC-KB              keyboard-only navigation reaches the journey view
+//   AC-PERF            deep-link and row-click render timings (documented method)
+//
+// Archived mobile fixtures (390px) — retained archived cases, NOT collected
+// by the registered desktop config (Preview 2 acceptance is desktop-only):
 //   AC-NARROW-SERVED   390px: journey stages stay visible on a served row
 //   AC-NARROW-BLOCKED  390px: blocked row states its termination
-//   AC-PERF            deep-link and row-click render timings (documented method)
 //
 // Run through the Go stand (see playwright.journey.config.ts header).
 import { expect, test, type Page } from '@playwright/test'
@@ -564,8 +567,12 @@ test('AC-KB keyboard-only navigation reaches the journey view (Tab + Enter)', as
 })
 
 // ---------------------------------------------------------------------------
-// AC-NARROW-SERVED / AC-NARROW-BLOCKED — 390px viewport keeps the journey
-// readable (two individually pinned cases of the frozen registry)
+// ARCHIVED mobile (390px) narrow-viewport cases. Preview 2 UI acceptance is
+// desktop-only: these phone-class specs are retained archived fixtures and
+// are NOT collected by the registered desktop config (playwright.journey.
+// config.ts excludes them by token match on the two frozen IDs). The Go
+// verifier independently fails the gate if an archived case ever records an
+// executed verdict. Bodies kept intact for the archived record.
 // ---------------------------------------------------------------------------
 
 const NARROW = { width: 390, height: 844 }

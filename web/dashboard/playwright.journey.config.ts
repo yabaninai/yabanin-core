@@ -15,6 +15,8 @@
 // Run via (from the repo root):
 //   go test -tags integration -run TestCV02RequestJourneyBrowserAcceptance \
 //     ./services/admin/handlers/ -count=1 -timeout 15m
+//
+// The Preview 2 journey runs on a desktop viewport.
 import { defineConfig } from '@playwright/test'
 
 const baseURL = process.env.CV02_BASE_URL
@@ -34,6 +36,8 @@ export default defineConfig({
   fullyParallel: false,
   workers: 1,
   retries: 0,
+  // Playwright prefixes each top-level spec title with its file name.
+  grepInvert: /(?:^|[/\s])journey\.spec\.ts AC-NARROW-(?:SERVED|BLOCKED)(?:\s|$)/,
   reporter: [['list']],
   outputDir: artifacts,
   use: {

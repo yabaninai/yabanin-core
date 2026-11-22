@@ -326,8 +326,10 @@ _quality-browser:
 # MANDATORY acceptance command — builds/verifies the
 # dashboard artifact first (same fingerprint contract as the browser gate),
 # then runs the Go stand, which itself FAILS on a missing/stale artifact and
-# enforces the frozen journey case registry (11 cases; no skips, no missing
-# cases, no unknown IDs; receipt at <artifacts>/stand-summary.json). The
+# enforces the frozen journey case registry (9 desktop cases; no skips, no
+# missing cases, no unknown IDs; the two archived 390px mobile cases are
+# excluded by the registered desktop config and must never execute here;
+# receipt at <artifacts>/stand-summary.json). The
 # mandatory command alone (e.g. from CI or another harness):
 #   go test -tags integration -run TestCV02RequestJourneyBrowserAcceptance \
 #     ./services/admin/handlers/ -count=1 -timeout 15m
