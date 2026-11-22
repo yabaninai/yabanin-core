@@ -435,6 +435,83 @@ func (s *f02LastUsedStore) Exec(_ context.Context, sql string, args ...any) (pgc
 	return pgconn.NewCommandTag("UPDATE 1"), nil
 }
 
+// --- response oracles -----------------------------------------------------------
+// Named response helpers keep each frozen case a linear scenario. Every
+// assertion below is the same check the inline bodies made, with only the
+// case label parameterized.
+
+// f02expectJWTError asserts err is the typed *jwtAuthError with exactly the
+// expected HTTP status and machine reason.
+func f02expectJWTError(t *testing.T, label string, err error, wantStatus int, wantReason string) {
+	t.Helper()
+	ae, ok := err.(*jwtAuthError)
+	if !ok || ae.status != wantStatus || ae.reason != wantReason {
+		t.Fatalf("%s: want %d/%s, got %+v (%v)", label, wantStatus, wantReason, ae, err)
+	}
+}
+
+// f02expectStatus asserts one recorded HTTP response: exact status plus the
+// required body substrings.
+func f02expectStatus(t *testing.T, label string, rec *httptest.ResponseRecorder, want int, contains ...string) {
+	t.Helper()
+	if rec.Code != want {
+		t.Fatalf("%s: status %d body %s", label, rec.Code, rec.Body.String())
+	}
+	for _, sub := range contains {
+		if !strings.Contains(rec.Body.String(), sub) {
+			t.Fatalf("%s: body missing %q: %s", label, sub, rec.Body.String())
+		}
+	}
+}
+
+// f02expectAbsentBody fails when any marker appears in the recorded body —
+// the leak oracle for partial reports.
+func f02expectAbsentBody(t *testing.T, label string, rec *httptest.ResponseRecorder, absent ...string) {
+	t.Helper()
+	for _, sub := range absent {
+		if strings.Contains(rec.Body.String(), sub) {
+			t.Fatalf("%s: body must not contain %q: %s", label, sub, rec.Body.String())
+		}
+	}
+}
+
+// f02expectLogContains / f02expectLogAbsent are the log-hygiene oracles.
+func f02expectLogContains(t *testing.T, label string, logs *bytes.Buffer, sub string) {
+	t.Helper()
+	if !strings.Contains(logs.String(), sub) {
+		t.Fatalf("%s: logs missing %q: %s", label, sub, logs.String())
+	}
+}
+
+func f02expectLogAbsent(t *testing.T, label string, logs *bytes.Buffer, sub string) {
+	t.Helper()
+	if strings.Contains(logs.String(), sub) {
+		t.Fatalf("%s: logs must not contain %q: %s", label, sub, logs.String())
+	}
+}
+
+// f02driveBearer sends tok as "Bearer <tok>" through the middleware with the
+// given next handler and returns the recorder.
+func f02driveBearer(t *testing.T, mw *AuthMiddleware, tok string, next http.Handler) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer "+tok)
+	rec := httptest.NewRecorder()
+	mw.ServeHTTP(next).ServeHTTP(rec, req)
+	return rec
+}
+
+// f02callExpect drives one session-key endpoint through the router and
+// asserts the exact status.
+func f02callExpect(t *testing.T, r chi.Router, method, path, body string, p principal, want int) *httptest.ResponseRecorder {
+	t.Helper()
+	rec := f02Call(t, r, method, path, body, p)
+	if rec.Code != want {
+		t.Fatalf("f02 %s %s: status %d body %s", method, path, rec.Code, rec.Body.String())
+	}
+	return rec
+}
+
 // --- fuzz target ------------------------------------------------------------------
 
 func FuzzFamily02AuthSessionKeys(f *testing.F) {
@@ -608,60 +685,58 @@ func f02Generated(t *testing.T, data []byte, g *f02GenJWT) {
 
 // --- frozen cases -------------------------------------------------------------------
 
-// F02-01 valid RS256/ES256 through the middleware; org + locked key-label
-// source reach downstream; wiring disabled → nil authenticator; metric.
-func fuzzF0201(t *testing.T) {
+// f02KeySourceCapture records the key label source observed downstream.
+type f02KeySourceCapture struct {
+	name    string
+	locked  bool
+	envTeam string
+}
+
+// f02expectKeySource asserts the single locked key source carries env=prod.
+func f02expectKeySource(t *testing.T, srcs []f02KeySourceCapture) {
 	t.Helper()
-	k := mustRSAJWK(t, "k1")
-	srv := newJWKSServer(t, k)
-	a := newTestJWTAuth(t, srv, nil)
-	mw := jwtMiddleware(a)
-
-	if NewJWTAuthenticator(JWTWiring{}, nil) != nil {
-		t.Fatal("F02-01: disabled wiring must yield a nil authenticator")
+	if len(srcs) != 1 || !srcs[0].locked || srcs[0].envTeam != "prod" {
+		t.Fatalf("F02-01: key label source %+v", srcs)
 	}
+}
 
-	c := baseClaims()
-	c["key_labels"] = map[string]any{"env": "prod"}
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer "+signToken(t, k, c))
-
+// f02ScenarioValidBearer drives a bearer request through the middleware and
+// verifies the org header, key label source, and validation metric delta.
+func f02ScenarioValidBearer(t *testing.T, mw *AuthMiddleware, k jwkPair, c map[string]any) {
+	t.Helper()
 	var gotOrg string
-	var srcs []struct {
-		name    string
-		locked  bool
-		envTeam string
-	}
+	var srcs []f02KeySourceCapture
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		gotOrg = r.Header.Get("X-Org-Id")
 		for _, s := range principalLabelSources(r.Context()) {
 			if s.Name == "key" {
-				srcs = append(srcs, struct {
-					name    string
-					locked  bool
-					envTeam string
-				}{s.Name, s.Locked, s.Labels["env"]})
+				srcs = append(srcs, f02KeySourceCapture{s.Name, s.Locked, s.Labels["env"]})
 			}
 		}
 		w.WriteHeader(http.StatusOK)
 	})
 	before := jwtValidations("ok")
-	rec := httptest.NewRecorder()
-	mw.ServeHTTP(next).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("F02-01: status %d body %s", rec.Code, rec.Body.String())
-	}
+	rec := f02driveBearer(t, mw, signToken(t, k, c), next)
+	f02expectStatus(t, "F02-01", rec, http.StatusOK)
 	if gotOrg != "org-42" {
 		t.Fatalf("F02-01: X-Org-Id %q", gotOrg)
 	}
-	if len(srcs) != 1 || !srcs[0].locked || srcs[0].envTeam != "prod" {
-		t.Fatalf("F02-01: key label source %+v", srcs)
-	}
+	f02expectKeySource(t, srcs)
 	if got := jwtValidations("ok"); got < before+1 {
 		t.Fatalf("F02-01: validations(ok) delta %v", got-before)
 	}
+}
 
-	// ES256 + key-label claim shapes through Authenticate.
+// f02LabelShape is a key_labels claim shape with the labels it must yield.
+type f02LabelShape struct {
+	claim any
+	want  []string
+}
+
+// f02ScenarioKeyLabelShapes verifies ES256 principals and every key_labels
+// claim shape maps to the expected label set through Authenticate.
+func f02ScenarioKeyLabelShapes(t *testing.T, a *JWTAuthenticator, k jwkPair) {
+	t.Helper()
 	ec := mustESJWK(t, "ec1")
 	ecSrv := newJWKSServer(t, ec)
 	ecAuth := newTestJWTAuth(t, ecSrv, nil)
@@ -669,10 +744,7 @@ func fuzzF0201(t *testing.T) {
 	if err != nil || p.OrgID != "org-42" || p.Subject != "svc-account-1" {
 		t.Fatalf("F02-01: es256 principal %+v err %v", p, err)
 	}
-	shapes := []struct {
-		claim any
-		want  []string
-	}{
+	shapes := []f02LabelShape{
 		{"prod", []string{"prod"}},
 		{[]any{"prod", "team-a"}, []string{"prod", "team-a"}},
 		{map[string]any{"env": "prod"}, []string{"env"}},
@@ -694,6 +766,25 @@ func fuzzF0201(t *testing.T) {
 			t.Fatalf("F02-01: shape %v: labels %v", tc.claim, p.KeyLabels)
 		}
 	}
+}
+
+// F02-01 valid RS256/ES256 through the middleware; org + locked key-label
+// source reach downstream; wiring disabled → nil authenticator; metric.
+func fuzzF0201(t *testing.T) {
+	t.Helper()
+	k := mustRSAJWK(t, "k1")
+	srv := newJWKSServer(t, k)
+	a := newTestJWTAuth(t, srv, nil)
+	mw := jwtMiddleware(a)
+
+	if NewJWTAuthenticator(JWTWiring{}, nil) != nil {
+		t.Fatal("F02-01: disabled wiring must yield a nil authenticator")
+	}
+
+	c := baseClaims()
+	c["key_labels"] = map[string]any{"env": "prod"}
+	f02ScenarioValidBearer(t, mw, k, c)
+	f02ScenarioKeyLabelShapes(t, a, k)
 
 	// Constructor defaults: a wiring with only the JWKS URL enables the
 	// path, defaults the org claim to org_id, and enforces no iss/aud.
@@ -848,6 +939,27 @@ func fuzzF0204(t *testing.T) {
 	}
 }
 
+// f02ScenarioTenantMiddleware verifies own-org tokens flow the X-Org-Id
+// header downstream while cross-org tokens are rejected on the JWT path
+// (never the legacy "invalid API key" body).
+func f02ScenarioTenantMiddleware(t *testing.T, own, foreign *JWTAuthenticator, tok string) {
+	t.Helper()
+	var gotOrg string
+	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotOrg = r.Header.Get("X-Org-Id")
+	})
+	rec := f02driveBearer(t, jwtMiddleware(own), tok, next)
+	if rec.Code != http.StatusOK || gotOrg != "org-a" {
+		t.Fatalf("F02-05: middleware own-org %d org %q", rec.Code, gotOrg)
+	}
+	rec2 := f02driveBearer(t, jwtMiddleware(foreign), tok, http.HandlerFunc(http.NotFound))
+	if rec2.Code != http.StatusUnauthorized ||
+		!strings.Contains(rec2.Body.String(), "invalid bearer token") ||
+		strings.Contains(rec2.Body.String(), "invalid API key") {
+		t.Fatalf("F02-05: middleware cross-org %d %s", rec2.Code, rec2.Body.String())
+	}
+}
+
 // F02-05 tenant isolation: same kid + subject, distinct material and policy.
 func fuzzF0205(t *testing.T) {
 	t.Helper()
@@ -879,10 +991,7 @@ func fuzzF0205(t *testing.T) {
 	// Cross-org: same kid + sub, other org's material → signature failure,
 	// and the victim JWKS is consulted exactly once.
 	_, err = authB.Authenticate(context.Background(), tokA)
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "signature" {
-		t.Fatalf("F02-05: cross-org want 401/signature, got %+v (%v)", ae, err)
-	}
+	f02expectJWTError(t, "F02-05: cross-org", err, http.StatusUnauthorized, "signature")
 	if got := srvB.fetchCount(); got != 1 {
 		t.Fatalf("F02-05: victim JWKS fetches = %d, want 1", got)
 	}
@@ -894,33 +1003,11 @@ func fuzzF0205(t *testing.T) {
 		w.Audience = "aud-a"
 	})
 	_, err = authA2.Authenticate(context.Background(), tokA)
-	ae, ok = err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "issuer" {
-		t.Fatalf("F02-05: foreign issuer want 401/issuer, got %+v (%v)", ae, err)
-	}
+	f02expectJWTError(t, "F02-05: foreign issuer", err, http.StatusUnauthorized, "issuer")
 
 	// Middleware: own org flows as X-Org-Id; cross-org token is rejected on
 	// the JWT path (not the legacy body).
-	var gotOrg string
-	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		gotOrg = r.Header.Get("X-Org-Id")
-	})
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer "+tokA)
-	rec := httptest.NewRecorder()
-	jwtMiddleware(authA).ServeHTTP(next).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK || gotOrg != "org-a" {
-		t.Fatalf("F02-05: middleware own-org %d org %q", rec.Code, gotOrg)
-	}
-	req2 := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req2.Header.Set("Authorization", "Bearer "+tokA)
-	rec2 := httptest.NewRecorder()
-	jwtMiddleware(authB).ServeHTTP(http.HandlerFunc(http.NotFound)).ServeHTTP(rec2, req2)
-	if rec2.Code != http.StatusUnauthorized ||
-		!strings.Contains(rec2.Body.String(), "invalid bearer token") ||
-		strings.Contains(rec2.Body.String(), "invalid API key") {
-		t.Fatalf("F02-05: middleware cross-org %d %s", rec2.Code, rec2.Body.String())
-	}
+	f02ScenarioTenantMiddleware(t, authA, authB, tokA)
 }
 
 // F02-06 cold concurrent burst: 24 goroutines, exactly one fetch, all
@@ -964,6 +1051,112 @@ func fuzzF0206(t *testing.T) {
 	}
 }
 
+// f02ScenarioJWKSDownMiddleware checks the empty-cache + dead-endpoint path:
+// the middleware renders 503 with the JSON authentication envelope and the
+// next handler is never reached.
+func f02ScenarioJWKSDownMiddleware(t *testing.T, k jwkPair) {
+	t.Helper()
+	deadSrv := newJWKSServer(t)
+	deadSrv.srv.Close()
+	a2 := newTestJWTAuth(t, deadSrv, nil)
+	rec := f02driveBearer(t, jwtMiddleware(a2), signToken(t, k, baseClaims()),
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+	if rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("F02-07: middleware empty cache: %d %s", rec.Code, rec.Body.String())
+	}
+	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
+		t.Fatalf("F02-07: Content-Type %q", ct)
+	}
+	if !strings.Contains(rec.Body.String(), "temporarily unavailable") ||
+		!strings.Contains(rec.Body.String(), apierrors.ErrorCodeAuthentication) {
+		t.Fatalf("F02-07: 503 body %s", rec.Body.String())
+	}
+}
+
+// f02truncateJWKSResponse serves a truncated HTTP stream by hijacking the
+// connection; it reports whether the hijack path applied.
+func f02truncateJWKSResponse(w http.ResponseWriter) bool {
+	hj, ok := w.(http.Hijacker)
+	if !ok {
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+	conn, _, cerr := hj.Hijack()
+	if cerr != nil {
+		w.WriteHeader(http.StatusInternalServerError)
+		return false
+	}
+	_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort"))
+	_ = conn.Close()
+	return true
+}
+
+// f02ScenarioBadJWKSBodies cycles the malformed JWKS modes (500, garbage
+// JSON, oversize >1MiB, empty key set, truncated stream) and requires each
+// to fail closed with 503/jwks_unavailable on an empty cache.
+func f02ScenarioBadJWKSBodies(t *testing.T, k jwkPair) {
+	t.Helper()
+	modes := 0
+	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		switch modes {
+		case 0:
+			w.WriteHeader(http.StatusInternalServerError)
+		case 1:
+			_, _ = w.Write([]byte("<html>not json</html>"))
+		case 2:
+			_, _ = w.Write(bytes.Repeat([]byte("x"), (1<<20)+2))
+		case 3:
+			_, _ = w.Write([]byte(`{"keys":[]}`))
+		case 4:
+			if !f02truncateJWKSResponse(w) {
+				return
+			}
+		}
+	}))
+	defer badSrv.Close()
+	for m := 0; m < 5; m++ {
+		modes = m
+		ba := NewJWTAuthenticator(JWTWiring{
+			JWKSURL: badSrv.URL, Issuer: "https://idp.example", Audience: "yabanin-gateway",
+			OrgClaim: "org_id", KeyLabelClaim: "key_labels",
+		}, nil)
+		_, err := ba.Authenticate(context.Background(), signToken(t, k, baseClaims()))
+		f02expectJWTError(t, fmt.Sprintf("F02-07: bad JWKS mode %d", m), err,
+			http.StatusServiceUnavailable, "jwks_unavailable")
+	}
+	modes = 0
+}
+
+// f02ScenarioStaleServingRefresh warms the cache, ages it past refreshDue,
+// and requires the request path to keep serving stale keys while exactly
+// one background refresh stores a fresher set.
+func f02ScenarioStaleServingRefresh(t *testing.T, a *JWTAuthenticator, tok string) {
+	t.Helper()
+	if _, err := a.Authenticate(context.Background(), tok); err != nil {
+		t.Fatalf("F02-07: warm2: %v", err)
+	}
+	a.cache.mu.Lock()
+	beforeFetch := a.cache.fetchedAt
+	a.cache.refreshDue = a.cache.now().Add(-time.Minute)
+	a.cache.mu.Unlock()
+	if _, err := a.Authenticate(context.Background(), tok); err != nil {
+		t.Fatalf("F02-07: stale-serving: %v", err)
+	}
+	refreshed := false
+	deadline := time.Now().Add(3 * time.Second)
+	for !refreshed && time.Now().Before(deadline) {
+		a.cache.mu.RLock()
+		refreshed = a.cache.fetchedAt.After(beforeFetch)
+		a.cache.mu.RUnlock()
+		if !refreshed {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if !refreshed {
+		t.Fatal("F02-07: background refresh never stored a fresh set")
+	}
+}
+
 // F02-07 JWKS-down fail-closed matrix.
 func fuzzF0207(t *testing.T) {
 	t.Helper()
@@ -980,92 +1173,28 @@ func fuzzF0207(t *testing.T) {
 	// Unknown kid with a warm live cache → 401 (cache is the truth).
 	unknown := mustRSAJWK(t, "never-seen")
 	_, err := a.Authenticate(context.Background(), signToken(t, unknown, baseClaims()))
-	ae, ok := err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusUnauthorized || ae.reason != "unknown_kid" {
-		t.Fatalf("F02-07: want 401/unknown_kid, got %+v (%v)", ae, err)
-	}
+	f02expectJWTError(t, "F02-07", err, http.StatusUnauthorized, "unknown_kid")
 
 	// Past max-stale → fail closed 503.
 	a.cache.mu.Lock()
 	a.cache.fetchedAt = a.cache.now().Add(-a.cache.maxStale - time.Minute)
 	a.cache.mu.Unlock()
 	_, err = a.Authenticate(context.Background(), tok)
-	ae, ok = err.(*jwtAuthError)
-	if !ok || ae.status != http.StatusServiceUnavailable || ae.reason != "jwks_unavailable" {
-		t.Fatalf("F02-07: want 503/jwks_unavailable, got %+v (%v)", ae, err)
-	}
+	f02expectJWTError(t, "F02-07", err, http.StatusServiceUnavailable, "jwks_unavailable")
 
 	// Empty cache + dead endpoint → 503; the middleware renders the status
 	// and the JSON envelope (status + header oracles).
-	deadSrv := newJWKSServer(t)
-	deadSrv.srv.Close()
-	a2 := newTestJWTAuth(t, deadSrv, nil)
-	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer "+signToken(t, k, baseClaims()))
-	rec := httptest.NewRecorder()
-	jwtMiddleware(a2).ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(rec, req)
-	if rec.Code != http.StatusServiceUnavailable {
-		t.Fatalf("F02-07: middleware empty cache: %d %s", rec.Code, rec.Body.String())
-	}
-	if ct := rec.Header().Get("Content-Type"); !strings.Contains(ct, "application/json") {
-		t.Fatalf("F02-07: Content-Type %q", ct)
-	}
-	if !strings.Contains(rec.Body.String(), "temporarily unavailable") ||
-		!strings.Contains(rec.Body.String(), apierrors.ErrorCodeAuthentication) {
-		t.Fatalf("F02-07: 503 body %s", rec.Body.String())
-	}
+	f02ScenarioJWKSDownMiddleware(t, k)
 
 	// Invalid JWKS URL: fetch cannot even build the request → fail closed.
 	badURL := NewJWTAuthenticator(JWTWiring{JWKSURL: "http://[::1]:namedport"}, nil)
 	_, err = badURL.Authenticate(context.Background(), signToken(t, k, baseClaims()))
-	buAe, buOK := err.(*jwtAuthError)
-	if !buOK || buAe.status != http.StatusServiceUnavailable || buAe.reason != "jwks_unavailable" {
-		t.Fatalf("F02-07: bad URL: want 503/jwks_unavailable, got %+v (%v)", buAe, err)
-	}
+	f02expectJWTError(t, "F02-07: bad URL", err, http.StatusServiceUnavailable, "jwks_unavailable")
 
 	// Malformed JWKS bodies: non-200, garbage JSON, oversize (>1MiB),
 	// empty key set, and a truncated stream all fail closed on an empty
 	// cache.
-	modes := 0
-	badSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		switch modes {
-		case 0:
-			w.WriteHeader(http.StatusInternalServerError)
-		case 1:
-			_, _ = w.Write([]byte("<html>not json</html>"))
-		case 2:
-			_, _ = w.Write(bytes.Repeat([]byte("x"), (1<<20)+2))
-		case 3:
-			_, _ = w.Write([]byte(`{"keys":[]}`))
-		case 4:
-			hj, ok := w.(http.Hijacker)
-			if !ok {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			conn, _, cerr := hj.Hijack()
-			if cerr != nil {
-				w.WriteHeader(http.StatusInternalServerError)
-				return
-			}
-			_, _ = conn.Write([]byte("HTTP/1.1 200 OK\r\nContent-Length: 100\r\n\r\nshort"))
-			_ = conn.Close()
-		}
-	}))
-	defer badSrv.Close()
-	for m := 0; m < 5; m++ {
-		modes = m
-		ba := NewJWTAuthenticator(JWTWiring{
-			JWKSURL: badSrv.URL, Issuer: "https://idp.example", Audience: "yabanin-gateway",
-			OrgClaim: "org_id", KeyLabelClaim: "key_labels",
-		}, nil)
-		_, err := ba.Authenticate(context.Background(), signToken(t, k, baseClaims()))
-		ae, ok := err.(*jwtAuthError)
-		if !ok || ae.status != http.StatusServiceUnavailable || ae.reason != "jwks_unavailable" {
-			t.Fatalf("F02-07: bad JWKS mode %d: want 503/jwks_unavailable, got %+v (%v)", m, ae, err)
-		}
-	}
-	modes = 0
+	f02ScenarioBadJWKSBodies(t, k)
 
 	// refreshSync: success stores a fresh set; a dead endpoint errors.
 	live := newJWKSServer(t, k)
@@ -1081,29 +1210,7 @@ func fuzzF0207(t *testing.T) {
 	// Aged-but-live cache schedules ONE background refresh; the request
 	// path keeps serving stale keys while it runs.
 	la2 := newTestJWTAuth(t, newJWKSServer(t, k), nil)
-	if _, err := la2.Authenticate(context.Background(), tok); err != nil {
-		t.Fatalf("F02-07: warm2: %v", err)
-	}
-	la2.cache.mu.Lock()
-	beforeFetch := la2.cache.fetchedAt
-	la2.cache.refreshDue = la2.cache.now().Add(-time.Minute)
-	la2.cache.mu.Unlock()
-	if _, err := la2.Authenticate(context.Background(), tok); err != nil {
-		t.Fatalf("F02-07: stale-serving: %v", err)
-	}
-	refreshed := false
-	deadline := time.Now().Add(3 * time.Second)
-	for !refreshed && time.Now().Before(deadline) {
-		la2.cache.mu.RLock()
-		refreshed = la2.cache.fetchedAt.After(beforeFetch)
-		la2.cache.mu.RUnlock()
-		if !refreshed {
-			time.Sleep(10 * time.Millisecond)
-		}
-	}
-	if !refreshed {
-		t.Fatal("F02-07: background refresh never stored a fresh set")
-	}
+	f02ScenarioStaleServingRefresh(t, la2, tok)
 }
 
 // F02-08 JWKS keys without explicit alg: the type switch admits RSA for
@@ -1156,45 +1263,47 @@ func fuzzF0208(t *testing.T) {
 	}
 }
 
-// F02-09 mint happy path: status, body, INSERT args, rate counter, log hygiene.
-func fuzzF0209(t *testing.T) {
+// f02MintBody is the decoded mintSessionKey response envelope.
+type f02MintBody struct {
+	ID        string `json:"id"`
+	Key       string `json:"key"`
+	ExpiresAt string `json:"expires_at"`
+}
+
+// f02ScenarioMintResponse drives one mint call, asserts the 201 envelope
+// (id, ybs_ key prefix, dropped/reserved markers, default TTL window) and
+// returns the decoded body plus the post-mint timestamp.
+func f02ScenarioMintResponse(t *testing.T, gw *gateway, p principal, body string, before time.Time) (f02MintBody, time.Time) {
 	t.Helper()
-	db := f02DB()
-	kv := &memSessionKV{}
-	var logs bytes.Buffer
-	gw := f02SessionGW(db, kv, &logs)
-
-	before := time.Now().UTC()
 	rec := httptest.NewRecorder()
-	gw.mintSessionKey(rec, mintReq(t, principal{APIKeyID: "parent-1", CanMintSessions: true},
-		`{"labels":{"yabanin.secret":"1","team":"other","project":"preview"}}`))
-	if rec.Code != http.StatusCreated {
-		t.Fatalf("F02-09: %d %s", rec.Code, rec.Body.String())
-	}
+	gw.mintSessionKey(rec, mintReq(t, p, body))
 	after := time.Now().UTC()
-
-	body := struct {
-		ID        string `json:"id"`
-		Key       string `json:"key"`
-		ExpiresAt string `json:"expires_at"`
-	}{}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+	f02expectStatus(t, "F02-09", rec, http.StatusCreated)
+	var out f02MintBody
+	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatalf("F02-09: body %s: %v", rec.Body.String(), err)
 	}
-	if body.ID != "sess-new" || !strings.HasPrefix(body.Key, "ybs_") {
-		t.Fatalf("F02-09: id/key %q/%q", body.ID, body.Key)
+	if out.ID != "sess-new" || !strings.HasPrefix(out.Key, "ybs_") {
+		t.Fatalf("F02-09: id/key %q/%q", out.ID, out.Key)
 	}
 	if !strings.Contains(rec.Body.String(), "dropped") || !strings.Contains(rec.Body.String(), "reserved") {
 		t.Fatalf("F02-09: dropped-reserved oracle missing: %s", rec.Body.String())
 	}
-	expires, err := time.Parse(time.RFC3339, body.ExpiresAt)
+	expires, err := time.Parse(time.RFC3339, out.ExpiresAt)
 	if err != nil {
-		t.Fatalf("F02-09: expires %q: %v", body.ExpiresAt, err)
+		t.Fatalf("F02-09: expires %q: %v", out.ExpiresAt, err)
 	}
 	if expires.Sub(before) < 7140*time.Second || expires.Sub(after) > 7260*time.Second {
-		t.Fatalf("F02-09: expires %s outside default TTL window", body.ExpiresAt)
+		t.Fatalf("F02-09: expires %s outside default TTL window", out.ExpiresAt)
 	}
+	return out, after
+}
 
+// f02ScenarioMintInsertTenant asserts the recorded INSERT carries the
+// minting tenant (own org, parent key, no user, not revoked) and stores
+// exactly the label policy allow-list.
+func f02ScenarioMintInsertTenant(t *testing.T, db *f02RecordingDB) {
+	t.Helper()
 	ins := db.f02Find("row", "INSERT INTO session_keys")
 	if len(ins) != 1 {
 		t.Fatalf("F02-09: INSERT statements %d", len(ins))
@@ -1207,14 +1316,27 @@ func fuzzF0209(t *testing.T) {
 	if string(raw) != `{"project":"preview"}` {
 		t.Fatalf("F02-09: unexpected stored session labels %s", raw)
 	}
+}
+
+// f02ScenarioMintInsertExpiry asserts the INSERT expiry argument lands in
+// the default TTL window and the hash argument differs from the plaintext
+// key.
+func f02ScenarioMintInsertExpiry(t *testing.T, db *f02RecordingDB, key string, before, after time.Time) {
+	t.Helper()
+	ins := db.f02Find("row", "INSERT INTO session_keys")
+	args := ins[0].args
 	if expArg, ok := args[8].(time.Time); !ok || expArg.Sub(before) < 7140*time.Second || expArg.Sub(after) > 7260*time.Second {
 		t.Fatalf("F02-09: INSERT expires arg %+v", args[8])
 	}
-	if hash, ok := args[0].(string); !ok || hash == "" || hash == body.Key {
+	if hash, ok := args[0].(string); !ok || hash == "" || hash == key {
 		t.Fatalf("F02-09: INSERT hash arg %+v", args[0])
 	}
+}
 
-	// Rate limiter consumed exactly one slot for the current minute.
+// f02ScenarioMintRateCounter asserts the rate limiter consumed exactly one
+// slot for the current minute.
+func f02ScenarioMintRateCounter(t *testing.T, kv *memSessionKV) {
+	t.Helper()
 	kv.mu.Lock()
 	found := false
 	for k, n := range kv.n {
@@ -1230,11 +1352,25 @@ func fuzzF0209(t *testing.T) {
 	if !found {
 		t.Fatal("F02-09: no rate counter recorded")
 	}
+}
+
+// F02-09 mint happy path: status, body, INSERT args, rate counter, log hygiene.
+func fuzzF0209(t *testing.T) {
+	t.Helper()
+	db := f02DB()
+	kv := &memSessionKV{}
+	var logs bytes.Buffer
+	gw := f02SessionGW(db, kv, &logs)
+
+	before := time.Now().UTC()
+	body, after := f02ScenarioMintResponse(t, gw, principal{APIKeyID: "parent-1", CanMintSessions: true},
+		`{"labels":{"yabanin.secret":"1","team":"other","project":"preview"}}`, before)
+	f02ScenarioMintInsertTenant(t, db)
+	f02ScenarioMintInsertExpiry(t, db, body.Key, before, after)
+	f02ScenarioMintRateCounter(t, kv)
 
 	// The secret must never reach the logs.
-	if strings.Contains(logs.String(), "ybs_") {
-		t.Fatal("F02-09: session secret leaked into logs")
-	}
+	f02expectLogAbsent(t, "F02-09", &logs, "ybs_")
 }
 
 // F02-10 mint denials and validation failures (fail closed).
@@ -1294,30 +1430,12 @@ func fuzzF0210(t *testing.T) {
 	}
 }
 
-// F02-11 revoke: UPDATE + purge oracles, idempotence, visibility, exec failure.
-func fuzzF0211(t *testing.T) {
+// f02ScenarioRevokeOnce drives the own revoke: 204, exactly one guarded
+// UPDATE (revoked_at = now(), AND revoked_at IS NULL, one id arg), and one
+// resolver cache purge keyed by the row hash.
+func f02ScenarioRevokeOnce(t *testing.T, r chi.Router, db *f02RecordingDB, kv *memSessionKV) {
 	t.Helper()
-	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
-	kv := &memSessionKV{}
-	gw := f02SessionGW(db, kv, nil)
-	r := f02Router(gw)
-
-	// Foreign and unknown ids never reach the UPDATE.
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-11: foreign: %d", rec.Code)
-	}
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-x", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-11: unknown: %d", rec.Code)
-	}
-	if got := len(db.f02Find("exec", "SET revoked_at")); got != 0 {
-		t.Fatalf("F02-11: premature UPDATEs %d", got)
-	}
-
-	// Own revoke → 204, one UPDATE, one cache purge.
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNoContent {
-		t.Fatalf("F02-11: own: %d %s", rec.Code, rec.Body.String())
-	}
+	f02callExpect(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}, http.StatusNoContent)
 	ups := db.f02Find("exec", "SET revoked_at = now()")
 	if len(ups) != 1 || !strings.Contains(ups[0].sql, "AND revoked_at IS NULL") || len(ups[0].args) != 1 || ups[0].args[0] != "sess-1" {
 		t.Fatalf("F02-11: UPDATE oracle %+v", ups)
@@ -1328,12 +1446,13 @@ func fuzzF0211(t *testing.T) {
 	if len(dels) != 1 || dels[0] != "org:resolve:hash-1" {
 		t.Fatalf("F02-11: purge dels %v", dels)
 	}
+}
 
-	// Idempotent second revoke: 204, NO second UPDATE, NO second purge
-	// (no stale resolver cache churn).
-	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNoContent {
-		t.Fatalf("F02-11: idempotent: %d", rec.Code)
-	}
+// f02ScenarioRevokeIdempotent asserts the second revoke returns 204 without
+// another UPDATE or purge.
+func f02ScenarioRevokeIdempotent(t *testing.T, r chi.Router, db *f02RecordingDB, kv *memSessionKV) {
+	t.Helper()
+	f02callExpect(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "parent-1"}, http.StatusNoContent)
 	if got := len(db.f02Find("exec", "SET revoked_at")); got != 1 {
 		t.Fatalf("F02-11: second revoke issued %d UPDATEs", got)
 	}
@@ -1343,6 +1462,30 @@ func fuzzF0211(t *testing.T) {
 	if n != 1 {
 		t.Fatalf("F02-11: second purge recorded, dels = %d", n)
 	}
+}
+
+// F02-11 revoke: UPDATE + purge oracles, idempotence, visibility, exec failure.
+func fuzzF0211(t *testing.T) {
+	t.Helper()
+	db := f02DB()
+	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	kv := &memSessionKV{}
+	gw := f02SessionGW(db, kv, nil)
+	r := f02Router(gw)
+
+	// Foreign and unknown ids never reach the UPDATE.
+	f02callExpect(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "attacker"}, http.StatusNotFound)
+	f02callExpect(t, r, http.MethodDelete, "/session-keys/sess-x", "", principal{APIKeyID: "parent-1"}, http.StatusNotFound)
+	if got := len(db.f02Find("exec", "SET revoked_at")); got != 0 {
+		t.Fatalf("F02-11: premature UPDATEs %d", got)
+	}
+
+	// Own revoke → 204, one UPDATE, one cache purge.
+	f02ScenarioRevokeOnce(t, r, db, kv)
+
+	// Idempotent second revoke: 204, NO second UPDATE, NO second purge
+	// (no stale resolver cache churn).
+	f02ScenarioRevokeIdempotent(t, r, db, kv)
 
 	// Exec failure → 500.
 	db2 := f02DB()
@@ -1350,9 +1493,7 @@ func fuzzF0211(t *testing.T) {
 	db2.failNext = "SET revoked_at"
 	gw2 := f02SessionGW(db2, &memSessionKV{}, nil)
 	rec := f02Call(t, f02Router(gw2), http.MethodDelete, "/session-keys/sess-2", "", principal{APIKeyID: "parent-1"})
-	if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "session_revoke_failed") {
-		t.Fatalf("F02-11: exec failure: %d %s", rec.Code, rec.Body.String())
-	}
+	f02expectStatus(t, "F02-11: exec failure", rec, http.StatusInternalServerError, "session_revoke_failed")
 
 	// KV purge failure is soft: revoke still succeeds and warns.
 	db3 := f02DB()
@@ -1360,11 +1501,30 @@ func fuzzF0211(t *testing.T) {
 	var logs3 bytes.Buffer
 	gw3 := f02SessionGW(db3, &f02FailingKV{memSessionKV: &memSessionKV{}, failDel: true}, &logs3)
 	rec3 := f02Call(t, f02Router(gw3), http.MethodDelete, "/session-keys/sess-3", "", principal{APIKeyID: "parent-1"})
-	if rec3.Code != http.StatusNoContent {
-		t.Fatalf("F02-11: kv-down revoke: %d %s", rec3.Code, rec3.Body.String())
+	f02expectStatus(t, "F02-11: kv-down revoke", rec3, http.StatusNoContent)
+	f02expectLogContains(t, "F02-11", &logs3, "session resolver cache purge failed")
+}
+
+// f02ScenarioFinishOracle drives the own finish and asserts the single
+// guarded UPDATE (status + exit code + duration, finished_at IS NULL guard,
+// session id first arg) plus the idempotent second finish without another
+// UPDATE.
+func f02ScenarioFinishOracle(t *testing.T, r chi.Router, db *f02RecordingDB, self principal) {
+	t.Helper()
+	f02callExpect(t, r, http.MethodPost, "/session-keys/sess-2/finish",
+		`{"status":"success","exit_code":0,"duration_ms":5}`, self, http.StatusNoContent)
+	ups := db.f02Find("exec", "finished_at IS NULL")
+	if len(ups) != 1 ||
+		!strings.Contains(ups[0].sql, "finished_at = now()") ||
+		!strings.Contains(ups[0].sql, "revoked_at = COALESCE(revoked_at, now())") ||
+		len(ups[0].args) != 4 || ups[0].args[0] != "sess-2" || ups[0].args[1] != "success" {
+		t.Fatalf("F02-12: UPDATE oracle %+v", ups)
 	}
-	if !strings.Contains(logs3.String(), "session resolver cache purge failed") {
-		t.Fatalf("F02-11: purge failure warning missing: %s", logs3.String())
+
+	// Second finish: 204 without another UPDATE.
+	f02callExpect(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"status":"failed"}`, self, http.StatusNoContent)
+	if got := len(db.f02Find("exec", "finished_at IS NULL")); got != 1 {
+		t.Fatalf("F02-12: second finish issued %d UPDATEs", got)
 	}
 }
 
@@ -1377,53 +1537,47 @@ func fuzzF0212(t *testing.T) {
 	r := f02Router(gw)
 	self := principal{SessionKeyID: "sess-2"}
 
-	if rec := f02Call(t, r, http.MethodPost, "/session-keys/sess-2/finish", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-12: foreign: %d", rec.Code)
-	}
-	if rec := f02Call(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"status":"bogus"}`, self); rec.Code != http.StatusBadRequest {
-		t.Fatalf("F02-12: invalid status: %d", rec.Code)
-	}
-	if rec := f02Call(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"bogus":1}`, self); rec.Code != http.StatusBadRequest {
-		t.Fatalf("F02-12: unknown field: %d", rec.Code)
-	}
+	f02callExpect(t, r, http.MethodPost, "/session-keys/sess-2/finish", "", principal{APIKeyID: "attacker"}, http.StatusNotFound)
+	f02callExpect(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"status":"bogus"}`, self, http.StatusBadRequest)
+	f02callExpect(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"bogus":1}`, self, http.StatusBadRequest)
 	if got := len(db.f02Find("exec", "finished_at IS NULL")); got != 0 {
 		t.Fatalf("F02-12: premature UPDATEs %d", got)
 	}
 
-	if rec := f02Call(t, r, http.MethodPost, "/session-keys/sess-2/finish",
-		`{"status":"success","exit_code":0,"duration_ms":5}`, self); rec.Code != http.StatusNoContent {
-		t.Fatalf("F02-12: own: %d %s", rec.Code, rec.Body.String())
-	}
-	ups := db.f02Find("exec", "finished_at IS NULL")
-	if len(ups) != 1 ||
-		!strings.Contains(ups[0].sql, "finished_at = now()") ||
-		!strings.Contains(ups[0].sql, "revoked_at = COALESCE(revoked_at, now())") ||
-		len(ups[0].args) != 4 || ups[0].args[0] != "sess-2" || ups[0].args[1] != "success" {
-		t.Fatalf("F02-12: UPDATE oracle %+v", ups)
-	}
-
-	// Second finish: 204 without another UPDATE.
-	if rec := f02Call(t, r, http.MethodPost, "/session-keys/sess-2/finish", `{"status":"failed"}`, self); rec.Code != http.StatusNoContent {
-		t.Fatalf("F02-12: idempotent: %d", rec.Code)
-	}
-	if got := len(db.f02Find("exec", "finished_at IS NULL")); got != 1 {
-		t.Fatalf("F02-12: second finish issued %d UPDATEs", got)
-	}
+	f02ScenarioFinishOracle(t, r, db, self)
 
 	// Oversized finish body → 400 at the read gate (unfinished session).
 	db3 := f02DB()
 	db3.scriptDB.loads["sess-3"] = sessionRow{id: "sess-3", parentID: "parent-1", keyHash: "hash-3", orgID: "org-1"}
 	r3 := f02Router(f02SessionGW(db3, &memSessionKV{}, nil))
 	self3 := principal{SessionKeyID: "sess-3"}
-	if rec := f02Call(t, r3, http.MethodPost, "/session-keys/sess-3/finish", strings.Repeat("x", 17*1024), self3); rec.Code != http.StatusBadRequest {
-		t.Fatalf("F02-12: oversized body: %d", rec.Code)
-	}
+	f02callExpect(t, r3, http.MethodPost, "/session-keys/sess-3/finish", strings.Repeat("x", 17*1024), self3, http.StatusBadRequest)
 
 	// UPDATE failure → 500 with the stable code.
 	db3.failNext = "finished_at IS NULL"
-	if rec := f02Call(t, r3, http.MethodPost, "/session-keys/sess-3/finish", `{"status":"success"}`, self3); rec.Code != http.StatusInternalServerError ||
-		!strings.Contains(rec.Body.String(), "session_finish_failed") {
-		t.Fatalf("F02-12: exec failure: %d %s", rec.Code, rec.Body.String())
+	rec := f02Call(t, r3, http.MethodPost, "/session-keys/sess-3/finish", `{"status":"success"}`, self3)
+	f02expectStatus(t, "F02-12: exec failure", rec, http.StatusInternalServerError, "session_finish_failed")
+}
+
+// f02usageGET drives one session-key usage GET through the router.
+func f02usageGET(t *testing.T, gw *gateway, id, apiKeyID string) *httptest.ResponseRecorder {
+	t.Helper()
+	return f02Call(t, f02Router(gw), http.MethodGet, "/session-keys/"+id+"/usage", "", principal{APIKeyID: apiKeyID})
+}
+
+// f02ScenarioUsageOwnOracle drives the own-tenant usage report and asserts
+// the body markers plus the own-tenant SQL oracle (org + session scoped,
+// never api_key-scoped).
+func f02ScenarioUsageOwnOracle(t *testing.T, gw *gateway, db *f02RecordingDB) {
+	t.Helper()
+	rec := f02usageGET(t, gw, "sess-1", "parent-1")
+	f02expectStatus(t, "F02-13: own", rec, http.StatusOK, `"requests":2`, `"model":"gpt-x"`, `"complete":false`)
+	rows := db.f02Find("row", "session_key_id = $2")
+	if len(rows) != 1 ||
+		!strings.Contains(rows[0].sql, "org_id = $1 AND session_key_id = $2") ||
+		strings.Contains(rows[0].sql, "api_key_id") ||
+		len(rows[0].args) != 2 || rows[0].args[0] != "org-1" || rows[0].args[1] != "sess-1" {
+		t.Fatalf("F02-13: own-tenant SQL oracle %+v", rows)
 	}
 }
 
@@ -1434,51 +1588,27 @@ func fuzzF0213(t *testing.T) {
 	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db.modelRows = [][]any{{"gpt-x", int64(3), int64(30), int64(20), 0.25}}
 	gw := f02SessionGW(db, &memSessionKV{}, nil)
-	r := f02Router(gw)
 
-	if rec := f02Call(t, r, http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-13: foreign: %d", rec.Code)
-	}
-	if rec := f02Call(t, r, http.MethodGet, "/session-keys/sess-x/usage", "", principal{APIKeyID: "parent-1"}); rec.Code != http.StatusNotFound {
-		t.Fatalf("F02-13: unknown: %d", rec.Code)
-	}
-
-	rec := f02Call(t, r, http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "parent-1"})
-	if rec.Code != http.StatusOK {
-		t.Fatalf("F02-13: own: %d %s", rec.Code, rec.Body.String())
-	}
-	for _, want := range []string{`"requests":2`, `"model":"gpt-x"`, `"complete":false`} {
-		if !strings.Contains(rec.Body.String(), want) {
-			t.Fatalf("F02-13: body missing %s: %s", want, rec.Body.String())
-		}
-	}
-	rows := db.f02Find("row", "session_key_id = $2")
-	if len(rows) != 1 ||
-		!strings.Contains(rows[0].sql, "org_id = $1 AND session_key_id = $2") ||
-		strings.Contains(rows[0].sql, "api_key_id") ||
-		len(rows[0].args) != 2 || rows[0].args[0] != "org-1" || rows[0].args[1] != "sess-1" {
-		t.Fatalf("F02-13: own-tenant SQL oracle %+v", rows)
-	}
+	// Foreign and unknown sessions are 404 on the session usage surface.
+	f02callExpect(t, f02Router(gw), http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "attacker"}, http.StatusNotFound)
+	f02callExpect(t, f02Router(gw), http.MethodGet, "/session-keys/sess-x/usage", "", principal{APIKeyID: "parent-1"}, http.StatusNotFound)
+	f02ScenarioUsageOwnOracle(t, gw, db)
 
 	// Required totals read failure → 503 usage_unavailable; no totals leak.
 	db2 := f02DB()
 	db2.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db2.failNext = "count(*)"
 	gw2 := f02SessionGW(db2, &memSessionKV{}, nil)
-	rec2 := f02Call(t, f02Router(gw2), http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "parent-1"})
-	if rec2.Code != http.StatusServiceUnavailable || !strings.Contains(rec2.Body.String(), "usage_unavailable") ||
-		strings.Contains(rec2.Body.String(), `"requests"`) {
-		t.Fatalf("F02-13: failed totals: %d %s", rec2.Code, rec2.Body.String())
-	}
+	rec2 := f02usageGET(t, gw2, "sess-1", "parent-1")
+	f02expectStatus(t, "F02-13: failed totals", rec2, http.StatusServiceUnavailable, "usage_unavailable")
+	f02expectAbsentBody(t, "F02-13: failed totals", rec2, `"requests"`)
 
 	// Session lookup store failure is 503 usage_unavailable, not 404.
 	db5 := f02DB()
 	db5.failNext = "FROM session_keys"
 	gw5 := f02SessionGW(db5, &memSessionKV{}, nil)
-	rec5 := f02Call(t, f02Router(gw5), http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "parent-1"})
-	if rec5.Code != http.StatusServiceUnavailable || !strings.Contains(rec5.Body.String(), "usage_unavailable") {
-		t.Fatalf("F02-13: lookup outage: %d %s", rec5.Code, rec5.Body.String())
-	}
+	rec5 := f02usageGET(t, gw5, "sess-1", "parent-1")
+	f02expectStatus(t, "F02-13: lookup outage", rec5, http.StatusServiceUnavailable, "usage_unavailable")
 
 	// Broken by-model row delivery aborts the report → 503; neither totals
 	// nor the healthy later row may leak.
@@ -1486,46 +1616,41 @@ func fuzzF0213(t *testing.T) {
 	db3.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db3.failModelScan = 0
 	db3.modelRows = [][]any{{"broken", int64(9), int64(9), int64(9), 9.0}, {"gpt-x", int64(3), int64(30), int64(20), 0.25}}
-	rec3 := f02Call(t, f02Router(f02SessionGW(db3, &memSessionKV{}, nil)), http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "parent-1"})
-	if rec3.Code != http.StatusServiceUnavailable || !strings.Contains(rec3.Body.String(), "usage_unavailable") ||
-		strings.Contains(rec3.Body.String(), `"requests"`) || strings.Contains(rec3.Body.String(), "gpt-x") {
-		t.Fatalf("F02-13: malformed model rows: %d %s", rec3.Code, rec3.Body.String())
-	}
+	gw3 := f02SessionGW(db3, &memSessionKV{}, nil)
+	rec3 := f02usageGET(t, gw3, "sess-1", "parent-1")
+	f02expectStatus(t, "F02-13: malformed model rows", rec3, http.StatusServiceUnavailable, "usage_unavailable")
+	f02expectAbsentBody(t, "F02-13: malformed model rows", rec3, `"requests"`, "gpt-x")
 
 	// Zero model rows → empty by_model array, not null.
 	db4 := f02DB()
 	db4.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db4.modelRows = [][]any{}
-	rec4 := f02Call(t, f02Router(f02SessionGW(db4, &memSessionKV{}, nil)), http.MethodGet, "/session-keys/sess-1/usage", "", principal{APIKeyID: "parent-1"})
-	if rec4.Code != http.StatusOK || !strings.Contains(rec4.Body.String(), `"by_model":[]`) {
-		t.Fatalf("F02-13: empty model rows: %d %s", rec4.Code, rec4.Body.String())
-	}
+	gw4 := f02SessionGW(db4, &memSessionKV{}, nil)
+	rec4 := f02usageGET(t, gw4, "sess-1", "parent-1")
+	f02expectStatus(t, "F02-13: empty model rows", rec4, http.StatusOK, `"by_model":[]`)
 }
 
-// F02-14 own-key usage: permission, SQL oracles, validation, grouping.
-func fuzzF0214(t *testing.T) {
+// f02serveOwnUsage drives one own-usage request with the org header set.
+func f02serveOwnUsage(t *testing.T, gw *gateway, p principal, query string) *httptest.ResponseRecorder {
 	t.Helper()
-	gw := f02SessionGW(f02DB(), &memSessionKV{}, nil)
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage"+query, nil)
+	req = req.WithContext(withPrincipal(req.Context(), p))
+	req.Header.Set("X-Org-Id", "org-1")
+	rec := httptest.NewRecorder()
+	gw.ownUsage(rec, req)
+	return rec
+}
 
-	serve := func(p principal, query string) *httptest.ResponseRecorder {
-		req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage"+query, nil)
-		req = req.WithContext(withPrincipal(req.Context(), p))
-		req.Header.Set("X-Org-Id", "org-1")
-		rec := httptest.NewRecorder()
-		gw.ownUsage(rec, req)
-		return rec
-	}
+// f02UsageBadCase is one invalid own-usage query with its 400 message.
+type f02UsageBadCase struct {
+	name, query, want string
+}
 
-	// Without the grant → 403.
-	if rec := serve(principal{APIKeyID: "parent-1"}, ""); rec.Code != http.StatusForbidden ||
-		!strings.Contains(rec.Body.String(), "usage_read_not_allowed") {
-		t.Fatalf("F02-14: no grant: %d %s", rec.Code, rec.Body.String())
-	}
-
-	ok := principal{APIKeyID: "parent-1", CanReadUsage: true}
-	bad := []struct {
-		name, query, want string
-	}{
+// f02ScenarioUsageValidation exercises the invalid own-usage queries and
+// asserts each renders exactly its 400 message.
+func f02ScenarioUsageValidation(t *testing.T, gw *gateway, ok principal) {
+	t.Helper()
+	bad := []f02UsageBadCase{
 		{"bad from", "?from=not-rfc3339", "from must be RFC3339"},
 		{"bad to", "?to=yesterday", "to must be RFC3339"},
 		{"span too wide", "?from=" + time.Now().Add(-32*24*time.Hour).UTC().Format(time.RFC3339), "range must be at most 31 days"},
@@ -1534,8 +1659,12 @@ func fuzzF0214(t *testing.T) {
 		{"invalid group", "?group_by=bogus", "group_by must be model or label:<key>"},
 	}
 	for _, tc := range bad {
-		rec := serve(ok, tc.query)
-		var body struct{ Error struct{ Message string } }
+		rec := f02serveOwnUsage(t, gw, ok, tc.query)
+		var body struct {
+			Error struct {
+				Message string
+			}
+		}
 		if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
 			t.Fatal(err)
 		}
@@ -1543,18 +1672,16 @@ func fuzzF0214(t *testing.T) {
 			t.Fatalf("F02-14 %s: %d %s", tc.name, rec.Code, rec.Body.String())
 		}
 	}
+}
 
-	// Happy path + label filter SQL oracle.
+// f02ScenarioUsageLabelOracle runs the happy label-filtered own usage and
+// asserts the api-key-scoped SQL oracle with the label filter argument.
+func f02ScenarioUsageLabelOracle(t *testing.T, ok principal) {
+	t.Helper()
 	db := f02DB()
 	gw2 := f02SessionGW(db, &memSessionKV{}, nil)
-	req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?label.team=x", nil)
-	req = req.WithContext(withPrincipal(req.Context(), ok))
-	req.Header.Set("X-Org-Id", "org-1")
-	rec := httptest.NewRecorder()
-	gw2.ownUsage(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("F02-14: happy: %d %s", rec.Code, rec.Body.String())
-	}
+	rec := f02serveOwnUsage(t, gw2, ok, "?label.team=x")
+	f02expectStatus(t, "F02-14: happy", rec, http.StatusOK)
 	rows := db.f02Find("row", "api_key_id = $2")
 	if len(rows) < 1 {
 		t.Fatalf("F02-14: no api-key-scoped row query recorded")
@@ -1571,59 +1698,48 @@ func fuzzF0214(t *testing.T) {
 	if raw, ok := q.args[4].([]byte); !ok || string(raw) != `{"team":"x"}` {
 		t.Fatalf("F02-14: filter arg %v", q.args[4])
 	}
+}
 
-	// group_by=model: model_used expression recorded (empty canned groups).
+// f02ScenarioUsageGroupModel asserts group_by=model records the model_used
+// grouped query.
+func f02ScenarioUsageGroupModel(t *testing.T, ok principal) {
+	t.Helper()
 	dbM := f02DB()
 	dbM.groupRows = [][]any{}
 	gwM := f02SessionGW(dbM, &memSessionKV{}, nil)
-	reqM := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=model", nil)
-	reqM = reqM.WithContext(withPrincipal(reqM.Context(), ok))
-	reqM.Header.Set("X-Org-Id", "org-1")
-	recM := httptest.NewRecorder()
-	gwM.ownUsage(recM, reqM)
-	if recM.Code != http.StatusOK {
-		t.Fatalf("F02-14: group model: %d %s", recM.Code, recM.Body.String())
-	}
+	recM := f02serveOwnUsage(t, gwM, ok, "?group_by=model")
+	f02expectStatus(t, "F02-14: group model", recM, http.StatusOK)
 	if gs := dbM.f02Find("rows", "GROUP BY 1"); len(gs) != 1 || !strings.Contains(gs[0].sql, "model_used") {
 		t.Fatalf("F02-14: group model SQL %+v", dbM.f02Find("rows", "GROUP BY 1"))
 	}
+}
 
-	// group_by=label:team: quoteLiteral renders labels->>'team'; canned
-	// group rows reach the body.
+// f02ScenarioUsageGroupLabel asserts group_by=label:team renders the
+// quoteLiteral labels->>'team' query and canned group rows reach the body.
+func f02ScenarioUsageGroupLabel(t *testing.T, ok principal) {
+	t.Helper()
 	dbL := f02DB()
 	dbL.groupRows = [][]any{{"payments", int64(3), int64(30), int64(20), 0.25}}
 	gwL := f02SessionGW(dbL, &memSessionKV{}, nil)
-	reqL := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=label:team", nil)
-	reqL = reqL.WithContext(withPrincipal(reqL.Context(), ok))
-	reqL.Header.Set("X-Org-Id", "org-1")
-	recL := httptest.NewRecorder()
-	gwL.ownUsage(recL, reqL)
-	if recL.Code != http.StatusOK {
-		t.Fatalf("F02-14: group label: %d %s", recL.Code, recL.Body.String())
-	}
+	recL := f02serveOwnUsage(t, gwL, ok, "?group_by=label:team")
+	f02expectStatus(t, "F02-14: group label", recL, http.StatusOK, "payments")
 	if gs := dbL.f02Find("rows", "labels->>'team'"); len(gs) != 1 || !strings.Contains(gs[0].sql, "GROUP BY 1") {
 		t.Fatalf("F02-14: quoteLiteral SQL oracle %+v", dbL.f02Find("rows", "labels->>'team'"))
 	}
-	if !strings.Contains(recL.Body.String(), "payments") {
-		t.Fatalf("F02-14: groups missing from body: %s", recL.Body.String())
-	}
+}
 
-	// Explicit from/to window flows into the SQL args; unknown params
-	// (limit, bogus) are ignored.
+// f02ScenarioUsageWindow asserts the explicit from/to window flows into the
+// SQL args and unknown params (limit, bogus) are ignored.
+func f02ScenarioUsageWindow(t *testing.T, ok principal) {
+	t.Helper()
 	dbW := f02DB()
 	dbW.scriptDB.usage = []any{int64(5), int64(50), int64(20), int64(2), 1.5, int64(0)}
 	gwW := f02SessionGW(dbW, &memSessionKV{}, nil)
 	fromW := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second)
 	toW := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
-	reqW := httptest.NewRequestWithContext(t.Context(), http.MethodGet,
-		"/v1/yabanin/usage?from="+fromW.Format(time.RFC3339)+"&to="+toW.Format(time.RFC3339)+"&limit=25&bogus=1", nil)
-	reqW = reqW.WithContext(withPrincipal(reqW.Context(), ok))
-	reqW.Header.Set("X-Org-Id", "org-1")
-	recW := httptest.NewRecorder()
-	gwW.ownUsage(recW, reqW)
-	if recW.Code != http.StatusOK {
-		t.Fatalf("F02-14: window: %d %s", recW.Code, recW.Body.String())
-	}
+	recW := f02serveOwnUsage(t, gwW, ok,
+		"?from="+fromW.Format(time.RFC3339)+"&to="+toW.Format(time.RFC3339)+"&limit=25&bogus=1")
+	f02expectStatus(t, "F02-14: window", recW, http.StatusOK)
 	rowsW := dbW.f02Find("row", "api_key_id = $2")
 	if len(rowsW) != 1 {
 		t.Fatalf("F02-14: window row queries %d", len(rowsW))
@@ -1634,84 +1750,74 @@ func fuzzF0214(t *testing.T) {
 	if gt, gok := rowsW[0].args[3].(time.Time); !gok || !gt.Equal(toW) {
 		t.Fatalf("F02-14: to arg %+v", rowsW[0].args[3])
 	}
+}
 
-	// Required totals read failure → 503 usage_unavailable; no totals leak.
-	dbF := f02DB()
-	dbF.failNext = "count(*)"
-	gwF := f02SessionGW(dbF, &memSessionKV{}, nil)
-	reqF := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage", nil)
-	reqF = reqF.WithContext(withPrincipal(reqF.Context(), ok))
-	reqF.Header.Set("X-Org-Id", "org-1")
-	recF := httptest.NewRecorder()
-	gwF.ownUsage(recF, reqF)
-	if recF.Code != http.StatusServiceUnavailable || !strings.Contains(recF.Body.String(), "usage_unavailable") ||
-		strings.Contains(recF.Body.String(), `"requests"`) {
-		t.Fatalf("F02-14: totals failure: %d %s", recF.Code, recF.Body.String())
-	}
-
-	// Group read failure → 503 usage_unavailable; neither the old stable
-	// 400 message nor partial totals may appear. The failure is injected on
-	// the "GROUP BY 1" groups statement (scriptDB itself answers empty rows).
-	dbG := f02DB()
-	dbG.failNext = "GROUP BY 1"
-	gwG := f02SessionGW(dbG, &memSessionKV{}, nil)
-	reqG := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=model", nil)
-	reqG = reqG.WithContext(withPrincipal(reqG.Context(), ok))
-	reqG.Header.Set("X-Org-Id", "org-1")
-	recG := httptest.NewRecorder()
-	gwG.ownUsage(recG, reqG)
-	if recG.Code != http.StatusServiceUnavailable || !strings.Contains(recG.Body.String(), "usage_unavailable") ||
-		strings.Contains(recG.Body.String(), "cost_usd") {
-		t.Fatalf("F02-14: group failure: %d %s", recG.Code, recG.Body.String())
-	}
-
-	// A NULL group value is a legitimate group: it renders "" at 200.
+// f02ScenarioUsageNullGroup asserts a NULL group value is a legitimate
+// group: exactly one entry rendering "" at 200.
+func f02ScenarioUsageNullGroup(t *testing.T, ok principal) {
+	t.Helper()
 	dbN := f02DB()
 	dbN.groupRows = [][]any{{nil, int64(2), int64(2), int64(2), 0.2}}
 	gwN := f02SessionGW(dbN, &memSessionKV{}, nil)
-	reqN := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=label:team", nil)
-	reqN = reqN.WithContext(withPrincipal(reqN.Context(), ok))
-	reqN.Header.Set("X-Org-Id", "org-1")
-	recN := httptest.NewRecorder()
-	gwN.ownUsage(recN, reqN)
-	if recN.Code != http.StatusOK {
-		t.Fatalf("F02-14: nil group value: %d %s", recN.Code, recN.Body.String())
-	}
+	recN := f02serveOwnUsage(t, gwN, ok, "?group_by=label:team")
+	f02expectStatus(t, "F02-14: nil group value", recN, http.StatusOK)
 	if n := strings.Count(recN.Body.String(), `"value"`); n != 1 {
 		t.Fatalf("F02-14: want exactly one group, values = %d body %s", n, recN.Body.String())
 	}
 	if !strings.Contains(recN.Body.String(), `"value":""`) {
 		t.Fatalf("F02-14: NULL group value must render empty: %s", recN.Body.String())
 	}
+}
 
-	// Broken group row delivery aborts the report → 503; no groups or
-	// totals may leak.
+// F02-14 own-key usage: permission, SQL oracles, validation, grouping.
+func fuzzF0214(t *testing.T) {
+	t.Helper()
+	gw := f02SessionGW(f02DB(), &memSessionKV{}, nil)
+
+	// Without the grant → 403.
+	f02expectStatus(t, "F02-14: no grant",
+		f02serveOwnUsage(t, gw, principal{APIKeyID: "parent-1"}, ""), http.StatusForbidden, "usage_read_not_allowed")
+
+	ok := principal{APIKeyID: "parent-1", CanReadUsage: true}
+	f02ScenarioUsageValidation(t, gw, ok)
+	f02ScenarioUsageLabelOracle(t, ok)
+	f02ScenarioUsageGroupModel(t, ok)
+	f02ScenarioUsageGroupLabel(t, ok)
+	f02ScenarioUsageWindow(t, ok)
+	f02ScenarioUsageNullGroup(t, ok)
+
+	// Required totals read failure → 503 usage_unavailable; no totals leak.
+	dbF := f02DB()
+	dbF.failNext = "count(*)"
+	recF := f02serveOwnUsage(t, f02SessionGW(dbF, &memSessionKV{}, nil), ok, "")
+	f02expectStatus(t, "F02-14: totals failure", recF, http.StatusServiceUnavailable, "usage_unavailable")
+	f02expectAbsentBody(t, "F02-14: totals failure", recF, `"requests"`)
+
+	// Group read failure → 503 usage_unavailable; neither the old stable
+	// 400 message nor partial totals may appear. The failure is injected on
+	// the "GROUP BY 1" groups statement (scriptDB itself answers empty rows).
+	dbG := f02DB()
+	dbG.failNext = "GROUP BY 1"
+	recG := f02serveOwnUsage(t, f02SessionGW(dbG, &memSessionKV{}, nil), ok, "?group_by=model")
+	f02expectStatus(t, "F02-14: group failure", recG, http.StatusServiceUnavailable, "usage_unavailable")
+	f02expectAbsentBody(t, "F02-14: group failure", recG, "cost_usd")
+
+	// A NULL group value is a legitimate group: it renders "" at 200
+	// (f02ScenarioUsageNullGroup); broken group row delivery aborts instead:
+	// no groups or totals may leak.
 	dbS := f02DB()
 	dbS.groupRows = [][]any{{"team-a", int64(1), int64(1), int64(1), 0.1}, {nil, int64(2), int64(2), int64(2), 0.2}}
 	dbS.failGroupScan = 0
-	gwS := f02SessionGW(dbS, &memSessionKV{}, nil)
-	reqS := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=label:team", nil)
-	reqS = reqS.WithContext(withPrincipal(reqS.Context(), ok))
-	reqS.Header.Set("X-Org-Id", "org-1")
-	recS := httptest.NewRecorder()
-	gwS.ownUsage(recS, reqS)
-	if recS.Code != http.StatusServiceUnavailable || !strings.Contains(recS.Body.String(), "usage_unavailable") ||
-		strings.Contains(recS.Body.String(), `"value"`) || strings.Contains(recS.Body.String(), `"requests"`) {
-		t.Fatalf("F02-14: broken group rows: %d %s", recS.Code, recS.Body.String())
-	}
+	recS := f02serveOwnUsage(t, f02SessionGW(dbS, &memSessionKV{}, nil), ok, "?group_by=label:team")
+	f02expectStatus(t, "F02-14: broken group rows", recS, http.StatusServiceUnavailable, "usage_unavailable")
+	f02expectAbsentBody(t, "F02-14: broken group rows", recS, `"value"`, `"requests"`)
 
 	// Zero group rows → the groups field is omitted (omitempty), not null.
 	dbE := f02DB()
 	dbE.groupRows = [][]any{}
-	gwE := f02SessionGW(dbE, &memSessionKV{}, nil)
-	reqE := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?group_by=label:team", nil)
-	reqE = reqE.WithContext(withPrincipal(reqE.Context(), ok))
-	reqE.Header.Set("X-Org-Id", "org-1")
-	recE := httptest.NewRecorder()
-	gwE.ownUsage(recE, reqE)
-	if recE.Code != http.StatusOK || strings.Contains(recE.Body.String(), "groups") {
-		t.Fatalf("F02-14: empty groups must omit the field: %d %s", recE.Code, recE.Body.String())
-	}
+	recE := f02serveOwnUsage(t, f02SessionGW(dbE, &memSessionKV{}, nil), ok, "?group_by=label:team")
+	f02expectStatus(t, "F02-14: empty groups", recE, http.StatusOK)
+	f02expectAbsentBody(t, "F02-14: empty groups", recE, "groups")
 }
 
 // F02-15 no DB → 501 on every endpoint; label policy default + auth gate.
@@ -1844,12 +1950,10 @@ func fuzzF0216(t *testing.T) {
 	}
 }
 
-// F02-17 legacy auth middleware: modes, header hygiene, resolver, expired
-// key, last-used tracker, authMiddlewareFunc.
-func fuzzF0217(t *testing.T) {
+// f02ScenarioLegacyStrictStrip verifies strict mode strips client-spoofed
+// identity headers, promotes x-api-key, and rejects foreign keys.
+func f02ScenarioLegacyStrictStrip(t *testing.T, strict *AuthMiddleware) {
 	t.Helper()
-	strict := NewAuthMiddleware(newGatewayConfig("strict", "sk-static", ""), nil)
-
 	// Client-spoofed identity headers are stripped; the static key passes.
 	var org, agent, session string
 	next := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1878,20 +1982,18 @@ func fuzzF0217(t *testing.T) {
 			t.Fatal("x-api-key must be removed before forwarding")
 		}
 	})).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("F02-17: x-api-key promotion: %d", rec.Code)
-	}
+	f02expectStatus(t, "F02-17: x-api-key promotion", rec, http.StatusOK)
 
 	// Bad key in strict mode → 401.
-	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer sk-wrong")
-	rec = httptest.NewRecorder()
-	strict.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized || !strings.Contains(rec.Body.String(), "invalid API key") {
-		t.Fatalf("F02-17: strict reject: %d %s", rec.Code, rec.Body.String())
-	}
+	rec = f02driveBearer(t, strict, "sk-wrong",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+	f02expectStatus(t, "F02-17: strict reject", rec, http.StatusUnauthorized, "invalid API key")
+}
 
-	// Resolver path: org + key id headers, principal, last-used UPDATE.
+// f02ScenarioLegacyResolver verifies the resolver path: org + key id
+// headers, downstream principal, and the last-used tracker UPDATE.
+func f02ScenarioLegacyResolver(t *testing.T) {
+	t.Helper()
 	store := &f02LastUsedStore{}
 	tracker := auth.NewLastUsedTracker(context.Background(), store, 1, 1, time.Minute)
 	res := NewAuthMiddleware(newGatewayConfig("header", "", ""), newTestResolver("org-res", nil))
@@ -1904,10 +2006,7 @@ func fuzzF0217(t *testing.T) {
 			t.Fatalf("F02-17: resolver headers org=%q key=%q", r.Header.Get("X-Org-Id"), r.Header.Get("X-API-Key-Id"))
 		}
 	})
-	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer ypk_whatever")
-	rec = httptest.NewRecorder()
-	res.ServeHTTP(nextRes).ServeHTTP(rec, req)
+	rec := f02driveBearer(t, res, "ypk_whatever", nextRes)
 	if rec.Code != http.StatusOK || !havePrincipal || p.APIKeyID != "org-res" {
 		t.Fatalf("F02-17: resolver principal: %d ok=%v %+v", rec.Code, havePrincipal, p)
 	}
@@ -1918,8 +2017,12 @@ func fuzzF0217(t *testing.T) {
 	if sql != "UPDATE api_keys SET last_used_at = now() WHERE id = ANY($1)" || len(batches) != 1 {
 		t.Fatalf("F02-17: last-used tracker sql %q batches %d", sql, len(batches))
 	}
+}
 
-	// Expired key → 401 with stable code key_expired.
+// f02ScenarioLegacyExpired asserts an expired resolver key renders 401 with
+// the stable key_expired code.
+func f02ScenarioLegacyExpired(t *testing.T) {
+	t.Helper()
 	expiredPool := &mockDBForGateway{queryRowFn: func(_ context.Context, query string, _ ...any) pgx.Row {
 		if !strings.Contains(query, "FROM api_keys") {
 			return scanRow{err: pgx.ErrNoRows}
@@ -1927,56 +2030,43 @@ func fuzzF0217(t *testing.T) {
 		return scanRow{vals: []any{"expired-id", "org-1", "", "", time.Now().Add(-time.Hour)}}
 	}}
 	exp := NewAuthMiddleware(newGatewayConfig("header", "", ""), auth.NewResolver(expiredPool, nil, 300, nil))
-	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer ypk_expired")
-	rec = httptest.NewRecorder()
-	exp.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(rec, req)
-	if rec.Code != http.StatusUnauthorized ||
-		!strings.Contains(rec.Body.String(), apierrors.CodeKeyExpired) ||
-		!strings.Contains(rec.Body.String(), "API key has expired") {
-		t.Fatalf("F02-17: expired key: %d %s", rec.Code, rec.Body.String())
-	}
+	rec := f02driveBearer(t, exp, "ypk_expired",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+	f02expectStatus(t, "F02-17: expired key", rec, http.StatusUnauthorized, apierrors.CodeKeyExpired, "API key has expired")
+}
 
-	// authMiddlewareFunc delegates to gw.auth.
-	gw := &gateway{gatewayCore: gatewayCore{log: fuzzDiscardLogger(), auth: strict}}
-	req = httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	req.Header.Set("Authorization", "Bearer sk-static")
-	rec = httptest.NewRecorder()
-	gw.authMiddlewareFunc(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("F02-17: authMiddlewareFunc: %d", rec.Code)
-	}
-
-	// Unknown auth mode behaves as strict (fail-closed): the static key
-	// still works, any other token is rejected.
+// f02ScenarioLegacyBogusMode asserts unknown auth modes behave as strict
+// (fail closed): the static key still works, any other token is rejected,
+// and resolver failures render "org resolution failed".
+func f02ScenarioLegacyBogusMode(t *testing.T) {
+	t.Helper()
 	bogus := NewAuthMiddleware(newGatewayConfig("bogus-mode", "sk-bogus", ""), nil)
-	reqB := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	reqB.Header.Set("Authorization", "Bearer sk-bogus")
-	recB := httptest.NewRecorder()
-	bogus.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) {})).ServeHTTP(recB, reqB)
-	if recB.Code != http.StatusOK {
-		t.Fatalf("F02-17: bogus mode static key: %d", recB.Code)
-	}
-	reqB2 := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	reqB2.Header.Set("Authorization", "Bearer sk-other")
-	recB2 := httptest.NewRecorder()
-	bogus.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(recB2, reqB2)
-	if recB2.Code != http.StatusUnauthorized || !strings.Contains(recB2.Body.String(), "invalid API key") {
-		t.Fatalf("F02-17: bogus mode reject: %d %s", recB2.Code, recB2.Body.String())
-	}
+	recB := f02driveBearer(t, bogus, "sk-bogus", http.HandlerFunc(func(http.ResponseWriter, *http.Request) {}))
+	f02expectStatus(t, "F02-17: bogus mode static key", recB, http.StatusOK)
+	recB2 := f02driveBearer(t, bogus, "sk-other",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+	f02expectStatus(t, "F02-17: bogus mode reject", recB2, http.StatusUnauthorized, "invalid API key")
 
-	// Resolver failure under an unknown mode → "org resolution failed".
 	bogusRes := NewAuthMiddleware(newGatewayConfig("bogus-mode", "", ""), newTestResolver("", errors.New("f02 resolver down")))
-	reqBR := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
-	reqBR.Header.Set("Authorization", "Bearer ypk_whatever")
-	recBR := httptest.NewRecorder()
-	bogusRes.ServeHTTP(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") })).ServeHTTP(recBR, reqBR)
-	if recBR.Code != http.StatusUnauthorized || !strings.Contains(recBR.Body.String(), "org resolution failed") {
-		t.Fatalf("F02-17: bogus mode resolver failure: %d %s", recBR.Code, recBR.Body.String())
-	}
+	recBR := f02driveBearer(t, bogusRes, "ypk_whatever",
+		http.HandlerFunc(func(http.ResponseWriter, *http.Request) { t.Fatal("next reached") }))
+	f02expectStatus(t, "F02-17: bogus mode resolver failure", recBR, http.StatusUnauthorized, "org resolution failed")
+}
 
-	// Session-key resolution: the session label source is appended (with
-	// the empty-set default for a NULL session labels column).
+// f02expectSessionSources asserts the session label source is appended with
+// the empty-set default for a NULL session labels column.
+func f02expectSessionSources(t *testing.T, sources []labels.Source) {
+	t.Helper()
+	if len(sources) != 2 || sources[0].Name != "key" || sources[1].Name != "session" ||
+		sources[1].Labels == nil || len(sources[1].Labels) != 0 {
+		t.Fatalf("F02-17: session label sources %+v", sources)
+	}
+}
+
+// f02ScenarioLegacySessionResolve verifies session-key resolution: the
+// session id and parent key headers flow downstream with the label sources.
+func f02ScenarioLegacySessionResolve(t *testing.T) {
+	t.Helper()
 	pool := &mockDBForGateway{queryRowFn: func(_ context.Context, query string, _ ...interface{}) pgx.Row {
 		if !strings.Contains(query, "FROM session_keys s") {
 			return scanRow{err: pgx.ErrNoRows}
@@ -1996,20 +2086,36 @@ func fuzzF0217(t *testing.T) {
 		sessHdr = r.Header.Get("X-Session-Key-Id")
 		keyHdr = r.Header.Get("X-API-Key-Id")
 	})
-	reqS := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
 	sessionKey, err := auth.GenerateSessionKey()
 	if err != nil {
 		t.Fatal(err)
 	}
-	reqS.Header.Set("Authorization", "Bearer "+sessionKey)
-	recS := httptest.NewRecorder()
-	sm.ServeHTTP(nextS).ServeHTTP(recS, reqS)
+	recS := f02driveBearer(t, sm, sessionKey, nextS)
 	if recS.Code != http.StatusOK || sessHdr != "sess-9" || keyHdr != "parent-9" {
 		t.Fatalf("F02-17: session resolve: %d sess=%q key=%q", recS.Code, sessHdr, keyHdr)
 	}
-	if len(sources) != 2 || sources[0].Name != "key" || sources[1].Name != "session" || sources[1].Labels == nil || len(sources[1].Labels) != 0 {
-		t.Fatalf("F02-17: session label sources %+v", sources)
-	}
+	f02expectSessionSources(t, sources)
+}
+
+// F02-17 legacy auth middleware: modes, header hygiene, resolver, expired
+// key, last-used tracker, authMiddlewareFunc.
+func fuzzF0217(t *testing.T) {
+	t.Helper()
+	strict := NewAuthMiddleware(newGatewayConfig("strict", "sk-static", ""), nil)
+	f02ScenarioLegacyStrictStrip(t, strict)
+	f02ScenarioLegacyResolver(t)
+	f02ScenarioLegacyExpired(t)
+
+	// authMiddlewareFunc delegates to gw.auth.
+	gw := &gateway{gatewayCore: gatewayCore{log: fuzzDiscardLogger(), auth: strict}}
+	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
+	req.Header.Set("Authorization", "Bearer sk-static")
+	rec := httptest.NewRecorder()
+	gw.authMiddlewareFunc(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {})).ServeHTTP(rec, req)
+	f02expectStatus(t, "F02-17: authMiddlewareFunc", rec, http.StatusOK)
+
+	f02ScenarioLegacyBogusMode(t)
+	f02ScenarioLegacySessionResolve(t)
 }
 
 // F02-18 deliberately broken variants: the oracles must catch each one
