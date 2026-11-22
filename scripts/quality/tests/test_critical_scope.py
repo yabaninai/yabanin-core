@@ -4557,14 +4557,7 @@ def row(package):
             "hash": "same-body", "start": 1, "end": 3}
 
 def side(package):
-    s = object.__new__(cc.Side)
-    s.root = Path.cwd()
-    s.files = {package + "/a.go": {"units": [row(package)]}}
-    s.production = [package + "/a.go"]
-    s.tests = []
-    s.dispatch_names = set()
-    s.dispatch_unresolved = False
-    return s
+    return cc.Side([{"path": package + "/a.go", "units": [row(package)]}], Path.cwd())
 
 def fake_archive(_root, _base, _dest):
     advance(10, "setup", next(setups))
