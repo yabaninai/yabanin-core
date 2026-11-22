@@ -159,17 +159,20 @@ func TestSQLContractCredits(t *testing.T) {
 	assert.Nil(t, bal)
 
 	// CheckBalance — funded wallet admits; the admission rule runs on the
-	// configured grace floor, so an empty wallet is rejected exactly at the
-	// floor (≤) and the 3-cent low wallet straddles it: admitted at a -1
-	// floor, rejected at a 3-cent floor.
+	// effective floor: the row's persisted grace_floor_cents (§8) wins when
+	// set, NULL falls back to the configured grace floor. The empty wallet
+	// is rejected exactly at the floor (≤) and the low wallet with a
+	// persisted -1 floor admits even under a raised store floor.
 	_, err = newStore(DefaultConfig().GracePeriodCents).CheckBalance(ctx, fx.OrgA)
 	require.NoError(t, err, "CheckBalance[orgA]")
 	_, err = newStore(0).CheckBalance(ctx, fx.OrgB)
 	require.ErrorIs(t, err, ErrInsufficientCredits, "CheckBalance[empty wallet, no overdraft]")
 	_, err = newStore(-1).CheckBalance(ctx, fx.LowWalletID)
 	require.NoError(t, err, "CheckBalance[low wallet, -1 floor]")
-	_, err = newStore(3).CheckBalance(ctx, fx.LowWalletID)
+	_, err = newStore(3).CheckBalance(ctx, fx.OrgB)
 	require.ErrorIs(t, err, ErrInsufficientCredits, "CheckBalance[at-floor is inclusive rejection]")
+	_, err = newStore(3).CheckBalance(ctx, fx.LowWalletID)
+	require.NoError(t, err, "CheckBalance[persisted -1 floor wins over a raised store floor (§8)]")
 
 	// TopUp — the upsert + ledger CTE executes and moves the wallet.
 	sqlc03fContract(t, "TopUp[orgA]", func(ctx context.Context) error {

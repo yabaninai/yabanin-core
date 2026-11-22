@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // AF-01 regressions (audit fixtures TestReview_* from code-review-2026-10-02).
@@ -60,27 +58,39 @@ func TestConfig_NegativeGracePeriodPreserved(t *testing.T) {
 // balance == floor every positive deduction breaches the floor, so the floor
 // itself must be rejected (inclusive); floor+1 cent is the last admissible
 // balance; floor−1 cent is rejected outright.
+//
+// Contract change (authoritative admission, 2026-11): CheckBalance reads a
+// fresh wallet snapshot per decision and never serves the display cache, so
+// the original audit fixture's seeded-cache/empty-pool form no longer
+// exercises the real path — the boundary matrix runs on the migrated
+// fixture stand instead. The AF-01 regression intent is unchanged.
 func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
+	ctx := context.Background()
+	pool := setupFixtureDB(t)
+
 	const floor = int64(-100)
 	cases := []struct {
 		name      string
+		org       string
 		balance   int64
 		wantAdmit bool
 	}{
-		{"floor_minus_1", floor - 1, false},
-		{"floor", floor, false},
-		{"floor_plus_1", floor + 1, true},
+		{"floor_minus_1", "org-fl-m1", floor - 1, false},
+		{"floor", "org-fl-0", floor, false},
+		{"floor_plus_1", "org-fl-p1", floor + 1, true},
 	}
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			// Non-nil pool so the balance cache path is reachable; the seeded
-			// cache entry means the DB is never touched (audit-fixture style).
-			s := NewStoreWithConfig(&pgxpool.Pool{}, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
-			s.mu.Lock()
-			s.cache["org-a"] = &cachedBalance{walletCents: tc.balance, cachedAt: time.Now()}
-			s.mu.Unlock()
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, $2, NULL)`,
+			tc.org, tc.balance); err != nil {
+			t.Fatalf("seed %s: %v", tc.org, err)
+		}
+	}
 
-			bal, err := s.CheckBalance(context.Background(), "org-a")
+	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			bal, err := s.CheckBalance(ctx, tc.org)
 			if tc.wantAdmit {
 				if err != nil {
 					t.Fatalf("balance %d must be admissible, got err=%v", tc.balance, err)

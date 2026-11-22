@@ -255,6 +255,14 @@ func (h *AdminHandlers) PutOrgGraceFloor() http.HandlerFunc {
 			h.respondError(w, r, fmt.Errorf("update org grace floor: %w", err), http.StatusInternalServerError)
 			return
 		}
+		// Refresh this process's display view immediately (the §8 floor
+		// rides the display snapshot cache). Admission itself is
+		// authoritative — CheckBalance reads a fresh snapshot per decision —
+		// so this is freshness for balance views, not the correctness gate
+		// (no-op when credits are not wired).
+		if h.billing.creditStore != nil {
+			h.billing.creditStore.InvalidateOrg(orgID)
+		}
 		h.auditOrgBudgetSettings(r, "org_grace_floor", orgID, before)
 		h.orgBudgetSettingsAfter(w, r, orgID)
 	}
