@@ -143,18 +143,18 @@ func chatPureLateCase(t *testing.T, index int) {
 		require.Positive(t, cachedUsageCounterfactual(withUsage, "openai", "gpt-4o"))
 		require.Zero(t, cachedUsageCounterfactual(withUsage, "openai", "no-such-model"))
 	case 10:
-		// comparableCheapResponse (TP-04): only a full non-empty text answer
+		// comparableResponseText (TP-04): only a full non-empty text answer
 		// is judgeable; tool-only or empty answers are not.
-		text, ok := comparableCheapResponse([]byte(`{"choices":[{"message":{"content":"answer"}}]}`))
+		text, ok := comparableResponseText([]byte(`{"choices":[{"message":{"content":"answer"}}]}`))
 		require.True(t, ok)
 		require.Equal(t, "answer", text)
-		_, ok = comparableCheapResponse([]byte(`torn`))
+		_, ok = comparableResponseText([]byte(`torn`))
 		require.False(t, ok)
-		_, ok = comparableCheapResponse([]byte(`{}`))
+		_, ok = comparableResponseText([]byte(`{}`))
 		require.False(t, ok)
-		_, ok = comparableCheapResponse([]byte(`{"choices":[{"message":{"content":null}}]}`))
+		_, ok = comparableResponseText([]byte(`{"choices":[{"message":{"content":null}}]}`))
 		require.False(t, ok)
-		_, ok = comparableCheapResponse([]byte(`{"choices":[{"message":{"content":"   "}}]}`))
+		_, ok = comparableResponseText([]byte(`{"choices":[{"message":{"content":"   "}}]}`))
 		require.False(t, ok)
 	case 11:
 		// A configured inner classifier is honored for ordinary outcomes but
