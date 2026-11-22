@@ -32,83 +32,103 @@ func TestReviewMediaKnownUsageAfterDisconnect(t *testing.T) {
 	for _, family := range []string{"speech", "transcriptions", "images"} {
 		for _, timing := range []string{"connected", "after_read"} {
 			t.Run(family+"/"+timing, func(t *testing.T) {
-				var calls atomic.Int32
-				srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-					_, _ = io.Copy(io.Discard, r.Body)
-					calls.Add(1)
-					_, _ = w.Write([]byte(reviewMediaResult))
-				}))
-				defer srv.Close()
-
-				var (
-					gw          *gateway
-					body        []byte
-					contentType = "application/json"
-					path        string
-					handle      func(http.ResponseWriter, *http.Request)
-					wantTokens  bool
-				)
-				switch family {
-				case "speech":
-					gw = newAudioGateway(t, audioTestModel(srv.URL))
-					body = []byte(`{"model":"tts","input":"hé","voice":"alloy"}`)
-					path = "/v1/audio/speech"
-					handle = gw.audioSpeech
-				case "transcriptions":
-					gw = newAudioGateway(t, audioTranscriptionModel(srv.URL))
-					body, contentType = buildAudioMultipart(t, map[string]string{"model": "m"}, "file", "sample.wav", "audio/wav", audioFixtureBytes(t, "hello.wav"))
-					path = "/v1/audio/transcriptions"
-					handle = gw.audioTranscriptions
-					wantTokens = true
-				case "images":
-					gw = imagesTestGateway(t, resolver.ModelInfo{ModelName: "gpt-image-1-canon", Provider: "openai", UpstreamURL: srv.URL, Enabled: true}, srv.URL)
-					body = []byte(`{"model":"m","prompt":"a single red cube"}`)
-					path = "/v1/images/generations"
-					handle = gw.imagesGenerations
-					wantTokens = true
-				}
-				gw.unitPricer = operatorUnitsForTest(t)
-				store := &fakeInvocationStore{}
-				gw.invocations = store
-
-				ctx, cancel := context.WithCancel(t.Context())
-				defer cancel()
-				var consumed atomic.Bool
-				ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{PutIdleConn: func(err error) {
-					if err == nil {
-						consumed.Store(true)
-						if timing == "after_read" {
-							cancel()
-						}
-					}
-				}})
-				req := httptest.NewRequestWithContext(ctx, http.MethodPost, path, bytes.NewReader(body))
-				req.Header.Set("Content-Type", contentType)
-				goldenIdentity(req)
-				rec := httptest.NewRecorder()
-				handle(rec, req)
-
-				require.True(t, consumed.Load(), "provider response must reach transport EOF: %s", rec.Body.String())
-				require.EqualValues(t, 1, calls.Load())
-				require.Len(t, store.admitted, 1)
-				require.Len(t, store.facts, 1, "known provider usage did not reach durable accounting")
-				require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
-				if wantTokens {
-					require.Equal(t, "7", store.facts[0].Fields["tokens_in"])
-					require.Equal(t, "3", store.facts[0].Fields["tokens_out"])
-				} else {
-					require.Equal(t, "0.000064", store.facts[0].Fields["estimated_cost_usd"])
-				}
-				if timing == "after_read" {
-					require.Empty(t, rec.Body.String())
-				} else {
-					if !bytes.Equal([]byte(reviewMediaResult), rec.Body.Bytes()) {
-						t.Fatalf("media response changed on the wire: %q", rec.Body.Bytes())
-					}
-				}
+				reviewMediaKnownUsageCase(t, family, timing)
 			})
 		}
 	}
+}
+
+type reviewMediaRequest struct {
+	gw         *gateway
+	path       string
+	content    string
+	body       []byte
+	handle     func(http.ResponseWriter, *http.Request)
+	wantTokens bool
+}
+
+// reviewMediaKnownUsageCase runs one named family/timing child. It keeps
+// transport EOF, admission/fact binding, usage and client-visible outcome
+// assertions together so each matrix child exercises the same lifecycle.
+func reviewMediaKnownUsageCase(t *testing.T, family, timing string) {
+	t.Helper()
+	var calls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		calls.Add(1)
+		_, _ = w.Write([]byte(reviewMediaResult))
+	}))
+	defer srv.Close()
+
+	setup := newReviewMediaRequest(t, family, srv.URL)
+	setup.gw.unitPricer = operatorUnitsForTest(t)
+	store := &fakeInvocationStore{}
+	setup.gw.invocations = store
+
+	ctx, cancel := context.WithCancel(t.Context())
+	defer cancel()
+	var consumed atomic.Bool
+	ctx = httptrace.WithClientTrace(ctx, &httptrace.ClientTrace{PutIdleConn: func(err error) {
+		if err == nil {
+			consumed.Store(true)
+			if timing == "after_read" {
+				cancel()
+			}
+		}
+	}})
+	req := httptest.NewRequestWithContext(ctx, http.MethodPost, setup.path, bytes.NewReader(setup.body))
+	req.Header.Set("Content-Type", setup.content)
+	goldenIdentity(req)
+	rec := httptest.NewRecorder()
+	setup.handle(rec, req)
+
+	require.True(t, consumed.Load(), "provider response must reach transport EOF: %s", rec.Body.String())
+	require.EqualValues(t, 1, calls.Load())
+	require.Len(t, store.admitted, 1)
+	require.Len(t, store.facts, 1, "known provider usage did not reach durable accounting")
+	require.Equal(t, store.admitted[0].InvocationID, store.facts[0].InvocationID)
+	requireReviewMediaKnownUsage(t, setup.wantTokens, store)
+	requireReviewMediaClientOutcome(t, timing, rec)
+}
+
+func newReviewMediaRequest(t *testing.T, family, upstream string) reviewMediaRequest {
+	t.Helper()
+	switch family {
+	case "speech":
+		gw := newAudioGateway(t, audioTestModel(upstream))
+		return reviewMediaRequest{gw: gw, path: "/v1/audio/speech", content: "application/json",
+			body: []byte(`{"model":"tts","input":"hé","voice":"alloy"}`), handle: gw.audioSpeech}
+	case "transcriptions":
+		gw := newAudioGateway(t, audioTranscriptionModel(upstream))
+		body, content := buildAudioMultipart(t, map[string]string{"model": "m"}, "file", "sample.wav", "audio/wav", audioFixtureBytes(t, "hello.wav"))
+		return reviewMediaRequest{gw: gw, path: "/v1/audio/transcriptions", content: content, body: body, handle: gw.audioTranscriptions, wantTokens: true}
+	case "images":
+		gw := imagesTestGateway(t, resolver.ModelInfo{ModelName: "gpt-image-1-canon", Provider: "openai", UpstreamURL: upstream, Enabled: true}, upstream)
+		return reviewMediaRequest{gw: gw, path: "/v1/images/generations", content: "application/json",
+			body: []byte(`{"model":"m","prompt":"a single red cube"}`), handle: gw.imagesGenerations, wantTokens: true}
+	default:
+		t.Fatalf("unknown media family %q", family)
+		return reviewMediaRequest{}
+	}
+}
+
+func requireReviewMediaKnownUsage(t *testing.T, wantTokens bool, store *fakeInvocationStore) {
+	t.Helper()
+	if wantTokens {
+		require.Equal(t, "7", store.facts[0].Fields["tokens_in"])
+		require.Equal(t, "3", store.facts[0].Fields["tokens_out"])
+		return
+	}
+	require.Equal(t, "0.000064", store.facts[0].Fields["estimated_cost_usd"])
+}
+
+func requireReviewMediaClientOutcome(t *testing.T, timing string, rec *httptest.ResponseRecorder) {
+	t.Helper()
+	if timing == "after_read" {
+		require.Empty(t, rec.Body.String())
+		return
+	}
+	require.Equal(t, []byte(reviewMediaResult), rec.Body.Bytes(), "media response changed on the wire")
 }
 
 // TestReviewMediaInterruptedReadNoFabricatedUsage is the other half of

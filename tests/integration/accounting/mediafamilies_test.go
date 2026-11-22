@@ -857,17 +857,7 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 		result <- speech.request(s, rid)
 	}()
 
-	// Harness validity: the provider must actually accept the dispatch
-	// (barrier reached) while the client keeps waiting.
-	if !s.fixture.WaitForDispatch(rid, 30*time.Second) {
-		t.Fatalf("harness: target speech request never reached the provider dispatch barrier — cannot test recovery of an admitted media request")
-	}
-	select {
-	case r := <-result:
-		t.Fatalf("harness: target speech request already finished (status=%d err=%v) before the crash — the case requires an in-flight request", r.status, r.err)
-	case <-time.After(500 * time.Millisecond):
-		// Still in flight, as required.
-	}
+	requireMediaDispatchHeld(t, s.fixture, rid, result)
 
 	// Product assertion: a durable start record must exist NOW, before
 	// the crash — the fact that makes recovery possible at all. Capture
@@ -881,29 +871,14 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 
 	// Release the held response: the dead gateway cannot receive it.
 	s.fixture.ReleaseAll()
-	select {
-	case r := <-result:
-		if r.err == nil && r.status == httpOK {
-			t.Fatalf("harness: client received a successful completion (%d) although the gateway died mid-flight", r.status)
-		}
-		t.Logf("harness: client observed the crash as expected (status=%d err=%v)", r.status, r.err)
-	case <-time.After(10 * time.Second):
-		t.Fatalf("harness: client speech request did not terminate after the gateway was killed")
-	}
+	requireMediaClientCrashOutcome(t, result)
 
 	s.restartGateway()
 
 	// Independent provider oracle: the whole case (including the
 	// restart) must have caused exactly one provider contact and one
 	// accepted dispatch. A recovery that re-dispatches bills twice.
-	s.fixture.VerifyEvidence()
-	if delta := s.fixture.Since(before); delta.arrivals != 0 {
-		t.Fatalf("product: media recovery case: %d additional provider contact(s) after the accepted dispatch (restart must not re-dispatch)", delta.arrivals)
-	}
-	if a, d, r := s.fixture.Counts(rid); a != 1 || d != 1 || r != 0 {
-		t.Fatalf("product: media recovery case: provider arrivals/dispatches/receipts for %s = %d/%d/%d, want 1/1/0 (the response was never delivered back)",
-			rid, a, d, r)
-	}
+	requireMediaSingleAcceptedDispatch(t, s.fixture, before, rid)
 
 	// Storage oracle (current b966c29 unresolved contract): discover the
 	// crashed media request through exactly one admission bound to the
@@ -916,6 +891,52 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 	// outcome means a crashed speech request can never legitimately
 	// produce a charge — exactly zero usage rows and settlement jobs,
 	// a stronger bound than the chat family's "at most one".
+	requireMediaNoRecoveryCharge(t, s, rid)
+
+	// The stand must still be healthy after recovery.
+	s.controlRequest(t, "post-recovery")
+	t.Logf("product: media recovery case passed (request id %s)", rid)
+}
+
+func requireMediaDispatchHeld(t *testing.T, fixture *fixture, rid string, result <-chan mediaReply) {
+	t.Helper()
+	if !fixture.WaitForDispatch(rid, 30*time.Second) {
+		t.Fatalf("harness: target speech request never reached the provider dispatch barrier — cannot test recovery of an admitted media request")
+	}
+	select {
+	case r := <-result:
+		t.Fatalf("harness: target speech request already finished (status=%d err=%v) before the crash — the case requires an in-flight request", r.status, r.err)
+	case <-time.After(500 * time.Millisecond):
+		// Still in flight, as required.
+	}
+}
+
+func requireMediaClientCrashOutcome(t *testing.T, result <-chan mediaReply) {
+	t.Helper()
+	select {
+	case r := <-result:
+		if r.err == nil && r.status == httpOK {
+			t.Fatalf("harness: client received a successful completion (%d) although the gateway died mid-flight", r.status)
+		}
+		t.Logf("harness: client observed the crash as expected (status=%d err=%v)", r.status, r.err)
+	case <-time.After(10 * time.Second):
+		t.Fatalf("harness: client speech request did not terminate after the gateway was killed")
+	}
+}
+
+func requireMediaSingleAcceptedDispatch(t *testing.T, fixture *fixture, before fixtureTotals, rid string) {
+	t.Helper()
+	fixture.VerifyEvidence()
+	if delta := fixture.Since(before); delta.arrivals != 0 {
+		t.Fatalf("product: media recovery case: %d additional provider contact(s) after the accepted dispatch (restart must not re-dispatch)", delta.arrivals)
+	}
+	if a, d, r := fixture.Counts(rid); a != 1 || d != 1 || r != 0 {
+		t.Fatalf("product: media recovery case: provider arrivals/dispatches/receipts for %s = %d/%d/%d, want 1/1/0 (the response was never delivered back)", rid, a, d, r)
+	}
+}
+
+func requireMediaNoRecoveryCharge(t *testing.T, s *stand, rid string) {
+	t.Helper()
 	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows+c.TopupRows != 0 {
 		t.Fatalf("product: media recovery case: %d credit transaction(s) for the crashed speech request — an unpriced codec must never charge, not even once (%+v)",
 			c.UsageRows+c.TopupRows, c)
@@ -923,10 +944,6 @@ func TestAccountingMediaDisconnectedAfterDispatch(t *testing.T) {
 	if n := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: media recovery case: %d settlement job(s) for the crashed speech request — an unpriced codec must never schedule settlement", n)
 	}
-
-	// The stand must still be healthy after recovery.
-	s.controlRequest(t, "post-recovery")
-	t.Logf("product: media recovery case passed (request id %s)", rid)
 }
 
 // requireMediaUnresolvedDurableState asserts, at recovery time, the
