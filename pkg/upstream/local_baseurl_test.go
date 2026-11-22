@@ -59,7 +59,7 @@ func TestLocalBaseURL_CleanOriginsConstructAndKeepOrigin(t *testing.T) {
 
 			// The request-time SSRF layer accepts the pinned origin (offline
 			// checks only: construction and validation dial nothing).
-			require.NoError(t, client.checkSSRF(),
+			require.NoError(t, client.checkSSRF(t.Context()),
 				"the pool-approved origin must pass its own request-time egress policy")
 		})
 	}

@@ -160,7 +160,7 @@ func TestRebindingMetadataRejectedAtDial(t *testing.T) {
 	}
 
 	// Lookup #1 — validate time: the legal answer must pass the allow-list.
-	if err := c.checkSSRF(); err != nil {
+	if err := c.checkSSRF(t.Context()); err != nil {
 		t.Fatalf("validate-time resolution rejected: %v", err)
 	}
 

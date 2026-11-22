@@ -281,7 +281,7 @@ func (c *Client) hopRequest(ctx context.Context, reqBody []byte, path string, st
 }
 
 func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration, capture bool, admit func(context.Context) error) (http.Header, []byte, []byte, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := c.checkSSRF(ctx); err != nil {
 		return nil, nil, nil, err
 	}
 	reqBody, err := c.preparePayload(body, model, "request")
@@ -406,7 +406,7 @@ func streamResponseStatus(resp *http.Response) *Error {
 // the caller is responsible for translating events via the provider's
 // stream translator (P3.13 wires this in serveStream).
 func (c *Client) Stream(ctx context.Context, data []byte, apiKey string) (*http.Response, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := c.checkSSRF(ctx); err != nil {
 		return nil, err
 	}
 	reqBody, err := c.preparePayload(data, "", "stream request")
@@ -457,7 +457,7 @@ func overrideModel(body []byte, model string) []byte {
 // response; the caller owns and must close resp.Body. extra headers are
 // applied after the adapter's: a key with an empty value deletes the header.
 func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string, stream bool, extra http.Header) (*http.Response, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := c.checkSSRF(ctx); err != nil {
 		return nil, err
 	}
 	req, err := c.adapter.PrepareRequest(ctx, c.baseURL, path, body, apiKey, stream)
@@ -590,7 +590,7 @@ func ValidateBaseURL(raw string) error {
 }
 
 // checkSSRF validates the configured upstream against the mandatory policy.
-func (c *Client) checkSSRF() error {
+func (c *Client) checkSSRF(ctx context.Context) error {
 	// c.baseURL is a full URL ("https://api.openai.com" or "http://127.0.0.1:53265").
 	// Extract the hostname before handing off to the allow-list, which compares
 	// against bare hostnames ("api.openai.com", "127.0.0.1") — using SplitHostPort
@@ -599,7 +599,7 @@ func (c *Client) checkSSRF() error {
 	if err != nil {
 		return fmt.Errorf("ssrf: invalid baseURL %q: %w", c.baseURL, err)
 	}
-	return validateURL(c.ssrfAllowList, c.allowedSchemes, parsed)
+	return validateURL(ctx, c.ssrfAllowList, c.allowedSchemes, parsed)
 }
 
 func (c *Client) checkRequestURL(target *url.URL) error {
@@ -630,9 +630,9 @@ func isHTTPURL(target *url.URL) bool {
 	return target != nil && (target.Scheme == "http" || target.Scheme == "https") && target.Hostname() != "" && target.User == nil
 }
 
-func validateURL(allowList ssrf.AllowList, allowedSchemes map[string]map[string]struct{}, target *url.URL) error {
+func validateURL(ctx context.Context, allowList ssrf.AllowList, allowedSchemes map[string]map[string]struct{}, target *url.URL) error {
 	if err := checkAllowedURL(allowList, allowedSchemes, target); err != nil {
 		return err
 	}
-	return allowList.ValidateUpstream(target.Hostname())
+	return allowList.ValidateUpstreamWithContext(ctx, target.Hostname())
 }

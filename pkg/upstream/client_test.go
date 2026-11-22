@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -17,6 +18,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/requestid"
 	"github.com/reireirei/yabanin/pkg/retry"
+	"github.com/reireirei/yabanin/pkg/ssrf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -180,6 +182,26 @@ func TestForwardJSON_UpstreamReadError(t *testing.T) {
 	} else {
 		assert.Error(t, err)
 	}
+}
+
+func TestUpstreamGuardRetainsRequestValuesAfterCancellation(t *testing.T) {
+	type markerKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), markerKey{}, "request-marker"))
+	cancel()
+
+	client, err := NewClient("https://provider.example", []string{"https://provider.example"})
+	require.NoError(t, err)
+	stop := errors.New("stop after checking guard context")
+	client.ssrfAllowList, err = ssrf.NewAllowListWithResolver([]string{"provider.example"},
+		func(guardCtx context.Context, host string) ([]net.IP, error) {
+			require.Equal(t, "provider.example", host)
+			require.Equal(t, "request-marker", guardCtx.Value(markerKey{}))
+			require.NoError(t, guardCtx.Err())
+			return nil, stop
+		})
+	require.NoError(t, err)
+	_, err = client.Do(ctx, "/v1/models", nil, "", false, nil)
+	require.ErrorIs(t, err, stop)
 }
 
 func TestForwardJSON_ContextCanceled(t *testing.T) {
