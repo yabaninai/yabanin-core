@@ -358,11 +358,11 @@ func TestMintSessionKey_CapsAtParentKeyExpiry(t *testing.T) {
 	assert.False(t, stored.After(parentExpires))
 }
 
-func TestOwnUsageRejectsPartiallyParsedFilters(t *testing.T) {
-	db := &scriptDB{}
-	gw := mintGW(db, nil, nil)
-	for _, query := range []string{"label.team=finance&label.project=50%", "from=%GG", "group_by=model;label.team=finance"} {
+func TestOwnUsageRejectsInvalidFiltersBeforeReadingTotals(t *testing.T) {
+	for _, query := range []string{"label.team=finance&label.project=50%", "from=%GG", "group_by=model;label.team=finance", "group_by=unsupported", "group_by=label:bad%25key"} {
 		t.Run(query, func(t *testing.T) {
+			db := &scriptDB{}
+			gw := mintGW(db, nil, nil)
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/v1/yabanin/usage?"+query, nil)
 			req = req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "parent-1", CanReadUsage: true}))
 			req.Header.Set("X-Org-Id", "org-1")

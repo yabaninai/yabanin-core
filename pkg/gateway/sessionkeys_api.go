@@ -411,6 +411,14 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	rawFilter, _ := json.Marshal(filter)
 	orgID := r.Header.Get("X-Org-Id")
+	var groups []usageGroup
+	if group := query.Get("group_by"); group != "" {
+		groups, err = gw.queryUsageGroups(r.Context(), db, group, orgID, p.APIKeyID, from, to, rawFilter)
+		if err != nil {
+			apierrors.Write(w, http.StatusBadRequest, "invalid_request", err.Error())
+			return
+		}
+	}
 	totals := gw.queryUsage(r.Context(), db,
 		`SELECT count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 		        COALESCE(sum(COALESCE(cache_read_tokens,0)),0),
@@ -428,14 +436,7 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 		    AND COALESCE(ab_group,'') <> 'shadow' AND labels @> $5::jsonb
 		  GROUP BY model_used`,
 		orgID, p.APIKeyID, from, to, rawFilter)
-	if group := query.Get("group_by"); group != "" {
-		groups, gerr := gw.queryUsageGroups(r.Context(), db, group, orgID, p.APIKeyID, from, to, rawFilter)
-		if gerr != nil {
-			apierrors.Write(w, http.StatusBadRequest, "invalid_request", gerr.Error())
-			return
-		}
-		totals.Groups = groups
-	}
+	totals.Groups = groups
 	totals.Complete = !to.After(time.Now().Add(-10 * time.Second))
 	writeJSONCode(w, http.StatusOK, totals)
 }
