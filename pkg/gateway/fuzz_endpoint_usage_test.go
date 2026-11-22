@@ -175,3 +175,171 @@ func endpointUsageLateCase(t *testing.T, index int) {
 		t.Fatalf("unknown late endpoint-usage case %d", index)
 	}
 }
+
+// FuzzEndpointUsageParsers feeds changing bodies — well-formed, typed wrong
+// and torn — into the endpoint usage parsers and checks every output against
+// an independent re-derivation of the documented contract, never against the
+// parsers' own code path.
+func FuzzEndpointUsageParsers(f *testing.F) {
+	f.Add([]byte(`{"usage":{"prompt_tokens":7,"total_tokens":9}}`), []byte("abcd"))
+	f.Add([]byte(`{"usage":{"prompt_tokens":0,"total_tokens":9}}`), []byte("abcdefg"))
+	f.Add([]byte(`{"usage":{}}`), []byte("abcd"))
+	f.Add([]byte(`{"usage":null}`), []byte("abcd"))
+	f.Add([]byte(`{"usage":5}`), []byte("abcd"))
+	f.Add([]byte(`{"usage":{"prompt_tokens":-7,"total_tokens":1}}`), []byte(""))
+	f.Add([]byte(`{"usage":{"input_tokens":3,"completion_tokens":4}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"input_tokens":2,"output_tokens":5,"total_tokens":99,"cached_tokens":1}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"prompt_tokens":8,"prompt_tokens_details":{"cached_tokens":2}}}`), []byte("x"))
+	f.Add([]byte(`{"response":{"usage":{"total_tokens":12}}}`), []byte("x"))
+	f.Add([]byte(`{"usage":{"total_tokens":4},"response":{"usage":{"total_tokens":99}}}`), []byte("x"))
+	f.Add([]byte(`{"response":{"usage":7}}`), []byte("x"))
+	f.Add([]byte(`{"response":{}}`), []byte("x"))
+	f.Add([]byte(`[1,2]`), []byte(""))
+	f.Add([]byte(`torn`), []byte("abcd"))
+	f.Fuzz(func(t *testing.T, body []byte, input []byte) {
+		// embeddingsUsage: a decodable non-null usage object wins with
+		// prompt_tokens (falling back to total_tokens); otherwise the
+		// estimate is ceil(len(input)/4) of the raw request bytes.
+		n, src := embeddingsUsage(body, input)
+		var doc struct {
+			Usage *struct {
+				PromptTokens int64 `json:"prompt_tokens"`
+				TotalTokens  int64 `json:"total_tokens"`
+			} `json:"usage"`
+		}
+		if err := json.Unmarshal(body, &doc); err == nil && doc.Usage != nil {
+			require.Equal(t, provider.UsageSourceProvider, src)
+			want := doc.Usage.PromptTokens
+			if want == 0 {
+				want = doc.Usage.TotalTokens
+			}
+			require.Equal(t, want, n)
+		} else {
+			require.Equal(t, provider.UsageSourceEstimated, src)
+			require.Equal(t, int64((len(input)+3)/4), n)
+		}
+
+		// moderationsUsage never fabricates a block: an unusable or
+		// absent usage object yields the zero usage.
+		mu := moderationsUsage(body)
+		wantMu, wantMok := expectedUsageBlock(t, body)
+		if wantMok {
+			require.Equal(t, wantMu, mu)
+		} else {
+			require.Equal(t, provider.Usage{}, mu)
+		}
+
+		// realtimeUsageFromEvent resolves the top-level usage first, then
+		// the response-nested one, and reports absence honestly.
+		ru, rok := realtimeUsageFromEvent(body)
+		wantRu, wantRok := expectedRealtimeUsage(t, body)
+		require.Equal(t, wantRok, rok)
+		if rok {
+			require.Equal(t, wantRu, ru)
+		}
+	})
+}
+
+// expectedUsageCounts re-derives the prompt/completion pair: the
+// prompt_tokens/input_tokens split names the input count, the
+// output_tokens/completion_tokens split the output count.
+func expectedUsageCounts(t *testing.T, raw []byte) (int64, int64) {
+	t.Helper()
+	var blk struct {
+		Prompt     *int64 `json:"prompt_tokens"`
+		Input      *int64 `json:"input_tokens"`
+		Output     *int64 `json:"output_tokens"`
+		Completion *int64 `json:"completion_tokens"`
+	}
+	require.NoError(t, json.Unmarshal(raw, &blk))
+	var in int64
+	switch {
+	case blk.Prompt != nil:
+		in = *blk.Prompt
+	case blk.Input != nil:
+		in = *blk.Input
+	}
+	var out int64
+	switch {
+	case blk.Output != nil:
+		out = *blk.Output
+	case blk.Completion != nil:
+		out = *blk.Completion
+	}
+	return in, out
+}
+
+// expectedUsageBlock re-derives the usage-block contract from the raw
+// bytes: the in/out pair, total_tokens over the in+out sum, cached tokens
+// from the flat field or either details object, and a missing or unusable
+// block reporting false.
+func expectedUsageBlock(t *testing.T, body []byte) (provider.Usage, bool) {
+	t.Helper()
+	var probe struct {
+		Usage *json.RawMessage `json:"usage"`
+	}
+	if err := json.Unmarshal(body, &probe); err != nil || probe.Usage == nil {
+		return provider.Usage{}, false
+	}
+	var blk struct {
+		Total         *int64 `json:"total_tokens"`
+		Cached        *int64 `json:"cached_tokens"`
+		PromptDetails *struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"prompt_tokens_details"`
+		InputDetails *struct {
+			CachedTokens int64 `json:"cached_tokens"`
+		} `json:"input_token_details"`
+	}
+	if err := json.Unmarshal(*probe.Usage, &blk); err != nil {
+		return provider.Usage{}, false
+	}
+	in, out := expectedUsageCounts(t, *probe.Usage)
+	total := int64(0)
+	if blk.Total != nil {
+		total = *blk.Total
+	}
+	if total == 0 {
+		total = in + out
+	}
+	var cached int64
+	switch {
+	case blk.Cached != nil:
+		cached = *blk.Cached
+	case blk.PromptDetails != nil:
+		cached = blk.PromptDetails.CachedTokens
+	case blk.InputDetails != nil:
+		cached = blk.InputDetails.CachedTokens
+	}
+	return provider.Usage{
+		PromptTokens:     in,
+		CompletionTokens: out,
+		TotalTokens:      total,
+		CacheReadTokens:  cached,
+		Source:           provider.UsageSourceProvider,
+	}, true
+}
+
+// expectedRealtimeUsage re-derives the realtime event contract: the
+// top-level usage block wins; when absent, a present response object's
+// usage is consulted; either way the leaf must decode as a usage block.
+func expectedRealtimeUsage(t *testing.T, body []byte) (provider.Usage, bool) {
+	t.Helper()
+	var doc struct {
+		Usage    json.RawMessage `json:"usage"`
+		Response *struct {
+			Usage json.RawMessage `json:"usage"`
+		} `json:"response"`
+	}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return provider.Usage{}, false
+	}
+	raw := doc.Usage
+	if len(raw) == 0 && doc.Response != nil {
+		raw = doc.Response.Usage
+	}
+	if len(raw) == 0 {
+		return provider.Usage{}, false
+	}
+	return expectedUsageBlock(t, []byte(`{"usage":`+string(raw)+`}`))
+}

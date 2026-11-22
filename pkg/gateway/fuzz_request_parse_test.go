@@ -208,3 +208,119 @@ func requestParseLateCase(t *testing.T, index int) {
 		t.Fatalf("unknown late request-parse case %d", index)
 	}
 }
+
+// FuzzRequestParseContract drives changing bodies — well-formed, typed
+// wrong and torn — through the request-parse gates with independent
+// expected effects: the cache-write contract (decodable object, no error
+// field, choices with non-null finish reasons), the message extraction
+// (object entries only, values intact) and the effort injection (only the
+// injected key changes).
+func FuzzRequestParseContract(f *testing.F) {
+	f.Add([]byte(`{"choices":[{"finish_reason":"stop"}]}`), "medium")
+	f.Add([]byte(`{"choices":[{"finish_reason":null}]}`), "")
+	f.Add([]byte(`{"choices":[{"finish_reason":"stop"},{"finish_reason":"length"}]}`), "high")
+	f.Add([]byte(`{"choices":["stop"]}`), "x")
+	f.Add([]byte(`{"choices":[]}`), "")
+	f.Add([]byte(`{"error":{"message":"x"}}`), "")
+	f.Add([]byte(`{}`), "")
+	f.Add([]byte(`{"choices":[{"finish_reason":"stop"}],"messages":[{"role":"user"},{"content":5},5,null]}`), "")
+	f.Add([]byte(`not json`), "")
+	f.Add([]byte(``), "")
+	f.Add([]byte(`{"messages":5}`), "")
+	f.Add([]byte(`{"messages":[{"role":"user"},{"role":"assistant"}]}`), "low")
+	f.Add([]byte(`[1]`), "")
+	f.Add([]byte(`null`), "")
+	f.Fuzz(func(t *testing.T, body []byte, effort string) {
+		require.Equal(t, expectedCacheGate(t, body), shouldCache(body))
+		requireMessageExtraction(t, body, extractChatMessages(body))
+		requireEffortInjection(t, body, effort, injectReasoningEffort(body, effort))
+	})
+}
+
+// expectedCacheGate re-derives the FIX-10 write contract: only a decodable
+// JSON object without an error field and with at least one choice — every
+// choice an object carrying a non-null finish_reason — may be written.
+func expectedCacheGate(t *testing.T, body []byte) bool {
+	t.Helper()
+	if len(body) == 0 {
+		return false
+	}
+	var resp interface{}
+	if err := json.Unmarshal(body, &resp); err != nil {
+		return false
+	}
+	root, ok := resp.(map[string]interface{})
+	if !ok {
+		return false
+	}
+	if _, hasError := root["error"]; hasError {
+		return false
+	}
+	choices, _ := root["choices"].([]interface{})
+	if len(choices) == 0 {
+		return false
+	}
+	for _, raw := range choices {
+		choice, ok := raw.(map[string]interface{})
+		if !ok {
+			return false
+		}
+		if fr, present := choice["finish_reason"]; !present || fr == nil {
+			return false
+		}
+	}
+	return true
+}
+
+// requireMessageExtraction pins extraction independently: nil only when the
+// body cannot decode as an object; otherwise a slice holding exactly the
+// object entries of the messages array, in order, with decoded values
+// intact.
+func requireMessageExtraction(t *testing.T, body []byte, msgs []map[string]interface{}) {
+	t.Helper()
+	var root map[string]interface{}
+	if err := json.Unmarshal(body, &root); err != nil {
+		require.Nil(t, msgs)
+		return
+	}
+	require.NotNil(t, msgs)
+	rawMsgs, _ := root["messages"].([]interface{})
+	var objectIdx []int
+	for i, rm := range rawMsgs {
+		if _, ok := rm.(map[string]interface{}); ok {
+			objectIdx = append(objectIdx, i)
+		}
+	}
+	require.Len(t, msgs, len(objectIdx))
+	for out, i := range objectIdx {
+		want, _ := rawMsgs[i].(map[string]interface{})
+		require.Equal(t, want, msgs[out])
+	}
+}
+
+// requireEffortInjection pins the patch contract: no effort or an
+// undecodable body returns the input untouched; a decodable object carries
+// the effort verbatim and every other key keeps its JSON value.
+func requireEffortInjection(t *testing.T, body []byte, effort string, out []byte) {
+	t.Helper()
+	if effort == "" || len(body) == 0 {
+		require.Equal(t, body, out)
+		return
+	}
+	var root map[string]json.RawMessage
+	if err := json.Unmarshal(body, &root); err != nil || root == nil {
+		require.Equal(t, body, out)
+		return
+	}
+	var patched map[string]json.RawMessage
+	require.NoError(t, json.Unmarshal(out, &patched))
+	require.Contains(t, patched, "reasoning_effort")
+	enc, err := json.Marshal(effort)
+	require.NoError(t, err)
+	require.Equal(t, string(enc), string(patched["reasoning_effort"]))
+	for k, v := range root {
+		if k != "reasoning_effort" {
+			require.JSONEq(t, string(v), string(patched[k]))
+		}
+	}
+}

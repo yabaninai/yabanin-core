@@ -96,24 +96,36 @@ func FuzzTraceEventDelivery(f *testing.F) {
 	for i := range traceDeliveryCases {
 		f.Add(uint8(i), uint32(23+i), i%2 == 0)
 	}
+	// The two wave-2 guard seeds stay reserved with their baseline
+	// arguments: 200 pins the cheap no-op arms, 201 the registry eviction
+	// bound. The exact-index dispatch keeps the expensive 201 saturation
+	// reachable only through its reserved seed — never a whole range of
+	// folded mutations.
+	f.Add(uint8(200), uint32(1), false)
+	f.Add(uint8(201), uint32(1), false)
 	f.Fuzz(func(t *testing.T, index uint8, request uint32, before bool) {
-		// Every mutated index folds into the fixed scenario table as a
-		// legal pick; the request id, the scaled cohort and the declare
-		// order are the genuinely varied inputs.
+		if index == 200 || index == 201 {
+			// Reserved guard indices dispatch explicitly; every other
+			// value folds into the fixed scenario table as a legal pick,
+			// and the request id, the scaled cohort and the declare order
+			// are the genuinely varied inputs.
+			traceStampGuardCase(t, int(index))
+			return
+		}
 		s := traceDeliveryCases[int(index)%len(traceDeliveryCases)].scaled(int(request % 31))
 		id := traceStampTestID(t, fmt.Sprintf("delivery-%08x", request))
 		traceDeliveryEvent(t, id, fmt.Sprintf("team-%x", request), s, before)
 	})
 }
 
-// TestTraceStampGuardPins pins the trace-stamp guard arms the request-
-// scoped scenarios cannot reach — empty-id / invalid-reason no-ops (200),
-// the cyclic registry eviction at the bound (201), the reason-append
-// bound with its valid-id drop pin (202) and the bounded-envelope
-// eviction loop (203). The guard facts are a fixed table, not a fuzz
+// TestTraceStampGuardPins pins the wave-3 trace-stamp guard arms the
+// request-scoped scenarios cannot reach — the reason-append bound with
+// its valid-id drop pin (202) and the bounded-envelope eviction loop
+// (203). Guards 200/201 stay pinned through the reserved fuzz seeds in
+// FuzzTraceEventDelivery. The guard facts are a fixed table, not a fuzz
 // dispatch: mutations must never reach a refusal arm.
 func TestTraceStampGuardPins(t *testing.T) {
-	for _, index := range []int{200, 201, 202, 203} {
+	for _, index := range []int{202, 203} {
 		traceStampGuardCase(t, index)
 	}
 }
