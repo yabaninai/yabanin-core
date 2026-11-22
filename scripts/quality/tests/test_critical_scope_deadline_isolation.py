@@ -26,17 +26,13 @@ class PackageDeadlineIsolation(unittest.TestCase):
                     _build_tags, _config):
             advance('package-scan', package, 10)
             selection = conservative.Selection(package)
-            selection.note_lost_baseline(
-                'TestRewrite', [{
-                    'file': package + '/rewrite_test.go',
-                    'name': 'TestRewrite',
-                    'hash': 'old-body',
-                    'start': 1,
-                }])
-            conservative.RUNS[package] = (selection, None, None)
-            return [{'file': package + '/production.go',
-                     'name': 'Changed', 'hash': package,
-                     'start': 1, 'end': 2, 'recv': ''}]
+            path = package + '/production.go'
+            unit = {'name': 'Changed', 'hash': package, 'start': 1, 'end': 2}
+            side = conservative.Side([{'path': path, 'units': [unit]}], _root)
+            consumers = side.functions()
+            selection.note_lost_baseline('TestRewrite', consumers)
+            conservative.RUNS[package] = (selection, side, None)
+            return consumers
 
         def covered(_root, package, _mode, origin='current tree',
                     config=None):
