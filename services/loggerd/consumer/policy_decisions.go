@@ -396,10 +396,13 @@ func max64(v, floor int64) int64 {
 }
 
 // insertPolicyDecision writes one policy_decisions row PER producer decision
-// inside the delivery transaction (same commit as the request log). Absent
-// policy field, empty org or request-less legacy shapes skip silently; a DB
-// error fails the delivery (the retry re-delivers the decisions together
-// with their request log, exactly like the request_logs path).
+// inside the delivery transaction (same commit as the request log). Each row
+// records the invocation it was produced for (0033; empty for legacy shapes)
+// so the duplicate-enrichment probe can tell a mirror decision from its
+// primary's. Absent policy field, empty org or request-less legacy shapes
+// skip silently; a DB error fails the delivery (the retry re-delivers the
+// decisions together with their request log, exactly like the request_logs
+// path).
 func (c *StreamConsumer) insertPolicyDecision(ctx context.Context, tx InboxTx, ev requestEvent) error {
 	decisions := parsePolicyDecision(ev.raw)
 	if len(decisions) == 0 || ev.orgID == "" {
@@ -416,9 +419,9 @@ func (c *StreamConsumer) insertPolicyDecision(ctx context.Context, tx InboxTx, e
 		decision := decisions[i]
 		if _, err := tx.Exec(ctx,
 			`INSERT INTO policy_decisions
-				 (org_id, request_id, policy_id, policy_version, mode, verdict, findings, duration_ms, created_at)
-				 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9)`,
-			ev.orgID, ev.requestID, decision.PolicyID, decision.Version,
+				 (org_id, request_id, invocation_id, policy_id, policy_version, mode, verdict, findings, duration_ms, created_at)
+				 VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10)`,
+			ev.orgID, ev.requestID, ev.invocationID, decision.PolicyID, decision.Version,
 			decision.Mode, decision.Verdict, []byte(decision.Findings), decision.DurationMs, ev.createdAt,
 		); err != nil {
 			return fmt.Errorf("insert policy decision: %w", err)

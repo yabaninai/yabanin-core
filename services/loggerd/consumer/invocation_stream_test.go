@@ -207,7 +207,7 @@ func admissionRow(schemaCols int, admission *fakeRow, facts map[string]any) func
 			}
 			return errRow{err: pgx.ErrNoRows}
 		case strings.Contains(query, "FROM policy_decisions"):
-			if want := []any{id.org, id.request}; !sameMockArgs(args, want) {
+			if want := []any{id.org, id.request, id.invocation}; !sameMockArgs(args, want) {
 				return unexpectedBind("policy_decisions probe", args, want)
 			}
 			return errRow{err: pgx.ErrNoRows}

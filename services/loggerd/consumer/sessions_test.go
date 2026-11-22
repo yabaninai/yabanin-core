@@ -8,6 +8,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
@@ -63,10 +64,34 @@ func TestResolveSessionID_UpsertArgsAndFailureFailsOpen(t *testing.T) {
 	mu.Lock()
 	defer mu.Unlock()
 	require.Len(t, qargs, 3)
-	assert.Equal(t, goldenOpenCodeSession, qargs[0], "registry id is the deterministic v5 mapping")
+	wantID := uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID + "\x00" + "ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String()
+	assert.Equal(t, wantID, qargs[0], "registry id is the org-scoped deterministic v5 mapping")
 	assert.Equal(t, testOrgUUID, qargs[1])
 	assert.Equal(t, "ses_f7c8cea03ffeQF8w3WLp7oRA9w", qargs[2], "client_session keeps the raw id")
-	assert.Contains(t, sql, "ON CONFLICT (client_session)")
+	assert.Contains(t, sql, "ON CONFLICT (org_id, client_session)",
+		"the conflict target is org-scoped: sessions RLS is region isolation only, so the query itself must never touch a foreign org's row")
+}
+
+// Two orgs delivering the same raw client session must offer distinct
+// registry ids (the org-scoped v5 mapping), so the second org's row mints
+// under the (org_id, client_session) arbiter instead of colliding on the
+// sessions primary key — and the same org always maps deterministically.
+func TestSessionRegistryUUIDIsOrgScoped(t *testing.T) {
+	orgA := "a1b2c3d4-e5f6-4a7b-8c9d-0e1f2a3b4c5d"
+	orgB := "b2c3d4e5-f6a7-4b8c-9d0e-1f2a3b4c5d6e"
+	raw := "ses_f7c8cea03ffeQF8w3WLp7oRA9w"
+
+	idA := sessionRegistryUUID(orgA, raw)
+	idB := sessionRegistryUUID(orgB, raw)
+	assert.NotEqual(t, idA, idB, "the same raw id maps to distinct registry rows per org")
+	assert.Equal(t, idA, sessionRegistryUUID(orgA, raw), "the mapping is deterministic for the same org")
+
+	// A client-supplied valid UUID keeps its exact value (the pre-0032
+	// contract); the one cross-org collision on the primary key fails the
+	// upsert and resolves to the documented fail-open.
+	clientUUID := "3f2b8a4c-9d1e-4f5a-8b7c-6e5d4c3b2a10"
+	assert.Equal(t, clientUUID, sessionRegistryUUID(orgA, clientUUID))
+	assert.Equal(t, clientUUID, sessionRegistryUUID(orgB, clientUUID))
 }
 
 func TestResolveSessionID_ValidClientUUIDKeepsValue(t *testing.T) {

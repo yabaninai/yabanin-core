@@ -2108,19 +2108,29 @@ func (c *StreamConsumer) enrichToolCallsIfAbsent(ctx context.Context, tx InboxTx
 }
 
 // enrichPolicyDecisionIfAbsent commits the policy decision with the
-// enrichment only when no decision row exists for the request yet. The
-// org GUC is pinned first because policy_decisions carries the org
-// isolation RLS posture and a bare probe would read zero rows.
+// enrichment only when no decision row exists for THIS delivery's identity
+// yet. The org GUC is pinned first because policy_decisions carries the org
+// isolation RLS posture and a bare probe would read zero rows. The probe
+// binds the invocation id (0033) in addition to org and request: a primary
+// and its shadow mirror may share both org_id and request_id (0028), so a
+// bare (org, request) probe let whichever delivery materialized first
+// suppress the other's decision rows — a recovery-first mirror lost its
+// decision record while the primary still charged. Any probe error other
+// than a clean miss fails the enrichment (delivery error, no ack,
+// redelivery) rather than being mistaken for absence.
 func (c *StreamConsumer) enrichPolicyDecisionIfAbsent(ctx context.Context, tx InboxTx, ev requestEvent) error {
 	if _, err := tx.Exec(ctx, "SELECT set_config('app.current_org', $1, true)", ev.orgID); err != nil {
 		return fmt.Errorf("pin policy decision org GUC: %w", err)
 	}
 	var one int
-	if err := tx.QueryRow(ctx,
-		`SELECT 1 FROM policy_decisions WHERE org_id = $1 AND request_id = $2 LIMIT 1`,
-		ev.orgID, ev.requestID,
-	).Scan(&one); err == nil {
+	switch err := tx.QueryRow(ctx,
+		`SELECT 1 FROM policy_decisions WHERE org_id = $1 AND request_id = $2 AND invocation_id = $3 LIMIT 1`,
+		ev.orgID, ev.requestID, ev.invocationID,
+	).Scan(&one); {
+	case err == nil:
 		return nil
+	case !errors.Is(err, pgx.ErrNoRows):
+		return fmt.Errorf("probe policy decision enrichment: %w", err)
 	}
 	return c.insertPolicyDecision(ctx, tx, ev)
 }

@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
@@ -531,7 +532,10 @@ func TestHandleRequestComplete_NonUUIDSessionIDHashed(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43) // +upstream_request, +upstream_response, +observability parity
-	assert.Equal(t, goldenOpenCodeSession, values[0])
+	// The stored id is the registry id offered by the org-scoped mapping
+	// (0032): deterministic per (org, raw), never the verbatim non-UUID
+	// string (the LG-U1 invariant).
+	assert.Equal(t, uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID+"\x00"+"ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String(), values[0])
 	// Legacy/absent observability fields must land as NULL ("unknown"),
 	// not as fake zeros that would poison TTFT/retry aggregates.
 	assert.Nil(t, values[30], "first_token_ms")

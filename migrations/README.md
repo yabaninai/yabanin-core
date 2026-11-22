@@ -8,11 +8,11 @@ beside an existing binary does not change its embedded migration set.
 
 ## Current schema and numbering
 
-- Current embedded head: **0031** (`request_payload_grant_row`). A successful
-  migration to this release records `version = 31` and `dirty = false`.
-- Next available migration number: **0032**.
-- The shipped set contains **30 up/down pairs**: `0001` through `0022`, then
-  `0024` through `0031`. Version **0023 is permanently reserved and unused**;
+- Current embedded head: **0034** (`policy_decision_invocation`). A successful
+  migration to this release records `version = 34` and `dirty = false`.
+- Next available migration number: **0035**.
+- The shipped set contains **33 up/down pairs**: `0001` through `0022`, then
+  `0024` through `0034`. Version **0023 is permanently reserved and unused**;
   do not create a replacement file for it or renumber later migrations.
 - Files use the format `NNNN_name.up.sql` and `NNNN_name.down.sql`, with a
   four-digit version and a lowercase descriptive name. Each version has exactly
@@ -46,6 +46,9 @@ The later additions include:
 | `0029` | Removal of the superseded settlement charge key and global credit usage index (contract of `0028`) |
 | `0030` | Per-invocation identity for retained tool facts: `invocation_id` on `tool_calls`/`tool_call_invocations` with partial unique arbiters (legacy rows keep NULL) |
 | `0031` | Row-identity binding for one-request payload grants: nullable `request_row_key` on `request_payload_grants`, bound at issuance, no backfill |
+| `0032` | Tenant-safe session attribution (expand): org-scoped registry conflict target `UNIQUE (org_id, client_session)` on `sessions` |
+| `0033` | Removal of the superseded bare `client_session` conflict target (contract of `0032`) |
+| `0034` | Durable policy-decision identity: `invocation_id` on `policy_decisions` (legacy rows stay `''`, bound probes never match them) |
 
 A schema object's presence does not by itself establish that a feature is
 configured, enabled or exposed by a particular deployment. Consult the SQL
