@@ -77,7 +77,7 @@ func grantAuditEventCount(t *testing.T, pool *pgxpool.Pool, ctx context.Context,
 	t.Helper()
 	var n int64
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT count(*) FROM admin_audit_logs WHERE admin_id=$1::uuid AND action=$2`, rootID, action).Scan(&n))
+		`SELECT count(*) FROM admin_audit_logs WHERE admin_id=$1 AND action=$2`, rootID, action).Scan(&n))
 	return n
 }
 
@@ -304,6 +304,11 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 	// audit write will block before anything of the issuance can commit.
 	lockTx, err := pool.Begin(ctx)
 	require.NoError(t, err)
+	// Deferred NOW, not at the convergence point: any assertion failure
+	// below must still release the advisory lock, or the pool cleanup
+	// deadlocks with the issuer goroutine (the leak the first corrected
+	// run exhibited).
+	defer func() { _ = lockTx.Rollback(context.Background()) }()
 	_, err = lockTx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database() || ':admin_audit_logs:append'))`)
 	require.NoError(t, err)
 
@@ -320,9 +325,49 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 	select {
 	case res := <-done:
 		t.Fatalf("issuance returned while its mandatory audit write was still blocked: grant=%+v err=%v", res.grant, res.err)
-	case <-time.After(600 * time.Millisecond):
-		// Still blocked inside the issuance transaction — nothing committed.
+	default:
 	}
+	// Reach-proof, not a timed guess: identify the holder session (the
+	// lockTx backend) and, from an independent connection, wait until an
+	// issuer connection is actually QUEUED on the very same advisory lock
+	// — a waiting row whose full database/classid/objid/objsubid tag
+	// matches a granted row of the holder. Matching the holder row instead
+	// of recomputing the key is the portable proof: pg_advisory_xact_lock
+	// widens the int4 hashtext() to bigint, and a negative hash
+	// sign-extends into classid=4294967295 rather than 0, so a classid=0
+	// probe would silently depend on the disposable database name.
+	var holderPID int32
+	require.NoError(t, lockTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID),
+		"identifying the advisory-lock holder backend")
+	var heldByHolder int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted AND pid=$1`, holderPID).Scan(&heldByHolder))
+	require.NotZero(t, heldByHolder,
+		"the holder transaction must already own the append advisory lock before the issuance starts")
+	const waitingOnHolderLockSQL = `SELECT count(*) FROM pg_locks w
+WHERE w.locktype='advisory' AND NOT w.granted
+  AND EXISTS (SELECT 1 FROM pg_locks h
+              WHERE h.locktype='advisory' AND h.granted AND h.pid=$1
+                AND h.database IS NOT DISTINCT FROM w.database
+                AND h.classid  IS NOT DISTINCT FROM w.classid
+                AND h.objid    IS NOT DISTINCT FROM w.objid
+                AND h.objsubid IS NOT DISTINCT FROM w.objsubid)`
+	reached := false
+	for deadline := time.Now().Add(5 * time.Second); !reached && time.Now().Before(deadline); {
+		var waiting int64
+		require.NoError(t, pool.QueryRow(ctx, waitingOnHolderLockSQL, holderPID).Scan(&waiting))
+		if waiting > 0 {
+			reached = true
+			break
+		}
+		select {
+		case res := <-done:
+			t.Fatalf("issuance returned before ever queuing on the append advisory lock: grant=%+v err=%v", res.grant, res.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	require.True(t, reached,
+		"the issuance never queued on the holder's admin_audit_logs append advisory lock within 5s")
 	assert.Zero(t, activeGrantCount(t, pool, ctx, orgID),
 		"while the issuance transaction is blocked in its audit write, zero active grants may exist")
 	assert.Zero(t, grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_issued"),
