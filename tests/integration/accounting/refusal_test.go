@@ -44,10 +44,22 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	rid := s.reqPrefix + "tgt-refusal"
 	status, body, err := s.chat(t, rid, 45*time.Second)
 
-	// Documented refusal contract (reservation gate, I40 family):
-	// HTTP 503 with a structured error envelope whose error.code is
-	// history_unavailable. A 401/402/403/500, a network drop or an
-	// unstructured body each fail the case explicitly.
+	requireHistoryUnavailableResponse(t, status, body, err)
+	requireNoProviderContactDuringRefusal(t, s, before)
+	requireNoRefusalAccounting(t, s, rid)
+
+	// Restore the write path (verified), then prove the stand is still
+	// good with the same credentials, route and provider: the refusal was
+	// caused by the accounting outage, nothing else.
+	s.disarmAccountingWriteOutage(t)
+	s.controlRequest(t, "post-fault")
+	requireNoRetroactiveRefusalCharge(t, s, rid)
+	t.Logf("product: refusal case passed (request id %s)", rid)
+}
+
+func requireHistoryUnavailableResponse(t *testing.T, status int, body string, err error) {
+	t.Helper()
+	// The reservation gate contract requires an HTTP 503 structured refusal.
 	switch {
 	case err != nil:
 		t.Fatalf("product: refusal case: client transport error %v — the request must be refused with the documented 503 history_unavailable contract, not dropped", err)
@@ -61,7 +73,10 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	if code != "history_unavailable" {
 		t.Fatalf("product: refusal case: 503 error.code %q, want history_unavailable (body %s)", code, clip(body))
 	}
+}
 
+func requireNoProviderContactDuringRefusal(t *testing.T, s *stand, before fixtureTotals) {
+	t.Helper()
 	// Independent provider oracle: zero provider contact in the window —
 	// the fixture ledger records every arrival regardless of the request
 	// id the gateway forwarded, authorized or not.
@@ -70,7 +85,10 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 		t.Fatalf("product: refusal case: whole-ledger provider contact during the outage arrivals/dispatches/receipts = %d/%d/%d, want 0/0/0 — the request must never be dispatched, retried or failed over",
 			delta.arrivals, delta.dispatches, delta.receipts)
 	}
+}
 
+func requireNoRefusalAccounting(t *testing.T, s *stand, rid string) {
+	t.Helper()
 	// Independent storage oracle: nothing was recorded or charged for the
 	// refused request (org-bound queries; cross-org rows cannot satisfy
 	// them).
@@ -86,13 +104,10 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	if n := s.oracleAdmissionRowCount(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d admission row(s) exist for the refused request", n)
 	}
+}
 
-	// Restore the write path (verified), then prove the stand is still
-	// good with the same credentials, route and provider: the refusal was
-	// caused by the accounting outage, nothing else.
-	s.disarmAccountingWriteOutage(t)
-	s.controlRequest(t, "post-fault")
-
+func requireNoRetroactiveRefusalCharge(t *testing.T, s *stand, rid string) {
+	t.Helper()
 	// The refused request must never retroactively bill.
 	if n := s.oracleRequestLogCount(t, rid, s.oracleDB.orgID); n != 0 {
 		t.Fatalf("product: refusal case: %d request_logs row(s) appeared for the refused request after restoration", n)
@@ -100,7 +115,6 @@ func TestAccountingRefusalBeforeDispatch(t *testing.T) {
 	if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows != 0 {
 		t.Fatalf("product: refusal case: %d usage transaction(s) appeared for the refused request after restoration", c.UsageRows)
 	}
-	t.Logf("product: refusal case passed (request id %s)", rid)
 }
 
 // armAccountingWriteOutage installs the real-infrastructure fault and

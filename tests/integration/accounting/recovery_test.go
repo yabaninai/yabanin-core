@@ -34,17 +34,35 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	s.controlRequest(t, "pre-crash")
 
 	rid := s.reqPrefix + "tgt-recovery"
+	start, before := crashHeldAdmittedRequest(t, s, rid)
+	s.restartGateway()
+	requireRecoveryDidNotRedispatch(t, s, rid, before)
+
+	// Storage oracle, pre-grace window: the restarted system must still
+	// know this exact in-flight request — same identity, still admitted,
+	// no fabricated terminal evidence, no charge — and must not have
+	// silently dropped it.
+	s.requireInFlightIdentityBeforeGrace(t, rid, start)
+
+	// The stand must still be healthy after recovery.
+	s.controlRequest(t, "post-recovery")
+	t.Logf("product: recovery case passed (request id %s)", rid)
+}
+
+type recoveryChatResult struct {
+	status int
+	body   string
+	err    error
+}
+
+func crashHeldAdmittedRequest(t *testing.T, s *stand, rid string) (durableStart, fixtureTotals) {
+	t.Helper()
 	s.fixture.Hold(rid)
 
-	type chatResult struct {
-		status int
-		body   string
-		err    error
-	}
-	result := make(chan chatResult, 1)
+	result := make(chan recoveryChatResult, 1)
 	go func() {
 		status, body, err := s.chat(t, rid, 120*time.Second)
-		result <- chatResult{status: status, body: body, err: err}
+		result <- recoveryChatResult{status: status, body: body, err: err}
 	}()
 
 	// Harness validity: the provider must actually accept the dispatch
@@ -82,10 +100,11 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	case <-time.After(10 * time.Second):
 		t.Fatalf("harness: client request did not terminate after the gateway was killed")
 	}
+	return start, before
+}
 
-	// Restart the gateway against the same storage.
-	s.restartGateway()
-
+func requireRecoveryDidNotRedispatch(t *testing.T, s *stand, rid string, before fixtureTotals) {
+	t.Helper()
 	// Independent provider oracle: the whole case (including the restart)
 	// must have caused exactly one provider contact and one accepted
 	// dispatch. A recovery that re-dispatches bills twice.
@@ -96,16 +115,6 @@ func TestAccountingAdmittedRequestRecovery(t *testing.T) {
 	if a, d, r := s.fixture.Counts(rid); a != 1 || d != 1 || r != 0 {
 		t.Fatalf("product: recovery case: provider arrivals/dispatches/receipts for %s = %d/%d/%d, want 1/1/0 (the response was never delivered back)", rid, a, d, r)
 	}
-
-	// Storage oracle, pre-grace window: the restarted system must still
-	// know this exact in-flight request — same identity, still admitted,
-	// no fabricated terminal evidence, no charge — and must not have
-	// silently dropped it.
-	s.requireInFlightIdentityBeforeGrace(t, rid, start)
-
-	// The stand must still be healthy after recovery.
-	s.controlRequest(t, "post-recovery")
-	t.Logf("product: recovery case passed (request id %s)", rid)
 }
 
 // durableStart captures what the dispatch barrier required: which record
