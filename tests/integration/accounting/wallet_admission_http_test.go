@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/cookiejar"
+	"net/http/httptest"
 	"net/url"
 	"path/filepath"
 	"strconv"
@@ -177,11 +178,10 @@ func adminLogin(t *testing.T, s *stand, adminURL string) *adminSession {
 // form POST must echo.
 func adminLoginStageCSRFCookie(t *testing.T, sess *adminSession) string {
 	t.Helper()
-	resp := adminSessionGet(t, sess, "/auth/login")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("harness: admin login page status %d", resp.StatusCode)
+	status, _ := adminSessionGet(t, sess, "/auth/login")
+	if status != http.StatusOK {
+		t.Fatalf("harness: admin login page status %d", status)
 	}
-	_ = readAllBody(t, resp)
 	csrfToken := sessionCookieValue(t, sess, "yabanin_csrf_token")
 	if csrfToken == "" {
 		t.Fatalf("harness: login page did not mint the CSRF cookie — the documented login protocol is broken")
@@ -197,11 +197,10 @@ func adminLoginStagePostForm(t *testing.T, sess *adminSession, email, password, 
 	form.Set("email", email)
 	form.Set("password", password)
 	form.Set("_csrf", csrfToken)
-	resp := adminSessionPostForm(t, sess, "/auth/login", form)
-	if resp.StatusCode >= 400 {
-		t.Fatalf("harness: admin login refused (status %d, body %s)", resp.StatusCode, clip(readAllBody(t, resp)))
+	status, body := adminSessionPostForm(t, sess, "/auth/login", form)
+	if status >= 400 {
+		t.Fatalf("harness: admin login refused (status %d, body %s)", status, clip(body))
 	}
-	readAllBody(t, resp)
 	if sessionCookieValue(t, sess, "yabanin_admin_session") == "" {
 		t.Fatalf("harness: admin login did not establish a session cookie")
 	}
@@ -211,53 +210,148 @@ func adminLoginStagePostForm(t *testing.T, sess *adminSession, email, password, 
 // canonical token used on protected admin API calls.
 func adminLoginStageSessionToken(t *testing.T, sess *adminSession) string {
 	t.Helper()
-	resp := adminSessionGet(t, sess, "/auth/csrf")
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("harness: admin csrf fetch status %d", resp.StatusCode)
+	status, body := adminSessionGet(t, sess, "/auth/csrf")
+	if status != http.StatusOK {
+		t.Fatalf("harness: admin csrf fetch status %d", status)
 	}
 	var csrf struct {
 		Token string `json:"csrf_token"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&csrf); err != nil || csrf.Token == "" {
+	if err := json.Unmarshal([]byte(body), &csrf); err != nil || csrf.Token == "" {
 		t.Fatalf("harness: admin csrf body decode: %v", err)
 	}
 	return csrf.Token
 }
 
-// adminSessionGet issues one bounded GET against the admin console.
-func adminSessionGet(t *testing.T, sess *adminSession, path string) *http.Response {
+// adminSessionGet issues one bounded GET against the admin console and
+// returns the status plus the fully drained body.
+func adminSessionGet(t *testing.T, sess *adminSession, path string) (int, string) {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), adminRequestTimeout)
-	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sess.baseURL+path, nil)
-	if err != nil {
-		t.Fatalf("harness: admin GET %s build: %v", path, err)
-	}
-	resp, err := sess.client.Do(req)
-	if err != nil {
-		t.Fatalf("harness: admin GET %s: %v", path, err)
-	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	return resp
+	return adminSessionDo(t, sess, http.MethodGet, path, "", nil)
 }
 
 // adminSessionPostForm issues one bounded form POST against the admin
-// console with the browser content type.
-func adminSessionPostForm(t *testing.T, sess *adminSession, path string, form url.Values) *http.Response {
+// console with the browser content type and returns status plus body.
+func adminSessionPostForm(t *testing.T, sess *adminSession, path string, form url.Values) (int, string) {
+	t.Helper()
+	return adminSessionDo(t, sess, http.MethodPost, path, "application/x-www-form-urlencoded", strings.NewReader(form.Encode()))
+}
+
+// adminSessionDo is the one common admin request helper: bounded request
+// context, bounded client, and the response body fully read and closed
+// BEFORE the context cancels. It returns (status, body); no live response
+// body is ever handed back tied to an already-cancelled context, so a slow
+// body can be late but never truncated or failed by the deferred cancel.
+func adminSessionDo(t *testing.T, sess *adminSession, method, path, contentType string, payload io.Reader) (int, string) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), adminRequestTimeout)
 	defer cancel()
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, sess.baseURL+path, strings.NewReader(form.Encode()))
+	req, err := http.NewRequestWithContext(ctx, method, sess.baseURL+path, payload)
 	if err != nil {
-		t.Fatalf("harness: admin POST %s build: %v", path, err)
+		t.Fatalf("harness: admin %s %s build: %v", method, path, err)
 	}
-	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if contentType != "" {
+		req.Header.Set("Content-Type", contentType)
+	}
 	resp, err := sess.client.Do(req)
 	if err != nil {
-		t.Fatalf("harness: admin POST %s: %v", path, err)
+		t.Fatalf("harness: admin %s %s: %v", method, path, err)
 	}
-	t.Cleanup(func() { _ = resp.Body.Close() })
-	return resp
+	defer resp.Body.Close()
+	body := readAllBody(t, resp)
+	return resp.StatusCode, body
+}
+
+// TestAdminSessionDelayedBodyRead pins the request-helper contract the
+// login stages depend on: a response whose body arrives LATE must be read
+// completely by the shipped common helper (body drained and closed before
+// the bounded context cancels), while the abandoned shape this replaces —
+// handing back a live *http.Response from a helper whose deferred cancel
+// fires on return — deterministically fails or truncates that same body.
+func TestAdminSessionDelayedBodyRead(t *testing.T) {
+	const payload = "yabanin-delayed-body-payload"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/plain")
+		w.WriteHeader(http.StatusOK)
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush() // headers are on the wire; client Do returns here
+		}
+		time.Sleep(300 * time.Millisecond) // body arrives only later
+		_, _ = io.WriteString(w, payload)
+	}))
+	defer srv.Close()
+
+	// Negative control: the abandoned helper shape. The context is
+	// cancelled the moment Do returns, before the delayed body exists —
+	// exactly what the previous deferred-cancel-and-return-response
+	// helpers did to every caller that then read the body.
+	ctx, cancel := context.WithCancel(context.Background())
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, srv.URL, nil)
+	if err != nil {
+		t.Fatalf("harness: control request build: %v", err)
+	}
+	controlResp, err := (&http.Client{Timeout: adminRequestTimeout}).Do(req)
+	if err != nil {
+		t.Fatalf("harness: control request: %v", err)
+	}
+	cancel()
+	if _, readErr := io.ReadAll(controlResp.Body); readErr == nil {
+		t.Fatalf("harness: negative control read the delayed body cleanly — the demonstration no longer reproduces the abandoned shape and must be rebuilt")
+	}
+	_ = controlResp.Body.Close()
+
+	// Shipped shape: GET and form POST through the common helper return
+	// status plus the fully drained body, late arrival notwithstanding.
+	sess := &adminSession{baseURL: srv.URL, client: &http.Client{Timeout: adminRequestTimeout}}
+	status, body := adminSessionGet(t, sess, "/")
+	if status != http.StatusOK || body != payload {
+		t.Fatalf("harness: helper GET of a delayed body truncated or failed (status %d, body %q), want 200/%q", status, body, payload)
+	}
+	status, body = adminSessionPostForm(t, sess, "/", url.Values{"k": {"v"}})
+	if status != http.StatusOK || body != payload {
+		t.Fatalf("harness: helper form POST of a delayed body truncated or failed (status %d, body %q), want 200/%q", status, body, payload)
+	}
+}
+
+// TestBudgetSettingsAbsentEffectiveKeyRejected pins the decode oracle for
+// the grace-floor JSON contract at both layers. Decode layer: an ABSENT
+// effective_grace_floor_cents decodes as a nil pointer — structurally
+// unable to equal an expected zero — while an explicit zero decodes as a
+// pointer to 0. Oracle layer: doJSON rejects the nil-pointer shape (its
+// guard fails the test on an absent key; the failure mode is a t.Fatalf,
+// demonstrated against a live server during review, where the run logged
+// "response omits effective_grace_floor_cents … must never satisfy an
+// expected zero") and accepts the explicit-zero shape, so a real zero
+// effective floor keeps passing.
+func TestBudgetSettingsAbsentEffectiveKeyRejected(t *testing.T) {
+	// Decode layer: absence is nil, never zero.
+	var absent budgetSettings
+	if err := json.Unmarshal([]byte(`{"grace_floor_cents":0,"balance_cents":100}`), &absent); err != nil {
+		t.Fatalf("oracle: absent-key body must decode (err %v)", err)
+	}
+	if absent.EffectiveGraceFloorCents != nil {
+		t.Fatalf("oracle: absent effective_grace_floor_cents decoded as %d — absence must stay nil so it can never equal an expected zero", *absent.EffectiveGraceFloorCents)
+	}
+
+	var explicit budgetSettings
+	if err := json.Unmarshal([]byte(`{"grace_floor_cents":0,"effective_grace_floor_cents":0,"balance_cents":100}`), &explicit); err != nil {
+		t.Fatalf("oracle: explicit-zero body must decode (err %v)", err)
+	}
+	if explicit.EffectiveGraceFloorCents == nil || *explicit.EffectiveGraceFloorCents != 0 {
+		t.Fatalf("oracle: explicit zero effective_grace_floor_cents decoded as %v, want a pointer to 0", explicit.EffectiveGraceFloorCents)
+	}
+
+	// Oracle layer: the explicit-zero shape passes the live doJSON path.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"grace_floor_cents":0,"effective_grace_floor_cents":0,"balance_cents":100}`)
+	}))
+	defer srv.Close()
+	sess := &adminSession{baseURL: srv.URL, client: &http.Client{Timeout: adminRequestTimeout}, csrf: "test"}
+	got := sess.doJSON(t, http.MethodGet, "/api/orgs/x/credits/grace", nil)
+	if got.EffectiveGraceFloorCents == nil || *got.EffectiveGraceFloorCents != 0 {
+		t.Fatalf("oracle: explicit zero effective_grace_floor_cents did not pass the oracle cleanly (got %v)", got.EffectiveGraceFloorCents)
+	}
 }
 
 // sessionCookieValue reads one named cookie from the session jar.
@@ -287,9 +381,13 @@ func readAllBody(t *testing.T, resp *http.Response) string {
 }
 
 // budgetSettings is the read projection of GET/PUT /api/orgs/{id}/credits/grace.
+// Both floor fields are pointers on purpose: an ABSENT key must never be
+// conflated with an explicit value — in particular an absent
+// effective_grace_floor_cents would decode as the zero value 0 and could
+// otherwise satisfy an expected zero floor assertion.
 type budgetSettings struct {
 	GraceFloorCents          *int64 `json:"grace_floor_cents"`
-	EffectiveGraceFloorCents int64  `json:"effective_grace_floor_cents"`
+	EffectiveGraceFloorCents *int64 `json:"effective_grace_floor_cents"`
 	BalanceCents             *int64 `json:"balance_cents"`
 }
 
@@ -318,6 +416,9 @@ func (a *adminSession) doJSON(t *testing.T, method, path string, payload []byte)
 	if err := json.Unmarshal([]byte(body), &out); err != nil {
 		t.Fatalf("harness: admin %s %s body decode: %v (body %s)", method, path, err, clip(body))
 	}
+	if out.EffectiveGraceFloorCents == nil {
+		t.Fatalf("harness: admin %s %s response omits effective_grace_floor_cents (body %s) — an absent key must never satisfy an expected zero", method, path, clip(body))
+	}
 	return &out
 }
 
@@ -341,15 +442,17 @@ func (a *adminSession) putGraceFloor(t *testing.T, orgID string, floor *int64, r
 }
 
 // requireBudgetSettings reads the real admin API projection and demands the
-// exact saved/effective floor pair (saved nil = platform default).
+// exact saved/effective floor pair (saved nil = platform default). The
+// effective field is presence-checked in the decode oracle, so an absent
+// key can never stand in for an expected value.
 func requireBudgetSettings(t *testing.T, sess *adminSession, orgID string, wantSaved *int64, wantEffective int64) {
 	t.Helper()
 	got := sess.getBudgetSettings(t, orgID)
 	if (wantSaved == nil) != (got.GraceFloorCents == nil) ||
 		(wantSaved != nil && *got.GraceFloorCents != *wantSaved) ||
-		got.EffectiveGraceFloorCents != wantEffective {
+		*got.EffectiveGraceFloorCents != wantEffective {
 		t.Fatalf("product: grace floor read-back saved/effective %v/%d, want %v/%d",
-			got.GraceFloorCents, got.EffectiveGraceFloorCents, wantSaved, wantEffective)
+			got.GraceFloorCents, *got.EffectiveGraceFloorCents, wantSaved, wantEffective)
 	}
 }
 
@@ -376,9 +479,9 @@ func requireTypedFloorMutation(t *testing.T, s *stand, sess *adminSession, orgID
 	put := sess.putGraceFloor(t, orgID, floor, reason)
 	if (floor == nil) != (put.GraceFloorCents == nil) ||
 		(floor != nil && *put.GraceFloorCents != *floor) ||
-		put.EffectiveGraceFloorCents != wantEffective {
+		*put.EffectiveGraceFloorCents != wantEffective {
 		t.Fatalf("product: floor PUT echoed saved/effective %v/%d, want %v/%d",
-			put.GraceFloorCents, put.EffectiveGraceFloorCents, floor, wantEffective)
+			put.GraceFloorCents, *put.EffectiveGraceFloorCents, floor, wantEffective)
 	}
 	requireBudgetSettings(t, sess, orgID, floor, wantEffective)
 	w := s.oracleWallet(t, orgID)
