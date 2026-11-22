@@ -12,6 +12,7 @@ import (
 
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/labels"
+	"github.com/reireirei/yabanin/pkg/requestid"
 )
 
 func TestLabelsMiddleware(t *testing.T) {
@@ -162,10 +163,8 @@ func TestLabelsReachChatStreamResponsesAndMessages(t *testing.T) {
 	}))
 	defer upstream.Close()
 	gw := decisionTestGateway(upstream.URL)
-	// The event observer also fires from detached pipelines (e.g. the shadow
-	// dispatcher), so `got` is touched by more than the test goroutine — a
-	// straggler from the previous subtest may land while the next one runs.
-	// Guard it; a straggler carrying the same labels is assertion-harmless.
+	// The observer also sees detached pipelines. Keep all events and bind each
+	// route's assertion to its own request ID so late events cannot satisfy it.
 	var gotMu sync.Mutex
 	var got []*eventpub.Event
 	restore := observeEvent(func(ev *eventpub.Event) {
@@ -175,22 +174,21 @@ func TestLabelsReachChatStreamResponsesAndMessages(t *testing.T) {
 	})
 	defer restore()
 	cases := []struct {
-		name    string
-		path    string
-		body    string
-		handler http.HandlerFunc
+		name      string
+		requestID string
+		path      string
+		body      string
+		handler   http.HandlerFunc
 	}{
-		{"chat", "/v1/chat/completions", `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`, gw.chatCompletions},
-		{"stream", "/v1/chat/completions", `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`, gw.chatCompletions},
-		{"responses", "/v1/responses", `{"model":"gpt-4o-mini","input":"hi"}`, gw.responses},
-		{"messages", "/v1/messages", `{"model":"gpt-4o-mini","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`, gw.messages},
+		{"chat", "labels-chat", "/v1/chat/completions", `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`, gw.chatCompletions},
+		{"stream", "labels-stream", "/v1/chat/completions", `{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`, gw.chatCompletions},
+		{"responses", "labels-responses", "/v1/responses", `{"model":"gpt-4o-mini","input":"hi"}`, gw.responses},
+		{"messages", "labels-messages", "/v1/messages", `{"model":"gpt-4o-mini","max_tokens":8,"messages":[{"role":"user","content":"hi"}]}`, gw.messages},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			gotMu.Lock()
-			got = nil
-			gotMu.Unlock()
 			req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, tc.path, strings.NewReader(tc.body))
+			req = req.WithContext(requestid.NewContext(req.Context(), requestid.ID(tc.requestID)))
 			req.Header.Set("Content-Type", "application/json")
 			// Handlers are invoked directly (no auth chain), so the trusted
 			// tenant header must be stamped by hand: durable accounting
@@ -203,15 +201,31 @@ func TestLabelsReachChatStreamResponsesAndMessages(t *testing.T) {
 				t.Fatalf("%d %s", rec.Code, rec.Body.String())
 			}
 			gotMu.Lock()
-			n := len(got)
-			var last *eventpub.Event
-			if n > 0 {
-				last = got[n-1]
-			}
+			events := append([]*eventpub.Event(nil), got...)
 			gotMu.Unlock()
-			if n == 0 || last.Labels["issue"] != "PAY-1" || last.Labels["ci.pipeline"] != "42" {
-				t.Fatalf("%d events, last %+v", n, last)
+			matched := labelsEventForRequest(events, tc.requestID)
+			if matched == nil || matched.Labels["issue"] != "PAY-1" || matched.Labels["ci.pipeline"] != "42" {
+				t.Fatalf("no correctly labelled event for request %q; events: %+v", tc.requestID, events)
 			}
 		})
+	}
+}
+
+func labelsEventForRequest(events []*eventpub.Event, requestID string) *eventpub.Event {
+	for _, event := range events {
+		if event != nil && event.RequestID == requestID {
+			return event
+		}
+	}
+	return nil
+}
+
+func TestLabelsEventRequestCorrelationRejectsStaleAndMissing(t *testing.T) {
+	stale := &eventpub.Event{RequestID: "previous-route", Labels: map[string]string{"issue": "PAY-1"}}
+	if event := labelsEventForRequest([]*eventpub.Event{stale}, "current-route"); event != nil {
+		t.Fatalf("stale event matched current route: %+v", event)
+	}
+	if event := labelsEventForRequest(nil, "missing-route"); event != nil {
+		t.Fatalf("missing route event unexpectedly matched: %+v", event)
 	}
 }
