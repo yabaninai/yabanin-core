@@ -54,12 +54,13 @@ func TestAccountingFactsRecoveryWithoutLiveEvent(t *testing.T) {
 	s.serveWhileConsumerDown(t, rid)
 	invocationID := s.requireTerminalFactsWhileConsumerDown(t, rid)
 	entries := s.removeUndeliveredFactsNotification(t, rdb, rid)
-	s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
+	s.ageAdmissionByInvocationPastGrace(t, invocationID, s.oracleDB.orgID)
 	s.restartLoggerd()
 	s.waitForRecoveredBilling(t, rid, 6*time.Minute)
 	s.requireBilledRow(t, rid, s.oracleDB.orgID, "facts recovery")
 	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "facts recovery")
-	wantKinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "facts recovery")
+	wantKinds := map[string]int{"resale_deduction": 1, "team_spend": 1}
+	s.requireSettlementIntents(t, rid, s.oracleDB.orgID, "facts recovery", wantKinds)
 	s.requireReconciledFromFacts(t, rid)
 	s.requireRecoveredChargeIdentity(t, rid, invocationID, "facts recovery")
 	s.replayAfterFactsRecovery(t, rdb, rid, entries, wantKinds)
@@ -129,7 +130,7 @@ func (s *stand) requireReconciledFromFacts(t *testing.T, rid string) {
 		requireAdmissionVocabulary(t, a)
 		switch a.State {
 		case "reconciled":
-			if a.ResolveReason.String != reasonRecovered {
+			if !a.ResolvedAt.Valid || !a.ResolveReason.Valid || a.ResolveReason.String != reasonRecovered {
 				return abortf("reconciled reason %q, want SPECIFICALLY %q (no live event existed — this is facts recovery)", a.ResolveReason.String, reasonRecovered)
 			}
 			return nil
@@ -182,7 +183,7 @@ func (s *stand) replayAfterFactsRecovery(t *testing.T, rdb *redis.Client, rid st
 	s.requireBilledRow(t, rid, s.oracleDB.orgID, "after late live replay")
 	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "after late live replay")
 	s.requireSettlementIntents(t, rid, s.oracleDB.orgID, "after late live replay", wantKinds)
-	if rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID); len(rows) != 1 || rows[0].State != "reconciled" || rows[0].ResolveReason.String != reasonRecovered {
+	if rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID); len(rows) != 1 || rows[0].State != "reconciled" || !rows[0].ResolvedAt.Valid || !rows[0].ResolveReason.Valid || rows[0].ResolveReason.String != reasonRecovered {
 		t.Fatalf("facts: admission changed after late live replay: %s (want reconciled/%s)", fmtAdmissions(rows), reasonRecovered)
 	}
 	s.requireSingleProviderRoundTrip(t, rid, "late live replay")

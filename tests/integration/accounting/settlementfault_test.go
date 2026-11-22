@@ -4,7 +4,7 @@ package accounting
 
 import (
 	"fmt"
-	"strings"
+	"github.com/stretchr/testify/require"
 	"testing"
 	"time"
 )
@@ -53,58 +53,10 @@ func TestAccountingFactsRecoverySettlementCommitBoundary(t *testing.T) {
 		}
 	}()
 
-	before := s.fixture.Snapshot()
-	status, body, err := s.chat(t, rid, 60*time.Second)
-	if err != nil || status != httpOK || !strings.Contains(body, fixtureAssistantContent) {
-		t.Fatalf("settlement fault: target invocation status=%d body=%q err=%v — serving must not depend on the consumer", status, body, err)
-	}
-	if delta := s.fixture.Since(before); delta.arrivals != 1 || delta.dispatches != 1 || delta.receipts != 1 {
-		t.Fatalf("settlement fault: ledger delta = %d/%d/%d, want 1/1/1 (one dispatch, one receipt)", delta.arrivals, delta.dispatches, delta.receipts)
-	}
-
-	// Durable terminal facts exist while the consumer is down — they are
-	// the recovery source this whole scenario depends on.
-	if !s.oracleTableExists(t, "request_terminal_facts") {
-		t.Fatalf("PRODUCT DEFECT (baseline): request_terminal_facts absent — no durable pre-publish terminal evidence to recover from")
-	}
-	if s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID) == 0 {
-		t.Fatalf("settlement fault: no terminal facts row for served %s while the consumer is down", rid)
-	}
-
-	// Remove the owned Redis carrier for this run: recovery must come
-	// from facts alone, not from a live (re)delivered event.
-	entries := s.findStreamEntries(t, rdb, rid)
-	if len(entries) == 0 {
-		t.Fatalf("settlement fault: no stream entries found for %s — construction failed", rid)
-	}
-	var ids []string
-	for _, e := range entries {
-		ids = append(ids, e.ID)
-	}
-	s.deleteStreamEntriesFor(t, rdb, rid, ids)
-	s.assertNoRetryCarrier(t, rdb, rid)
-	if cursor, ok := s.groupDeliveryCursor(t, rdb); ok {
-		for _, id := range ids {
-			if !entryIDAfter(id, cursor) {
-				t.Fatalf("settlement fault: stream entry %s at or before delivery cursor %s — event was consumed before the consumer stopped; construction failed", id, cursor)
-			}
-		}
-	}
-
-	// Bind the server-minted invocation identity while the consumer is
-	// down and the admission is stable.
-	if !s.oracleTableExists(t, "request_admissions") {
-		t.Fatalf("PRODUCT DEFECT (baseline): request_admissions absent — the settlement boundary cannot be scoped to the invocation")
-	}
-	rows := s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-	if len(rows) != 1 || rows[0].InvocationID == "" {
-		t.Fatalf("settlement fault: admissions for %s = %d, want exactly one invocation-minted admission", rid, len(rows))
-	}
-	targetUUID := rows[0].InvocationID
-
-	// Deterministic sweep visit: age the (single) admission past the
-	// 15-minute grace window before the consumer restarts.
-	s.ageAdmissionPastGrace(t, rid, s.oracleDB.orgID)
+	s.serveWhileConsumerDown(t, rid)
+	targetUUID := s.requireTerminalFactsWhileConsumerDown(t, rid)
+	entries := s.removeUndeliveredFactsNotification(t, rdb, rid)
+	s.ageAdmissionByInvocationPastGrace(t, targetUUID, s.oracleDB.orgID)
 
 	// Install the boundary fault, scoped to this invocation only: any
 	// settlement_jobs insert for it records one nontransactional
@@ -115,6 +67,7 @@ func TestAccountingFactsRecoverySettlementCommitBoundary(t *testing.T) {
 		trgName = "acc_settlement_boundary"
 	)
 	s.oracleExec(t, "create boundary sequence", fmt.Sprintf(`CREATE SEQUENCE %s`, seqName))
+	s.oracleExec(t, "allow consumer trigger to record attempts", "GRANT USAGE ON SEQUENCE "+seqName+" TO yabanin_app")
 	s.oracleExec(t, "create boundary fault function", fmt.Sprintf(
 		`CREATE FUNCTION %s() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN PERFORM nextval('%s'); RAISE EXCEPTION 'injected settlement commit boundary failure'; END $$`,
 		fnName, seqName))
@@ -154,99 +107,29 @@ func TestAccountingFactsRecoverySettlementCommitBoundary(t *testing.T) {
 	// The boundary state: the ENTIRE sweep transaction rolled back. No
 	// partial accounting may survive a failure between the request_logs
 	// insert and the settlement-intent commit.
-	if got := s.oracleRequestLogCount(t, rid, s.oracleDB.orgID); got != 0 {
-		t.Fatalf("settlement fault boundary: request_logs rows = %d for %s, want 0 — the sweep's request_logs insert leaked past the rolled-back settlement commit", got, rid)
-	}
-	if jobs := s.oracleSettlementJobs(t, rid, s.oracleDB.orgID); jobs != 0 {
-		t.Fatalf("settlement fault boundary: settlement jobs = %d for %s, want 0 (trigger must abort the insert)", jobs, rid)
-	}
-	if invJobs := s.oracleCount(t,
-		`SELECT count(*) FROM settlement_jobs WHERE invocation_id = $1::uuid AND org_id = $2`,
-		targetUUID, s.oracleDB.orgID); invJobs != 0 {
-		t.Fatalf("settlement fault boundary: settlement jobs = %d under invocation %s, want 0", invJobs, targetUUID)
-	}
-	s.requireNoWalletDebit(t, rid, s.oracleDB.orgID, "settlement fault boundary")
-	if s.oracleTerminalFactsCount(t, rid, s.oracleDB.orgID) == 0 {
-		t.Fatalf("settlement fault boundary: terminal facts vanished for %s — they must survive the failed sweep (they are the recovery source)", rid)
-	}
-	adm, ok := s.oracleAdmissionByInvocation(t, targetUUID, s.oracleDB.orgID)
-	if !ok {
-		t.Fatalf("settlement fault boundary: admission for invocation %s vanished", targetUUID)
-	}
-	requireAdmissionVocabulary(t, adm)
-	switch adm.State {
-	case "reconciled":
-		t.Fatalf("settlement fault boundary: admission %s is reconciled while its accounting rolled back — a charge-less reconcile at the boundary", targetUUID)
-	case "voided":
-		t.Fatalf("settlement fault boundary: admission %s is voided although terminal facts exist", targetUUID)
-	default:
-		t.Logf("settlement fault boundary: admission %s non-reconciled in state %q with its accounting fully rolled back", targetUUID, adm.State)
-	}
+	org := s.oracleDB.orgID
+	require.Zero(t, s.oracleRequestLogCount(t, rid, org))
+	require.Zero(t, s.oracleSettlementJobs(t, rid, org))
+	require.Zero(t, s.oracleCount(t, "SELECT count(*) FROM settlement_jobs WHERE invocation_id=$1::uuid AND org_id=$2", targetUUID, org))
+	s.requireNoWalletDebit(t, rid, org, "settlement fault boundary")
+	require.Equal(t, 1, s.oracleTerminalFactsCount(t, rid, org))
+	adm, ok := s.oracleAdmissionByInvocation(t, targetUUID, org)
+	require.True(t, ok)
+	require.Equal(t, "admitted", adm.State)
+	require.False(t, adm.ResolvedAt.Valid)
+	require.False(t, adm.ResolveReason.Valid)
 
-	// Remove the fault; the sweep retries from the intact facts and
-	// materializes exactly once, inside an explicit horizon.
 	dropFault()
+	s.waitForRecoveredBilling(t, rid, 6*time.Minute)
+	s.requireExactlyOneBilledRow(t, rid, org, "settlement fault retry")
+	s.requireBilledRow(t, rid, org, "settlement fault retry")
+	s.requireWalletChargedExactlyOnce(t, rid, org, "settlement fault retry")
+	kinds := map[string]int{"resale_deduction": 1, "team_spend": 1}
+	s.requireSettlementIntents(t, rid, org, "settlement fault retry", kinds)
+	s.requireReconciledFromFacts(t, rid)
+	s.requireRecoveredChargeIdentity(t, rid, targetUUID, "settlement fault retry")
 
-	pollUntil(t, 6*time.Minute, "sweep retries and materializes after fault removal", func() error {
-		if s.oracleRequestLogCount(t, rid, s.oracleDB.orgID) == 0 {
-			return fmt.Errorf("no request_logs row for %s yet", rid)
-		}
-		if c := s.oracleCreditTotals(t, rid, s.oracleDB.orgID); c.UsageRows == 0 {
-			return fmt.Errorf("no wallet usage row for %s yet", rid)
-		}
-		return nil
-	})
-	s.requireExactlyOneBilledRow(t, rid, s.oracleDB.orgID, "settlement fault retry")
-	s.requireBilledRow(t, rid, s.oracleDB.orgID, "settlement fault retry")
-	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "settlement fault retry")
-	kinds := s.requireWalletIntentPresent(t, rid, s.oracleDB.orgID, "settlement fault retry")
-
-	pollUntil(t, 6*time.Minute, "admission reconciles via facts after retry", func() error {
-		a, ok := s.oracleAdmissionByInvocation(t, targetUUID, s.oracleDB.orgID)
-		if !ok {
-			return abortf("admission for invocation %s vanished after successful materialization", targetUUID)
-		}
-		requireAdmissionVocabulary(t, a)
-		switch a.State {
-		case "reconciled":
-			if a.ResolveReason.String != reasonRecovered {
-				return abortf("admission %s reconciled with reason %q, want %q (facts are present; the live event never existed)", targetUUID, a.ResolveReason.String, reasonRecovered)
-			}
-			if !a.ResolvedAt.Valid {
-				return abortf("admission %s reconciled without resolved_at", targetUUID)
-			}
-			return nil
-		case "admitted", "unresolved":
-			return fmt.Errorf("admission %s still %q after the sweep materialized its accounting", targetUUID, a.State)
-		}
-		return abortf("admission %s in unexpected state %q", targetUUID, a.State)
-	})
-	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
-		t.Fatalf("settlement fault: ledger after recovery = %d/%d/%d, want 1/1/1 — the sweep must not re-dispatch the provider call", arr, disp, recv)
-	}
-
-	// The existing late-live dedupe contract must still hold after
-	// facts-based materialization: the original event surfaces late under
-	// fresh stream ids and must be claimed, drained, and deduped.
-	var replayIDs []string
-	for _, e := range entries {
-		replayIDs = append(replayIDs, s.replayEntryUnderFreshID(t, rdb, e))
-	}
-	s.requireInboxClaimsCommitted(t, rdb, replayIDs)
-	s.requireGroupDrainedWithin(t, rdb, 2*time.Minute)
-	s.assertNoRetryCarrier(t, rdb, rid)
-
-	s.requireExactlyOneBilledRow(t, rid, s.oracleDB.orgID, "after late live replay")
-	s.requireBilledRow(t, rid, s.oracleDB.orgID, "after late live replay")
-	s.requireWalletChargedExactlyOnce(t, rid, s.oracleDB.orgID, "after late live replay")
-	s.requireSettlementIntents(t, rid, s.oracleDB.orgID, "after late live replay", kinds)
-	rows = s.oracleAdmissions(t, rid, s.oracleDB.orgID)
-	if len(rows) != 1 || rows[0].InvocationID != targetUUID || rows[0].State != "reconciled" || rows[0].ResolveReason.String != reasonRecovered {
-		t.Fatalf("settlement fault: late live replay changed the admission record: %+v, want the single %s reconciled via %s", rows, targetUUID, reasonRecovered)
-	}
-	if arr, disp, recv := s.fixture.Counts(rid); arr != 1 || disp != 1 || recv != 1 {
-		t.Fatalf("settlement fault: ledger after late live replay = %d/%d/%d, want 1/1/1 — the replay must be fully deduped", arr, disp, recv)
-	}
-
+	s.replayAfterFactsRecovery(t, rdb, rid, entries, kinds)
+	s.requireRecoveredChargeIdentity(t, rid, targetUUID, "settlement fault late replay")
 	s.controlRequest(t, "settlefault-post")
 }
