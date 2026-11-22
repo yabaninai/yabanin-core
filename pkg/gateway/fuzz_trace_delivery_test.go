@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
+	"github.com/reireirei/yabanin/pkg/labels"
 	"github.com/reireirei/yabanin/pkg/requestid"
 	"github.com/reireirei/yabanin/pkg/testdb"
 	"github.com/stretchr/testify/require"
@@ -95,20 +96,26 @@ func FuzzTraceEventDelivery(f *testing.F) {
 	for i := range traceDeliveryCases {
 		f.Add(uint8(i), uint32(23+i), i%2 == 0)
 	}
-	// Critical-go wave-2 frozen pins: the guard arms the request-scoped
-	// scenarios cannot reach — empty-id / invalid-reason no-ops (200) and
-	// the cyclic registry eviction at the bound (201).
-	f.Add(uint8(200), uint32(1), false)
-	f.Add(uint8(201), uint32(1), false)
 	f.Fuzz(func(t *testing.T, index uint8, request uint32, before bool) {
-		if index >= 200 {
-			traceStampGuardCase(t, int(index))
-			return
-		}
+		// Every mutated index folds into the fixed scenario table as a
+		// legal pick; the request id, the scaled cohort and the declare
+		// order are the genuinely varied inputs.
 		s := traceDeliveryCases[int(index)%len(traceDeliveryCases)].scaled(int(request % 31))
 		id := traceStampTestID(t, fmt.Sprintf("delivery-%08x", request))
 		traceDeliveryEvent(t, id, fmt.Sprintf("team-%x", request), s, before)
 	})
+}
+
+// TestTraceStampGuardPins pins the trace-stamp guard arms the request-
+// scoped scenarios cannot reach — empty-id / invalid-reason no-ops (200),
+// the cyclic registry eviction at the bound (201), the reason-append
+// bound with its valid-id drop pin (202) and the bounded-envelope
+// eviction loop (203). The guard facts are a fixed table, not a fuzz
+// dispatch: mutations must never reach a refusal arm.
+func TestTraceStampGuardPins(t *testing.T) {
+	for _, index := range []int{200, 201, 202, 203} {
+		traceStampGuardCase(t, index)
+	}
 }
 
 // traceStampGuardCase pins the trace-stamp guard arms (critical-go wave 2):
@@ -157,6 +164,54 @@ func traceStampGuardCase(t *testing.T, index int) {
 		traceStampStateFor("evict-newest")
 		require.Nil(t, traceStampClaim(victim))
 		require.NotNil(t, traceStampClaim("evict-newest"))
+	case 202:
+		// The reason append is deduplicating and bounded: at the cap the
+		// marker is appended once, further reasons are dropped. A valid-id
+		// drop is stored per reason in call order (wave-3 explicit pin for
+		// the observe-drop path the scenarios only reach via emit).
+		one := traceStampAppendUnique(nil, traceStampDropPublishFailed)
+		require.Equal(t, []string{traceStampDropPublishFailed}, one)
+		require.Len(t, traceStampAppendUnique(one, traceStampDropPublishFailed), 1)
+		full := traceStampAppendUnique(
+			[]string{traceStampDropBacklogFull, traceStampTruncPolicySteps, traceStampTruncPolicyFindings},
+			traceStampDropPublishFailed)
+		require.Equal(t, []string{
+			traceStampDropBacklogFull, traceStampTruncPolicySteps, traceStampTruncPolicyFindings,
+			traceStampReasonsTruncatedCode,
+		}, full)
+		require.Equal(t, full, traceStampAppendUnique(full, traceStampDropPublishFailed))
+		id := traceStampTestID(t, "drop-pin")
+		traceStampDeclare(id, 2)
+		traceStampObserveDrop(id, traceStampDropPublishFailed)
+		traceStampObserveDrop(id, traceStampDropPublishFailed) // dedup: still one reason
+		traceStampObserveDrop(id, traceStampDropBacklogFull)
+		ev := &eventpub.Event{RequestID: id}
+		traceStampEvent(ev)
+		require.JSONEq(t, `{"v":1,"c":"partial","r":[`+
+			`"drop:event_publish:publish_failed","drop:event_publish:backlog_full"]}`,
+			ev.Labels["trace_completeness"])
+	case 203:
+		// marshalBounded keeps the stamp within the label bound: a natural
+		// envelope passes through, the reason-less guard returns the value
+		// unchanged, and an oversized reason list degrades oldest-first
+		// down to the truncation marker.
+		fit := traceCompletenessEnvelope{Version: 1, Completeness: "full",
+			Reasons: []string{traceStampDropBacklogFull}}.marshalBounded()
+		require.JSONEq(t, `{"v":1,"c":"full","r":["drop:event_publish:backlog_full"]}`, fit)
+		guard := traceCompletenessEnvelope{Version: 1,
+			Completeness: stringsRepear(200)}.marshalBounded()
+		require.Equal(t, `{"v":1,"c":"`+stringsRepear(200)+`"}`, guard)
+		reasons := []string{
+			stringsRepear(30), stringsRepear(30) + "b", stringsRepear(30) + "c", stringsRepear(30) + "d",
+		}
+		degraded := traceCompletenessEnvelope{Version: 1, Completeness: stringsRepear(50),
+			Reasons: reasons}.marshalBounded()
+		require.LessOrEqual(t, len(degraded), labels.MaxValueLen)
+		var decoded traceCompletenessEnvelope
+		require.NoError(t, json.Unmarshal([]byte(degraded), &decoded))
+		require.Equal(t, 1, decoded.Version)
+		require.Equal(t, stringsRepear(50), decoded.Completeness)
+		require.Equal(t, []string{stringsRepear(30), traceStampReasonsTruncatedCode}, decoded.Reasons)
 	default:
 		t.Fatalf("unknown trace guard case %d", index)
 	}
