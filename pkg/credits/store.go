@@ -576,7 +576,10 @@ func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.
 	if err != nil {
 		return fmt.Errorf("deduct begin tx: %w", err)
 	}
+	return s.deductMicroTx(ctx, tx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
+}
 
+func (s *Store) deductMicroTx(ctx context.Context, tx pgx.Tx, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
 	// Step 0: serialize deduction writers for this org.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
 		s.rollbackDeduct(ctx, tx)
