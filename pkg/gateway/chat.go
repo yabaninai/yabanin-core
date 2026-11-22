@@ -116,6 +116,7 @@ type chatContext struct {
 //	executeChatJSON       breaker + per-model retry + fallback chain
 //	finalizeChatJSON      usage/accounting, events, cache write, response
 func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Keep the entry context; admission updates *r with request-scoped labels.
 	ctx := r.Context()
 	cc, ok := gw.normalizeChatRequest(w, r)
 	if !ok {
@@ -127,60 +128,52 @@ func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// release before the batch executor's next in-process line, which made
 	// every N>Capacity line shed on the batch path.
 	defer cc.fairTicket.Release()
-	if !gw.routeChatCandidate(ctx, cc) {
-		return
-	}
-	if !gw.enforceChatPolicy(ctx, cc) {
-		return
-	}
-	// OP-8: unified policy-pipeline run point (pre-upstream, before any
-	// forward or cache branch). One call site for the whole chat JSON path;
-	// the SSE branch carries the OP-4 streaming stubs instead.
-	if !gw.policyPreChat(ctx, cc) {
-		return
-	}
-	ctx = withInvocationIdentity(ctx, cc.invocation)
-	ctx = withRequestPolicyEntryOutcome(ctx, cc.r, gw.policyRuntime, cc.orgID)
-	// request context so every downstream routing site sees it.
-	ctx = withRequestRouteHint(ctx, cc.r)
-	// org's compiled policies (X-Policy-Judge-Version), before any response
-	// bytes (the cache branch below may answer directly). No extra store
-	// read: the request-scoped policy outcome was just stamped above.
-	gw.setJudgeVersionHeader(ctx, w, cc.orgID)
-	// NEXT-18c (ADR-0001 §5.1): reservation pre-check after route+policy and
-	// BEFORE the cache lookup — a cache hit at exhaustion must be denied too
-	// (D7). The gate rides the context for the finalize stages below.
-	gate, ok := gw.reservationPlan(w, r, "chat.completions",
-		gw.reservationRequest(ctx, cc.orgID, cc.teamID, cc.agentID, headerSessionKeyID(r), cc.info, cc.body, reservationMaxTokens(cc.req.MaxTokens), false))
+	ctx, gate, ok := gw.prepareChatDispatch(ctx, w, r, cc)
 	if !ok {
 		return
 	}
-	ctx = withReservationGate(ctx, gate)
 	if gw.serveChatCache(ctx, cc) {
 		return
 	}
-	// Cache miss: reserve locally (granting from Postgres on shortage).
-	if !gate.reserve(ctx) {
+	if !gw.confirmChatDispatch(ctx, cc, gate) {
 		return
 	}
-	// Preview2 durable accounting: the confirmed start commits BEFORE the
-	// first paid provider dispatch — post-cache-miss like the reservation,
-	// one admission per request (the stream and JSON branches below share
-	// it; the kind binds to the transport actually dispatched). Fail
-	// closed: an unwritten start (write error, timeout or lost ACK —
-	// outcome unknown) refuses the request with ZERO provider arrivals
-	// under the history_unavailable envelope.
+	gw.dispatchChatCompletion(ctx, cc)
+}
+
+func (gw *gateway) prepareChatDispatch(ctx context.Context, w http.ResponseWriter, r *http.Request, cc *chatContext) (context.Context, *reservationGate, bool) {
+	if !gw.routeChatCandidate(ctx, cc) || !gw.enforceChatPolicy(ctx, cc) || !gw.policyPreChat(ctx, cc) {
+		return nil, nil, false
+	}
+	ctx = withInvocationIdentity(ctx, cc.invocation)
+	ctx = withRequestPolicyEntryOutcome(ctx, cc.r, gw.policyRuntime, cc.orgID)
+	ctx = withRequestRouteHint(ctx, cc.r)
+	gw.setJudgeVersionHeader(ctx, w, cc.orgID)
+	// Plan before cache lookup so cache hits cannot bypass exhausted budgets.
+	gate, ok := gw.reservationPlan(w, r, "chat.completions",
+		gw.reservationRequest(ctx, cc.orgID, cc.teamID, cc.agentID, headerSessionKeyID(r), cc.info, cc.body, reservationMaxTokens(cc.req.MaxTokens), false))
+	if !ok {
+		return nil, nil, false
+	}
+	return withReservationGate(ctx, gate), gate, true
+}
+
+func (gw *gateway) confirmChatDispatch(ctx context.Context, cc *chatContext, gate *reservationGate) bool {
+	if !gate.reserve(ctx) {
+		return false
+	}
+	// Confirm the start after reservation and before the first paid provider call.
 	if err := gw.confirmPaidInvocation(ctx, invocationKindForChat(cc.req.Stream)); err != nil {
-		// Escrow parity with the other never-dispatched refusals (stream
-		// breaker-open path): release the just-reserved local escrow
-		// exactly once (finalizeNoEvent is done-flag guarded) — a failed
-		// or lost-ACK durable start leaves no spend and must not hold
-		// enforce-mode reservation credit.
+		// A failed or unknown start must release the local reservation before refusal.
 		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
 		cc.l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
 		writeInvocationStartRefusal(cc.w, err)
-		return
+		return false
 	}
+	return true
+}
+
+func (gw *gateway) dispatchChatCompletion(ctx context.Context, cc *chatContext) {
 	if cc.req.Stream {
 		// Cache hits (including for streaming clients) were served in the
 		// RT-05 cache branch above; here the request always goes upstream.
@@ -215,44 +208,16 @@ func (gw *gateway) policyPreChat(_ context.Context, cc *chatContext) bool {
 	return true
 }
 
-// normalizeChatRequest (stage 1) reads the body, funnels the shared
-// pre-routing admission core (guards → typed-projection rebuild → model
-// resolution → unknown-model policy → task tag → whitelist → budgets — the
-// the chat-specific post-admission steps: request validation and the vertical
-// transform. A false result means the request was answered terminally inside
-// the stage.
+// normalizeChatRequest admits the guarded body, validates its typed projection,
+// and applies the chat-specific vertical transform before routing.
 func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) (*chatContext, bool) {
 	l := logctx.From(r.Context(), gw.log)
 	reqID := logctx.RequestID(r.Context())
-
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"request body too large or malformed")
+	raw, req, ok := readChatRequest(w, r)
+	if !ok {
 		return nil, false
 	}
-
-	var req openai.ChatCompletionRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"malformed JSON: "+err.Error())
-		return nil, false
-	}
-
-	// RT-04: rebuild the typed projection from the GUARDED body. Every
-	// downstream consumer (validation, verticals, classifier, cache key,
-	// events, forwarding) must agree with the payload that will actually be
-	// forwarded; a pre-guard projection would leak removed secrets back into
-	// the upstream payload and hide the guard's rewrites.
-	core, ok := gw.admissionCore(w, r, l, admissionCoreInput{
-		Model: req.Model,
-		Body:  raw,
-		Rebuild: func(body []byte) error {
-			return json.Unmarshal(body, &req)
-		},
-		// The chat budget event historically carries the key owner.
-		BudgetEventUser: true,
-	})
+	core, ok := gw.admitChatProjection(w, r, l, raw, &req)
 	if !ok {
 		return nil, false
 	}
@@ -286,73 +251,109 @@ func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) 
 
 	l.Debug("chat request", "model", cc.model, "session", cc.sessionID, "org", cc.orgID, "msgs", len(req.Messages))
 
-	if apiErr, statusCode := validator.ValidateRequest(req); apiErr != nil {
-		validator.WriteError(w, apiErr, statusCode)
-		publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-			EventType:      "request.invalid",
-			RequestID:      reqID,
-			SessionID:      cc.sessionID,
-			Payload:        string(cc.body),
-			OrgID:          cc.orgID,
-			TeamID:         cc.teamID,
-			ModelRequested: cc.requestedModel,
-			Error:          apiErr.Error.Message,
-			Labels:         labelsFrom(r.Context()),
-		}.build())
+	if !gw.validateChatProjection(l, reqID, cc) {
 		return nil, false
 	}
-
-	// PC2: Run vertical pack PreTransform (compliance checks + data masking).
-	if gw.verticalReg != nil && cc.orgID != "" {
-		vReq := verticals.Request{
-			OrgID:          cc.orgID,
-			ModelRequested: cc.requestedModel,
-			Prompt:         extractUserPrompt(req.Messages),
-			SystemPrompt:   extractSystemMessage(req.Messages),
-			Metadata:       make(map[string]string),
-		}
-		newCtx, newIn, err := gw.verticalReg.PreTransform(r.Context(), cc.orgID, vReq)
-		if err != nil {
-			l.Warn("vertical transform denied request", "error", err, "org_id", cc.orgID)
-			apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
-				fmt.Sprintf("compliance check failed: %s", err))
-			return nil, false
-		}
-
-		// Propagate context from vertical transform (may carry metadata for downstream).
-		r = r.WithContext(newCtx)
-		cc.r = r
-
-		originalPrompt := extractUserPrompt(req.Messages)
-		// RT-04: if the prompt was redacted/modified by a vertical, patch the
-		// GUARDED raw JSON in place. Re-serializing the typed projection here
-		// would restore pre-guard content (removed secrets) and drop unknown
-		// provider fields; the raw patch touches only the last message's
-		// content and keeps everything else byte-for-byte.
-		if newIn.Prompt != originalPrompt {
-			patched, perr := patchLastMessageContent(cc.body, newIn.Prompt)
-			if perr != nil {
-				l.Warn("vertical prompt patch failed", "error", perr, "org_id", cc.orgID)
-				apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-					"failed to apply vertical transform to request body")
-				return nil, false
-			}
-			// Keep the typed projection consistent with the patched payload
-			// for classifier, events and forwarding below.
-			if uerr := json.Unmarshal(patched, &cc.req); uerr != nil {
-				l.Warn("vertically patched body is not a valid chat completion request", "error", uerr, "org_id", cc.orgID)
-				apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-					"malformed JSON: "+uerr.Error())
-				return nil, false
-			}
-			cc.body = patched
-			for k, v := range newIn.Metadata {
-				r.Header.Set("X-Vertical-"+k, v)
-			}
-		}
+	if !gw.transformChatProjection(w, cc) {
+		return nil, false
 	}
-
 	return cc, true
+}
+
+func readChatRequest(w http.ResponseWriter, r *http.Request) ([]byte, openai.ChatCompletionRequest, bool) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"request body too large or malformed")
+		return nil, openai.ChatCompletionRequest{}, false
+	}
+	var req openai.ChatCompletionRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"malformed JSON: "+err.Error())
+		return nil, openai.ChatCompletionRequest{}, false
+	}
+	return raw, req, true
+}
+
+func (gw *gateway) admitChatProjection(w http.ResponseWriter, r *http.Request, l *slog.Logger, raw []byte, req *openai.ChatCompletionRequest) (admissionCore, bool) {
+	// Rebuild the typed view from guarded bytes before downstream consumers run.
+	return gw.admissionCore(w, r, l, admissionCoreInput{
+		Model: req.Model,
+		Body:  raw,
+		Rebuild: func(body []byte) error {
+			return json.Unmarshal(body, req)
+		},
+		BudgetEventUser: true,
+	})
+}
+
+func (gw *gateway) validateChatProjection(l *slog.Logger, reqID string, cc *chatContext) bool {
+	apiErr, statusCode := validator.ValidateRequest(cc.req)
+	if apiErr == nil {
+		return true
+	}
+	validator.WriteError(cc.w, apiErr, statusCode)
+	publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+		EventType:      "request.invalid",
+		RequestID:      reqID,
+		SessionID:      cc.sessionID,
+		Payload:        string(cc.body),
+		OrgID:          cc.orgID,
+		TeamID:         cc.teamID,
+		ModelRequested: cc.requestedModel,
+		Error:          apiErr.Error.Message,
+		Labels:         labelsFrom(cc.r.Context()),
+	}.build())
+	return false
+}
+
+func (gw *gateway) transformChatProjection(w http.ResponseWriter, cc *chatContext) bool {
+	if gw.verticalReg == nil || cc.orgID == "" {
+		return true
+	}
+	request := verticals.Request{
+		OrgID:          cc.orgID,
+		ModelRequested: cc.requestedModel,
+		Prompt:         extractUserPrompt(cc.req.Messages),
+		SystemPrompt:   extractSystemMessage(cc.req.Messages),
+		Metadata:       make(map[string]string),
+	}
+	newCtx, transformed, err := gw.verticalReg.PreTransform(cc.r.Context(), cc.orgID, request)
+	if err != nil {
+		cc.l.Warn("vertical transform denied request", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
+			fmt.Sprintf("compliance check failed: %s", err))
+		return false
+	}
+	cc.r = cc.r.WithContext(newCtx)
+	return applyChatVerticalResult(w, cc, transformed)
+}
+
+func applyChatVerticalResult(w http.ResponseWriter, cc *chatContext, transformed verticals.Request) bool {
+	originalPrompt := extractUserPrompt(cc.req.Messages)
+	if transformed.Prompt == originalPrompt {
+		return true
+	}
+	// Patch only message content so guarded fields and unknown provider keys survive.
+	patched, err := patchLastMessageContent(cc.body, transformed.Prompt)
+	if err != nil {
+		cc.l.Warn("vertical prompt patch failed", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"failed to apply vertical transform to request body")
+		return false
+	}
+	if err := json.Unmarshal(patched, &cc.req); err != nil {
+		cc.l.Warn("vertically patched body is not a valid chat completion request", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"malformed JSON: "+err.Error())
+		return false
+	}
+	cc.body = patched
+	for key, value := range transformed.Metadata {
+		cc.r.Header.Set("X-Vertical-"+key, value)
+	}
+	return true
 }
 
 // routeChatCandidate (stage 2) resolves the candidate that will be called:
