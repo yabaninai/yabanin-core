@@ -10302,7 +10302,7 @@ class R2SelectorRepairControls(unittest.TestCase):
                 '\tctx, cancel := context.WithTimeout('
                 'context.Background(), budget)')
 
-    def budget_go_wrapper(self, handoff_log):
+    def budget_go_wrapper(self, handoff_log, prebuilt_run=None):
         """PATH-first go wrapper recording pid, command and the actually
         forwarded unit budget of every intercepted go invocation."""
         real_go = shutil.which('go')
@@ -10319,7 +10319,8 @@ class R2SelectorRepairControls(unittest.TestCase):
             f'exec {real_go} "$@"\n')
         script.chmod(0o755)
         saved = {key: os.environ.get(key) for key in
-                 ('BUDGET_HANDOFF_LOG', 'BUDGET_HELPER_LOG', 'PATH')}
+                 ('BUDGET_HANDOFF_LOG', 'BUDGET_HELPER_LOG', 'PATH',
+                  'BUDGET_PREBUILT_SOURCE', 'BUDGET_PREBUILT_BINARY')}
 
         def restore():
             for key, value in saved.items():
@@ -10330,6 +10331,21 @@ class R2SelectorRepairControls(unittest.TestCase):
         self.addCleanup(restore)
         os.environ['BUDGET_HANDOFF_LOG'] = str(handoff_log)
         os.environ['PATH'] = str(wrapper) + os.pathsep + os.environ['PATH']
+        if prebuilt_run is not None:
+            os.environ['BUDGET_PREBUILT_SOURCE'] = str(prebuilt_run[0])
+            os.environ['BUDGET_PREBUILT_BINARY'] = str(prebuilt_run[1])
+            script.write_text(
+                '#!/bin/sh\n'
+                '# test-only: record pid, command, forwarded unit budget\n'
+                'printf "%s %s %s\\n" "$$" "$1" '
+                '"${YABANIN_UNIT_REMAINING_NS-unset}" '
+                '>> "$BUDGET_HANDOFF_LOG"\n'
+                'if [ "$1" = run ] && '
+                '[ "$2" = "$BUDGET_PREBUILT_SOURCE" ]; then\n'
+                '  exec "$BUDGET_PREBUILT_BINARY"\n'
+                'fi\n'
+                f'exec {real_go} "$@"\n')
+            script.chmod(0o755)
 
     def budget_invocations(self, handoff_log):
         """(pid, command, forwarded) per intercepted go invocation; the
@@ -10594,6 +10610,16 @@ class R2SelectorRepairControls(unittest.TestCase):
         closed instead. Same fixture and one identical helper copy for
         both legs; each leg is bounded by its parent deadline itself."""
         cc = critical_conservative
+        saved_gomaxprocs = os.environ.get('GOMAXPROCS')
+        os.environ['GOMAXPROCS'] = '2'
+
+        def restore_gomaxprocs():
+            if saved_gomaxprocs is None:
+                os.environ.pop('GOMAXPROCS', None)
+            else:
+                os.environ['GOMAXPROCS'] = saved_gomaxprocs
+
+        self.addCleanup(restore_gomaxprocs)
         mutant = self.budget_load_variant(
             'reserve_zero', Path(cc.__file__).read_text(),
             [('UNIT_HANDOFF_RESERVE_NS = 500_000_000',
@@ -10605,10 +10631,22 @@ class R2SelectorRepairControls(unittest.TestCase):
             'budget-reserve-units.go', budget_ms=8000,
             fifo=(self.BUDGET_DEP, str(fifo)),
             splices=[self.budget_log_splice()])
+        warm_binary = self.root / 'budget-reserve-units'
+        built = subprocess.run(['go', 'build', '-o', str(warm_binary), str(helper)],
+                                cwd=module, capture_output=True, text=True,
+                                env=self.go_env(GOMAXPROCS='2'), timeout=120)
+        self.assertEqual(built.returncode, 0, built.stderr[-800:])
+        warm_request = json.dumps({'paths': ['shared.go', 'm1only.go'],
+                                   'modes': [['m1']]})
+        warm = subprocess.run([str(warm_binary)], cwd=module,
+                              input=warm_request, capture_output=True, text=True,
+                              env=self.go_env(GOMAXPROCS='2'), timeout=120)
+        self.assertEqual(warm.returncode, 0, warm.stderr[-800:])
+        self.assertEqual(json.loads(warm.stdout)[0]['path'], 'shared.go')
         paths = ['shared.go', 'm1only.go', 'blocked.go', 'm3only.go']
-        modes = ['m1', 'm2', 'm3']
+        modes = ['m2', 'm1', 'm3']
         handoff_log = self.root / 'budget-reserve.log'
-        self.budget_go_wrapper(handoff_log)
+        self.budget_go_wrapper(handoff_log, prebuilt_run=(helper, warm_binary))
         record = []
 
         def current_call(caller, budget_log):
@@ -10626,14 +10664,19 @@ class R2SelectorRepairControls(unittest.TestCase):
                                             package='fntime2', config={})
                 except ValueError as exc:
                     rows, error = None, str(exc)
-                connected = state['connected']
+                connected = (state['connected'] - started
+                             if state['connected'] is not None else None)
             finally:
                 self.stop_fifo_writer(state, release, thread)
             return rows, error, connected, time.monotonic() - started
 
         shipped_log = self.root / 'budget-reserve-shipped-ns'
         rows, error, connected, elapsed = current_call(cc, shipped_log)
-        self.assertIsNone(error, error)
+        helper_budget = shipped_log.read_text() if shipped_log.exists() else None
+        forwarded = self.budget_forwarded_runs(handoff_log)
+        self.assertIsNone(error, f'{error}; elapsed={elapsed:.3f}s; '
+                          f'fifo_connected_after={connected}; '
+                          f'forwarded={forwarded}; helper_budget={helper_budget}')
         self.assert_deadline_floor({row['path']: row for row in rows},
                                    paths)
         self.assertIsNotNone(connected, 'real gc importer never opened')
