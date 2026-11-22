@@ -16,7 +16,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
 
@@ -124,33 +123,33 @@ func TestSettlementBatchCommitClassification(t *testing.T) {
 	// with an explicit outcome-unknown class — uncertain, never replay.
 	_, _, err = settleToCommit(t, &pgconn.PgError{Code: "08007", Message: "connection failure during commit"})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrCommitUncertain, "08007 is outcome-unknown, not a proven rollback")
-	assert.NotErrorIs(t, err, pgx.ErrTxCommitRollback)
-	assert.Contains(t, err.Error(), "settlement batch commit", "the error must come from the commit site, not an earlier stage")
+	require.ErrorIs(t, err, ErrCommitUncertain, "08007 is outcome-unknown, not a proven rollback")
+	require.NotErrorIs(t, err, pgx.ErrTxCommitRollback)
+	require.Contains(t, err.Error(), "settlement batch commit", "the error must come from the commit site, not an earlier stage")
 
 	// SQLSTATE 40003 statement_completion_unknown: same verdict.
 	_, _, err = settleToCommit(t, &pgconn.PgError{Code: "40003", Message: "statement completion unknown"})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrCommitUncertain, "40003 is outcome-unknown, not a proven rollback")
-	assert.NotErrorIs(t, err, pgx.ErrTxCommitRollback)
+	require.ErrorIs(t, err, ErrCommitUncertain, "40003 is outcome-unknown, not a proven rollback")
+	require.NotErrorIs(t, err, pgx.ErrTxCommitRollback)
 
 	// A server-evaluated commit rejection (deferred constraint at COMMIT)
 	// is ALSO uncertain under the default-uncertain rule: lease recovery
 	// decides, never an immediate replay.
 	_, _, err = settleToCommit(t, &pgconn.PgError{Code: "23503", Message: "foreign key violation on commit"})
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrCommitUncertain)
+	require.ErrorIs(t, err, ErrCommitUncertain)
 
 	// Transport loss: no outcome at all — uncertain.
 	_, _, err = settleToCommit(t, errors.New("write tcp: broken pipe"))
 	require.Error(t, err)
-	assert.ErrorIs(t, err, ErrCommitUncertain)
+	require.ErrorIs(t, err, ErrCommitUncertain)
 
 	// Definite rollback: pgx.ErrTxCommitRollback is returned only when the
 	// COMMIT command executed and rolled the transaction back — the one
 	// provably-safe case, which keeps the ordinary fallback contract.
 	_, _, err = settleToCommit(t, pgx.ErrTxCommitRollback)
 	require.Error(t, err)
-	assert.NotErrorIs(t, err, ErrCommitUncertain, "a proven rollback keeps the fallback contract")
-	assert.Contains(t, err.Error(), "settlement batch commit")
+	require.NotErrorIs(t, err, ErrCommitUncertain, "a proven rollback keeps the fallback contract")
+	require.Contains(t, err.Error(), "settlement batch commit")
 }

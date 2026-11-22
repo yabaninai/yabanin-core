@@ -20,6 +20,8 @@ import (
 	"sync"
 	"testing"
 
+	"log/slog"
+
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -30,7 +32,6 @@ import (
 	"github.com/reireirei/yabanin/pkg/money"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"log/slog"
 )
 
 const (
@@ -192,6 +193,7 @@ type moneyReviewDB struct {
 	inner        SettlementDB
 	mu           sync.Mutex
 	failQuerySub string // fail the next tx QueryRow whose query contains this
+	fired        int    // how many armed failures actually fired (non-vacuous fault proof)
 	commitHook   func() // run once after a successful inner Commit
 	hookDone     bool
 }
@@ -200,6 +202,15 @@ func (d *moneyReviewDB) armQueryFailure(sub string) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 	d.failQuerySub = sub
+}
+
+// firedQueryFailures reports how many armed query failures actually fired.
+// Tests assert > 0 BEFORE outcome checks so a seam drift (marker no longer
+// matching the batch statement) can never pass vacuously.
+func (d *moneyReviewDB) firedQueryFailures() int {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.fired
 }
 
 func (d *moneyReviewDB) Begin(ctx context.Context) (pgx.Tx, error) {
@@ -227,6 +238,7 @@ func (d *moneyReviewDB) takeQueryFailure(query string) bool {
 	defer d.mu.Unlock()
 	if d.failQuerySub != "" && strings.Contains(query, d.failQuerySub) {
 		d.failQuerySub = ""
+		d.fired++
 		return true
 	}
 	return false
@@ -281,10 +293,16 @@ type moneyReviewErrRow struct{ err error }
 
 func (r moneyReviewErrRow) Scan(dest ...any) error { return r.err }
 
-// batchWalletReadMarker matches the batch executor's wallet read (a bare
-// SELECT with the org column, no CTE prefix), never the per-job deduction
-// statement (which opens WITH wallet AS ...).
-const batchWalletReadMarker = "grace_floor_cents FROM org_credits"
+// batchWalletReadMarker matches the batch executor's tx wallet read on
+// BOTH the pre-fix and post-fix sources (`FROM org_credits WHERE org_id
+// = $1 FOR UPDATE` is invariant across them, so the injected failure
+// fires identically on the defect and the candidate — the evidence gate
+// compares the same fault). The per-job deduction CTE contains the same
+// fragment, but the arm is one-shot and the batch wallet read is the
+// FIRST org_credits FOR UPDATE read of a tick, so it consumes the arm
+// before any fallback deduction runs. T6/T8 assert the fired counter
+// before outcome checks to keep the seam non-vacuous.
+const batchWalletReadMarker = "FROM org_credits WHERE org_id = $1 FOR UPDATE"
 
 // Compile-time guard that the wrapper satisfies the worker's DB contract.
 var _ SettlementDB = (*moneyReviewDB)(nil)
@@ -313,12 +331,17 @@ func TestMoneyReview_B6_IdentityConflictDifferentOrgTerminalOnFirstAttempt(t *te
 
 	reviewLog := &moneyReviewLog{}
 	w, db := moneyReviewWorker(t, pool, reviewLog)
-	drainSettlementQueue(ctx, t, w, db, orgB, ChargeKindResaleDeduction)
+	// One explicit tick: the first attempt must decide the disposition
+	// itself. (No queue drain — a defect that retries identity conflicts
+	// forever would otherwise surface as a harness timeout instead of a
+	// failed first-attempt assertion.)
+	w.tick(ctx)
 
 	status, attempts, lastErr := jobStatus(ctx, t, db, job)
 	assert.Equal(t, "requires_attention", status, "an identity conflict is permanent: park, never settle")
 	assert.Equal(t, 1, attempts, "the FIRST attempt must classify the conflict terminal (retry budget untouched)")
-	assert.Contains(t, lastErr, "charge identity conflict", "the durable record must name the integrity conflict")
+	assert.Contains(t, lastErr, "charge identity conflict",
+		"the durable record must name the integrity conflict (raw bounded diagnostic — this family has no batch code twin)")
 
 	balanceB, _, existsB := moneyReviewWallet(t, ctx, pool, orgB)
 	require.True(t, existsB)
@@ -350,12 +373,14 @@ func TestMoneyReview_B6_IdentityConflictDifferentAmountTerminalOnFirstAttempt(t 
 
 	reviewLog := &moneyReviewLog{}
 	w, db := moneyReviewWorker(t, pool, reviewLog)
-	drainSettlementQueue(ctx, t, w, db, org, ChargeKindResaleDeduction)
+	// One explicit tick, as in the different-org case above: the first
+	// attempt decides, no drain.
+	w.tick(ctx)
 
 	status, attempts, lastErr := jobStatus(ctx, t, db, job)
-	assert.Equal(t, "requires_attention", status)
-	assert.Equal(t, 1, attempts, "a same-invocation amount mismatch is terminal on the first attempt")
-	assert.Contains(t, lastErr, "charge identity conflict")
+	assert.Equal(t, "requires_attention", status, "a same-invocation amount mismatch is terminal on the first attempt")
+	assert.Equal(t, 1, attempts, "a same-invocation amount mismatch is terminal on the first attempt (retry budget untouched)")
+	assert.Contains(t, lastErr, "charge identity conflict", "the durable record must name the integrity conflict")
 
 	balance, _, _ := moneyReviewWallet(t, ctx, pool, org)
 	assert.Equal(t, int64(100), balance, "no money may move on an identity conflict")
@@ -389,9 +414,9 @@ func TestMoneyReview_B6_NoWalletVsFloorRejectionDiagnostics(t *testing.T) {
 	noWalletBefore := testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet"))
 	insufficientBefore := testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient"))
 	drainSettlementQueue(ctx, t, w, db, orgNW, ChargeKindResaleDeduction)
-	assert.Equal(t, noWalletBefore+1, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet")),
+	assert.InDelta(t, noWalletBefore+1, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet")), 0.001,
 		"a missing wallet must count as no_wallet, matching the batch disposition")
-	assert.Equal(t, insufficientBefore, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient")),
+	assert.InDelta(t, insufficientBefore, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient")), 0.001,
 		"no-wallet must not be counted as insufficient credits")
 
 	status, _, lastErr := jobStatus(ctx, t, db, jobNW)
@@ -410,9 +435,9 @@ func TestMoneyReview_B6_NoWalletVsFloorRejectionDiagnostics(t *testing.T) {
 	noWalletBefore = testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet"))
 	insufficientBefore = testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient"))
 	drainSettlementQueue(ctx, t, w, db, orgFR, ChargeKindResaleDeduction)
-	assert.Equal(t, insufficientBefore+1, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient")),
+	assert.InDelta(t, insufficientBefore+1, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient")), 0.001,
 		"a floor rejection must count as insufficient credits")
-	assert.Equal(t, noWalletBefore, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet")),
+	assert.InDelta(t, noWalletBefore, testutil.ToFloat64(metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet")), 0.001,
 		"a floor rejection must not be counted as no_wallet")
 
 	status, _, _ = jobStatus(ctx, t, db, jobFR)
@@ -511,6 +536,12 @@ func TestMoneyReview_B8_FallbackMatchesBatchAtOrgFloor(t *testing.T) {
 	w, db := moneyReviewWorker(t, pool, reviewLog, injected)
 	drainSettlementQueue(ctx, t, w, db, org, ChargeKindResaleDeduction)
 
+	// Non-vacuous fault proof BEFORE outcome checks: the marker is
+	// invariant across pre-fix and post-fix sources, so the batch wallet
+	// read must actually have been failed on whichever source runs.
+	assert.GreaterOrEqual(t, injected.firedQueryFailures(), 1,
+		"the injected batch-abort must fire on the batch wallet read (seam invariant across old and new sources)")
+
 	for _, job := range []int64{job1, job2} {
 		status, _, lastErr := jobStatus(ctx, t, db, job)
 		assert.Equal(t, "requires_attention", status, "the per-job fallback parks at the org floor like the batch")
@@ -588,6 +619,11 @@ func TestMoneyReview_B8_GenuineRollbackStillFallsBack(t *testing.T) {
 	w, db := moneyReviewWorker(t, pool, reviewLog, injected)
 	drainSettlementQueue(ctx, t, w, db, org, ChargeKindResaleDeduction)
 
+	// Non-vacuous fault proof BEFORE outcome checks (same seam contract
+	// as the fallback test above).
+	assert.GreaterOrEqual(t, injected.firedQueryFailures(), 1,
+		"the injected pre-commit failure must fire on the batch wallet read")
+
 	statusS, _, _ := jobStatus(ctx, t, db, jobSettled)
 	assert.Equal(t, "settled", statusS, "a pre-commit failure still falls back and settles the chargeable job")
 	statusP, _, _ := jobStatus(ctx, t, db, jobParked)
@@ -600,25 +636,22 @@ func TestMoneyReview_B8_GenuineRollbackStillFallsBack(t *testing.T) {
 	assert.Equal(t, []int64{-int64(moneyReviewCent)}, amounts)
 }
 
-// Floor resolution details (review follow-up): (a) a NULL org floor falls
-// back to the global grace period — a NULL column must not park charges
-// that the global floor allows; (b) sub-cent charges carry their residue
-// through remainder_micro_usd; (c) an exact-floor landing stands only
-// with an exactly zero new remainder — a sub-cent charge at the floor
-// leaves residue and must park.
-func TestMoneyReview_B8_FloorResolutionCarryAndNullFallback(t *testing.T) {
+// Floor resolution details (review follow-up), split into an independent
+// healthy control and an explicit-floor negative so the evidence gate can
+// distinguish "NULL fallback resolves to the global floor" (correct on
+// BOTH pre-fix and post-fix sources) from "explicit org floor wins with
+// residue discipline" (the B8 defect shows only on the pre-fix source).
+
+// (a) A NULL org floor falls back to the GLOBAL grace period — a NULL
+// column must not park charges that the global floor allows. Healthy on
+// every source: wallet 0 + 1¢ charge legitimately overdraws to −1.
+func TestMoneyReview_B8_NullFloorFallsBackToGlobalFloor(t *testing.T) {
 	ctx, pool := newSettlementLiveEnv(t)
 	moneyReviewReset(t, ctx, pool)
-
-	floorZero := int64(moneyReviewFloorZero)
 
 	reviewLog := &moneyReviewLog{}
 	w, db := moneyReviewWorker(t, pool, reviewLog)
 
-	// (a) NULL org floor + wallet 0 + 1¢ charge: the global floor is
-	// −100¢, so the charge stands and the wallet legitimately overdraws
-	// to −1 — the NULL fallback must resolve to the GLOBAL floor, not to
-	// zero and not to an unconditional park.
 	orgNull := "b8-null-floor-org"
 	moneyReviewOrg(t, ctx, pool, orgNull, &[]int64{0}[0], nil)
 	jobNull := moneyReviewSeedJob(t, ctx, pool, orgNull, "b8-null-req", "b8000000-0000-4000-8000-00000000b810", int64(moneyReviewCent))
@@ -631,6 +664,22 @@ func TestMoneyReview_B8_FloorResolutionCarryAndNullFallback(t *testing.T) {
 	total, amounts := moneyReviewUsage(t, ctx, pool, orgNull)
 	assert.Equal(t, int64(1), total)
 	assert.Equal(t, []int64{-int64(moneyReviewCent)}, amounts)
+}
+
+// (b)+(c) With an EXPLICIT org floor: sub-cent charges carry their
+// residue through remainder_micro_usd, but an exact-floor landing stands
+// only with an exactly zero new remainder — a sub-cent charge at the
+// floor leaves residue and must park. (c) is the decisive negative: a
+// source that ignores the org floor settles the residue charge instead
+// of parking it.
+func TestMoneyReview_B8_CarryAndSubcentResidueAtExplicitFloor(t *testing.T) {
+	ctx, pool := newSettlementLiveEnv(t)
+	moneyReviewReset(t, ctx, pool)
+
+	floorZero := int64(moneyReviewFloorZero)
+
+	reviewLog := &moneyReviewLog{}
+	w, db := moneyReviewWorker(t, pool, reviewLog)
 
 	// (b) explicit org floor 0 + wallet 100¢ + sub-cent 1.5¢ charge: the
 	// residue carries into remainder_micro_usd (100 − 1 = 99¢, remainder
@@ -641,13 +690,13 @@ func TestMoneyReview_B8_FloorResolutionCarryAndNullFallback(t *testing.T) {
 	jobCarry := moneyReviewSeedJob(t, ctx, pool, orgCarry, "b8-carry-req", "b8000000-0000-4000-8000-00000000b811", 15000)
 	drainSettlementQueue(ctx, t, w, db, orgCarry, ChargeKindResaleDeduction)
 
-	status, _, _ = jobStatus(ctx, t, db, jobCarry)
+	status, _, _ := jobStatus(ctx, t, db, jobCarry)
 	assert.Equal(t, "settled", status, "a sub-cent charge above the org floor settles")
 	balance, remainder, _ := moneyReviewWallet(t, ctx, pool, orgCarry)
 	assert.Equal(t, int64(99), balance, "one whole cent charged")
 	assert.Equal(t, int64(5000), remainder, "the 0.5¢ residue carries in remainder_micro_usd")
-	total, amounts = moneyReviewUsage(t, ctx, pool, orgCarry)
-	assert.Equal(t, int64(2), total)
+	total, amounts := moneyReviewUsage(t, ctx, pool, orgCarry)
+	assert.Equal(t, int64(1), total)
 	assert.Equal(t, []int64{-15000}, amounts)
 
 	// (c) org floor 0 + wallet 0 + sub-cent 0.5¢ charge: the balance would
@@ -666,6 +715,6 @@ func TestMoneyReview_B8_FloorResolutionCarryAndNullFallback(t *testing.T) {
 	assert.Equal(t, int64(0), balance)
 	assert.Equal(t, int64(0), remainder, "a parked charge must not move the wallet")
 	total, amounts = moneyReviewUsage(t, ctx, pool, orgFloorSub)
-	assert.Equal(t, int64(2), total)
+	assert.Equal(t, int64(1), total)
 	assert.Empty(t, amounts)
 }
