@@ -297,3 +297,29 @@ func TestResponsesNativeJSON_ShortReadSuppressesReplay(t *testing.T) {
 			fixture.declaredLen.Load(), fixture.servedBytes.Load(), len(full))
 	}
 }
+
+func TestNativeBufferedProviderErrorBound(t *testing.T) {
+	for _, tc := range []struct {
+		name, request string
+		limit         int
+		gateway       func(*testing.T, string, *fakeInvocationStore, *bodyBoundsEvents) *gateway
+		post          func(*testing.T, *gateway, string) *httptest.ResponseRecorder
+	}{
+		{"messages", bodyBoundsMessagesClientBody, messagesResponseLimit, bodyBoundsMessagesGateway, postMessages},
+		{"responses", `{"model":"m","input":"Hi"}`, responsesBodyLimit, bodyBoundsResponsesGateway, postResponses},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			const document = `{"type":"error","error":{"type":"rate_limit_error","message":"busy"}}`
+			body := document + strings.Repeat(" ", tc.limit-len(document))
+			server := newBodyBoundsServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.WriteHeader(http.StatusTooManyRequests)
+				_, _ = io.WriteString(w, body+"\t")
+			})
+			gw := tc.gateway(t, server.URL, &fakeInvocationStore{}, &bodyBoundsEvents{})
+			rec := tc.post(t, gw, tc.request)
+			if rec.Code != http.StatusTooManyRequests || rec.Body.String() != body {
+				t.Fatalf("provider error returned status %d and %d bytes, want 429 and %d bytes", rec.Code, rec.Body.Len(), tc.limit)
+			}
+		})
+	}
+}

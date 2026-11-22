@@ -208,3 +208,12 @@ func writePaidBodyError(w http.ResponseWriter, message string) {
 	w.Header().Set("X-Should-Retry", "false")
 	apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, message)
 }
+
+// Keep provider errors within their passthrough bound. A success needs one
+// extra byte to distinguish an exact fit from a truncated answer.
+func readNativeBufferedBody(resp *http.Response, limit int64) ([]byte, error) {
+	if resp.StatusCode == http.StatusOK {
+		limit++
+	}
+	return io.ReadAll(io.LimitReader(resp.Body, limit))
+}

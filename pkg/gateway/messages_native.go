@@ -134,7 +134,7 @@ func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rc
 			l.Debug("close upstream body", "error", cerr)
 		}
 	}()
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, messagesResponseLimit+1))
+	limited, err := readNativeBufferedBody(resp, messagesResponseLimit)
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		writePaidBodyError(w, "failed to read upstream response")
