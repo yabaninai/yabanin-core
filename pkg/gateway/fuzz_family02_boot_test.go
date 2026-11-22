@@ -87,6 +87,7 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"strings"
 	"sync"
 	"testing"
@@ -125,7 +126,7 @@ func f02DeadRedis() *redis.Client {
 // treats as a hard error.
 func f02FreeAddr(t *testing.T) string {
 	t.Helper()
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	ln, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("F02 boot: free-address probe failed: %v", err)
 	}
@@ -196,7 +197,7 @@ func f02BootConfig(listen, provider, apiKey string) config.Gateway {
 			AuthMode:    "strict",
 			APIKey:      apiKey,
 			EventStream: "yabanin-f02-boot",
-			PGURI:       "postgres://f02:f02@127.0.0.1:1/f02?sslmode=disable",
+			PGURI:       f02DeadPGURI(),
 		},
 		GatewayEgress: config.GatewayEgress{
 			Provider: provider,
@@ -205,6 +206,16 @@ func f02BootConfig(listen, provider, apiKey string) config.Gateway {
 			FallbackModel: "smart",
 		},
 	}
+}
+
+func f02DeadPGURI() string {
+	return (&url.URL{
+		Scheme:   "postgres",
+		User:     url.UserPassword("f02", "f02"),
+		Host:     "127.0.0.1:1",
+		Path:     "/f02",
+		RawQuery: "sslmode=disable",
+	}).String()
 }
 
 // f02BootDB is the disposable real database behind the pool-backed boot
@@ -363,7 +374,11 @@ func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JW
 			t.Fatal("F02 boot: server returned nil before readiness")
 		default:
 		}
-		resp, err := client.Get(bs.baseURL + "/healthz")
+		req, reqErr := http.NewRequestWithContext(t.Context(), http.MethodGet, bs.baseURL+"/healthz", nil)
+		if reqErr != nil {
+			t.Fatalf("F02 boot: readiness request: %v", reqErr)
+		}
+		resp, err := client.Do(req)
 		if err == nil {
 			_, _ = io.Copy(io.Discard, resp.Body)
 			_ = resp.Body.Close()
@@ -385,7 +400,11 @@ func f02BootGateway(t *testing.T, cfg config.Gateway, rdb *redis.Client, jwtw JW
 // f02HealthJSON fetches and decodes /healthz.
 func f02HealthJSON(t *testing.T, baseURL string) (int, map[string]string, http.Header) {
 	t.Helper()
-	resp, err := http.Get(baseURL + "/healthz")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, baseURL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("F02 boot: healthz request: %v", err)
+	}
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("F02 boot: healthz: %v", err)
 	}
@@ -399,9 +418,14 @@ func f02HealthJSON(t *testing.T, baseURL string) (int, map[string]string, http.H
 }
 
 // f02Chat fires one chat completion through the booted server.
-func f02Chat(t *testing.T, baseURL, auth, requestID, orgSpoof string) (*http.Response, string) {
+type f02ChatResponse struct {
+	StatusCode int
+	Header     http.Header
+}
+
+func f02Chat(t *testing.T, baseURL, auth, requestID, orgSpoof string) (f02ChatResponse, string) {
 	t.Helper()
-	req, err := http.NewRequest(http.MethodPost, baseURL+"/v1/chat/completions",
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, baseURL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"smart","messages":[{"role":"user","content":"f02 boot"}]}`))
 	if err != nil {
 		t.Fatalf("F02 boot: chat request: %v", err)
@@ -422,15 +446,15 @@ func f02Chat(t *testing.T, baseURL, auth, requestID, orgSpoof string) (*http.Res
 	}
 	defer resp.Body.Close()
 	body, _ := io.ReadAll(resp.Body)
-	return resp, string(body)
+	return f02ChatResponse{StatusCode: resp.StatusCode, Header: resp.Header.Clone()}, string(body)
 }
 
 // --- generated-input behavior --------------------------------------------------------
 
-func f02BootGenFixture(t testing.TB, org string) (string, JWTWiring) {
-	t.Helper()
-	k := mustRSAJWK(t, "boot-gen-kid")
-	srv := newJWKSServer(t, k)
+func f02BootGenFixture(tb testing.TB, org string) (string, JWTWiring) {
+	tb.Helper()
+	k := mustRSAJWK(tb, "boot-gen-kid")
+	srv := newJWKSServer(tb, k)
 	w := JWTWiring{
 		JWKSURL:       srv.srv.URL,
 		Issuer:        "https://idp.example",
@@ -439,7 +463,7 @@ func f02BootGenFixture(t testing.TB, org string) (string, JWTWiring) {
 		KeyLabelClaim: "key_labels",
 	}
 	claims := f02OrgClaims(w.Issuer, w.Audience, org)
-	return signToken(t, k, claims), w
+	return signToken(tb, k, claims), w
 }
 
 // f02BootGenerated derives the expected outcome independently and drives one
@@ -569,7 +593,11 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	}
 
 	// Unauthenticated surface: the health route and the public hello.
-	hello, err := http.Head(bs.baseURL + "/api/hello")
+	helloReq, err := http.NewRequestWithContext(t.Context(), http.MethodHead, bs.baseURL+"/api/hello", nil)
+	if err != nil {
+		t.Fatalf("F02-19: /api/hello request: %v", err)
+	}
+	hello, err := http.DefaultClient.Do(helloReq)
 	if err != nil {
 		t.Fatalf("F02-19: /api/hello: %v", err)
 	}
@@ -592,7 +620,13 @@ func fuzzF0219(t *testing.T, _ *f02BootDB) {
 	if err := bs.stop(); err != nil {
 		t.Fatalf("F02-19: shutdown error: %v", err)
 	}
-	if _, err := http.Get(bs.baseURL + "/healthz"); err == nil {
+	stoppedReq, err := http.NewRequestWithContext(t.Context(), http.MethodGet, bs.baseURL+"/healthz", nil)
+	if err != nil {
+		t.Fatalf("F02-19: stopped health request: %v", err)
+	}
+	stoppedResp, err := http.DefaultClient.Do(stoppedReq)
+	if err == nil {
+		_ = stoppedResp.Body.Close()
 		t.Fatal("F02-19: listener still serving after shutdown")
 	}
 }
@@ -759,11 +793,15 @@ func fuzzF0221(t *testing.T, _ *f02BootDB) {
 	}
 
 	// Occupied listen port: hold the address, expect the listen failure.
-	held, err := net.Listen("tcp", "127.0.0.1:0")
+	held, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	if err != nil {
 		t.Fatalf("F02-21: hold listener: %v", err)
 	}
-	defer held.Close()
+	defer func() {
+		if err := held.Close(); err != nil {
+			t.Errorf("F02-21: close held listener: %v", err)
+		}
+	}()
 	occupied := f02BootConfig(held.Addr().String(), up.srv.URL, "k")
 	errCh := make(chan error, 1)
 	go func() { errCh <- run(occupied) }()
@@ -805,7 +843,10 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 func f02CheckBootDebugVars(t *testing.T, admin string, cfg config.Gateway, up *f02Upstream) {
 	t.Helper()
 	// /debug/vars requires localhost access plus the configured bearer.
-	req, _ := http.NewRequest(http.MethodGet, admin+"/debug/vars", nil)
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, admin+"/debug/vars", nil)
+	if err != nil {
+		t.Fatalf("F02-22: /debug/vars request: %v", err)
+	}
 	req.Header.Set("Authorization", "Bearer f02-admin-key")
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
@@ -828,7 +869,11 @@ func f02CheckBootDebugVars(t *testing.T, admin string, cfg config.Gateway, up *f
 
 func f02CheckBootDebugVarsDenied(t *testing.T, admin string) {
 	t.Helper()
-	noAuth, err := http.Get(admin + "/debug/vars")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, admin+"/debug/vars", nil)
+	if err != nil {
+		t.Fatalf("F02-22: /debug/vars without bearer request: %v", err)
+	}
+	noAuth, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("F02-22: /debug/vars without bearer: %v", err)
 	}
@@ -841,7 +886,11 @@ func f02CheckBootDebugVarsDenied(t *testing.T, admin string) {
 
 func f02CheckBootMetrics(t *testing.T, admin string) {
 	t.Helper()
-	metricsResp, err := http.Get(admin + "/metrics")
+	req, err := http.NewRequestWithContext(t.Context(), http.MethodGet, admin+"/metrics", nil)
+	if err != nil {
+		t.Fatalf("F02-22: /metrics request: %v", err)
+	}
+	metricsResp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("F02-22: /metrics: %v", err)
 	}
@@ -855,13 +904,17 @@ func f02CheckBootMetrics(t *testing.T, admin string) {
 func f02CheckBootCORS(t *testing.T, bs *f02BootServer) {
 	t.Helper()
 	// CORS preflight echoes the configured origin.
-	pre, _ := http.NewRequest(http.MethodOptions, bs.baseURL+"/v1/chat/completions", nil)
+	pre, err := http.NewRequestWithContext(t.Context(), http.MethodOptions, bs.baseURL+"/v1/chat/completions", nil)
+	if err != nil {
+		t.Fatalf("F02-22: preflight request: %v", err)
+	}
 	pre.Header.Set("Origin", "https://boot.example")
 	pre.Header.Set("Access-Control-Request-Method", "POST")
 	preflight, err := http.DefaultClient.Do(pre)
 	if err != nil {
 		t.Fatalf("F02-22: preflight: %v", err)
 	}
+	defer preflight.Body.Close()
 	_, _ = io.Copy(io.Discard, preflight.Body)
 	_ = preflight.Body.Close()
 	if preflight.StatusCode != http.StatusOK && preflight.StatusCode != http.StatusNoContent {
