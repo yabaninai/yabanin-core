@@ -33,7 +33,7 @@ type jwkPair struct {
 	pub  jose.JSONWebKey // public (JWKS)
 }
 
-func mustRSAJWK(t *testing.T, kid string) jwkPair {
+func mustRSAJWK(t testing.TB, kid string) jwkPair {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
@@ -82,7 +82,7 @@ func (g *jwksGate) enter() {
 	<-g.release
 }
 
-func newJWKSServer(t *testing.T, keys ...jwkPair) *jwksServer {
+func newJWKSServer(t testing.TB, keys ...jwkPair) *jwksServer {
 	t.Helper()
 	s := &jwksServer{}
 	for _, k := range keys {
@@ -113,7 +113,7 @@ func (s *jwksServer) setKeys(keys ...jwkPair) {
 func (s *jwksServer) fetchCount() int64 { return s.fetches.Load() }
 
 // signToken serializes one signed compact JWT with the given claims.
-func signToken(t *testing.T, k jwkPair, claims map[string]any) string {
+func signToken(t testing.TB, k jwkPair, claims map[string]any) string {
 	t.Helper()
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.SignatureAlgorithm(k.priv.Algorithm), Key: k.priv.Key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", k.priv.KeyID))
@@ -140,7 +140,7 @@ func baseClaims() map[string]any {
 	}
 }
 
-func newTestJWTAuth(t *testing.T, srv *jwksServer, mutate func(*JWTWiring)) *JWTAuthenticator {
+func newTestJWTAuth(t testing.TB, srv *jwksServer, mutate func(*JWTWiring)) *JWTAuthenticator {
 	t.Helper()
 	w := JWTWiring{
 		JWKSURL:       srv.srv.URL,
