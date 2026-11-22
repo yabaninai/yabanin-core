@@ -74,10 +74,19 @@ class ConfigControls(unittest.TestCase):
     def test_shipped_schema2_config_and_rejected_variants(self):
         config = self.config()
         critical.validate_config(config)
+        self.assertEqual(critical.budget(config), {'unit': 300, 'fuzz': 420, 'mutation': 300})
         for bad in (dict(config, schema_version=1),
                     dict(config, fuzz_applicability='all-packages'),
                     dict(config, mutation_qualified_packages='pkg/budget'),
-                    dict(config, seconds_per_package_and_kind=600)):
+                    dict(config, seconds_per_package_and_kind=600),
+                    dict(config, budget={'schema_version': 1, 'seconds_per_package':
+                                         {'unit': 300, 'fuzz': 300, 'mutation': 300}}),
+                    dict(config, budget={'schema_version': 2, 'seconds_per_package':
+                                         {'unit': 300, 'fuzz': 420, 'mutation': 300}}),
+                    dict(config, budget={'schema_version': 1, 'seconds_per_package':
+                                         {'unit': 300, 'mutation': 300}}),
+                    dict(config, budget={'schema_version': 1}),
+                    dict(config, budget=None)):
             with self.subTest(bad=bad.get('schema_version', bad)), self.assertRaises(ValueError):
                 critical.validate_config(bad)
 
