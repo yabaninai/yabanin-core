@@ -128,7 +128,7 @@ func requireReviewMediaClientOutcome(t *testing.T, timing string, rec *httptest.
 		require.Empty(t, rec.Body.String())
 		return
 	}
-	require.Equal(t, []byte(reviewMediaResult), rec.Body.Bytes(), "media response changed on the wire")
+	require.True(t, bytes.Equal([]byte(reviewMediaResult), rec.Body.Bytes()), "media response changed on the wire")
 }
 
 // TestReviewMediaInterruptedReadNoFabricatedUsage is the other half of

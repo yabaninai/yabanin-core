@@ -826,7 +826,7 @@ func (c *StreamConsumer) persistBudgetExceededProfile(ctx context.Context, tx In
 	if err != nil {
 		return err
 	}
-	row := budgetRequestLogRow(ev, sessionIDStr, errorMsg)
+	row := budgetRequestLogRow(ev, sessionIDStr.sqlValue(), errorMsg)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	// Budget-refused requests carry no gateway-minted invocation today; the
 	// binding is purely defensive and never downgrades to the legacy domain.
@@ -969,7 +969,7 @@ func (c *StreamConsumer) insertTerminalRequestLog(ctx context.Context, tx InboxT
 	if err != nil {
 		return pgconn.CommandTag{}, err
 	}
-	row := fullRequestLogRow(ev, sessionIDStr, errorValue, statusCode)
+	row := fullRequestLogRow(ev, sessionIDStr.sqlValue(), errorValue, statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)
 	return tx.Exec(ctx, row.insertSQL(), row.args()...)
@@ -1154,7 +1154,7 @@ func (c *StreamConsumer) persistShadowCompleteProfile(ctx context.Context, tx In
 	if err != nil {
 		return err
 	}
-	row := shadowRequestLogRow(ev, sessionIDStr, statusCode)
+	row := shadowRequestLogRow(ev, sessionIDStr.sqlValue(), statusCode)
 	row.setAttribution(c.attributionID(fields, "api_key_id"), c.attributionID(fields, "session_key_id"))
 	row.setInvocation(ev.invocationIDValue)
 

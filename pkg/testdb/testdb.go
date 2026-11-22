@@ -73,7 +73,7 @@ func repoRoot() (string, error) {
 // role the RLS pools assume is provisioned here exactly as the deployment
 // layer does (NOLOGIN least-privilege + application-surface grants; LOGIN
 // and the password stay a deploy-layer concern the stands never need).
-func applyMigrations(pool *pgxpool.Pool) error {
+func applyMigrations(parent context.Context, pool *pgxpool.Pool) error {
 	root, err := repoRoot()
 	if err != nil {
 		return err
@@ -86,7 +86,7 @@ func applyMigrations(pool *pgxpool.Pool) error {
 		return errors.New("no up-migrations discovered")
 	}
 	sort.Strings(paths)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancel := context.WithTimeout(parent, 60*time.Second)
 	defer cancel()
 	for _, p := range paths {
 		sqlBytes, err := os.ReadFile(p) //nolint:gosec // G304: repo-relative migration fixture
@@ -366,7 +366,7 @@ func initializePostgres(ctx context.Context, pool *pgxpool.Pool) error {
 		if err := waitStablePostmaster(ctx, pool); err != nil {
 			return err
 		}
-		if err := applyMigrations(pool); err != nil {
+		if err := applyMigrations(ctx, pool); err != nil {
 			return err
 		}
 		if coreTablesPresent(ctx, pool) {

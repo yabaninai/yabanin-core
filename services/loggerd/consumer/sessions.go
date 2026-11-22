@@ -41,12 +41,28 @@ func sessionRegistryUUID(orgID, raw string) string {
 // success log line; failing the delivery cleanly sends it to redelivery,
 // where the deterministic upsert either succeeds (transient failure) or
 // fails with the same wrapped cause.
-func (c *StreamConsumer) resolveSessionID(ctx context.Context, tx InboxTx, orgID, raw string) (any, error) {
-	if raw == "" || orgID == "" {
-		return nil, nil
+type optionalSessionID struct {
+	id      string
+	present bool
+}
+
+func (id optionalSessionID) sqlValue() any {
+	if !id.present {
+		return nil
 	}
-	if _, err := uuid.Parse(orgID); err != nil {
-		return nil, nil // sessions.org_id has an FK to organizations; don't even try
+	return id.id
+}
+
+func validSessionOrgID(orgID string) bool {
+	return uuid.Validate(orgID) == nil
+}
+
+func (c *StreamConsumer) resolveSessionID(ctx context.Context, tx InboxTx, orgID, raw string) (optionalSessionID, error) {
+	if raw == "" || orgID == "" {
+		return optionalSessionID{}, nil
+	}
+	if !validSessionOrgID(orgID) {
+		return optionalSessionID{}, nil // sessions.org_id has an FK to organizations; don't even try
 	}
 	sessionUUID := sessionRegistryUUID(orgID, raw)
 	var id string
@@ -56,7 +72,7 @@ func (c *StreamConsumer) resolveSessionID(ctx context.Context, tx InboxTx, orgID
 		ON CONFLICT (org_id, client_session) DO UPDATE SET updated_at = now()
 		RETURNING id`, sessionUUID, orgID, raw).Scan(&id)
 	if err != nil {
-		return nil, fmt.Errorf("session registry upsert: %w", err)
+		return optionalSessionID{}, fmt.Errorf("session registry upsert: %w", err)
 	}
-	return id, nil
+	return optionalSessionID{id: id, present: true}, nil
 }

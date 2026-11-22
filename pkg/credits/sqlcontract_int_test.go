@@ -152,6 +152,7 @@ func TestSQLContractCredits(t *testing.T) {
 }
 
 func sqlc03fGetBalanceContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	ctx := context.Background()
 	// GetBalance — remainder-aware wallet present.
 	sqlc03fContract(t, "GetBalance[orgA]", func(ctx context.Context) error {
@@ -176,6 +177,7 @@ func sqlc03fGetBalanceContract(t *testing.T, newStore func(grace int64) *Store, 
 // wallet is rejected exactly at the floor (≤) and the low wallet with a
 // persisted -1 floor admits even under a raised store floor.
 func sqlc03fCheckBalanceContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	ctx := context.Background()
 	_, err := newStore(DefaultConfig().GracePeriodCents).CheckBalance(ctx, fx.OrgA)
 	require.NoError(t, err, "CheckBalance[orgA]")
@@ -192,6 +194,7 @@ func sqlc03fCheckBalanceContract(t *testing.T, newStore func(grace int64) *Store
 // sqlc03fTopUpContract exercises the upsert + ledger CTE and the zero-amount
 // validation rejection.
 func sqlc03fTopUpContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	ctx := context.Background()
 	sqlc03fContract(t, "TopUp[orgA]", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
@@ -212,6 +215,7 @@ func sqlc03fTopUpContract(t *testing.T, newStore func(grace int64) *Store, fx *s
 // sqlc03fDeductContract covers the whole-cent path with an idempotent
 // replay.
 func sqlc03fDeductContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	sqlc03fContract(t, "Deduct[orgA]+replay", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
 		if err := st.Deduct(ctx, fx.OrgA, 10, fx.Token+"-req-deduct", map[string]interface{}{"env": "contract"}); err != nil {
@@ -233,6 +237,7 @@ func sqlc03fDeductContract(t *testing.T, newStore func(grace int64) *Store, fx *
 // residue on the wallet (reserved/grace schema in play), and the grace floor
 // rejects a charge that would cross it.
 func sqlc03fDeductMicroContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	ctx := context.Background()
 	sqlc03fContract(t, "DeductMicro[orgA,subcent]", func(ctx context.Context) error {
 		st := newStore(DefaultConfig().GracePeriodCents)
@@ -258,6 +263,7 @@ func sqlc03fDeductMicroContract(t *testing.T, newStore func(grace int64) *Store,
 // defaulting (0/negative/oversize clamp to 50) and the empty result for an
 // unknown org.
 func sqlc03fGetTransactionsContract(t *testing.T, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	sqlc03fContract(t, "GetTransactions[orgA,limit2]", func(ctx context.Context) error {
 		txns, err := newStore(0).GetTransactions(ctx, fx.OrgA, 2)
 		if err != nil {
@@ -297,6 +303,7 @@ func sqlc03fGetTransactionsContract(t *testing.T, newStore func(grace int64) *St
 // sqlc03fLowBalanceContract covers threshold and limit combinations on the
 // real scan.
 func sqlc03fLowBalanceContract(t *testing.T, pool *pgxpool.Pool, newStore func(grace int64) *Store, fx *sqlc03fCreditsFixture) {
+	t.Helper()
 	sqlc03fContract(t, "LowBalanceOrgs[threshold5]", func(ctx context.Context) error {
 		orgs, err := newStore(0).LowBalanceOrgs(ctx, 5, 100)
 		if err != nil {

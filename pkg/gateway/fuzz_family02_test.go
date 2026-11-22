@@ -208,7 +208,7 @@ func (d *f02RecordingDB) QueryRow(ctx context.Context, sql string, args ...any) 
 		hash, _ := args[0].(string)
 		org, _ := args[1].(string)
 		parent, _ := args[2].(string)
-		d.scriptDB.loads["sess-new"] = sessionRow{id: "sess-new", parentID: parent, keyHash: hash, orgID: org}
+		d.loads["sess-new"] = sessionRow{id: "sess-new", parentID: parent, keyHash: hash, orgID: org}
 	}
 	if d.shouldFail(sql) {
 		return scanRow{err: errors.New("f02 injected row failure")}
@@ -574,15 +574,15 @@ type f02GenJWT struct {
 	org [2]string
 }
 
-func f02GenFixture(t testing.TB) *f02GenJWT {
-	t.Helper()
+func f02GenFixture(tb testing.TB) *f02GenJWT {
+	tb.Helper()
 	g := &f02GenJWT{org: [2]string{"org-a", "org-b"}}
 	iss := [2]string{"https://idp-a.example", "https://idp-b.example"}
 	aud := [2]string{"aud-a", "aud-b"}
 	for i := range g.mw {
-		k := mustRSAJWK(t, "shared-kid")
-		srv := newJWKSServer(t, k)
-		a := newTestJWTAuth(t, srv, func(w *JWTWiring) {
+		k := mustRSAJWK(tb, "shared-kid")
+		srv := newJWKSServer(tb, k)
+		a := newTestJWTAuth(tb, srv, func(w *JWTWiring) {
 			w.Issuer = iss[i]
 			w.Audience = aud[i]
 		})
@@ -595,7 +595,7 @@ func f02GenFixture(t testing.TB) *f02GenJWT {
 		for m, mut := range muts {
 			c := f02OrgClaims(iss[i], aud[i], g.org[i])
 			mut(c)
-			g.tok[i][m] = signToken(t, k, c)
+			g.tok[i][m] = signToken(tb, k, c)
 		}
 	}
 	return g
@@ -669,7 +669,7 @@ func f02Generated(t *testing.T, data []byte, g *f02GenJWT) {
 	}
 	ids := []string{"sess-1", "sess-x"}
 	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	kv := &memSessionKV{}
 	gw := f02SessionGW(db, kv, nil)
 	want := f02sessGenExpect(op, pIdx, idSel == 0)
@@ -1490,7 +1490,7 @@ func f02ScenarioRevokeIdempotent(t *testing.T, r chi.Router, db *f02RecordingDB,
 func fuzzF0211(t *testing.T) {
 	t.Helper()
 	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	kv := &memSessionKV{}
 	gw := f02SessionGW(db, kv, nil)
 	r := f02Router(gw)
@@ -1511,7 +1511,7 @@ func fuzzF0211(t *testing.T) {
 
 	// Exec failure → 500.
 	db2 := f02DB()
-	db2.scriptDB.loads["sess-2"] = sessionRow{id: "sess-2", parentID: "parent-1", keyHash: "hash-2", orgID: "org-1"}
+	db2.loads["sess-2"] = sessionRow{id: "sess-2", parentID: "parent-1", keyHash: "hash-2", orgID: "org-1"}
 	db2.failNext = "SET revoked_at"
 	gw2 := f02SessionGW(db2, &memSessionKV{}, nil)
 	rec := f02Call(t, f02Router(gw2), http.MethodDelete, "/session-keys/sess-2", "", principal{APIKeyID: "parent-1"})
@@ -1519,7 +1519,7 @@ func fuzzF0211(t *testing.T) {
 
 	// KV purge failure is soft: revoke still succeeds and warns.
 	db3 := f02DB()
-	db3.scriptDB.loads["sess-3"] = sessionRow{id: "sess-3", parentID: "parent-1", keyHash: "hash-3", orgID: "org-1"}
+	db3.loads["sess-3"] = sessionRow{id: "sess-3", parentID: "parent-1", keyHash: "hash-3", orgID: "org-1"}
 	var logs3 bytes.Buffer
 	gw3 := f02SessionGW(db3, &f02FailingKV{memSessionKV: &memSessionKV{}, failDel: true}, &logs3)
 	rec3 := f02Call(t, f02Router(gw3), http.MethodDelete, "/session-keys/sess-3", "", principal{APIKeyID: "parent-1"})
@@ -1554,7 +1554,7 @@ func f02ScenarioFinishOracle(t *testing.T, r chi.Router, db *f02RecordingDB, sel
 func fuzzF0212(t *testing.T) {
 	t.Helper()
 	db := f02DB()
-	db.scriptDB.loads["sess-2"] = sessionRow{id: "sess-2", parentID: "parent-1", keyHash: "hash-2", orgID: "org-1"}
+	db.loads["sess-2"] = sessionRow{id: "sess-2", parentID: "parent-1", keyHash: "hash-2", orgID: "org-1"}
 	gw := f02SessionGW(db, &memSessionKV{}, nil)
 	r := f02Router(gw)
 	self := principal{SessionKeyID: "sess-2"}
@@ -1570,7 +1570,7 @@ func fuzzF0212(t *testing.T) {
 
 	// Oversized finish body → 400 at the read gate (unfinished session).
 	db3 := f02DB()
-	db3.scriptDB.loads["sess-3"] = sessionRow{id: "sess-3", parentID: "parent-1", keyHash: "hash-3", orgID: "org-1"}
+	db3.loads["sess-3"] = sessionRow{id: "sess-3", parentID: "parent-1", keyHash: "hash-3", orgID: "org-1"}
 	r3 := f02Router(f02SessionGW(db3, &memSessionKV{}, nil))
 	self3 := principal{SessionKeyID: "sess-3"}
 	f02callExpect(t, r3, http.MethodPost, "/session-keys/sess-3/finish", strings.Repeat("x", 17*1024), self3, http.StatusBadRequest)
@@ -1607,7 +1607,7 @@ func f02ScenarioUsageOwnOracle(t *testing.T, gw *gateway, db *f02RecordingDB) {
 func fuzzF0213(t *testing.T) {
 	t.Helper()
 	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db.modelRows = [][]any{{"gpt-x", int64(3), int64(30), int64(20), 0.25}}
 	gw := f02SessionGW(db, &memSessionKV{}, nil)
 
@@ -1618,7 +1618,7 @@ func fuzzF0213(t *testing.T) {
 
 	// Required totals read failure → 503 usage_unavailable; no totals leak.
 	db2 := f02DB()
-	db2.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db2.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db2.failNext = "count(*)"
 	gw2 := f02SessionGW(db2, &memSessionKV{}, nil)
 	rec2 := f02usageGET(t, gw2, "sess-1", "parent-1")
@@ -1635,7 +1635,7 @@ func fuzzF0213(t *testing.T) {
 	// Broken by-model row delivery aborts the report → 503; neither totals
 	// nor the healthy later row may leak.
 	db3 := f02DB()
-	db3.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db3.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db3.failModelScan = 0
 	db3.modelRows = [][]any{{"broken", int64(9), int64(9), int64(9), 9.0}, {"gpt-x", int64(3), int64(30), int64(20), 0.25}}
 	gw3 := f02SessionGW(db3, &memSessionKV{}, nil)
@@ -1645,7 +1645,7 @@ func fuzzF0213(t *testing.T) {
 
 	// Zero model rows → empty by_model array, not null.
 	db4 := f02DB()
-	db4.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db4.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	db4.modelRows = [][]any{}
 	gw4 := f02SessionGW(db4, &memSessionKV{}, nil)
 	rec4 := f02usageGET(t, gw4, "sess-1", "parent-1")
@@ -1755,7 +1755,7 @@ func f02ScenarioUsageGroupLabel(t *testing.T, ok principal) {
 func f02ScenarioUsageWindow(t *testing.T, ok principal) {
 	t.Helper()
 	dbW := f02DB()
-	dbW.scriptDB.usage = []any{int64(5), int64(50), int64(20), int64(2), 1.5, int64(0)}
+	dbW.usage = []any{int64(5), int64(50), int64(20), int64(2), 1.5, int64(0)}
 	gwW := f02SessionGW(dbW, &memSessionKV{}, nil)
 	fromW := time.Now().Add(-24 * time.Hour).UTC().Truncate(time.Second)
 	toW := time.Now().Add(-time.Hour).UTC().Truncate(time.Second)
@@ -2224,7 +2224,7 @@ func f02tamperedToken(t *testing.T, tok string) string {
 func f02ScenarioCorruptedPrincipal(t *testing.T) {
 	t.Helper()
 	db := f02DB()
-	db.scriptDB.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
+	db.loads["sess-1"] = sessionRow{id: "sess-1", parentID: "parent-1", keyHash: "hash-1", orgID: "org-1"}
 	r := f02Router(f02SessionGW(db, &memSessionKV{}, nil))
 	if rec := f02Call(t, r, http.MethodDelete, "/session-keys/sess-1", "", principal{APIKeyID: "attacker"}); rec.Code != http.StatusNotFound {
 		t.Fatalf("F02-18: corrupted principal not caught: %d", rec.Code)

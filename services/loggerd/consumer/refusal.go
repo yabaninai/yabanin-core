@@ -78,7 +78,7 @@ func (c *StreamConsumer) persistRefusalHistory(ctx context.Context, msg redis.XM
 	if err != nil {
 		return err
 	}
-	row := refusalRequestLogRow(ev, sessionIDStr, ev.statusCode)
+	row := refusalRequestLogRow(ev, sessionIDStr.sqlValue(), ev.statusCode)
 	row.setAttribution(c.attributionID(msg.Values, "api_key_id"), c.attributionID(msg.Values, "session_key_id"))
 
 	if _, err := tx.Exec(ctx, row.insertSQL(), row.args()...); err != nil {

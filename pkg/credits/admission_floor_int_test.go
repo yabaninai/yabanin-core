@@ -12,19 +12,26 @@ import (
 )
 
 // seedAdmissionWallet creates one private wallet in the migrated schema.
-func seedAdmissionWallet(t *testing.T, pool *pgxpool.Pool, balance int64, floor *int64) string {
+func seedAdmissionWallet(t *testing.T, ctx context.Context, pool *pgxpool.Pool, balance int64, floor *int64) string {
 	t.Helper()
 	org := uuid.NewString()
-	_, err := pool.Exec(t.Context(), `INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents)
+	_, err := pool.Exec(ctx, `INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents)
 		VALUES ($1, $2, $3)`, org, balance, floor)
 	require.NoError(t, err)
 	t.Cleanup(func() {
-		_, err := pool.Exec(context.Background(), `DELETE FROM credit_transactions WHERE org_id = $1`, org)
-		require.NoError(t, err)
-		_, err = pool.Exec(context.Background(), `DELETE FROM org_credits WHERE org_id = $1`, org)
-		require.NoError(t, err)
+		cleanupCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		require.NoError(t, deleteAdmissionWallet(cleanupCtx, pool, org))
 	})
 	return org
+}
+
+func deleteAdmissionWallet(ctx context.Context, pool *pgxpool.Pool, org string) error {
+	if _, err := pool.Exec(ctx, `DELETE FROM credit_transactions WHERE org_id = $1`, org); err != nil {
+		return err
+	}
+	_, err := pool.Exec(ctx, `DELETE FROM org_credits WHERE org_id = $1`, org)
+	return err
 }
 
 // TestCheckBalance_PersistedGraceFloorContract: persisted floors decide —
@@ -33,13 +40,13 @@ func seedAdmissionWallet(t *testing.T, pool *pgxpool.Pool, balance int64, floor 
 // rejects. The override never leaks across org rows.
 func TestCheckBalance_PersistedGraceFloorContract(t *testing.T) {
 	pool := setupTestDB(t)
-	ctx := context.Background()
+	ctx := t.Context()
 
 	zero, deep := int64(0), int64(-10000)
-	zeroOrg := seedAdmissionWallet(t, pool, -50, &zero)
-	defaultOrg := seedAdmissionWallet(t, pool, -50, nil)
-	deepOrg := seedAdmissionWallet(t, pool, -500, &deep)
-	deepDefaultOrg := seedAdmissionWallet(t, pool, -500, nil)
+	zeroOrg := seedAdmissionWallet(t, ctx, pool, -50, &zero)
+	defaultOrg := seedAdmissionWallet(t, ctx, pool, -50, nil)
+	deepOrg := seedAdmissionWallet(t, ctx, pool, -500, &deep)
+	deepDefaultOrg := seedAdmissionWallet(t, ctx, pool, -500, nil)
 
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 
@@ -80,8 +87,8 @@ func TestCheckBalance_PersistedGraceFloorContract(t *testing.T) {
 // decides on them. InvalidateOrg refreshes only the display view.
 func TestCheckBalance_FloorChangeIsAuthoritativeOnAdmission(t *testing.T) {
 	pool := setupTestDB(t)
-	ctx := context.Background()
-	org := seedAdmissionWallet(t, pool, -50, nil)
+	ctx := t.Context()
+	org := seedAdmissionWallet(t, ctx, pool, -50, nil)
 
 	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 
@@ -131,8 +138,8 @@ func TestCheckBalance_FloorChangeIsAuthoritativeOnAdmission(t *testing.T) {
 // fresh on every call.
 func TestCheckBalance_TwoStoresFreshAdmissionExactContacts(t *testing.T) {
 	pool := setupTestDB(t)
-	ctx := context.Background()
-	org := seedAdmissionWallet(t, pool, -50, nil)
+	ctx := t.Context()
+	org := seedAdmissionWallet(t, ctx, pool, -50, nil)
 
 	gw := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
 	admin := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: -100, CacheTTL: time.Minute})
