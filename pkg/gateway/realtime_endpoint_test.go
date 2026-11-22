@@ -419,6 +419,10 @@ func realtimeBoundaryWire(t *testing.T, shape string) string {
 			"event: response.done\ndata: " + done + "\n\n"
 	}
 	switch shape {
+	case "cr":
+		return strings.ReplaceAll(response("first", "one", 7, 3), "\n", "\r")
+	case "crlf":
+		return strings.ReplaceAll(response("first", "one", 7, 3), "\n", "\r\n")
 	case "large":
 		return response("first", strings.Repeat("a", (1<<20)+1), 7, 3)
 	case "trailing":
@@ -440,7 +444,7 @@ func realtimeBoundaryWire(t *testing.T, shape string) string {
 // accounting_commit_failed followed by [DONE] — the client never sees
 // a success terminator for an unaccounted session.
 func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
-	for _, shape := range []string{"large", "trailing", "multiple"} {
+	for _, shape := range []string{"large", "trailing", "multiple", "cr", "crlf"} {
 		for _, commitFails := range []bool{false, true} {
 			name := shape + "/healthy"
 			if commitFails {

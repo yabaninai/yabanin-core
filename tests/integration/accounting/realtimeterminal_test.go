@@ -23,6 +23,12 @@ func realtimeBoundarySession(shape string) []string {
 			"event: response.done\ndata: " + done + "\n\n"}
 	}
 	switch shape {
+	case "cr":
+		wire := response("first", "one", 7, 3)
+		for i := range wire {
+			wire[i] = strings.ReplaceAll(wire[i], "\n", "\r")
+		}
+		return wire
 	case "large":
 		return response("first", strings.Repeat("a", (1<<20)+1), 7, 3)
 	case "trailing":
@@ -49,7 +55,7 @@ func requestBoundarySession(t *testing.T, s *stand, rid string, wire []string) s
 
 func TestAccountingRealtimeTerminalBoundaries(t *testing.T) {
 	s := startStand(t)
-	shapes := []string{"large", "trailing", "multiple"}
+	shapes := []string{"large", "trailing", "multiple", "cr"}
 	var targets []string
 	for _, shape := range shapes {
 		targets = append(targets, s.reqPrefix+"failure-"+shape)
@@ -85,7 +91,7 @@ func TestRealtimeBoundaryFixture(t *testing.T) {
 	for _, tc := range []struct {
 		shape string
 		count int
-	}{{"large", 3}, {"trailing", 4}, {"multiple", 6}} {
+	}{{"large", 3}, {"trailing", 4}, {"multiple", 6}, {"cr", 3}} {
 		wire := realtimeBoundarySession(tc.shape)
 		body := requestBoundarySession(t, s, tc.shape, wire)
 		require.Equal(t, sha256.Sum256([]byte(strings.Join(wire, ""))), sha256.Sum256([]byte(body)))

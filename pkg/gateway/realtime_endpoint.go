@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -617,12 +616,18 @@ func (s *realtimeRelaySink) settleTail() error {
 			return lerr
 		}
 	}
-	if len(partial) > 0 || !s.frames.Salvageable() {
+	if len(partial) > 0 {
 		return nil
 	}
-	if lerr := s.hold.admit(append(s.frames.Take(), '\r', '\n')); lerr != nil {
-		return lerr
+	if s.frames.Salvageable() {
+		if lerr := s.hold.admit(append(s.frames.Take(), '\r', '\n')); lerr != nil {
+			return lerr
+		}
+	} else if len(flushLines) == 0 || string(flushLines[0]) != "\r" {
+		return nil
 	}
+	// A final lone CR can complete the blank separator at EOF. The side
+	// parser must see that boundary even when no frame needs salvage.
 	for _, ev := range s.parser.Flush() {
 		if u, ok := realtimeUsageFromEvent([]byte(ev.Data)); ok {
 			s.usage = u
@@ -829,22 +834,8 @@ func (e errRealtimeHoldIO) Unwrap() error { return e.err }
 // failure/incomplete response.done frames are not successful terminals and
 // are never held.
 func realtimeCompletedResponseDone(frame []byte) bool {
-	var event string
-	var data []byte
-	for _, line := range bytes.Split(frame, []byte("\n")) {
-		line = bytes.TrimSuffix(line, []byte("\r"))
-		if after, ok := bytes.CutPrefix(line, []byte("event:")); ok {
-			event = strings.TrimSpace(string(after))
-			continue
-		}
-		if after, ok := bytes.CutPrefix(line, []byte("data:")); ok {
-			if len(data) > 0 {
-				data = append(data, '\n')
-			}
-			data = append(data, bytes.TrimPrefix(after, []byte(" "))...)
-		}
-	}
-	if event != "response.done" || len(data) == 0 {
+	events := apiformat.ParseSSE(frame)
+	if len(events) != 1 || strings.TrimSpace(events[0].Event) != "response.done" {
 		return false
 	}
 	var doc struct {
@@ -852,7 +843,7 @@ func realtimeCompletedResponseDone(frame []byte) bool {
 			Status string `json:"status"`
 		} `json:"response"`
 	}
-	if err := json.Unmarshal(data, &doc); err != nil || doc.Response == nil {
+	if err := json.Unmarshal([]byte(events[0].Data), &doc); err != nil || doc.Response == nil {
 		return false
 	}
 	return doc.Response.Status == "completed"
