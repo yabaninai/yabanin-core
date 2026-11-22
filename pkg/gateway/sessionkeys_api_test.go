@@ -69,6 +69,7 @@ func (m *memSessionKV) Del(_ context.Context, keys ...string) *redis.IntCmd {
 type scriptDB struct {
 	inserts   [][]any
 	loads     map[string]sessionRow
+	lookupErr error
 	usage     []any
 	usageArgs []any
 }
@@ -79,6 +80,9 @@ func (s *scriptDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 		s.inserts = append(s.inserts, args)
 		return scanRow{vals: []any{"sess-new"}}
 	case strings.Contains(sql, "FROM session_keys WHERE id"):
+		if s.lookupErr != nil {
+			return scanRow{err: s.lookupErr}
+		}
 		id, _ := args[0].(string)
 		row, ok := s.loads[id]
 		if !ok {
@@ -474,5 +478,30 @@ func TestUsageReportsRejectIncompleteReads(t *testing.T) {
 				require.NotContains(t, rec.Body.String(), "test database")
 			})
 		}
+	}
+}
+
+func TestSessionUsageLookupErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name, id, code string
+		err            error
+		status         int
+	}{
+		{"malformed UUID", "invalid-id", "not_found", &pgconn.PgError{Code: "22P02"}, http.StatusNotFound},
+		{"absent session", "d0602833-fef7-4671-87bc-db975fd3493a", "not_found", pgx.ErrNoRows, http.StatusNotFound},
+		{"database unavailable", "d0602833-fef7-4671-87bc-db975fd3493a", "usage_unavailable", &pgconn.PgError{Code: "57P03"}, http.StatusServiceUnavailable},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &scriptDB{lookupErr: tc.err}
+			gw := mintGW(db, nil, nil)
+			router := chi.NewRouter()
+			router.Get("/session-keys/{id}/usage", gw.sessionKeyUsage)
+			req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, "/session-keys/"+tc.id+"/usage", nil)
+			rec := httptest.NewRecorder()
+			router.ServeHTTP(rec, req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "parent"})))
+			require.Equal(t, tc.status, rec.Code)
+			require.Contains(t, rec.Body.String(), tc.code)
+			require.Empty(t, db.usageArgs)
+		})
 	}
 }

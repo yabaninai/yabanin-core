@@ -220,6 +220,11 @@ func (gw *gateway) loadSession(ctx context.Context, db sessionQuerier, id string
 		`SELECT id::text, parent_api_key_id::text, key_hash, org_id::text, revoked_at, finished_at
 		   FROM session_keys WHERE id = $1`, id,
 	).Scan(&row.id, &row.parentID, &row.keyHash, &row.orgID, &row.revokedAt, &row.finishedAt)
+	// The only input to this query is the UUID from the URL.
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) && pgErr.Code == "22P02" {
+		return sessionRow{}, pgx.ErrNoRows
+	}
 	return row, err
 }
 
