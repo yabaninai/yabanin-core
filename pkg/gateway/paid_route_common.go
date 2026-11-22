@@ -12,6 +12,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/httpmw"
 	"github.com/reireirei/yabanin/pkg/logctx"
 	"github.com/reireirei/yabanin/pkg/provider"
+	"github.com/reireirei/yabanin/pkg/retry"
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
@@ -211,6 +212,16 @@ func (gw *gateway) finishBufferedJSONRoute(f bufferedJSONFinish) {
 func writePaidBodyError(w http.ResponseWriter, message string) {
 	w.Header().Set("X-Should-Retry", "false")
 	apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, message)
+}
+
+// An unknown post-dispatch outcome must not invite a duplicate paid call.
+func writeNativeDispatchError(w http.ResponseWriter, err error) {
+	if retry.DefinitelyNotSent(err) {
+		w.Header().Set("X-Should-Retry", "true")
+	} else {
+		w.Header().Set("X-Should-Retry", "false")
+	}
+	apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
 }
 
 // Keep provider errors within their passthrough bound. A success needs one

@@ -94,7 +94,7 @@ func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rc
 	if err != nil {
 		closeUpstream(l, resp)
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
+		writeNativeDispatchError(w, err)
 		return
 	}
 	defer closeUpstream(l, resp)
@@ -149,7 +149,7 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 	if err != nil {
 		closeUpstream(l, resp)
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
+		writeNativeDispatchError(w, err)
 		return
 	}
 	defer closeUpstream(l, resp)
