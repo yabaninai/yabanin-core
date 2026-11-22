@@ -103,22 +103,17 @@ func TestCompletions_StreamPassthroughSuppressesUsage(t *testing.T) {
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
 
 	rec := postCompletions(t, gw, `{"model":"m","prompt":"fn","suffix":"()","stream":true}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-	}
-	if !rec.Flushed {
-		t.Fatal("stream was not flushed")
-	}
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.True(t, rec.Flushed, "stream was not flushed")
 	body := rec.Body.String()
-	if !strings.Contains(body, `"text":"hi"`) || !strings.Contains(body, "[DONE]") {
-		t.Fatalf("body %q", body)
-	}
-	if strings.Contains(body, `"prompt_tokens"`) {
-		t.Fatalf("usage chunk reached the client: %s", body)
-	}
-	if ev == nil || ev.Endpoint != "completions" || ev.TokensIn != 2 || ev.TokensOut != 1 || ev.UsageSource != "provider" {
-		t.Fatalf("event %+v", ev)
-	}
+	require.Contains(t, body, `"text":"hi"`)
+	require.Contains(t, body, "[DONE]")
+	require.NotContains(t, body, `"prompt_tokens"`, "usage chunk reached the client")
+	require.NotNil(t, ev)
+	require.Equal(t, "completions", ev.Endpoint)
+	require.Equal(t, int64(2), ev.TokensIn)
+	require.Equal(t, int64(1), ev.TokensOut)
+	require.Equal(t, "provider", ev.UsageSource)
 }
 
 func TestCompletions_StreamOutlivesTimeout(t *testing.T) {

@@ -16,6 +16,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/policy"
 	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
+	"github.com/stretchr/testify/require"
 )
 
 func postEmbeddings(t *testing.T, gw *gateway, body string) *httptest.ResponseRecorder {
@@ -58,15 +59,13 @@ func TestEmbeddings_HappyPathUsageAndEvent(t *testing.T) {
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
 
 	rec := postEmbeddings(t, gw, `{"model":"m","input":"hello"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("status %d %s", rec.Code, rec.Body.String())
-	}
-	if rec.Body.String() != upstreamBody+"\n" && strings.TrimSpace(rec.Body.String()) != upstreamBody {
-		t.Fatalf("body %q", rec.Body.String())
-	}
-	if ev == nil || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
-		t.Fatalf("event %+v", ev)
-	}
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.True(t, rec.Body.String() == upstreamBody+"\n" || strings.TrimSpace(rec.Body.String()) == upstreamBody, "body %q", rec.Body.String())
+	require.NotNil(t, ev)
+	require.Equal(t, "embeddings", ev.Endpoint)
+	require.Equal(t, int64(3), ev.TokensIn)
+	require.Zero(t, ev.TokensOut)
+	require.Equal(t, "provider", ev.UsageSource)
 }
 
 func TestEmbeddings_UnsupportedProvider(t *testing.T) {
