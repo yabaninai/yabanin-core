@@ -427,7 +427,8 @@ paths:
         Non-stream returns a single JSON completion. `stream: true` returns
         `text/event-stream` with OpenAI-style chunks terminated by `[DONE]`.
         Fail-closed semantics: 403 model not whitelisted / budget not configured,
-        429 budget exceeded, 503 budget or whitelist datastore unavailable.
+        429 budget exceeded, 503 budget or whitelist datastore unavailable
+        or paid-request start unconfirmed.
       operationId: createChatCompletion
       requestBody:
         required: true
@@ -459,7 +460,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -550,7 +554,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Upstream overloaded_error passthrough"
+          description: >-
+            Upstream overloaded_error passthrough.
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -667,6 +674,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /moderations:
     post:
@@ -732,6 +747,14 @@ paths:
                 $ref: "#/components/schemas/Error"
         "502":
           description: "Upstream failure or oversized upstream response"
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -807,6 +830,14 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          description: >-
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
 
   /completions:
     post:
@@ -875,7 +906,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -949,7 +983,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -1025,7 +1062,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -1104,7 +1144,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -1194,7 +1237,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
@@ -1553,7 +1599,10 @@ paths:
               schema:
                 $ref: "#/components/schemas/Error"
         "503":
-          description: "Budget or whitelist check unavailable (fail-closed)"
+          description: >-
+            Budget or whitelist check unavailable (fail-closed).
+            If Core cannot confirm the durable start of a paid request, it returns
+            history_unavailable before contacting the provider.
           content:
             application/json:
               schema:
