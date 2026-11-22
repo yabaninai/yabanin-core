@@ -33,15 +33,16 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 	rid := s.reqPrefix + "tgt-xt-shared"
 	s.runSharedCorrelationPair(t, rid)
 
+	// The consumer writes the logs asynchronously. Wait for both durable
+	// reconciliation records before inspecting either tenant's ledger.
+	s.requireAdmissionsReconciledPerOrg(t, rid, orgA, orgB)
+
 	// Exactly one billed row per org, bound to that org only.
 	s.requireSharedCorrelationBilled(t, rid, orgA, orgB)
 
 	// Each wallet debited exactly once, signed, in its own org ledger.
 	s.requireWalletChargedExactlyOnce(t, rid, orgA, "cross-tenant A")
 	s.requireWalletChargedExactlyOnce(t, rid, orgB, "cross-tenant B")
-
-	// Admissions are org-bound: one per org, never leaked, both reconciled.
-	s.requireAdmissionsReconciledPerOrg(t, rid, orgA, orgB)
 
 	// Settlement intents stay org-scoped too.
 	if jobsA, jobsB := s.oracleSettlementJobs(t, rid, orgA), s.oracleSettlementJobs(t, rid, orgB); jobsA > 1 || jobsB > 1 {
