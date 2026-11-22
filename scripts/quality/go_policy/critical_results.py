@@ -19,15 +19,21 @@ class ProfileIndex:
     consumer's result can change.
     """
 
-    __slots__ = ('rows', '_by_file', '_matched')
+    __slots__ = ('rows', '_by_file', '_matched', '_by_file_pos',
+                 '_matched_rows')
 
     def __init__(self, rows):
         self.rows = list(rows)
         by_file = {}
-        for file, line, count, _ in self.rows:
-            by_file.setdefault(Path(file).as_posix(), []).append((line, count))
+        by_file_pos = {}
+        for index, (file, line, count, _) in enumerate(self.rows):
+            key = Path(file).as_posix()
+            by_file.setdefault(key, []).append((line, count))
+            by_file_pos.setdefault(key, []).append(index)
         self._by_file = by_file
+        self._by_file_pos = by_file_pos
         self._matched = {}
+        self._matched_rows = {}
 
     def __iter__(self):
         return iter(self.rows)
@@ -42,6 +48,25 @@ class ProfileIndex:
                     entries.extend(rows)
             self._matched[expected] = entries
         return entries
+
+    def matched_rows(self, expected):
+        """Full profile rows of every file matching expected, row order.
+
+        The naive full scans in in_span and uncovered_span keep the
+        original row order (sorted() is stable and uncovered_span keeps
+        source order), so this accessor must too: bucket positions are
+        merged back into one ascending position list before lookup.
+        """
+        rows = self._matched_rows.get(expected)
+        if rows is None:
+            positions = []
+            for actual, indexes in self._by_file_pos.items():
+                if same_file(actual, expected):
+                    positions.extend(indexes)
+            positions.sort()
+            rows = [self.rows[index] for index in positions]
+            self._matched_rows[expected] = rows
+        return rows
 
     def covered(self, start, end, expected):
         """Whether any matching file has an executed block inside the span."""

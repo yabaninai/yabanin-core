@@ -2217,9 +2217,14 @@ def unpreserved_blocks(counterpart, row, base_rows, now_rows):
 
 def in_span(rows, row):
     """Cover-profile blocks of one function's span, in source order."""
-    return sorted((block for block in rows
-                   if critical_results.same_file(block[0], row['file'])
-                   and row['start'] <= block[1] <= row['end']), key=block_order)
+    if isinstance(rows, critical_results.ProfileIndex):
+        blocks = [block for block in rows.matched_rows(row['file'])
+                  if row['start'] <= block[1] <= row['end']]
+    else:
+        blocks = (block for block in rows
+                  if critical_results.same_file(block[0], row['file'])
+                  and row['start'] <= block[1] <= row['end'])
+    return sorted(blocks, key=block_order)
 
 
 def block_order(block):
@@ -2230,9 +2235,13 @@ def block_order(block):
 
 def uncovered_span(row, now_rows):
     """Unexecuted current-tree blocks inside a changed function body."""
-    return [spec for file, line, count, spec in now_rows
-            if critical_results.same_file(file, row['file'])
-            and row['start'] <= line <= row['end'] and count == 0]
+    if isinstance(now_rows, critical_results.ProfileIndex):
+        rows = now_rows.matched_rows(row['file'])
+    else:
+        rows = [row_ for row_ in now_rows
+                if critical_results.same_file(row_[0], row['file'])]
+    return [spec for file, line, count, spec in rows
+            if row['start'] <= line <= row['end'] and count == 0]
 
 
 def unit_budget(config):
