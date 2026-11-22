@@ -102,19 +102,32 @@ func TestAccountingCrashClientRetrySingleCharge(t *testing.T) {
 
 func retryAdmissionPair(t *testing.T, rows []admissionRow, crashedID string) (string, error) {
 	t.Helper()
+	crashed, completed, err := selectRetryAdmissionPair(rows, crashedID)
+	if err != nil {
+		return "", err
+	}
+	if err := unresolvedState(t, []admissionRow{crashed}, crashedID); err != nil {
+		return "", err
+	}
+	return completedAdmissionID(t, rows, completed)
+}
+
+func selectRetryAdmissionPair(rows []admissionRow, crashedID string) (admissionRow, admissionRow, error) {
 	if len(rows) != 2 {
-		return "", fmt.Errorf("want two admissions, got %s", fmtAdmissions(rows))
+		return admissionRow{}, admissionRow{}, fmt.Errorf("want two admissions, got %s", fmtAdmissions(rows))
 	}
 	crashed, completed := rows[0], rows[1]
 	if completed.InvocationID == crashedID {
 		crashed, completed = completed, crashed
 	}
 	if crashed.InvocationID != crashedID || completed.InvocationID == crashedID {
-		return "", abortf("captured %s does not identify exactly one of %s", crashedID, fmtAdmissions(rows))
+		return admissionRow{}, admissionRow{}, abortf("captured %s does not identify exactly one of %s", crashedID, fmtAdmissions(rows))
 	}
-	if err := unresolvedState(t, []admissionRow{crashed}, crashedID); err != nil {
-		return "", err
-	}
+	return crashed, completed, nil
+}
+
+func completedAdmissionID(t *testing.T, rows []admissionRow, completed admissionRow) (string, error) {
+	t.Helper()
 	requireAdmissionVocabulary(t, completed)
 	if completed.State == "admitted" {
 		return "", errTransient("completed invocation still admitted")

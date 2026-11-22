@@ -112,6 +112,10 @@ func unresolvedState(t *testing.T, rows []admissionRow, targetUUID string) error
 		return abortf("admission UUID changed across the restart: barrier %s, now %s", targetUUID, a.InvocationID)
 	}
 	requireAdmissionVocabulary(t, a)
+	return unresolvedAdmissionOutcome(rows, a)
+}
+
+func unresolvedAdmissionOutcome(rows []admissionRow, a admissionRow) error {
 	switch a.State {
 	case "unresolved":
 		if !a.ResolveReason.Valid || a.ResolveReason.String != reasonGraceElapsed {
