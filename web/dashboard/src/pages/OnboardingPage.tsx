@@ -165,7 +165,9 @@ export function OnboardingPage() {
       requestEntry={evidenceIdentity.requestEntry}
       setRequestEntry={evidenceIdentity.setRequestEntry}
       entryState={evidenceIdentity.entryState}
+      requestIdParam={requestIdParam}
       setRequestIdParam={setRequestIdParam}
+      retryCheck={evidenceIdentity.retryCheck}
     />
   )
 

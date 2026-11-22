@@ -1125,6 +1125,7 @@
     "setupRequestIdPlaceholder": "クライアントが送信した X-Request-ID を貼り付け",
     "setupRequestIdVerify": "検証",
     "setupRequestNotFound": "このIDのリクエストはこの組織にありません。",
+    "setupRequestUnavailable": "ただ今そのIDを確認できません — リクエスト履歴が一時的に利用できません。「検証」を押して再試行してください。",
     "skippedNote": "この組織ではこのフローをスキップ済みです。以下のステップは引き続きライブ状態を反映します。",
     "flagUnavailable": "このデプロイでは進行状況を保存できません。フローは引き続き機能し、次回のアクセス時に再確認されます。",
     "stateChecking": "確認中…",
