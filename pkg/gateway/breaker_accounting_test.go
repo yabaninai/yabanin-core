@@ -12,6 +12,33 @@ import (
 	"github.com/reireirei/yabanin/pkg/circuit"
 )
 
+// refusalAdmissionsClosed reports whether the admission accounting for one
+// refused request behind a dispatched call with identity healthyID is exact:
+// the refusal starts at most one admission with an identity distinct from
+// the dispatch, and the void list equals that admission exactly once — no
+// repeated void, no substitution with the dispatched identity, nothing
+// missing. Zero starts (early rejection before admission) is valid and
+// voids nothing.
+func refusalAdmissionsClosed(admitted []admissionRecord, voided []string, healthyID string) bool {
+	extra := len(admitted) - 1
+	if extra < 0 || extra > 1 || len(voided) != extra {
+		return false
+	}
+	seen := make(map[string]bool, len(voided))
+	for _, id := range voided {
+		if id == healthyID || seen[id] {
+			return false
+		}
+		seen[id] = true
+	}
+	for _, rec := range admitted[1:] {
+		if !seen[rec.InvocationID] {
+			return false
+		}
+	}
+	return true
+}
+
 func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 	for name, scope := range map[string]circuit.Scope{"global": circuit.ScopeGlobal, "per_endpoint": circuit.ScopePerEndpoint} {
 		for _, transport := range []string{"buffered", "stream"} {
@@ -25,7 +52,7 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 				gw.invocations = store
 				rec := rt02Post(t, gw, rt03ChatBody, nil)
 				require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
-				require.Equal(t, 1, upstream.totalCalls())
+				require.Equal(t, 1, upstream.totalCalls(), "the healthy call contacted the provider exactly once")
 				require.Len(t, store.admitted, 1)
 				require.Len(t, store.facts, 1)
 				key := circuit.GlobalBreakerKey
@@ -46,12 +73,78 @@ func TestOpenCircuitClosesUndispatchedAdmission(t *testing.T) {
 				}
 				require.Equal(t, 1, upstream.totalCalls(), "entry refusal contacted provider")
 				require.Len(t, store.facts, 1, "entry refusal added a terminal charge")
-				require.Len(t, store.voided, len(store.admitted)-1, "proven non-dispatch left a durable start open")
-				if len(store.voided) > 0 {
-					require.Equal(t, store.admitted[1].InvocationID, store.voided[0])
-				}
+				require.True(t, refusalAdmissionsClosed(store.admitted, store.voided, store.admitted[0].InvocationID),
+					"breaker refusal must close its admission exactly: %d admissions, voided %v", len(store.admitted), store.voided)
 			})
 		}
+	}
+}
+
+// TestRefusalAdmissionsClosed is the focused negative for the oracle
+// predicate: both valid arms (the ordinary admitted-then-voided refusal and
+// the correct zero-start early rejection) pass, and every audited defect —
+// duplicate starts, repeated void of only the first identity, substitution
+// or reuse of the dispatched identity, missing and spurious voids — is
+// rejected.
+func TestRefusalAdmissionsClosed(t *testing.T) {
+	cases := []struct {
+		name     string
+		admitted []admissionRecord
+		voided   []string
+		want     bool
+	}{
+		{
+			name:     "ordinary admitted-then-voided refusal",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "refused"}},
+			voided:   []string{"refused"},
+			want:     true,
+		},
+		{
+			name:     "correct zero-start early rejection",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}},
+			want:     true,
+		},
+		{
+			name:     "duplicate admission starts for one refusal",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "first"}, {InvocationID: "second"}},
+			voided:   []string{"first", "second"},
+			want:     false,
+		},
+		{
+			name:     "two distinct extra starts with two voids of only the first",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "first"}, {InvocationID: "second"}},
+			voided:   []string{"first", "first"},
+			want:     false,
+		},
+		{
+			name:     "void substitutes the dispatched identity",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "refused"}},
+			voided:   []string{"dispatched"},
+			want:     false,
+		},
+		{
+			name:     "extra start reuses the dispatched identity with a matching void",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "dispatched"}},
+			voided:   []string{"dispatched"},
+			want:     false,
+		},
+		{
+			name:     "missing void leaves the refusal start durable",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}, {InvocationID: "refused"}},
+			want:     false,
+		},
+		{
+			name:     "spurious void without any start",
+			admitted: []admissionRecord{{InvocationID: "dispatched"}},
+			voided:   []string{"ghost"},
+			want:     false,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			require.Equal(t, tc.want, refusalAdmissionsClosed(tc.admitted, tc.voided, "dispatched"),
+				"admitted %+v voided %v", tc.admitted, tc.voided)
+		})
 	}
 }
 
