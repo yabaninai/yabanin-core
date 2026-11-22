@@ -3560,9 +3560,25 @@ G8F_RECEIVER_TESTS = (
 )
 G8F_RECEIVER_BETA_ONLY_TESTS = (
     'package auth\nimport "testing"\n'
-    'func TestCheck(t *testing.T) { if !(Beta{}).Check(1) '
+    'func TestCheck(t *testing.T) { note := "(Alpha{}).Check(1)"; _ = note; '
+    'if !(Beta{}).Check(1) { t.Fatal("beta false denial") } }\n'
+)
+G8F_RECEIVER_VARIABLE_TESTS = (
+    'package auth\nimport "testing"\n'
+    'func TestCheck(t *testing.T) { var a Alpha; if !a.Check(1) '
+    '{ t.Fatal("alpha false denial") }; var b Beta; if !b.Check(1) '
     '{ t.Fatal("beta false denial") } }\n'
 )
+G8F_RECEIVER_ALIAS_POLICY = G8F_RECEIVER_POLICY + 'type Active = Alpha\n'
+G8F_RECEIVER_ALIAS_TESTS = (
+    'package auth\nimport "testing"\n'
+    'func TestCheck(t *testing.T) { if !(Active{}).Check(1) '
+    '{ t.Fatal("active false denial") } }\n'
+)
+G8F_RECEIVER_ALIAS_RETARGETED = G8F_RECEIVER_ALIAS_POLICY.replace(
+    'type Active = Alpha', 'type Active = Beta').replace(
+    'func (a Alpha) Check(n int) bool { if n > Limit { return false }; '
+    'return true }\n', '')
 G8F_RECEIVER_CHANGED = G8F_RECEIVER_POLICY.replace(
     'func (a Alpha) Check(n int) bool { if n > Limit { return false }; '
     'return true }',
@@ -3819,6 +3835,35 @@ class G8FollowupRepairControls(G7AuditRepairControls):
         root, base = self.write_repo(G8F_RECEIVER_POLICY,
                                      G8F_RECEIVER_BETA_ONLY_TESTS)
         (root / 'pkg/auth/policy.go').write_text(G8F_RECEIVER_DROP_ALPHA)
+        result = self.selector_output(root, base)
+        self.assertIn('removed production function without visible consumers: Alpha.Check',
+                      result['widened'], json.dumps(result['widened']))
+        self.assertFalse(any('removed function still referenced: Alpha.Check'
+                             in reason for reason in result['widened']),
+                         json.dumps(result['widened']))
+
+    def test_receiver_method_deletion_finds_variable_receiver(self):
+        # G8F-RECV-VAR: the exact baseline unit fingerprint keeps a typed
+        # variable receiver binding when deletion degrades analysis to floors.
+        root, base = self.write_repo(G8F_RECEIVER_POLICY,
+                                     G8F_RECEIVER_VARIABLE_TESTS)
+        (root / 'pkg/auth/policy.go').write_text(G8F_RECEIVER_DROP_ALPHA)
+        result = self.selector_output(root, base)
+        self.assertTrue(any('removed function still referenced: Alpha.Check'
+                            in reason for reason in result['widened']),
+                        json.dumps(result['widened']))
+        survivors = [(row['name'], row.get('recv'))
+                     for row in result['rows'] if row['name'] == 'Check']
+        self.assertEqual(survivors, [('Check', 'Beta')],
+                         json.dumps(result['rows']))
+
+    def test_receiver_alias_retarget_is_not_old_receiver_evidence(self):
+        # G8F-RECV-ALIAS: unchanged call syntax is rebound by the current
+        # alias target; it cannot prove a surviving Alpha.Check consumer.
+        root, base = self.write_repo(G8F_RECEIVER_ALIAS_POLICY,
+                                     G8F_RECEIVER_ALIAS_TESTS)
+        (root / 'pkg/auth/policy.go').write_text(
+            G8F_RECEIVER_ALIAS_RETARGETED)
         result = self.selector_output(root, base)
         self.assertIn('removed production function without visible consumers: Alpha.Check',
                       result['widened'], json.dumps(result['widened']))

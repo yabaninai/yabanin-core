@@ -739,10 +739,12 @@ def note_removed_function(row, previous, current, selection):
     if dispatch_reference(row['name'], previous, current):
         selection.widen('removed function in dynamic-dispatch package: ' + label)
         return
-    files = referencing_files(row, previous, current)
+    files, uncertain = referencing_files(row, previous, current)
     if files:
         selection.widen('removed function still referenced: ' + label +
                         ' (' + ', '.join(files) + ')')
+        if uncertain:
+            selection.mark_cross('removed function: ' + label)
         return
     selection.widen('removed production function without visible consumers: ' + label)
     selection.mark_cross('removed function: ' + label)
@@ -761,6 +763,7 @@ def referencing_files(row, previous, current):
     recv = row.get('recv', '')
     key = identity_key(row)
     files = []
+    uncertain = False
     for path in sorted(previous.files):
         if path not in current.files:
             continue
@@ -770,28 +773,32 @@ def referencing_files(row, previous, current):
             if key not in unit_refs(before):
                 continue
             exact = key in unit_refs(now)
-            fallback = name in unit_floor_refs(now) and mentions_receiver_method(
-                current, path, recv, name)
+            fallback = unchanged_receiver_consumer(before, now, key, name)
             if exact or fallback:
                 files.append(path)
+                uncertain = uncertain or (fallback and not exact)
         elif name in unit_refs(before) and mentions(current, path, name):
             files.append(path)
-    return files
+    return files, uncertain
 
 
-def unit_floor_refs(units):
-    """Name-only references whose analyzer resolution was conservative."""
-    return {name for item in units for name in item.get('floor_refs', [])}
+def unchanged_receiver_consumer(before, now, key, name):
+    """Keep a baseline receiver binding only when its whole unit survives.
 
-
-def mentions_receiver_method(current, path, recv, name):
-    """Match a literal receiver still calling a method after its deletion."""
-    receiver = re.escape(recv)
-    method = re.escape(name)
-    pattern = (r'\(?\s*&?\s*\b' + receiver +
-               r'\s*\{[^{}]*\}\s*\)?\s*\.\s*' + method + r'\b')
-    text = (current.root / path).read_text(errors='replace')
-    return re.search(pattern, text) is not None
+    After a removed method makes package type checking fail, the unit analyzer
+    may retain only a bare selector floor. Pairing the unchanged declaration
+    by its AST fingerprint proves that the baseline receiver-qualified call
+    remains in that unit without treating comments, strings, or sibling
+    receivers as evidence.
+    """
+    old_bindings = {(item['name'], item['hash'])
+                    for item in before
+                    if key in set(item.get('refs', [])) |
+                    set(item.get('selrefs', []))}
+    if not old_bindings:
+        return False
+    return any((item['name'], item['hash']) in old_bindings and
+               name in item.get('floor_refs', []) for item in now)
 
 
 def unit_refs(units):
