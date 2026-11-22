@@ -1130,11 +1130,12 @@ func f02ScenarioBadJWKSBodies(t *testing.T, k jwkPair) {
 // f02ScenarioStaleServingRefresh warms the cache, ages it past refreshDue,
 // and requires the request path to keep serving stale keys while exactly
 // one background refresh stores a fresher set.
-func f02ScenarioStaleServingRefresh(t *testing.T, a *JWTAuthenticator, tok string) {
+func f02ScenarioStaleServingRefresh(t *testing.T, a *JWTAuthenticator, srv *jwksServer, tok string) {
 	t.Helper()
 	if _, err := a.Authenticate(context.Background(), tok); err != nil {
 		t.Fatalf("F02-07: warm2: %v", err)
 	}
+	fetchesBeforeRefresh := srv.fetchCount()
 	a.cache.mu.Lock()
 	beforeFetch := a.cache.fetchedAt
 	a.cache.refreshDue = a.cache.now().Add(-time.Minute)
@@ -1154,6 +1155,9 @@ func f02ScenarioStaleServingRefresh(t *testing.T, a *JWTAuthenticator, tok strin
 	}
 	if !refreshed {
 		t.Fatal("F02-07: background refresh never stored a fresh set")
+	}
+	if delta := srv.fetchCount() - fetchesBeforeRefresh; delta != 1 {
+		t.Fatalf("F02-07: stale refresh made %d JWKS requests, want 1", delta)
 	}
 }
 
@@ -1209,8 +1213,9 @@ func fuzzF0207(t *testing.T) {
 
 	// Aged-but-live cache schedules ONE background refresh; the request
 	// path keeps serving stale keys while it runs.
-	la2 := newTestJWTAuth(t, newJWKSServer(t, k), nil)
-	f02ScenarioStaleServingRefresh(t, la2, tok)
+	refreshServer := newJWKSServer(t, k)
+	la2 := newTestJWTAuth(t, refreshServer, nil)
+	f02ScenarioStaleServingRefresh(t, la2, refreshServer, tok)
 }
 
 // F02-08 JWKS keys without explicit alg: the type switch admits RSA for
