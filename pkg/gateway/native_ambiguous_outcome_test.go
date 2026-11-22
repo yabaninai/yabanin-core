@@ -1,7 +1,6 @@
 package cli
 
 import (
-	"context"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +17,7 @@ import (
 
 func TestNativeAcceptedRequestWithoutResponseSuppressesRetry(t *testing.T) {
 	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		t.Helper()
 		var arrivals atomic.Int32
 		server := httptest.NewServer(closeAfterNativeRequest(t, &arrivals))
 		t.Cleanup(server.Close)
@@ -34,12 +34,18 @@ func TestNativeAcceptedRequestWithoutResponseSuppressesRetry(t *testing.T) {
 
 func TestNativeProvenDialFailureRemainsRetryable(t *testing.T) {
 	endpoint := closedLoopbackURL(t)
-	client, err := upstream.NewClient(endpoint, []string{endpoint})
+	client, err := upstream.NewClientWithAdapter(upstream.Options{
+		BaseURL: endpoint, AllowedUpstreams: []string{endpoint}, ProviderName: "anthropic",
+	})
 	require.NoError(t, err)
-	_, dialErr := client.Do(context.Background(), "/v1/messages", []byte(`{}`), "", false, nil)
+	resp, dialErr := client.Do(t.Context(), "/v1/messages", []byte(`{}`), "", false, nil)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
+	}
 	require.True(t, retry.DefinitelyNotSent(dialErr), "closed-listener transport error proves no provider request was sent")
 
 	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		t.Helper()
 		store := &fakeInvocationStore{}
 		capture := &bodyBoundsEvents{}
 		rec := postNativeOutcome(t, route, stream, endpoint, store, capture)
@@ -52,6 +58,7 @@ func TestNativeProvenDialFailureRemainsRetryable(t *testing.T) {
 func TestNativeRedirectedDialFailureSuppressesRetry(t *testing.T) {
 	childURL := closedLoopbackURL(t)
 	runNativeOutcomeCases(t, func(t *testing.T, route string, stream bool) {
+		t.Helper()
 		var arrivals atomic.Int32
 		server := httptest.NewServer(redirectAfterNativeRequest(t, &arrivals, childURL+"/after-redirect"))
 		t.Cleanup(server.Close)
@@ -148,7 +155,7 @@ func assertNativeAdmissionOnly(t *testing.T, store *fakeInvocationStore, capture
 
 func closedLoopbackURL(t *testing.T) string {
 	t.Helper()
-	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	listener, err := (&net.ListenConfig{}).Listen(t.Context(), "tcp", "127.0.0.1:0")
 	require.NoError(t, err)
 	endpoint := listener.Addr().String()
 	require.NoError(t, listener.Close())

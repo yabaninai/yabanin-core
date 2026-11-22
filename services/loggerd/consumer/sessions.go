@@ -33,14 +33,7 @@ func sessionRegistryUUID(orgID, raw string) string {
 // the scope is what keeps a delivery from returning another org's registry
 // row.
 //
-// Statement-free input guards (absent session, absent/invalid org) return
-// nil — no statement has run, so nil cannot poison the delivery
-// transaction. A FAILED upsert statement propagates instead: PostgreSQL
-// aborts the enclosing transaction on a failed statement, so swallowing the
-// error would only move the failure to the next insert (25P02) under a
-// success log line; failing the delivery cleanly sends it to redelivery,
-// where the deterministic upsert either succeeds (transient failure) or
-// fails with the same wrapped cause.
+// optionalSessionID carries the nullable request log session ID explicitly.
 type optionalSessionID struct {
 	id      string
 	present bool
@@ -54,9 +47,16 @@ func (id optionalSessionID) sqlValue() any {
 }
 
 func validSessionOrgID(orgID string) bool {
-	return uuid.Validate(orgID) == nil
+	_, err := uuid.Parse(orgID)
+	return err == nil
 }
 
+// Statement-free input guards (absent session, absent/invalid org) return an
+// absent ID — no statement has run, so nil cannot poison the delivery
+// transaction. A failed upsert propagates instead: PostgreSQL aborts the
+// enclosing transaction on a failed statement, so swallowing the error would
+// only move the failure to the next insert (25P02) under a success log line.
+// Failing the delivery cleanly sends it to redelivery.
 func (c *StreamConsumer) resolveSessionID(ctx context.Context, tx InboxTx, orgID, raw string) (optionalSessionID, error) {
 	if raw == "" || orgID == "" {
 		return optionalSessionID{}, nil

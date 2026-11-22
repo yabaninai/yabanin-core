@@ -251,10 +251,10 @@ func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) 
 
 	l.Debug("chat request", "model", cc.model, "session", cc.sessionID, "org", cc.orgID, "msgs", len(req.Messages))
 
-	if !gw.validateChatProjection(l, reqID, cc) {
+	if !gw.validateChatProjection(r.Context(), l, reqID, cc) {
 		return nil, false
 	}
-	if !gw.transformChatProjection(w, cc) {
+	if !gw.transformChatProjection(r.Context(), w, cc) {
 		return nil, false
 	}
 	return cc, true
@@ -288,13 +288,13 @@ func (gw *gateway) admitChatProjection(w http.ResponseWriter, r *http.Request, l
 	})
 }
 
-func (gw *gateway) validateChatProjection(l *slog.Logger, reqID string, cc *chatContext) bool {
+func (gw *gateway) validateChatProjection(ctx context.Context, l *slog.Logger, reqID string, cc *chatContext) bool {
 	apiErr, statusCode := validator.ValidateRequest(cc.req)
 	if apiErr == nil {
 		return true
 	}
 	validator.WriteError(cc.w, apiErr, statusCode)
-	publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
+	publishEventWithContext(ctx, gw.publisher, l, eventBase{
 		EventType:      "request.invalid",
 		RequestID:      reqID,
 		SessionID:      cc.sessionID,
@@ -303,12 +303,12 @@ func (gw *gateway) validateChatProjection(l *slog.Logger, reqID string, cc *chat
 		TeamID:         cc.teamID,
 		ModelRequested: cc.requestedModel,
 		Error:          apiErr.Error.Message,
-		Labels:         labelsFrom(cc.r.Context()),
+		Labels:         labelsFrom(ctx),
 	}.build())
 	return false
 }
 
-func (gw *gateway) transformChatProjection(w http.ResponseWriter, cc *chatContext) bool {
+func (gw *gateway) transformChatProjection(ctx context.Context, w http.ResponseWriter, cc *chatContext) bool {
 	if gw.verticalReg == nil || cc.orgID == "" {
 		return true
 	}
@@ -319,7 +319,7 @@ func (gw *gateway) transformChatProjection(w http.ResponseWriter, cc *chatContex
 		SystemPrompt:   extractSystemMessage(cc.req.Messages),
 		Metadata:       make(map[string]string),
 	}
-	newCtx, transformed, err := gw.verticalReg.PreTransform(cc.r.Context(), cc.orgID, request)
+	newCtx, transformed, err := gw.verticalReg.PreTransform(ctx, cc.orgID, request)
 	if err != nil {
 		cc.l.Warn("vertical transform denied request", "error", err, "org_id", cc.orgID)
 		apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
