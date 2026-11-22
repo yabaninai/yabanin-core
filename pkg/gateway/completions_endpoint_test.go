@@ -430,3 +430,28 @@ func TestCompletionsBufferedResponseLimit(t *testing.T) {
 		})
 	}
 }
+
+func TestCompletionsInterruptedPaidResponse(t *testing.T) {
+	var hits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.Header().Set("Content-Length", "4096")
+		_, _ = io.WriteString(w, `{"choices":[{"text":"partial-provider-content"}]`)
+	}))
+	defer server.Close()
+	gw := r105TestGateway(t, resolver.ModelInfo{ModelName: "gpt-4o", Provider: "openai", UpstreamURL: server.URL, Enabled: true})
+	store := &fakeInvocationStore{}
+	gw.invocations = store
+	var events int
+	gw.eventNote = func(*eventpub.Event) { events++ }
+
+	rec := postCompletions(t, gw, `{"model":"m","prompt":"hello"}`)
+	require.Equal(t, http.StatusBadGateway, rec.Code)
+	require.Contains(t, rec.Body.String(), "failed to read upstream response")
+	require.NotContains(t, rec.Body.String(), "partial-provider-content")
+	require.EqualValues(t, 1, hits.Load())
+	require.Len(t, store.admitted, 1)
+	require.Empty(t, store.facts)
+	require.Zero(t, events)
+	require.Equal(t, "false", rec.Header().Get("X-Should-Retry"))
+}

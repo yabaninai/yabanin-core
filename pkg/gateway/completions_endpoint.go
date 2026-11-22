@@ -193,6 +193,7 @@ func (gw *gateway) relayCompletionsJSON(d completionsJSONDispatch) {
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit+1))
 	if err != nil {
 		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		d.w.Header().Set("X-Should-Retry", "false")
 		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
 		return
 	}
