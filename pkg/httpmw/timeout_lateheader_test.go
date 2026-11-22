@@ -129,3 +129,59 @@ func TestTimeout_AnnouncedTrailerSetAfterFirstWriteSurvives(t *testing.T) {
 		t.Fatalf("trailer X-Export-Error = %q, want row_limit (declared: %q, header: %q)", got, resp.Trailer, resp.Header.Get("Trailer"))
 	}
 }
+
+// TestTimeout_HeaderBeforeFlushReachesTheWire guards the stream contract:
+// headers set before the first Flush must be snapshotted together with the
+// response start, not attached after the flush already committed it.
+func TestTimeout_HeaderBeforeFlushReachesTheWire(t *testing.T) {
+	h := Timeout(5 * time.Second)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("X-Pre-Flush", "yes")
+		w.(http.Flusher).Flush()
+		w.Write([]byte("chunk"))
+	}))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if string(body) != "chunk" {
+		t.Fatalf("body = %q, want chunk", body)
+	}
+	if got := resp.Header.Get("X-Pre-Flush"); got != "yes" {
+		t.Fatalf("X-Pre-Flush = %q, want yes", got)
+	}
+}
+
+// TestTimeout_TrailerWithStreamedFlushKeepsCompatibility covers the SSE-like
+// pattern: a trailer declared before the first flush, a header set right
+// before it, and a trailer value assigned after streaming began — everything
+// must survive the flush-committed response start.
+func TestTimeout_TrailerWithStreamedFlushKeepsCompatibility(t *testing.T) {
+	h := Timeout(5 * time.Second)(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Add("Trailer", "X-Stream-Error")
+		f := w.(http.Flusher)
+		w.Header().Set("X-Stream-State", "open")
+		f.Flush()
+		w.Write([]byte("ev1\n"))
+		f.Flush()
+		w.Header().Set("X-Stream-Error", "upstream_reset")
+		w.Write([]byte("ev2\n"))
+	}))
+	srv := httptest.NewServer(h)
+	defer srv.Close()
+	resp, err := srv.Client().Get(srv.URL)
+	if err != nil {
+		t.Fatalf("request failed: %v", err)
+	}
+	_, _ = io.ReadAll(resp.Body)
+	resp.Body.Close()
+	if got := resp.Header.Get("X-Stream-State"); got != "open" {
+		t.Fatalf("X-Stream-State = %q, want open", got)
+	}
+	if got := resp.Trailer.Get("X-Stream-Error"); got != "upstream_reset" {
+		t.Fatalf("trailer X-Stream-Error = %q, want upstream_reset", got)
+	}
+}

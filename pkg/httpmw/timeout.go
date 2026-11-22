@@ -93,6 +93,13 @@ func (tw *timeoutWriter) Flush() {
 		return
 	}
 	if f, ok := tw.w.(http.Flusher); ok {
+		// Flush commits the response start on the underlying writer: the
+		// server snapshots the real header map at the first flush. Sync the
+		// handler's headers before forwarding and mark the response started,
+		// so the done-branch treats later values as announced-trailer rescue
+		// under the same contract as Write and WriteHeader.
+		tw.syncHeadersLocked()
+		tw.wroteHeader = true
 		f.Flush()
 	}
 }
