@@ -293,6 +293,13 @@ func (h *AdminHandlers) streamRequestExport(w http.ResponseWriter, r *http.Reque
 		if errors.Is(err, adminstore.ErrRequestExportTooLarge) {
 			outcome = "row_limit"
 			w.Header().Set("X-Export-Error", "row_limit")
+		} else if errors.Is(err, adminstore.ErrOriginalRetentionDisabled) {
+			// The disclosure snapshot found retention disabled — an in-flight
+			// disable between the authorize-time preflight and the snapshot
+			// must not let retained originals flow under a stale allow. The
+			// store fails before any read: nothing was emitted.
+			outcome = "original_retention_disabled"
+			w.Header().Set("X-Export-Error", "retention_disabled")
 		} else if w.Header().Get("X-Export-Error") == "" {
 			outcome = "store_error"
 			w.Header().Set("X-Export-Error", "store_error")

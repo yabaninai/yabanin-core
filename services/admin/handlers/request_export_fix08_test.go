@@ -434,6 +434,64 @@ func TestFIX08MidStreamStoreFailureBurnsGrantAndIsJournalled(t *testing.T) {
 	require.NotContains(t, replay.Body.String(), "arguments")
 }
 
+// fix08RetentionRefusedStore models the A7 stale-allow window: the
+// authorize-time preflight sees retention enabled, but the store refuses the
+// disclosure at snapshot time (ErrOriginalRetentionDisabled) — retention was
+// turned off in-flight between the preflight and the disclosure snapshot.
+type fix08RetentionRefusedStore struct {
+	*mockStore
+}
+
+func (s *fix08RetentionRefusedStore) GetOrgOriginalRetention(_ context.Context, orgID string) (*adminstore.OrgOriginalRetention, error) {
+	on := true
+	return &adminstore.OrgOriginalRetention{OrgID: orgID, Enabled: &on, Effective: true}, nil
+}
+
+func (s *fix08RetentionRefusedStore) UpdateOrgOriginalRetention(_ context.Context, _ string, _ *bool) error {
+	return nil
+}
+
+func (s *fix08RetentionRefusedStore) StreamRequestExport(_ context.Context, _ adminstore.RequestListFilters, access adminstore.RequestPayloadAccess, _ int, _ func(*adminstore.RequestDetail) error) (int, error) {
+	if !access.Originals {
+		return 0, errors.New("test: only originals-scoped streams are expected here")
+	}
+	return 0, adminstore.ErrOriginalRetentionDisabled
+}
+
+// A snapshot-time retention refusal is a post-consume final outcome: the
+// disclosure snapshot found retention disabled (the authorize-time preflight
+// had seen it enabled — exactly the stale-allow window), the store fails
+// before any read, and the handler must surface it as a committed 200 with
+// the X-Export-Error: retention_disabled trailer, the
+// original_retention_disabled journal outcome, zero emitted bytes — and the
+// grant stays burned (no refund seam exists after the consume).
+func TestFIX08RetentionDisabledAtSnapshotIsFinal(t *testing.T) {
+	base := newMockStore()
+	store := &fix08RetentionRefusedStore{mockStore: base}
+	h := New(store, "", "", nil)
+	t.Cleanup(h.Stop)
+	token := issueExportGrant(t, h, `{"ttl_seconds":60,"org_id":"org-1","request_id":"req-1","scope":"payload.read_originals"}`)
+
+	rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token+"&scope=payload.read_originals")
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String(), "the refusal happens after the 200 commit")
+	require.Empty(t, rec.Body.String(), "a snapshot-time retention refusal must disclose nothing")
+	require.Equal(t, "retention_disabled", rec.Header().Get("X-Export-Error"))
+	require.False(t, grantAlive(base, token), "post-consume refusals are final: the token stays consumed")
+
+	base.auditMu.Lock()
+	var journalled *adminstore.AuditLogEntryRecord
+	for i := range base.auditRecords {
+		if base.auditRecords[i].Action == "request_export" {
+			journalled = &base.auditRecords[i]
+		}
+	}
+	base.auditMu.Unlock()
+	require.NotNil(t, journalled, "the allowed-but-refused stream attempt must be journalled")
+	require.Contains(t, journalled.Details, `"outcome":"original_retention_disabled"`)
+	require.Contains(t, journalled.Details, `"rows":0`)
+}
+
 // Two concurrent redemptions of one grant must produce at most one payload:
 // the winner's 200 streams the row, every loser is denied with the generic
 // 403 and zero payload bytes. The store's conditional consume stays the
