@@ -522,7 +522,7 @@ func f02GeneratedAuth(mode int, token string, wiring JWTWiring) (JWTWiring, stri
 	return jwtw, auth
 }
 
-func f02CheckGeneratedFirstResponse(t *testing.T, resp *http.Response, up *f02Upstream, mode int, adminOn, spoof, rid bool) {
+func f02CheckGeneratedFirstResponse(t *testing.T, resp f02ChatResponse, up *f02Upstream, mode int, adminOn, spoof, rid bool) {
 	t.Helper()
 	wantStatus := http.StatusOK
 	if mode == 2 {
