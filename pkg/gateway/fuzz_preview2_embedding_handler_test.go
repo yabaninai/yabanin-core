@@ -225,6 +225,18 @@ func fuzzAffinityAccounted(t *testing.T) {
 	}
 }
 
+// finishEventFacts is the finisher-event projection the termination canon
+// pins; the finisher stamps volatile or integration-bound fields beside
+// them, which stay unpinned here.
+type finishEventFacts struct {
+	eventType   string
+	endpoint    string
+	tokensIn    int64
+	tokensOut   int64
+	usageSource string
+	statusCode  int64
+}
+
 // fuzzFinishCompletionTerminated executes finishCompletion over a canceled
 // request context on the fuzz path (critical-go wave 2): §5.3 Finalize must
 // classify the dead context as a client cancel, the provider-reported usage
@@ -267,10 +279,27 @@ func fuzzFinishCompletionTerminated(t *testing.T) {
 	if want := []string{"event_note", "publish"}; !slices.Equal(order, want) {
 		t.Fatalf("finishCompletion hook order = %v, want %v", order, want)
 	}
-	if note == nil || note.EventType != "request.completed" || note.Endpoint != "completions" ||
-		note.TokensIn != 3 || note.TokensOut != 5 || note.UsageSource != "provider" ||
-		note.StatusCode != http.StatusOK {
-		t.Fatalf("finishCompletion event = %+v", note)
+	if note == nil {
+		t.Fatal("finishCompletion published no event")
+	}
+	got := finishEventFacts{
+		eventType:   note.EventType,
+		endpoint:    note.Endpoint,
+		tokensIn:    note.TokensIn,
+		tokensOut:   note.TokensOut,
+		usageSource: note.UsageSource,
+		statusCode:  note.StatusCode,
+	}
+	want := finishEventFacts{
+		eventType:   "request.completed",
+		endpoint:    "completions",
+		tokensIn:    3,
+		tokensOut:   5,
+		usageSource: "provider",
+		statusCode:  http.StatusOK,
+	}
+	if got != want {
+		t.Fatalf("finishCompletion event facts = %+v, want %+v", got, want)
 	}
 }
 
