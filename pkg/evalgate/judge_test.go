@@ -176,6 +176,15 @@ func TestTP03_JudgeVerdictValidation(t *testing.T) {
 	}
 }
 
+// judgeWantCallFacts pins the measured call contract: the configured judge
+// model, the HTTP status and the provider-reported token usage.
+func judgeWantCallFacts(t *testing.T, name string, call JudgeCall, model string, status int, prompt, completion int64) {
+	t.Helper()
+	if call.Model != model || call.Status != status || call.Usage.PromptTokens != prompt || call.Usage.CompletionTokens != completion {
+		t.Fatalf("%s: call=%+v, want model=%q status=%d prompt=%d completion=%d", name, call, model, status, prompt, completion)
+	}
+}
+
 func TestMeasuredJudgePreservesUsageForInvalidVerdict(t *testing.T) {
 	const model = "configured-evaluator"
 	var arrived atomic.Int32
@@ -193,14 +202,23 @@ func TestMeasuredJudgePreservesUsageForInvalidVerdict(t *testing.T) {
 		}
 		return refused
 	}
+	// Failed admission must not contact the evaluator at all.
 	_, _, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", admit)
 	if !errors.Is(err, refused) || arrived.Load() != 0 {
 		t.Fatalf("failed admission contacted evaluator: arrivals=%d err=%v", arrived.Load(), err)
 	}
+	// An invalid verdict still reports the provider facts of its call.
 	v, call, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
-	if v != nil || err == nil || arrived.Load() != 1 || call.Model != model || call.Status != 200 || call.Usage.PromptTokens != 11 || call.Usage.CompletionTokens != 3 {
-		t.Fatalf("invalid verdict lost provider facts: call=%+v verdict=%v arrivals=%d err=%v", call, v, arrived.Load(), err)
+	if v != nil {
+		t.Fatalf("invalid verdict must not produce a verdict: %+v", v)
 	}
+	if err == nil {
+		t.Fatalf("invalid verdict must surface its decode error")
+	}
+	if arrived.Load() != 1 {
+		t.Fatalf("evaluator arrivals = %d, want exactly 1", arrived.Load())
+	}
+	judgeWantCallFacts(t, "invalid verdict preserves provider facts", call, model, 200, 11, 3)
 }
 
 func TestMeasuredJudgeStopsAtFirstProvider(t *testing.T) {

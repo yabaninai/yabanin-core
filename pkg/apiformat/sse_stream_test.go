@@ -88,6 +88,36 @@ func TestSSELineReader_LoneCRTerminatorDeliveredComplete(t *testing.T) {
 	}
 }
 
+// sseWantLines asserts the framing layer emitted exactly the want lines,
+// byte-identical.
+func sseWantLines(t *testing.T, name string, got [][]byte, want ...string) {
+	t.Helper()
+	if len(got) != len(want) {
+		t.Fatalf("%s: %d lines, want %d: %q", name, len(got), len(want), got)
+	}
+	for i := range got {
+		if string(got[i]) != want[i] {
+			t.Fatalf("%s: line %d %q, want %q", name, i, got[i], want[i])
+		}
+	}
+}
+
+// sseWantFlushed asserts a Flush result: the emitted lines byte-identical,
+// and nil partial exactly when wantPartial is nil.
+func sseWantFlushed(t *testing.T, name string, lines [][]byte, partial []byte, wantLines []string, wantPartial []byte) {
+	t.Helper()
+	sseWantLines(t, name, lines, wantLines...)
+	if wantPartial == nil {
+		if partial != nil {
+			t.Fatalf("%s: unexpected partial %q", name, partial)
+		}
+		return
+	}
+	if string(partial) != string(wantPartial) {
+		t.Fatalf("%s: partial %q, want %q", name, partial, wantPartial)
+	}
+}
+
 // TestSSELineSplitter_Terminators pins the one set of boundary rules every
 // framing layer shares: LF, CRLF and lone CR each terminate a line, a CR
 // split across chunk boundaries resolves once its successor arrives (as
@@ -95,40 +125,34 @@ func TestSSELineReader_LoneCRTerminatorDeliveredComplete(t *testing.T) {
 // a trailing CR as a complete line while any other remainder is the
 // unterminated partial.
 func TestSSELineSplitter_Terminators(t *testing.T) {
+	feeds := []struct {
+		name    string
+		chunk   string
+		want    []string
+		pending int // negative: pending not pinned by this step
+	}{
+		{"lf line", "data: a\ndata: b\r", []string{"data: a\n"}, len("data: b\r")},
+		// The "\n" completes the CRLF held from the previous chunk.
+		{"crlf resolved across chunks", "\ndata: c", []string{"data: b\r\n"}, -1},
+		// A lone CR followed by content terminates its line alone, and the
+		// chunk's own trailing CR stays held unresolved.
+		{"lone cr line", "\rdata: d\r", []string{"data: c\r"}, -1},
+	}
 	var s SSELineSplitter
-	got := s.Feed([]byte("data: a\ndata: b\r"))
-	if len(got) != 1 || string(got[0]) != "data: a\n" {
-		t.Fatalf("lf line: %q", got)
-	}
-	if s.Pending() != len("data: b\r") {
-		t.Fatalf("pending after trailing cr: %d", s.Pending())
-	}
-	// The "\n" completes the CRLF held from the previous chunk.
-	got = s.Feed([]byte("\ndata: c"))
-	if len(got) != 1 || string(got[0]) != "data: b\r\n" {
-		t.Fatalf("crlf resolved across chunks: %q", got)
-	}
-	// A lone CR followed by content terminates its line alone, and the
-	// chunk's own trailing CR stays held unresolved.
-	got = s.Feed([]byte("\rdata: d\r"))
-	if len(got) != 1 || string(got[0]) != "data: c\r" {
-		t.Fatalf("lone cr line: %q", got)
+	for _, f := range feeds {
+		sseWantLines(t, f.name, s.Feed([]byte(f.chunk)), f.want...)
+		if f.pending >= 0 && s.Pending() != f.pending {
+			t.Fatalf("%s: pending %d, want %d", f.name, s.Pending(), f.pending)
+		}
 	}
 	// Flush: a trailing CR is a complete line; otherwise the remainder is
 	// the unterminated partial.
 	lines, partial := s.Flush()
-	if len(lines) != 1 || string(lines[0]) != "data: d\r" {
-		t.Fatalf("flush trailing-cr line: %q %q", lines, partial)
-	}
-	if partial != nil {
-		t.Fatalf("no partial expected after cr flush, got %q", partial)
-	}
+	sseWantFlushed(t, "flush trailing-cr line", lines, partial, []string{"data: d\r"}, nil)
 	var s2 SSELineSplitter
 	s2.Feed([]byte("data: cut"))
 	lines, partial = s2.Flush()
-	if len(lines) != 0 || string(partial) != "data: cut" {
-		t.Fatalf("flush unterminated: %q %q", lines, partial)
-	}
+	sseWantFlushed(t, "flush unterminated", lines, partial, nil, []byte("data: cut"))
 }
 
 func TestSSECommentLine(t *testing.T) {
@@ -212,48 +236,52 @@ func TestSSEFrameBuffer_BoundsBeforeAppend(t *testing.T) {
 	}
 }
 
+// sseFeedLines buffers each line through SSEFrameBuffer.Add at the salvage
+// probe's 1 MiB ceiling; with strict set, a blank or overflow classification
+// fails the scenario.
+func sseFeedLines(t *testing.T, f *SSEFrameBuffer, name string, lines []string, strict bool) {
+	t.Helper()
+	for _, l := range lines {
+		blank, overflow := f.Add([]byte(l), 1<<20)
+		if strict && (blank || overflow) {
+			t.Fatalf("%s: add %q: blank=%v overflow=%v", name, l, blank, overflow)
+		}
+	}
+}
+
 // TestSSEFrameBuffer_SalvageRules pins the break probe: a decodable
 // event missing just its separator is salvageable (multiline data joined
 // with LF included), while comment-only, event-only and truncated-JSON
 // frames are not.
 func TestSSEFrameBuffer_SalvageRules(t *testing.T) {
-	var multiline SSEFrameBuffer
-	for _, l := range []string{"event: x\n", "data: {\"a\":1,\n", "data: \"b\":2}\n"} {
-		if blank, overflow := multiline.Add([]byte(l), 1<<20); blank || overflow {
-			t.Fatalf("add %q: blank=%v overflow=%v", l, blank, overflow)
+	cases := []struct {
+		name   string
+		lines  []string
+		want   bool
+		strict bool // also require every Add to classify cleanly
+	}{
+		{
+			name:   "decodable multiline event missing only its separator",
+			lines:  []string{"event: x\n", "data: {\"a\":1,\n", "data: \"b\":2}\n"},
+			want:   true,
+			strict: true,
+		},
+		{name: "truncated multiline JSON", lines: []string{"data: {\"a\":1,\n", "data: \"b\":2\n"}, want: false},
+		{name: "comment-only frame carries no event", lines: []string{": keepalive\n"}, want: false},
+		{name: "[DONE] sentinel", lines: []string{"data: [DONE]\n"}, want: true},
+		// CR-terminated buffered lines join through the same probe as LF ones.
+		{
+			name:  "CR-terminated decodable event missing only its separator",
+			lines: []string{"event: x\r", "data: {\"a\":1}\r"},
+			want:  true,
+		},
+	}
+	for _, tc := range cases {
+		var f SSEFrameBuffer
+		sseFeedLines(t, &f, tc.name, tc.lines, tc.strict)
+		if f.Salvageable() != tc.want {
+			t.Fatalf("%s: salvageable=%v, want %v", tc.name, f.Salvageable(), tc.want)
 		}
-	}
-	if !multiline.Salvageable() {
-		t.Fatalf("decodable multiline event missing only its separator must be salvageable")
-	}
-
-	var truncated SSEFrameBuffer
-	for _, l := range []string{"data: {\"a\":1,\n", "data: \"b\":2\n"} {
-		_, _ = truncated.Add([]byte(l), 1<<20)
-	}
-	if truncated.Salvageable() {
-		t.Fatalf("truncated multiline JSON must not be salvageable")
-	}
-
-	var commentOnly SSEFrameBuffer
-	_, _ = commentOnly.Add([]byte(": keepalive\n"), 1<<20)
-	if commentOnly.Salvageable() {
-		t.Fatalf("comment-only frame carries no event and must not be salvageable")
-	}
-
-	var done SSEFrameBuffer
-	_, _ = done.Add([]byte("data: [DONE]\n"), 1<<20)
-	if !done.Salvageable() {
-		t.Fatalf("[DONE] sentinel must be salvageable")
-	}
-
-	// CR-terminated buffered lines join through the same probe as LF ones.
-	var crLines SSEFrameBuffer
-	for _, l := range []string{"event: x\r", "data: {\"a\":1}\r"} {
-		_, _ = crLines.Add([]byte(l), 1<<20)
-	}
-	if !crLines.Salvageable() {
-		t.Fatalf("CR-terminated decodable event missing only its separator must be salvageable")
 	}
 }
 
