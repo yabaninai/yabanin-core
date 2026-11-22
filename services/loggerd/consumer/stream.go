@@ -1345,6 +1345,11 @@ func (c *StreamConsumer) terminalChargePlan(ev requestEvent) (money.MicroUSD, mo
 			slog.String("cost_quote", ev.costQuoteState.String()),
 		)
 	}
+	// A cache replay has a history identity and can carry team attribution,
+	// but it never opened a paid dispatch or a spend reservation.
+	if ev.invocationIDValue != nil && genuineCacheHit(ev) {
+		return chargeMicro, chargeState, nil
+	}
 	return chargeMicro, chargeState, scopeChargePlan(ev, chargeMicro, chargeState)
 }
 
@@ -1744,7 +1749,7 @@ func (c *StreamConsumer) bindAdmission(ctx context.Context, tx InboxTx, ev reque
 			)
 			return b, errPaidWithoutAdmission
 		}
-		if !genuineCacheHit(ev, plan) {
+		if !genuineCacheHit(ev) || planHasPayableScope(plan) {
 			// Zero-charge, unpriced and provider-BYOK terminals are not
 			// cache history: without an admission row the identity is
 			// unaccounted for, and recording it as cache would silently
@@ -1827,9 +1832,8 @@ func planHasPayableScope(plan []scopeCharge) bool {
 // gateway-declared cache_hit_type (a real cache kind, never an arbitrary
 // string), the gateway's cache accounting shape (usage_source "none" and
 // cost_status "cache_hit"), quotes resolved to a genuine zero (not
-// unknown/unpriced), no reservation linkage, and no payable scope in the
-// plan (wallet, team, agent or session). Anything else parks.
-func genuineCacheHit(ev requestEvent, plan []scopeCharge) bool {
+// unknown/unpriced), no new token consumption and no reservation linkage.
+func genuineCacheHit(ev requestEvent) bool {
 	kind, ok := ev.cacheHitType.(string)
 	if !ok || !genuineCacheHitKinds[kind] {
 		return false
@@ -1840,10 +1844,7 @@ func genuineCacheHit(ev requestEvent, plan []scopeCharge) bool {
 	if ev.resaleQuoteState != money.QuoteZero || ev.costQuoteState != money.QuoteZero {
 		return false
 	}
-	if len(ev.reservations) > 0 {
-		return false
-	}
-	return !planHasPayableScope(plan)
+	return len(ev.reservations) == 0 && ev.tokensIn == 0 && ev.tokensOut == 0
 }
 
 // verifyTerminalFacts selects the admission's terminal fact row FOR UPDATE

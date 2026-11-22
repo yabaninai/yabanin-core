@@ -83,6 +83,8 @@ func invocationCacheHitMsg(id string) redis.XMessage {
 	msg := invocationChargedMsg(id)
 	msg.Values["estimated_cost_usd"] = "0"
 	msg.Values["resale_cost_usd"] = "0"
+	msg.Values["tokens_in"] = "0"
+	msg.Values["tokens_out"] = "0"
 	msg.Values["cache_hit_type"] = "exact"
 	msg.Values["usage_source"] = "none"
 	msg.Values["cost_status"] = "cache_hit"
@@ -230,7 +232,9 @@ func TestCacheHitWithoutAdmissionRecordsInvocationHistory(t *testing.T) {
 		},
 	}
 	c := NewWithCreditStore(&mockRedis{}, db, "events:queue", silentLogger(), credits.NewStore(nil, silentLogger()))
-	require.NoError(t, c.processMessage(context.Background(), invocationCacheHitMsg("32-1")))
+	msg := invocationCacheHitMsg("32-1")
+	msg.Values["team_id"] = "95bba3ea-95ce-4196-92be-fa221efbd2b0"
+	require.NoError(t, c.processMessage(context.Background(), msg))
 
 	mu.Lock()
 	defer mu.Unlock()

@@ -90,6 +90,8 @@ func TestUnadmittedNonCacheTerminalParks(t *testing.T) {
 	cacheWithReservation := invocationCacheHitMsg("41-2")
 	cacheWithReservation.Values["reservations"] = `[{"scope_kind":"wallet","scope_key":"org-abc","period":"","allowance_id":7,"bound_micro_usd":120000}]`
 
+	metered := invocationCacheHitMsg("41-4")
+	metered.Values["tokens_in"] = "1"
 	unpriced := invocationChargedMsg("41-3")
 	delete(unpriced.Values, "estimated_cost_usd")
 	delete(unpriced.Values, "resale_cost_usd")
@@ -99,6 +101,7 @@ func TestUnadmittedNonCacheTerminalParks(t *testing.T) {
 		"zero quotes without a cache_hit_type":       zeroNoCache,
 		"cache hit that still carries a reservation": cacheWithReservation,
 		"unpriced terminal with a reservation":       unpriced,
+		"cache hit reporting newly consumed tokens":  metered,
 	} {
 		t.Run(name, func(t *testing.T) {
 			var mu sync.Mutex
