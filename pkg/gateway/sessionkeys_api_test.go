@@ -82,7 +82,7 @@ func (s *scriptDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 		id, _ := args[0].(string)
 		row, ok := s.loads[id]
 		if !ok {
-			return scanRow{err: errors.New("no row")}
+			return scanRow{err: pgx.ErrNoRows}
 		}
 		return scanRow{vals: []any{row.id, row.parentID, row.keyHash, row.orgID, row.revokedAt, row.finishedAt}}
 	case strings.Contains(sql, "count(*)"):
@@ -92,12 +92,12 @@ func (s *scriptDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row 
 		}
 		return scanRow{vals: s.usage}
 	default:
-		return scanRow{err: errors.New("no row")}
+		return scanRow{err: pgx.ErrNoRows}
 	}
 }
 
 func (s *scriptDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
-	return nil, errors.New("no model rows")
+	return rt06EmptyRows{}, nil
 }
 
 func (s *scriptDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
@@ -388,4 +388,91 @@ func TestOwnUsagePassesEncodedLabelToTotals(t *testing.T) {
 	require.Len(t, db.usageArgs, 5)
 	require.Equal(t, []any{"org-1", "parent-1"}, db.usageArgs[:2])
 	require.Equal(t, []byte(`{"team":"50%"}`), db.usageArgs[4])
+}
+
+type usageOutageDB struct {
+	*scriptDB
+	stage string
+}
+
+func (d usageOutageDB) QueryRow(ctx context.Context, query string, args ...any) pgx.Row {
+	if d.stage == "totals" && strings.Contains(query, "FROM request_logs") || d.stage == "lookup" && strings.Contains(query, "FROM session_keys") {
+		return scanRow{err: errors.New("test database outage")}
+	}
+	return d.scriptDB.QueryRow(ctx, query, args...)
+}
+
+func (d usageOutageDB) Query(ctx context.Context, query string, args ...any) (pgx.Rows, error) {
+	part := "models"
+	if strings.Contains(query, "GROUP BY 1") {
+		part = "groups"
+	}
+	switch d.stage {
+	case part + "-query":
+		return nil, errors.New("test database outage")
+	case part + "-scan", part + "-iterator":
+		return &usageBrokenRows{scanFailure: d.stage == part+"-scan"}, nil
+	}
+	return d.scriptDB.Query(ctx, query, args...)
+}
+
+type usageBrokenRows struct {
+	rt06EmptyRows
+	seen        int
+	scanFailure bool
+}
+
+func (r *usageBrokenRows) Next() bool {
+	r.seen++
+	return r.seen == 1 || r.seen == 2 && r.scanFailure
+}
+
+func (r *usageBrokenRows) Scan(...any) error {
+	if r.seen == 2 {
+		return errors.New("test malformed row")
+	}
+	return nil
+}
+
+func (r *usageBrokenRows) Err() error {
+	if !r.scanFailure {
+		return errors.New("test interrupted read")
+	}
+	return nil
+}
+
+func TestUsageReportsRejectIncompleteReads(t *testing.T) {
+	for _, path := range []string{"/usage?group_by=model", "/session-keys/s/usage"} {
+		stages := []string{"healthy", "totals", "models-query", "models-scan", "models-iterator"}
+		if strings.HasPrefix(path, "/session-keys") {
+			stages = append(stages, "lookup")
+		} else {
+			stages = append(stages, "groups-query", "groups-scan", "groups-iterator")
+		}
+		for _, stage := range stages {
+			t.Run(path+"/"+stage, func(t *testing.T) {
+				base := &scriptDB{loads: map[string]sessionRow{"s": {id: "s", parentID: "key", orgID: "org"}}, usage: []any{int64(0), int64(0), int64(0), int64(0), 0.0, int64(0)}}
+				gw := mintGW(base, nil, nil)
+				gw.sessionDB = usageOutageDB{scriptDB: base, stage: stage}
+				router := chi.NewRouter()
+				router.Get("/usage", gw.ownUsage)
+				router.Get("/session-keys/{id}/usage", gw.sessionKeyUsage)
+				req := httptest.NewRequestWithContext(t.Context(), http.MethodGet, path, nil)
+				req.Header.Set("X-Org-Id", "org")
+				req = req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: "key", CanReadUsage: true}))
+				rec := httptest.NewRecorder()
+				router.ServeHTTP(rec, req)
+				if stage == "healthy" {
+					require.Equal(t, http.StatusOK, rec.Code)
+					require.Contains(t, rec.Body.String(), `"requests":0`)
+					require.Contains(t, rec.Body.String(), `"by_model":[]`)
+					return
+				}
+				require.Equal(t, http.StatusServiceUnavailable, rec.Code)
+				require.Contains(t, rec.Body.String(), "usage_unavailable")
+				require.NotContains(t, rec.Body.String(), "cost_usd")
+				require.NotContains(t, rec.Body.String(), "test database")
+			})
+		}
+	}
 }

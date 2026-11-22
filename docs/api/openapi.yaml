@@ -1859,6 +1859,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          description: A required database read failed. Retry the report later (usage_unavailable).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 
   /yabanin/usage:
     get:
@@ -1923,6 +1930,13 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+        "503":
+          description: A required database read failed. Retry the report later (usage_unavailable).
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
+
 
   /yabanin/label-policy:
     get:

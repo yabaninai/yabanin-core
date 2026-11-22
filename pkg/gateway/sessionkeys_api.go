@@ -354,11 +354,15 @@ func (gw *gateway) sessionKeyUsage(w http.ResponseWriter, r *http.Request) {
 	}
 	p, _ := principalFrom(r.Context())
 	row, err := gw.loadSession(r.Context(), db, chi.URLParam(r, "id"))
+	if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+		gw.usageUnavailable(w, err)
+		return
+	}
 	if err != nil || !sessionVisible(p, row) {
 		apierrors.Write(w, http.StatusNotFound, "not_found", "session key not found")
 		return
 	}
-	totals := gw.queryUsage(r.Context(), db,
+	totals, err := queryUsage(r.Context(), db,
 		`SELECT count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 		        COALESCE(sum(COALESCE(cache_read_tokens,0)),0),
 		        COALESCE(sum(cost_in_usd) FILTER (WHERE cost_status IN ('priced','cache_hit','legacy')),0),
@@ -366,12 +370,20 @@ func (gw *gateway) sessionKeyUsage(w http.ResponseWriter, r *http.Request) {
 		   FROM request_logs
 		  WHERE org_id = $1 AND session_key_id = $2 AND COALESCE(ab_group,'') <> 'shadow'`,
 		row.orgID, row.id)
-	totals.ByModel = gw.queryUsageModels(r.Context(), db,
+	if err != nil {
+		gw.usageUnavailable(w, err)
+		return
+	}
+	totals.ByModel, err = queryUsageModels(r.Context(), db,
 		`SELECT model_used, count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 		        COALESCE(sum(cost_in_usd) FILTER (WHERE cost_status IN ('priced','cache_hit','legacy')),0)
 		   FROM request_logs
 		  WHERE org_id = $1 AND session_key_id = $2 AND COALESCE(ab_group,'') <> 'shadow'
 		  GROUP BY model_used`, row.orgID, row.id)
+	if err != nil {
+		gw.usageUnavailable(w, err)
+		return
+	}
 	totals.Complete = row.finishedAt != nil && time.Since(*row.finishedAt) >= 10*time.Second
 	writeJSONCode(w, http.StatusOK, totals)
 }
@@ -386,40 +398,30 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 		apierrors.Write(w, http.StatusForbidden, "usage_read_not_allowed", "this key cannot read usage")
 		return
 	}
-	query, err := url.ParseQuery(r.URL.RawQuery)
-	if err != nil {
-		apierrors.Write(w, http.StatusBadRequest, "invalid_request", "invalid usage query encoding")
-		return
-	}
-	from, to, err := ownUsageTimeRange(query)
+	params, err := parseOwnUsageParams(r.URL.RawQuery)
 	if err != nil {
 		apierrors.Write(w, http.StatusBadRequest, "invalid_request", err.Error())
 		return
 	}
-	filter := map[string]string{}
-	for key, values := range query {
-		name, ok := strings.CutPrefix(key, "label.")
-		if !ok || name == "" || len(values) == 0 {
-			continue
-		}
-		norm, keyOK := labels.NormalizeKey(name)
-		if !keyOK {
-			apierrors.Write(w, http.StatusBadRequest, "invalid_request", "label filter key is not valid")
-			return
-		}
-		filter[norm] = values[0]
+	totals, err := queryOwnUsageReport(r.Context(), db, r.Header.Get("X-Org-Id"), p.APIKeyID, params)
+	if err != nil {
+		gw.usageUnavailable(w, err)
+		return
 	}
-	rawFilter, _ := json.Marshal(filter)
-	orgID := r.Header.Get("X-Org-Id")
+	writeJSONCode(w, http.StatusOK, totals)
+}
+
+func queryOwnUsageReport(ctx context.Context, db sessionQuerier, orgID, keyID string, params ownUsageParams) (usageTotals, error) {
+	from, to, rawFilter := params.from, params.to, params.filter
 	var groups []usageGroup
-	if group := query.Get("group_by"); group != "" {
-		groups, err = gw.queryUsageGroups(r.Context(), db, group, orgID, p.APIKeyID, from, to, rawFilter)
+	if params.groupExpr != "" {
+		var err error
+		groups, err = queryUsageGroups(ctx, db, params.groupExpr, orgID, keyID, from, to, rawFilter)
 		if err != nil {
-			apierrors.Write(w, http.StatusBadRequest, "invalid_request", err.Error())
-			return
+			return usageTotals{}, err
 		}
 	}
-	totals := gw.queryUsage(r.Context(), db,
+	totals, err := queryUsage(ctx, db,
 		`SELECT count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 		        COALESCE(sum(COALESCE(cache_read_tokens,0)),0),
 		        COALESCE(sum(cost_in_usd) FILTER (WHERE cost_status IN ('priced','cache_hit','legacy')),0),
@@ -427,18 +429,62 @@ func (gw *gateway) ownUsage(w http.ResponseWriter, r *http.Request) {
 		   FROM request_logs
 		  WHERE org_id = $1 AND api_key_id = $2 AND created_at >= $3 AND created_at < $4
 		    AND COALESCE(ab_group,'') <> 'shadow' AND labels @> $5::jsonb`,
-		orgID, p.APIKeyID, from, to, rawFilter)
-	totals.ByModel = gw.queryUsageModels(r.Context(), db,
+		orgID, keyID, from, to, rawFilter)
+	if err != nil {
+		return usageTotals{}, err
+	}
+	totals.ByModel, err = queryUsageModels(ctx, db,
 		`SELECT model_used, count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 		        COALESCE(sum(cost_in_usd) FILTER (WHERE cost_status IN ('priced','cache_hit','legacy')),0)
 		   FROM request_logs
 		  WHERE org_id = $1 AND api_key_id = $2 AND created_at >= $3 AND created_at < $4
 		    AND COALESCE(ab_group,'') <> 'shadow' AND labels @> $5::jsonb
 		  GROUP BY model_used`,
-		orgID, p.APIKeyID, from, to, rawFilter)
+		orgID, keyID, from, to, rawFilter)
+	if err != nil {
+		return usageTotals{}, err
+	}
 	totals.Groups = groups
 	totals.Complete = !to.After(time.Now().Add(-10 * time.Second))
-	writeJSONCode(w, http.StatusOK, totals)
+	return totals, nil
+}
+
+type ownUsageParams struct {
+	from, to  time.Time
+	filter    []byte
+	groupExpr string
+}
+
+func parseOwnUsageParams(raw string) (ownUsageParams, error) {
+	var p ownUsageParams
+	query, err := url.ParseQuery(raw)
+	if err != nil {
+		return p, errors.New("invalid usage query encoding")
+	}
+	p.from, p.to, err = ownUsageTimeRange(query)
+	if err != nil {
+		return p, err
+	}
+	filter := map[string]string{}
+	for key, values := range query {
+		name, ok := strings.CutPrefix(key, "label.")
+		if !ok || name == "" || len(values) == 0 {
+			continue
+		}
+		norm, valid := labels.NormalizeKey(name)
+		if !valid {
+			return p, errors.New("label filter key is not valid")
+		}
+		filter[norm] = values[0]
+	}
+	p.filter, err = json.Marshal(filter)
+	if err != nil {
+		return p, err
+	}
+	if group := query.Get("group_by"); group != "" {
+		p.groupExpr, err = usageGroupExpression(group)
+	}
+	return p, err
 }
 
 func ownUsageTimeRange(query url.Values) (time.Time, time.Time, error) {
@@ -464,50 +510,45 @@ func ownUsageTimeRange(query url.Values) (time.Time, time.Time, error) {
 	return from, to, nil
 }
 
-func (gw *gateway) queryUsage(ctx context.Context, db sessionQuerier, sql string, args ...any) usageTotals {
-	var out usageTotals
-	out.ByModel = []usageModel{}
-	if err := db.QueryRow(ctx, sql, args...).Scan(&out.Requests, &out.TokensIn, &out.TokensOut, &out.CacheRead, &out.CostUSD, &out.Unpriced); err != nil {
-		gw.log.Warn("usage query failed", "error", err)
-	}
-	return out
+func (gw *gateway) usageUnavailable(w http.ResponseWriter, err error) {
+	gw.log.Warn("usage report unavailable", "error", err)
+	apierrors.Write(w, http.StatusServiceUnavailable, "usage_unavailable", "usage report is temporarily unavailable")
 }
 
-func (gw *gateway) queryUsageModels(ctx context.Context, db sessionQuerier, sql string, args ...any) []usageModel {
+func queryUsage(ctx context.Context, db sessionQuerier, sql string, args ...any) (usageTotals, error) {
+	var out usageTotals
+	err := db.QueryRow(ctx, sql, args...).Scan(&out.Requests, &out.TokensIn, &out.TokensOut, &out.CacheRead, &out.CostUSD, &out.Unpriced)
+	return out, err
+}
+
+func queryUsageModels(ctx context.Context, db sessionQuerier, sql string, args ...any) ([]usageModel, error) {
 	rows, err := db.Query(ctx, sql, args...)
 	if err != nil {
-		gw.log.Warn("usage by model failed", "error", err)
-		return []usageModel{}
+		return nil, err
 	}
-	defer rows.Close()
-	var out []usageModel
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (usageModel, error) {
 		var item usageModel
-		if err := rows.Scan(&item.Model, &item.Requests, &item.TokensIn, &item.TokensOut, &item.CostUSD); err != nil {
-			continue
-		}
-		out = append(out, item)
-	}
-	if out == nil {
-		out = []usageModel{}
-	}
-	return out
+		err := row.Scan(&item.Model, &item.Requests, &item.TokensIn, &item.TokensOut, &item.CostUSD)
+		return item, err
+	})
 }
 
-func (gw *gateway) queryUsageGroups(ctx context.Context, db sessionQuerier, group, orgID, apiKeyID string, from, to time.Time, filter []byte) ([]usageGroup, error) {
-	var expr string
-	switch {
-	case group == "model":
-		expr = "model_used"
-	case strings.HasPrefix(group, "label:"):
-		key, ok := labels.NormalizeKey(strings.TrimPrefix(group, "label:"))
-		if !ok {
-			return nil, fmt.Errorf("group_by label key is not valid")
-		}
-		expr = "labels->>" + quoteLiteral(key)
-	default:
-		return nil, fmt.Errorf("group_by must be model or label:<key>")
+func usageGroupExpression(group string) (string, error) {
+	if group == "model" {
+		return "model_used", nil
 	}
+	key, ok := strings.CutPrefix(group, "label:")
+	if !ok {
+		return "", fmt.Errorf("group_by must be model or label:<key>")
+	}
+	key, ok = labels.NormalizeKey(key)
+	if !ok {
+		return "", fmt.Errorf("group_by label key is not valid")
+	}
+	return "labels->>" + quoteLiteral(key), nil
+}
+
+func queryUsageGroups(ctx context.Context, db sessionQuerier, expr, orgID, apiKeyID string, from, to time.Time, filter []byte) ([]usageGroup, error) {
 	sql := `SELECT ` + expr + `, count(*), COALESCE(sum(tokens_in),0), COALESCE(sum(tokens_out),0),
 	        COALESCE(sum(cost_in_usd) FILTER (WHERE cost_status IN ('priced','cache_hit','legacy')),0)
 	   FROM request_logs
@@ -516,25 +557,17 @@ func (gw *gateway) queryUsageGroups(ctx context.Context, db sessionQuerier, grou
 	  GROUP BY 1`
 	rows, err := db.Query(ctx, sql, orgID, apiKeyID, from, to, filter)
 	if err != nil {
-		return nil, fmt.Errorf("usage group query failed")
+		return nil, err
 	}
-	defer rows.Close()
-	var out []usageGroup
-	for rows.Next() {
+	return pgx.CollectRows(rows, func(row pgx.CollectableRow) (usageGroup, error) {
 		var item usageGroup
 		var value *string
-		if err := rows.Scan(&value, &item.Requests, &item.TokensIn, &item.TokensOut, &item.CostUSD); err != nil {
-			continue
-		}
+		err := row.Scan(&value, &item.Requests, &item.TokensIn, &item.TokensOut, &item.CostUSD)
 		if value != nil {
 			item.Value = *value
 		}
-		out = append(out, item)
-	}
-	if out == nil {
-		out = []usageGroup{}
-	}
-	return out, nil
+		return item, err
+	})
 }
 
 func quoteLiteral(s string) string {
