@@ -285,6 +285,38 @@ func TestSSEFrameBuffer_SalvageRules(t *testing.T) {
 	}
 }
 
+func TestCutSSERestLineBoundaries(t *testing.T) {
+	line, tail := cutSSERest([]byte("data: partial"))
+	if string(line) != "data: partial" || tail != nil {
+		t.Fatalf("unterminated line = %q, tail = %q", line, tail)
+	}
+	line, tail = cutSSERest([]byte("data: first\r\ndata: second"))
+	if string(line) != "data: first\r\n" || string(tail) != "data: second" {
+		t.Fatalf("CRLF line = %q, tail = %q", line, tail)
+	}
+}
+
+func TestSSEFrameBufferCRLFSeparator(t *testing.T) {
+	var frame SSEFrameBuffer
+	const limit = 128
+	for _, line := range []string{"data: {\r\n", "data: }\r\n"} {
+		blank, overflow := frame.Add([]byte(line), limit)
+		if blank || overflow {
+			t.Fatalf("data line %q classified as blank=%v overflow=%v", line, blank, overflow)
+		}
+	}
+	if !frame.Salvageable() {
+		t.Fatal("expected the two CRLF data lines to form a complete JSON object")
+	}
+	blank, overflow := frame.Add([]byte("\r\n"), limit)
+	if !blank || overflow {
+		t.Fatalf("separator classified as blank=%v overflow=%v", blank, overflow)
+	}
+	if got := string(frame.Take()); got != "data: {\r\ndata: }\r\n" {
+		t.Fatalf("buffered frame = %q", got)
+	}
+}
+
 // errThenEOFReader delivers one chunk together with a non-EOF error — the
 // bytes-plus-error transport shape a bufio layer can surface.
 type errThenEOFReader struct {
