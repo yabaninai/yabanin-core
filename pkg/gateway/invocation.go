@@ -267,7 +267,7 @@ func (h *invocationIdentity) beginPaidDispatch(ctx context.Context, store invoca
 		// dispatch (a fallback hop would risk unaccounted spend). Only
 		// a fresh client invocation — a newly minted identity — retries.
 		h.startRefused = true
-		return fmt.Errorf("%w: admit %s: %v", ErrInvocationStoreUnavailable, h.id, err)
+		return fmt.Errorf("%w: admit %s: %w", ErrInvocationStoreUnavailable, h.id, err)
 	}
 	h.kind, h.admitted = kind, true
 	return nil
@@ -489,7 +489,7 @@ func (s pgInvocationStore) RecordTerminalFacts(ctx context.Context, rec terminal
 func (s pgInvocationStore) verifyFailedCommit(ctx context.Context, rec terminalFactsRecord, event []byte, cause error) error {
 	state, err := s.verifyTerminalFacts(ctx, rec, event)
 	if err != nil {
-		return fmt.Errorf("%w: commit terminal facts for %s: %w (verify: %v)",
+		return fmt.Errorf("%w: commit terminal facts for %s: %w (verify: %w)",
 			ErrInvocationStoreUnavailable, rec.InvocationID, cause, err)
 	}
 	switch state {

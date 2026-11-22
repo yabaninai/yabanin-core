@@ -675,7 +675,7 @@ func hopTermination(ctx context.Context, callErr error) string {
 // the commit error so settle can withhold the event from the consumer.
 func (c *budgetedJudgeClient) commitHopTerminal(ctx context.Context, h *invocationIdentity, ev *eventpub.Event) error {
 	if err := nilInvocationStore(c.invocations); err != nil {
-		return fmt.Errorf("%w: admitted invocation %s: %v", ErrInvocationStoreUnavailable, h.ID(), err)
+		return fmt.Errorf("%w: admitted invocation %s: %w", ErrInvocationStoreUnavailable, h.ID(), err)
 	}
 	if ev.TS == 0 {
 		ev.TS = time.Now().UnixMilli()

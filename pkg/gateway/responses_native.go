@@ -504,7 +504,7 @@ func (rl *responsesStreamRelay) drain(lr *apiformat.SSELineReader) (stopErr erro
 // finishRead may close a complete final event missing its separator. A
 // partially read or oversized line cannot establish an event boundary.
 func (rl *responsesStreamRelay) finishRead(line []byte, err error) (error, bool) {
-	if err == apiformat.ErrSSELineLimit {
+	if errors.Is(err, apiformat.ErrSSELineLimit) {
 		return err, false
 	}
 	if len(line) == 0 && rl.frames.Salvageable() {

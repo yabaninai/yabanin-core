@@ -19,6 +19,7 @@ package adminstore
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"reflect"
@@ -1065,7 +1066,7 @@ func runDetailBoundaryContracts(t *testing.T, store *Store, fx *contractFixture)
 	contract(t, "GetRequestDetail/cross-org", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		_, err := store.GetRequestDetail(contentCtx, fx.OrgB, fx.Token+"-rx")
-		if err != ErrNotFound {
+		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetRequestDetail/cross-org: expected ErrNotFound, got %v", err)
 		}
 		return nil
@@ -1073,7 +1074,7 @@ func runDetailBoundaryContracts(t *testing.T, store *Store, fx *contractFixture)
 	contract(t, "GetRequestDetail/missing", func(ctx context.Context) error {
 		contentCtx := WithRequestPayloadAccess(ctx, RequestPayloadAccess{Grant: true})
 		_, err := store.GetRequestDetail(contentCtx, fx.OrgA, "zz-missing")
-		if err != ErrNotFound {
+		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("GetRequestDetail/missing: expected ErrNotFound, got %v", err)
 		}
 		return nil
@@ -1160,7 +1161,7 @@ func runAPIKeyLabelClearContract(t *testing.T, store *Store, pool *pgxpool.Pool,
 	})
 	contract(t, "UpdateAPIKeyLabels/missing", func(ctx context.Context) error {
 		err := store.UpdateAPIKeyLabels(ctx, "ffffffff-ffff-ffff-ffff-ffffffffffff", map[string]string{"k": "v"}, false, false, false)
-		if err != ErrNotFound {
+		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("UpdateAPIKeyLabels/missing: expected ErrNotFound, got %v", err)
 		}
 		return nil
@@ -1214,7 +1215,7 @@ func runAPIKeyLabelCASErrorContracts(t *testing.T, store *Store, fx *contractFix
 		}
 		st, err := store.UpdateAPIKeyLabelsPreconditioned(ctx, fx.APIKeyA,
 			map[string]string{"team": "gamma"}, false, false, false, stale)
-		if err != ErrPreconditionFailed {
+		if !errors.Is(err, ErrPreconditionFailed) {
 			t.Errorf("CAS mismatch: expected ErrPreconditionFailed, got %v", err)
 		}
 		if st == nil || st.Labels["team"] != "beta" {
@@ -1225,7 +1226,7 @@ func runAPIKeyLabelCASErrorContracts(t *testing.T, store *Store, fx *contractFix
 	contract(t, "UpdateAPIKeyLabelsPreconditioned/missing", func(ctx context.Context) error {
 		_, err := store.UpdateAPIKeyLabelsPreconditioned(ctx, "ffffffff-ffff-ffff-ffff-ffffffffffff",
 			map[string]string{"k": "v"}, false, false, false, nil)
-		if err != ErrNotFound {
+		if !errors.Is(err, ErrNotFound) {
 			t.Errorf("CAS missing: expected ErrNotFound, got %v", err)
 		}
 		return nil

@@ -277,7 +277,7 @@ func TestRequestPayloadGrant_FailsClosedWithoutDurableStore(t *testing.T) {
 
 func TestRequestPayloadGrant_RejectsUnboundedTTL(t *testing.T) {
 	_, err := (&Store{}).CreateRequestPayloadGrant("org-a", "request-a", "root-a", MaxRequestPayloadGrantTTL+time.Second, time.Now())
-	if err != ErrInvalidRequestPayloadGrant {
+	if !errors.Is(err, ErrInvalidRequestPayloadGrant) {
 		t.Fatalf("CreateRequestPayloadGrant() error = %v, want %v", err, ErrInvalidRequestPayloadGrant)
 	}
 }
@@ -346,12 +346,12 @@ func TestRequestPayloadGrant_IssuanceBindsExactlyOnePhysicalRow(t *testing.T) {
 	db := newPayloadGrantFakeDB()
 	db.requestLogCarriers = 0
 	store := newForTest(db, newTestLogger(), nil)
-	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); err != ErrRequestPayloadGrantTargetMissing {
+	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); !errors.Is(err, ErrRequestPayloadGrantTargetMissing) {
 		t.Fatalf("issuance without a carrier row = %v, want %v", err, ErrRequestPayloadGrantTargetMissing)
 	}
 
 	db.requestLogCarriers = 2
-	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); err != ErrRequestPayloadGrantTargetAmbiguous {
+	if _, err := store.CreateRequestPayloadGrant("org-a", "request-a", "root-a", time.Minute, now); !errors.Is(err, ErrRequestPayloadGrantTargetAmbiguous) {
 		t.Fatalf("issuance over an ambiguous correlation = %v, want %v", err, ErrRequestPayloadGrantTargetAmbiguous)
 	}
 
@@ -461,7 +461,7 @@ func TestRequestPayloadGrant_LegacyUnboundGrantIsPermanentlyUnusable(t *testing.
 	hash := sha256.Sum256([]byte("legacy-token"))
 	db.grants[hash] = RequestPayloadGrant{ID: "legacy-grant", OrgID: "org-a", RequestID: "request-a", RootID: "root-a", Scope: RequestPayloadScopeRead, ExpiresAt: now.Add(time.Minute)}
 
-	if _, err := store.PeekRequestPayloadGrantTarget(context.Background(), "legacy-token", "org-a", "request-a", "root-a", now); err != ErrInvalidRequestPayloadGrant {
+	if _, err := store.PeekRequestPayloadGrantTarget(context.Background(), "legacy-token", "org-a", "request-a", "root-a", now); !errors.Is(err, ErrInvalidRequestPayloadGrant) {
 		t.Fatalf("legacy unbound grant peek = %v, want the generic invalid error", err)
 	}
 	if _, err := store.ConsumeRequestPayloadGrantScope("legacy-token", "org-a", "request-a", 4242, "root-a", RequestPayloadScopeRead, now); err == nil {
@@ -542,7 +542,7 @@ func TestRequestPayloadGrantAuditInterruptionCompensatesAndRetryConverges(t *tes
 				t.Fatalf("active grant %d rejected: %v", i+1, err)
 			}
 		}
-		if _, err := store.CreateRequestPayloadGrant("org-a", "request-over-cap", "root-a", time.Minute, now.Add(2*time.Second)); err != ErrInvalidRequestPayloadGrant {
+		if _, err := store.CreateRequestPayloadGrant("org-a", "request-over-cap", "root-a", time.Minute, now.Add(2*time.Second)); !errors.Is(err, ErrInvalidRequestPayloadGrant) {
 			t.Fatalf("grant beyond the active cap = %v, want %v", err, ErrInvalidRequestPayloadGrant)
 		}
 	})

@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -530,7 +531,7 @@ func (rl *anthStreamRelay) drain(lr *apiformat.SSELineReader) {
 	// After a client write fails, finish accounting for buffered bytes only.
 	for rl.werr == nil || lr.Buffered() {
 		line, err := lr.ReadLine()
-		if err == apiformat.ErrSSELineLimit {
+		if errors.Is(err, apiformat.ErrSSELineLimit) {
 			// Oversized upstream line: drop it and the held frame, stop
 			// relaying. The synthesis below closes the client stream (no
 			// stop was seen); the caller's deferred upstream body close

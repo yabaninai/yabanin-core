@@ -2,6 +2,7 @@ package credits
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 	"time"
@@ -232,7 +233,7 @@ func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Deduct to fail when balance would go below grace period")
 	}
-	if err != ErrInsufficientCredits {
+	if !errors.Is(err, ErrInsufficientCredits) {
 		t.Fatalf("expected ErrInsufficientCredits, got %v", err)
 	}
 
@@ -305,7 +306,7 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 
 	// Now CheckBalance should fail.
 	_, err = store.CheckBalance(ctx, "org-check")
-	if err != ErrInsufficientCredits {
+	if !errors.Is(err, ErrInsufficientCredits) {
 		t.Fatalf("expected CheckBalance to return ErrInsufficientCredits, got %v", err)
 	}
 }
