@@ -254,23 +254,23 @@ func SettleOrgBatch(ctx context.Context, db BatchDB, orgID string, graceFloorCen
 		return nil, err
 	}
 
-	if err := tx.Commit(ctx); err != nil {
-		// Default to uncertain for EVERY commit-stage error. Only
-		// pgx.ErrTxCommitRollback proves a rollback (pgx returns it when
-		// the COMMIT command executed and rolled the transaction back);
-		// a server-answered PgError is NOT proof — SQLSTATE 08007
-		// (transaction_resolution_unknown) and 40003
-		// (statement_completion_unknown) report exactly that the outcome
-		// could not be resolved — and transport errors carry no outcome
-		// at all. Uncertain groups never re-execute; fenced lease
-		// recovery decides. Pre-commit failures keep the fallback
-		// contract unchanged.
-		if errors.Is(err, pgx.ErrTxCommitRollback) {
-			return nil, fmt.Errorf("settlement batch commit: %w", err)
-		}
-		return nil, fmt.Errorf("%w: settlement batch commit: %w", ErrCommitUncertain, err)
+	if err := commitSettlementBatch(ctx, tx); err != nil {
+		return nil, err
 	}
 	return dispositions, nil
+}
+
+func commitSettlementBatch(ctx context.Context, tx pgx.Tx) error {
+	if err := tx.Commit(ctx); err != nil {
+		// Only pgx.ErrTxCommitRollback proves a rollback. Every other
+		// commit-stage error leaves the outcome uncertain; fenced recovery
+		// decides whether to reclaim the job.
+		if errors.Is(err, pgx.ErrTxCommitRollback) {
+			return fmt.Errorf("settlement batch commit: %w", err)
+		}
+		return fmt.Errorf("%w: settlement batch commit: %w", ErrCommitUncertain, err)
+	}
+	return nil
 }
 
 func validateSettlementBatch(db BatchDB, orgID string, entries []SettleEntry) error {

@@ -797,26 +797,25 @@ func (c *StreamConsumer) resolveRefusalAdmission(ctx context.Context, tx InboxTx
 
 func (c *StreamConsumer) handleRequestBudgetExceededProfile(ctx context.Context, msg redis.XMessage, policy deliveryPolicy) error {
 	fields := msg.Values
-
 	if c.dbPool == nil {
 		c.logger.Error("DB pool not configured — cannot write request.budget_exceeded logs")
 		return fmt.Errorf("DB is required but not configured")
 	}
-
 	c.markDeliverySeen(ctx, msg.ID)
-
 	ev := parseRequestEventPolicy(fields, policy)
 	errorMsg := ev.errorMsg
 	if errorMsg == "" {
 		errorMsg = "team budget limit reached"
 	}
-
 	tx, claimed, err := c.beginDelivery(ctx, msg.ID)
 	if err != nil || !claimed {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	return c.persistBudgetExceededProfile(ctx, tx, fields, ev, errorMsg, policy)
+}
 
+func (c *StreamConsumer) persistBudgetExceededProfile(ctx context.Context, tx InboxTx, fields map[string]interface{}, ev requestEvent, errorMsg string, policy deliveryPolicy) error {
 	if ev.invocationIDValue != nil {
 		if err := c.resolveRefusalAdmission(ctx, tx, &ev); err != nil {
 			return err
@@ -1124,26 +1123,25 @@ func (c *StreamConsumer) reservationsMode(ctx context.Context, orgID string) (st
 // (beginDelivery): exactly-once persistence no longer depends on Redis.
 func (c *StreamConsumer) handleRequestShadowCompleteProfile(ctx context.Context, msg redis.XMessage, policy deliveryPolicy) error {
 	fields := msg.Values
-
 	if c.dbPool == nil {
 		c.logger.Error("DB pool not configured — cannot write shadow request logs")
 		return fmt.Errorf("DB is required but not configured")
 	}
-
 	c.markDeliverySeen(ctx, msg.ID)
-
 	ev := parseRequestEventPolicy(fields, policy)
 	statusCode := ev.statusCode
 	if statusCode == 0 {
 		statusCode = 200
 	}
-
 	tx, claimed, err := c.beginDelivery(ctx, msg.ID)
 	if err != nil || !claimed {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }() // no-op after a successful commit
+	return c.persistShadowCompleteProfile(ctx, tx, fields, ev, statusCode, policy)
+}
 
+func (c *StreamConsumer) persistShadowCompleteProfile(ctx context.Context, tx InboxTx, fields map[string]interface{}, ev requestEvent, statusCode int64, policy deliveryPolicy) error {
 	// Shadow admissions bind like primary ones (the gateway admits the
 	// shadow dispatch before mirroring); the shadow plan never charges, so
 	// the paid-without-admission gate cannot fire here — an org conflict or
