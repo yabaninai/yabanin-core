@@ -326,37 +326,8 @@ func (l *SSELineReader) ReadLine() ([]byte, error) {
 			return line, l.rerr
 		}
 		n, err := l.r.Read(l.scratch[:])
-		if n > 0 {
-			over := false
-			for _, line := range l.split.Feed(l.scratch[:n]) {
-				if len(sseLineContent(line)) > l.limit {
-					// A line that completed inside this chunk never shows
-					// up in Pending: check it here too.
-					over = true
-					break
-				}
-				l.queue = append(l.queue, line)
-			}
-			switch {
-			case over || l.split.Pending() > l.limit:
-				// Bounded memory: the oversized line is abandoned, but
-				// lines already queued before it stay — they were
-				// accepted, and are dispatched before the limit error.
-				// No partial is salvageable from an oversized line.
-				l.partial = nil
-				l.rerr = ErrSSELineLimit
-			case err != nil:
-				// The final chunk carried bytes with its error: finalize
-				// exactly like a separate error read — the chunk's
-				// complete lines first, then the torn tail with the
-				// error — and never poll the reader again. EOF with
-				// bytes is the same shape as EOF after bytes: a clean
-				// boundary-aligned end keeps the partial empty.
-				lines, partial := l.split.Flush()
-				l.queue = append(l.queue, lines...)
-				l.partial = partial
-				l.rerr = err
-			}
+		if lineErr := l.queueLines(l.scratch[:n]); lineErr != nil {
+			l.rerr = lineErr
 			continue
 		}
 		if err != nil {
@@ -364,9 +335,22 @@ func (l *SSELineReader) ReadLine() ([]byte, error) {
 			l.queue = append(l.queue, lines...)
 			l.partial = partial
 			l.rerr = err
-			continue
 		}
 	}
+}
+
+// queueLines preserves complete lines before the first over-limit line.
+func (l *SSELineReader) queueLines(chunk []byte) error {
+	for _, line := range l.split.Feed(chunk) {
+		if len(sseLineContent(line)) > l.limit {
+			return ErrSSELineLimit
+		}
+		l.queue = append(l.queue, line)
+	}
+	if l.split.Pending() > l.limit {
+		return ErrSSELineLimit
+	}
+	return nil
 }
 
 // SSEFrameBuffer batches complete upstream SSE lines into whole client
