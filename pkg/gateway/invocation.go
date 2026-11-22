@@ -659,14 +659,14 @@ func (gw *gateway) stampAndCommitInvocationTerminal(ctx context.Context, ev *eve
 		return nil
 	}
 	ev.InvocationID = h.ID()
+	if ev.TS == 0 {
+		ev.TS = time.Now().UnixMilli()
+	}
 	if !h.Admitted() {
 		return nil // free-cache contract: id on the wire, no admission row, no facts
 	}
 	if gw.invocations == nil {
 		return fmt.Errorf("%w: admitted invocation %s has no store to commit terminal facts", ErrInvocationStoreUnavailable, h.ID())
-	}
-	if ev.TS == 0 {
-		ev.TS = time.Now().UnixMilli()
 	}
 	err := retryInvocationWrite(ctx, func(ctx context.Context) error {
 		return h.commitInvocationTerminal(ctx, gw.invocations, ev)

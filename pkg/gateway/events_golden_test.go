@@ -412,6 +412,17 @@ func TestGoldenEvent_ChatJSON_UpstreamFailed(t *testing.T) {
 
 const goldenCachedDoc = `{"id":"cached","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"from-cache"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`
 
+func requirePublishableCacheReplay(t *testing.T, ev *eventpub.Event) {
+	t.Helper()
+	fields, err := ev.TerminalAccountingFields()
+	require.NoError(t, err)
+	require.NotEmpty(t, fields["invocation_id"])
+	require.Positive(t, ev.TS)
+	require.Equal(t, "cache_hit", fields["cost_status"])
+	require.Equal(t, "0", fields["estimated_cost_usd"])
+	require.Equal(t, "0", fields["resale_cost_usd"])
+}
+
 func TestGoldenEvent_CacheHit_Exact(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("a cache hit must not reach the provider")
@@ -437,6 +448,7 @@ func TestGoldenEvent_CacheHit_Exact(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "EXACT", rec.Header().Get("X-Cache"))
 	ev := cap.last(t)
+	requirePublishableCacheReplay(t, ev)
 	goldenEvent(t, "cache hit exact", ev, &eventpub.Event{
 		EventType:             "request.completed",
 		Source:                "gateway",
@@ -506,6 +518,7 @@ func TestGoldenEvent_CacheHit_Semantic(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "SEMANTIC", rec.Header().Get("X-Cache"))
 	ev := cap.last(t)
+	requirePublishableCacheReplay(t, ev)
 	goldenEvent(t, "cache hit semantic", ev, &eventpub.Event{
 		EventType:             "request.completed",
 		Source:                "gateway",
