@@ -222,3 +222,36 @@ func TestMeasuredJudgeStopsAtFirstProvider(t *testing.T) {
 		t.Fatalf("lost reported usage on unsuccessful response: %+v", call)
 	}
 }
+
+func TestMeasuredJudgeUnusableProviderReply(t *testing.T) {
+	for _, tc := range []struct {
+		name, key, authorization, body, wantError string
+		promptTokens, completionTokens            int64
+	}{
+		{"invalid JSON", "", "", `{"choices":`, "parse judge response", 0, 0},
+		{"empty choices with measured usage", "fixture-key", "Bearer fixture-key",
+			`{"choices":[],"usage":{"prompt_tokens":17,"completion_tokens":4}}`, "judge returned empty choices", 17, 4},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.Header.Get("Authorization") != tc.authorization {
+					http.Error(w, "unexpected evaluator credentials", http.StatusUnauthorized)
+					return
+				}
+				if _, err := io.WriteString(w, tc.body); err != nil {
+					t.Errorf("write evaluator reply: %v", err)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			judge := NewJudge(srv.URL, nil)
+			judge.SetAPIKey(tc.key)
+			verdict, call, err := judge.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+			if verdict != nil || err == nil || !strings.Contains(err.Error(), tc.wantError) {
+				t.Fatalf("verdict = %v, error = %v, want failure containing %q", verdict, err, tc.wantError)
+			}
+			if call.Status != http.StatusOK || call.Usage.PromptTokens != tc.promptTokens || call.Usage.CompletionTokens != tc.completionTokens {
+				t.Fatalf("unexpected provider facts: %+v", call)
+			}
+		})
+	}
+}
