@@ -64,7 +64,7 @@ func sseClientFrames(t *testing.T, raw string) (frames []sseFrame, torn string) 
 	t.Helper()
 	pos, frameStart, lastContentEnd := 0, 0, 0
 	var cur sseFrame
-	sawLine, hasField := false, false
+	hasField := false
 	for pos < len(raw) {
 		i := strings.IndexAny(raw[pos:], "\r\n")
 		if i < 0 {
@@ -80,38 +80,40 @@ func sseClientFrames(t *testing.T, raw string) (frames []sseFrame, torn string) 
 		line := raw[pos:contentEnd]
 		pos = next
 		if line == "" {
-			if sawLine && hasField {
+			if hasField {
 				cur.raw = raw[frameStart:lastContentEnd]
 				frames = append(frames, cur)
 				cur = sseFrame{}
-				sawLine, hasField = false, false
+				hasField = false
 			}
 			frameStart = pos
 			continue
 		}
-		sawLine = true
 		lastContentEnd = contentEnd
-		switch {
-		case strings.HasPrefix(line, "event:"):
-			if cur.event != "" {
-				t.Fatalf("frame carries two event lines:\n%s", line)
-			}
-			cur.event = strings.TrimPrefix(strings.TrimPrefix(line, "event:"), " ")
+		if cur.addLine(t, line) {
 			hasField = true
-		case strings.HasPrefix(line, "data:"):
-			cur.data = append(cur.data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
-			hasField = true
-		case strings.HasPrefix(line, ":"):
-			// SSE comment line: rides no event, so a comment-only frame
-			// is not an event (the keepalive passthrough contract).
-		default:
-			t.Fatalf("frame carries a non-SSE line %q", line)
 		}
 	}
-	if sawLine {
-		return frames, raw[frameStart:]
+	return frames, raw[frameStart:]
+}
+
+// addLine returns whether the line belongs to an event.
+func (f *sseFrame) addLine(t *testing.T, line string) bool {
+	t.Helper()
+	switch {
+	case strings.HasPrefix(line, "event:"):
+		if f.event != "" {
+			t.Fatalf("frame carries two event lines:\n%s", line)
+		}
+		f.event = strings.TrimPrefix(strings.TrimPrefix(line, "event:"), " ")
+	case strings.HasPrefix(line, "data:"):
+		f.data = append(f.data, strings.TrimPrefix(strings.TrimPrefix(line, "data:"), " "))
+	case strings.HasPrefix(line, ":"):
+		return false
+	default:
+		t.Fatalf("frame carries a non-SSE line %q", line)
 	}
-	return frames, ""
+	return true
 }
 
 // requireFramePrefix asserts the client stream is whole-framed and starts
@@ -826,7 +828,7 @@ func TestMessagesNative_KeepaliveForwardedWhileUpstreamOpen(t *testing.T) {
 		<-gate
 		_, _ = io.WriteString(w, messagesNativeWhole+"event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n")
 	}))
-	defer upstream.Close()
+	t.Cleanup(upstream.Close)
 
 	gw := nativeMessagesGateway(t, upstream.URL)
 	router := chi.NewRouter()
@@ -837,7 +839,9 @@ func TestMessagesNative_KeepaliveForwardedWhileUpstreamOpen(t *testing.T) {
 	release := sync.OnceFunc(func() { close(gate) })
 	t.Cleanup(release)
 
-	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost, gwServer.URL+"/v1/messages",
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, gwServer.URL+"/v1/messages",
 		strings.NewReader(messagesRequestBody))
 	if err != nil {
 		t.Fatal(err)
@@ -850,52 +854,27 @@ func TestMessagesNative_KeepaliveForwardedWhileUpstreamOpen(t *testing.T) {
 	}
 	defer resp.Body.Close()
 
-	lines := make(chan string, 16)
-	go func(reader io.Reader) {
-		sc := bufio.NewScanner(reader)
-		for sc.Scan() {
-			lines <- sc.Text()
-		}
-		close(lines)
-	}(resp.Body)
-
-	select {
-	case first, ok := <-lines:
-		if !ok || first != ": ping" {
-			t.Fatalf("first client line must be the keepalive comment, got %q", first)
-		}
-		// Received while the upstream handler is still blocked on the
-		// gate: the comment was forwarded immediately, not batched.
-	case <-time.After(5 * time.Second):
-		t.Fatal("keepalive comment was not forwarded while the upstream was open")
+	reader := bufio.NewReader(resp.Body)
+	first, err := reader.ReadString('\n')
+	if err != nil || first != ": ping\n" {
+		t.Fatalf("keepalive while upstream was open: first line %q, error %v", first, err)
 	}
-
-	// Release the upstream; the healthy remainder streams and ends with
-	// message_stop — nothing synthesized, comment rode through.
+	separator, err := reader.ReadString('\n')
+	if err != nil || separator != "\n" {
+		t.Fatalf("keepalive while upstream was open: blank separator %q, error %v", separator, err)
+	}
 	release()
-	var raw strings.Builder
-	raw.WriteString(": ping\n\n")
-	for line := range lines {
-		raw.WriteString(line)
-		raw.WriteString("\n")
+	remainder, err := io.ReadAll(reader)
+	if err != nil {
+		t.Fatal(err)
 	}
-	stream, torn := sseClientFrames(t, raw.String())
-	if torn != "" {
-		t.Fatalf("messages keepalive: stream ends in a torn tail %q\nstream:\n%s", torn, raw.String())
-	}
-	if len(stream) != 3 {
-		t.Fatalf("messages keepalive: got %d frames, want 3 (2 upstream + message_stop; the comment rides no event)\nstream:\n%s", len(stream), raw.String())
-	}
-	// The comment's presence on the wire is pinned by the first-line
-	// check above; the frame scanner counts only event-bearing frames.
 	want := append(append([]string{}, messagesNativeWholeFrames...),
 		"event: message_stop\ndata: {\"type\":\"message_stop\"}")
-	for i, wf := range want {
-		if stream[i].raw != wf {
-			t.Fatalf("messages keepalive: frame %d mismatch\n got %q\nwant %q\nstream:\n%s", i, stream[i].raw, wf, raw.String())
-		}
+	frames := requireFramePrefix(t, "messages keepalive", first+separator+string(remainder), want)
+	if len(frames) != len(want) {
+		t.Fatalf("messages keepalive: got %d frames, want %d", len(frames), len(want))
 	}
-	requireAllDataJSON(t, "messages keepalive", stream)
+	requireAllDataJSON(t, "messages keepalive", frames)
 }
 
 // TestMessagesNative_OversizedFrameAbortsBounded: a frame whose buffered
