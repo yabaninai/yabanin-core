@@ -454,22 +454,8 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring,
 	spoof, rid, traceOn := int(p[2])%2 == 1, int(p[3])%2 == 1, int(p[4])%2 == 1
 
 	up := f02UpstreamRecorder(t)
-	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02GenStaticKey)
-	if adminOn {
-		cfg.AdminListen = f02FreeAddr(t)
-		cfg.MetricsEnabled = int(p[5])%2 == 1
-	}
-	if traceOn {
-		cfg.OTELTracingEndpoint = "http://127.0.0.1:4317"
-	}
-	jwtw := JWTWiring{}
-	auth := ""
-	switch mode {
-	case 0:
-		auth = "Bearer f02-gen-key"
-	case 1:
-		jwtw, auth = wiring, "Bearer "+token
-	}
+	cfg := f02GeneratedConfig(t, p, up, adminOn, traceOn)
+	jwtw, auth := f02GeneratedAuth(mode, token, wiring)
 	bs := f02BootGateway(t, cfg, f02DeadRedis(), jwtw, db.pool)
 
 	ridVal := ""
@@ -481,6 +467,39 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring,
 		spoofVal = "org-spoof"
 	}
 	resp, _ := f02Chat(t, bs.baseURL, auth, ridVal, spoofVal)
+	f02CheckGeneratedFirstResponse(t, resp, up, mode, adminOn, spoof, rid)
+	if mode != 2 {
+		f02CheckGeneratedIdentityAndReplay(t, bs, up, auth, ridVal, spoofVal, mode, rid)
+	}
+}
+
+func f02GeneratedConfig(t *testing.T, p []byte, up *f02Upstream, adminOn, traceOn bool) config.Gateway {
+	t.Helper()
+	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02GenStaticKey)
+	if adminOn {
+		cfg.AdminListen = f02FreeAddr(t)
+		cfg.MetricsEnabled = int(p[5])%2 == 1
+	}
+	if traceOn {
+		cfg.OTELTracingEndpoint = "http://127.0.0.1:4317"
+	}
+	return cfg
+}
+
+func f02GeneratedAuth(mode int, token string, wiring JWTWiring) (JWTWiring, string) {
+	jwtw := JWTWiring{}
+	auth := ""
+	switch mode {
+	case 0:
+		auth = "Bearer f02-gen-key"
+	case 1:
+		jwtw, auth = wiring, "Bearer "+token
+	}
+	return jwtw, auth
+}
+
+func f02CheckGeneratedFirstResponse(t *testing.T, resp *http.Response, up *f02Upstream, mode int, adminOn, spoof, rid bool) {
+	t.Helper()
 	wantStatus := http.StatusOK
 	if mode == 2 {
 		wantStatus = http.StatusUnauthorized
@@ -500,31 +519,33 @@ func f02BootGenerated(t *testing.T, data []byte, token string, wiring JWTWiring,
 		t.Fatalf("F02 gen boot: upstream X-Request-ID %q, want exact f02-gen-rid",
 			up.lastHeader().Get("X-Request-ID"))
 	}
-	if wantHits == 1 {
-		// Exact outbound identity contract (upstream.Client forwards only
-		// X-Request-ID): the org identity hop is exactly absent in every
-		// mode — client-sent spoofs and claim orgs alike.
-		if got := up.lastHeader().Get("X-Org-Id"); got != "" {
-			t.Fatalf("F02 gen boot: unexpected upstream org identity hop (len %d), want none", len(got))
-		}
-		// Successful requests repeat against the same seed keys and
-		// database: client_request_id-style state must not swallow the
-		// replay, so the identical call dispatches again.
-		resp2, _ := f02Chat(t, bs.baseURL, auth, ridVal, spoofVal)
-		if resp2.StatusCode != http.StatusOK {
-			t.Fatalf("F02 gen boot: mode=%d repeat = %d, want 200", mode, resp2.StatusCode)
-		}
-		if got := up.count(); got != 2 {
-			t.Fatalf("F02 gen boot: mode=%d repeat: upstream hits %d, want exactly 2", mode, got)
-		}
-		if rid && up.lastHeader().Get("X-Request-ID") != "f02-gen-rid" {
-			t.Fatalf("F02 gen boot: mode=%d repeat: upstream X-Request-ID %q, want exact f02-gen-rid",
-				mode, up.lastHeader().Get("X-Request-ID"))
-		}
-		if got := up.lastHeader().Get("X-Org-Id"); got != "" {
-			t.Fatalf("F02 gen boot: mode=%d repeat: unexpected upstream org identity hop (len %d), want none",
-				mode, len(got))
-		}
+}
+
+func f02CheckGeneratedIdentityAndReplay(t *testing.T, bs *f02BootServer, up *f02Upstream, auth, ridVal, spoofVal string, mode int, rid bool) {
+	t.Helper()
+	// Successful requests keep org identity off egress and remain replayable.
+	if got := up.lastHeader().Get("X-Org-Id"); got != "" {
+		t.Fatalf("F02 gen boot: unexpected upstream org identity hop (len %d), want none", len(got))
+	}
+	resp2, _ := f02Chat(t, bs.baseURL, auth, ridVal, spoofVal)
+	if resp2.StatusCode != http.StatusOK {
+		t.Fatalf("F02 gen boot: mode=%d repeat = %d, want 200", mode, resp2.StatusCode)
+	}
+	if got := up.count(); got != 2 {
+		t.Fatalf("F02 gen boot: mode=%d repeat: upstream hits %d, want exactly 2", mode, got)
+	}
+	f02CheckGeneratedReplayHeaders(t, up, mode, rid)
+}
+
+func f02CheckGeneratedReplayHeaders(t *testing.T, up *f02Upstream, mode int, rid bool) {
+	t.Helper()
+	if rid && up.lastHeader().Get("X-Request-ID") != "f02-gen-rid" {
+		t.Fatalf("F02 gen boot: mode=%d repeat: upstream X-Request-ID %q, want exact f02-gen-rid",
+			mode, up.lastHeader().Get("X-Request-ID"))
+	}
+	if got := up.lastHeader().Get("X-Org-Id"); got != "" {
+		t.Fatalf("F02 gen boot: mode=%d repeat: unexpected upstream org identity hop (len %d), want none",
+			mode, len(got))
 	}
 }
 
@@ -583,13 +604,24 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	up := f02UpstreamRecorder(t)
 	cfg := f02BootConfig(f02FreeAddr(t), up.srv.URL, f02BootStaticKey)
 	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{}, db.pool)
+	f02CheckBootHealthDegraded(t, bs)
+	f02CheckBootAuthorizedResponse(t, bs)
+	f02CheckBootDeniedNoSideEffect(t, bs, up)
+	f02CheckBootOutboundRequest(t, up)
+	f02CheckBootAdmission(t, db)
+	f02CheckBootDuplicateCorrelation(t, bs, db, up)
+}
 
-	// Dead redis is visible in health but must not block serving.
+func f02CheckBootHealthDegraded(t *testing.T, bs *f02BootServer) {
+	t.Helper()
 	code, m, _ := f02HealthJSON(t, bs.baseURL)
 	if code != http.StatusServiceUnavailable || m["status"] != "degraded" || m["redis"] != "down" {
 		t.Fatalf("F02-20: healthz %d %v, want 503 degraded/down", code, m)
 	}
+}
 
+func f02CheckBootAuthorizedResponse(t *testing.T, bs *f02BootServer) {
+	t.Helper()
 	resp, body := f02Chat(t, bs.baseURL, "Bearer f02-boot-key", "f02-boot-req-42", "org-hacker")
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("F02-20: authorized chat = %d body %s", resp.StatusCode, body)
@@ -597,8 +629,7 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	if ct := resp.Header.Get("Content-Type"); !strings.Contains(ct, "json") {
 		t.Fatalf("F02-20: response Content-Type %q", ct)
 	}
-	// Request-ID contract (gateway.go mount comment): the client's
-	// X-Request-ID is echoed verbatim on the response.
+	// The mounted gateway echoes the client request ID verbatim.
 	if got := resp.Header.Get("X-Request-ID"); got != "f02-boot-req-42" {
 		t.Fatalf("F02-20: response X-Request-ID %q, want verbatim f02-boot-req-42", got)
 	}
@@ -606,8 +637,10 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	if err := json.Unmarshal([]byte(body), &parsed); err != nil {
 		t.Fatalf("F02-20: response not JSON: %v body %s", err, body)
 	}
+}
 
-	// A later denied request must not add upstream effects.
+func f02CheckBootDeniedNoSideEffect(t *testing.T, bs *f02BootServer, up *f02Upstream) {
+	t.Helper()
 	denied, _ := f02Chat(t, bs.baseURL, "", "", "")
 	if denied.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("F02-20: denied chat = %d, want 401", denied.StatusCode)
@@ -615,6 +648,10 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	if got := up.count(); got != 1 {
 		t.Fatalf("F02-20: upstream hits = %d, want exactly 1 (zero unintended upstream effects)", got)
 	}
+}
+
+func f02CheckBootOutboundRequest(t *testing.T, up *f02Upstream) {
+	t.Helper()
 	h := up.lastHeader()
 	if got := h.Get("X-Request-ID"); got != "f02-boot-req-42" {
 		t.Fatalf("F02-20: upstream X-Request-ID %q, want exact f02-boot-req-42", got)
@@ -622,24 +659,18 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	if got := h.Get("X-Org-Id"); got == "org-hacker" {
 		t.Fatal("F02-20: spoofed X-Org-Id reached the upstream")
 	}
-	// Upstream credential contract (gateway.go newGatewayWiring): an empty
-	// encryption key disables per-model keys, and the gateway falls back to
-	// cfg.APIKey as the upstream credential — the static gateway key is by
-	// contract the same secret, so the pinned posture is the EXACT fallback
-	// credential (any drift, e.g. client-passthrough of a different bearer,
-	// fails this pin).
+	// With encryption disabled, the configured API key is the exact fallback.
 	if auth := h.Get("Authorization"); auth != "Bearer "+f02BootStaticKey {
 		t.Fatal("F02-20: upstream credential is not the exact documented cfg.APIKey fallback credential")
 	}
 	if b := up.lastBody(); !strings.Contains(b, "f02 boot") {
 		t.Fatalf("F02-20: upstream body %q missing request content", b)
 	}
+}
 
-	// Durable admission contract (0028): the paid call was durably admitted
-	// BEFORE dispatch and finalized with terminal facts bound to the same
-	// (invocation, org) identity. Correlating on the client request id keeps
-	// this exact even though the target-wide database accumulates rows from
-	// sibling seeds.
+func f02CheckBootAdmission(t *testing.T, db *f02BootDB) {
+	t.Helper()
+	// The admitted start and terminal facts bind to the same invocation/org.
 	var state, kind, org string
 	err := db.pool.QueryRow(t.Context(),
 		`SELECT state, kind, org_id FROM request_admissions WHERE client_request_id = $1`,
@@ -661,12 +692,11 @@ func fuzzF0220(t *testing.T, db *f02BootDB) {
 	).Scan(&facts); err != nil || facts != 1 {
 		t.Fatalf("F02-20: bound terminal facts = %d (err %v), want exactly 1", facts, err)
 	}
+}
 
-	// Duplicate-correlation repeat: 0028 keeps client_request_id correlation-
-	// only ("never an identity"), so replaying the identical request must
-	// admit a SECOND invocation instead of being swallowed by state-dependent
-	// dedupe. The exact-1 checks above catch a double insert per call; the
-	// exact-2 checks below catch a repeat that silently dedupes.
+func f02CheckBootDuplicateCorrelation(t *testing.T, bs *f02BootServer, db *f02BootDB, up *f02Upstream) {
+	t.Helper()
+	// The client request ID correlates calls; it must not deduplicate them.
 	resp2, body2 := f02Chat(t, bs.baseURL, "Bearer f02-boot-key", "f02-boot-req-42", "org-hacker")
 	if resp2.StatusCode != http.StatusOK {
 		t.Fatalf("F02-20: duplicate-correlation repeat = %d body %s", resp2.StatusCode, body2)
@@ -766,8 +796,15 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	cfg.OTELTracingEndpoint = "http://127.0.0.1:4317"
 	bs := f02BootGateway(t, cfg, f02DeadRedis(), JWTWiring{}, nil)
 	admin := "http://" + cfg.AdminListen
+	f02CheckBootDebugVars(t, admin, cfg, up)
+	f02CheckBootMetrics(t, admin)
+	f02CheckBootCORS(t, bs)
+	f02CheckBootDeniedAdminNoSideEffect(t, bs, up)
+}
 
-	// /debug/vars: localhost + Bearer cfg.APIKey, config echo.
+func f02CheckBootDebugVars(t *testing.T, admin string, cfg config.Gateway, up *f02Upstream) {
+	t.Helper()
+	// /debug/vars requires localhost access plus the configured bearer.
 	req, _ := http.NewRequest(http.MethodGet, admin+"/debug/vars", nil)
 	req.Header.Set("Authorization", "Bearer f02-admin-key")
 	resp, err := http.DefaultClient.Do(req)
@@ -786,7 +823,11 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	if dbg["config"]["listen_addr"] != cfg.ListenAddr || dbg["config"]["provider"] != up.srv.URL {
 		t.Fatalf("F02-22: /debug/vars echo %+v", dbg["config"])
 	}
-	// Without the bearer the debug surface refuses.
+	f02CheckBootDebugVarsDenied(t, admin)
+}
+
+func f02CheckBootDebugVarsDenied(t *testing.T, admin string) {
+	t.Helper()
 	noAuth, err := http.Get(admin + "/debug/vars")
 	if err != nil {
 		t.Fatalf("F02-22: /debug/vars without bearer: %v", err)
@@ -796,7 +837,10 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	if noAuth.StatusCode != http.StatusForbidden {
 		t.Fatalf("F02-22: /debug/vars without bearer = %d, want 403", noAuth.StatusCode)
 	}
+}
 
+func f02CheckBootMetrics(t *testing.T, admin string) {
+	t.Helper()
 	metricsResp, err := http.Get(admin + "/metrics")
 	if err != nil {
 		t.Fatalf("F02-22: /metrics: %v", err)
@@ -806,7 +850,10 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	if metricsResp.StatusCode != http.StatusOK || len(metricsBody) == 0 {
 		t.Fatalf("F02-22: /metrics = %d len %d", metricsResp.StatusCode, len(metricsBody))
 	}
+}
 
+func f02CheckBootCORS(t *testing.T, bs *f02BootServer) {
+	t.Helper()
 	// CORS preflight echoes the configured origin.
 	pre, _ := http.NewRequest(http.MethodOptions, bs.baseURL+"/v1/chat/completions", nil)
 	pre.Header.Set("Origin", "https://boot.example")
@@ -823,7 +870,10 @@ func fuzzF0222(t *testing.T, _ *f02BootDB) {
 	if got := preflight.Header.Get("Access-Control-Allow-Origin"); got != "https://boot.example" {
 		t.Fatalf("F02-22: ACAO %q, want https://boot.example", got)
 	}
+}
 
+func f02CheckBootDeniedAdminNoSideEffect(t *testing.T, bs *f02BootServer, up *f02Upstream) {
+	t.Helper()
 	// The traced main router still denies unauthenticated traffic.
 	denied, _ := f02Chat(t, bs.baseURL, "", "", "")
 	if denied.StatusCode != http.StatusUnauthorized {
