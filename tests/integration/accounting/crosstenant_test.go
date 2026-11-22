@@ -40,17 +40,36 @@ func TestAccountingCrossTenantScoping(t *testing.T) {
 	// Exactly one billed row per org, bound to that org only.
 	s.requireSharedCorrelationBilled(t, rid, orgA, orgB)
 
-	// Each wallet debited exactly once, signed, in its own org ledger.
-	s.requireWalletChargedExactlyOnce(t, rid, orgA, "cross-tenant A")
-	s.requireWalletChargedExactlyOnce(t, rid, orgB, "cross-tenant B")
-
-	// Settlement intents stay org-scoped too.
-	if jobsA, jobsB := s.oracleSettlementJobs(t, rid, orgA), s.oracleSettlementJobs(t, rid, orgB); jobsA > 1 || jobsB > 1 {
-		t.Fatalf("cross-tenant: settlement jobs A/B = %d/%d, want <= 1 each", jobsA, jobsB)
+	idA := s.requireCrossTenantDebit(t, rid, orgA)
+	idB := s.requireCrossTenantDebit(t, rid, orgB)
+	if idA == idB {
+		t.Fatal("independent tenant requests received the same invocation ID")
+	}
+	for _, pair := range []struct{ invocation, otherOrg string }{{idA, orgB}, {idB, orgA}} {
+		if n := s.oracleCount(t, `SELECT count(*) FROM credit_transactions WHERE invocation_id=$1::uuid AND org_id=$2`, pair.invocation, pair.otherOrg); n != 0 {
+			t.Fatalf("invocation %s has %d credit transactions in the other tenant", pair.invocation, n)
+		}
 	}
 
 	s.controlRequest(t, "xt-post-a")
 	s.controlRequestOpts(t, "xt-post-b", orgB, chatOptions{stream: true, apiKey: s.orgB.apiKey})
+}
+
+// Debit settlement is asynchronous even after request admission reconciliation.
+func (s *stand) requireCrossTenantDebit(t *testing.T, rid, org string) string {
+	t.Helper()
+	requireEventually(t, time.Minute, 100*time.Millisecond, func() bool {
+		return s.oracleCount(t, `SELECT count(*) FROM settlement_jobs WHERE request_id=$1 AND org_id=$2 AND charge_kind='resale_deduction' AND status='settled'`, rid, org) == 1
+	}, "both tenants must independently settle their wallet debit")
+	id := s.requireUUIDKeyedCharge(t, rid, org, "cross-tenant")
+	c := s.oracleUsageByInvocation(t, id, org)
+	if c.SumCents > 0 || c.TopupRows != 0 {
+		t.Fatalf("unexpected wallet totals for invocation %s: %+v", id, c)
+	}
+	if n := s.oracleSettlementJobs(t, rid, org); n != 1 {
+		t.Fatalf("tenant %s has %d settlement jobs for %s, want exactly one", org, n, rid)
+	}
+	return id
 }
 
 // runSharedCorrelationPair drives the buffered org-A request and the
