@@ -142,6 +142,67 @@ func TestStreamRequestExportCapsEmittedRowsAtMaxRows(t *testing.T) {
 	}
 }
 
+func TestStreamRequestExportCapCountsVisibleRowsAfterDrift(t *testing.T) {
+	t.Run("missing detail does not consume cap", func(t *testing.T) {
+		got := runDriftedVisibleExport(t, []RequestListRow{
+			{RowKey: 1, RequestID: "missing"},
+			{RowKey: 2, RequestID: "live-a"},
+			{RowKey: 3, RequestID: "live-b"},
+		})
+		if fmt.Sprint(got) != "[live-a live-b]" {
+			t.Fatalf("visible rows = %v, want [live-a live-b]", got)
+		}
+	})
+	t.Run("visible rows still cannot exceed cap", func(t *testing.T) {
+		got := runDriftedVisibleExport(t, []RequestListRow{
+			{RowKey: 1, RequestID: "missing"},
+			{RowKey: 2, RequestID: "live-a"},
+			{RowKey: 3, RequestID: "live-b"},
+			{RowKey: 4, RequestID: "over-cap"},
+		})
+		if fmt.Sprint(got) != "[live-a live-b]" {
+			t.Fatalf("visible rows = %v, want only [live-a live-b] before cap error", got)
+		}
+	})
+}
+
+func runDriftedVisibleExport(t *testing.T, rows []RequestListRow) []string {
+	t.Helper()
+	calls := 0
+	list := func(_ context.Context, f RequestListFilters) ([]RequestListRow, int, error) {
+		calls++
+		if calls == 1 {
+			return nil, 2, nil
+		}
+		return rows, 2, nil
+	}
+	details := map[int64]*RequestDetail{
+		2: {RequestID: "live-a"},
+		3: {RequestID: "live-b"},
+		4: {RequestID: "over-cap"},
+	}
+	detailCalls := 0
+	detail := func(ctx context.Context, orgID string, rowKey int64) (*RequestDetail, error) {
+		detailCalls++
+		return fakeExportDetail(details)(ctx, orgID, rowKey)
+	}
+	var visible []string
+	_, err := streamRequestExport(context.Background(), list, detail, RequestListFilters{}, RequestPayloadAccess{}, 2, func(d *RequestDetail) error {
+		visible = append(visible, d.RequestID)
+		return nil
+	})
+	if len(rows) == 3 && err != nil {
+		t.Fatalf("two visible rows should fit cap after missing detail: %v", err)
+	}
+	if len(rows) == 4 && !errors.Is(err, ErrRequestExportTooLarge) {
+		t.Fatalf("four candidates with three visible rows: err=%v, want ErrRequestExportTooLarge", err)
+	}
+	if detailCalls != 3 {
+		t.Fatalf("detail calls=%d, want only missing, live-a, and live-b looked up", detailCalls)
+	}
+	return visible
+}
+
 // TestStreamRequestExportNeverReemitsDriftedRows is the FIX-05 regression
 // for the OFFSET duplicate (CA-05): a page source whose first row is newly
 // inserted between page fetches shifts every OFFSET window, so the previous
