@@ -532,7 +532,7 @@ func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= maxDeductRetries; attempt++ {
+	for attempt := 0; ; attempt++ {
 		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
 		if lastErr == nil {
 			return nil
@@ -561,7 +561,6 @@ func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money
 		// Non-retryable error or last attempt exhausted — return.
 		return lastErr
 	}
-	return lastErr
 }
 
 // deductOnceMicro performs a single attempt at the exact micro-USD credit
