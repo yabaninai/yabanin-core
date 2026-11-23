@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 """Reject empty, unrelated or unsuccessful critical-test evidence."""
 import json
+from contextlib import nullcontext as _null
 from pathlib import Path
 import sys
 import tempfile
+import time
 import unittest
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / 'go_policy'))
@@ -65,6 +67,167 @@ class FuzzControls(unittest.TestCase):
                 stream.write('example.test/pkg/auth/check.go:15.1,16.2 1 0\n')
             with self.assertRaises(ValueError):
                 results.seed_coverage(path, [TARGET])
+
+
+class BaselineOnlyParserControls(unittest.TestCase):
+    BASELINE = ('fuzz: elapsed: 0s, gathering baseline coverage: 0/378 completed\n'
+                'fuzz: elapsed: 9s, gathering baseline coverage: 307/378 completed\n'
+                'PASS\nok  example/pkg 11.1s\n')
+
+    def parser_case(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'f.log'
+            path.write_text(text)
+            return results.baseline_only_fuzz_log(path)
+
+    def test_baseline_only_pass_is_recognized(self):
+        self.assertTrue(self.parser_case(self.BASELINE))
+
+    def test_generated_executions_disqualify_retry(self):
+        text = ('fuzz: elapsed: 3s, execs: 512 (170/sec), new interesting: 1\n'
+                'PASS\nok  example/pkg 4.0s\n')
+        self.assertFalse(self.parser_case(text))
+
+    def test_zero_execution_progress_is_not_baseline_only(self):
+        text = ('fuzz: elapsed: 0s, gathering baseline coverage: 0/2 completed\n'
+                'fuzz: elapsed: 3s, execs: 0 (0/sec)\nPASS\nok  example/pkg 4.0s\n')
+        self.assertFalse(self.parser_case(text))
+
+    def test_fail_build_error_and_empty_stay_red(self):
+        crash = ('fuzz: elapsed: 1s, execs: 40 (40/sec)\n'
+                 '--- FAIL: FuzzX\nFAIL\n')
+        build = 'build failed\n'
+        for text in (crash, build, ''):
+            with self.subTest(text=text[:20]):
+                self.assertFalse(self.parser_case(text))
+
+    def test_fail_summary_blocks_retry(self):
+        text = self.BASELINE + 'FAIL\n'
+        self.assertFalse(self.parser_case(text))
+
+
+class FuzzRetrySchedulingControls(unittest.TestCase):
+    BASELINE = ('fuzz: elapsed: 0s, gathering baseline coverage: 0/378 completed\n'
+                'fuzz: elapsed: 9s, gathering baseline coverage: 307/378 completed\n'
+                'PASS\nok  example/pkg 11.1s\n')
+    GENERATED = ('fuzz: elapsed: 3s, execs: 512 (170/sec), new interesting: 1\n'
+                 'PASS\nok  example/pkg 4.0s\n')
+    GENERATED_NEXT = ('fuzz: elapsed: 2s, execs: 7 (3/sec), new interesting: 0\n'
+                      'PASS\nok  example/pkg 3.0s\n')
+
+    def run_fuzz(self, tmp, script, clock=None, deadline=None):
+        """Script per-target fuzz logs; record every -fuzztime window.
+
+        script maps target name -> list of main-attempt log texts consumed in
+        order (a second entry exercises the retry). Warm and seed-profile
+        invocations always PASS and never consume scripted entries.
+        """
+        windows = []
+        used = []
+
+        def fake_checked(argv, root, log, deadline, env=None):
+            for a in argv:
+                if a.startswith('-coverprofile='):
+                    Path(a[len('-coverprofile='):]).write_text('mode: set\n')
+            arg = [a for a in argv if a.startswith('-fuzztime=')]
+            if arg and arg[0] != '-fuzztime=1x':
+                name = [a for a in argv if a.startswith('-fuzz=')][0]
+                name = name[len('-fuzz='):].strip('^$')
+                text = script[name].pop(0)
+                used.append(name)
+                windows.append((name, int(arg[0][len('-fuzztime='):-1])))
+            else:
+                text = 'PASS\n'
+            Path(log).write_text(text)
+
+        from unittest import mock
+        out = Path(tmp)
+        out.mkdir(parents=True, exist_ok=True)
+        with mock.patch.object(critical, 'checked', fake_checked), \
+                mock.patch.object(critical, 'fuzz_targets',
+                                  lambda *a: list(script)), \
+                (mock.patch.object(critical.time, 'monotonic',
+                                   side_effect=iter(clock)) if clock
+                 else _null()):
+            value = critical.fuzz(out, 'pkg/auth', [], [], out,
+                                  deadline or time.monotonic() + 10000)
+        return value, windows, used
+
+    def test_baseline_only_earns_one_bounded_retry(self):
+        script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            value, windows, used = self.run_fuzz(tmp, script)
+        self.assertEqual(used, ['FuzzBigCorpus', 'FuzzBigCorpus', 'FuzzNext'])
+        self.assertEqual(value, {'FuzzBigCorpus': 512, 'FuzzNext': 7})
+
+    def test_first_attempt_preserved_and_retry_is_separate(self):
+        script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            self.run_fuzz(tmp, script)
+            self.assertEqual((Path(tmp) / 'FuzzBigCorpus-baseline-only.log')
+                             .read_text(), self.BASELINE)
+            self.assertIn('execs: 512',
+                          (Path(tmp) / 'FuzzBigCorpus-retry.log').read_text())
+            self.assertFalse((Path(tmp) / 'FuzzBigCorpus.log').exists(),
+                             'the primary log must be renamed, not overwritten')
+
+    def test_retry_window_grows_within_deadline_and_later_share_recomputes(self):
+        # Fake clock: monotonic returns 100, 103, 106 (one reading per
+        # scheduling decision); deadline = 2100. Expected by hand:
+        #   slice0 = (2100-100-10)//2 = 995
+        #   retry  = min(2100-103-10, 3*995) = 1987  -> bounded by remaining
+        #   slice1 = (2100-106-10)//1 = 1984         -> recomputed after retry
+        script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            _, windows, _ = self.run_fuzz(tmp, script, clock=[100, 103, 106],
+                                          deadline=2100)
+        self.assertEqual([w for _, w in windows], [995, 1987, 1984])
+        self.assertLess(windows[1][1], 2100 - 100,
+                        'retry must stay inside the original mode deadline')
+
+    def test_persistent_baseline_only_stays_red_with_both_logs(self):
+        script = {'FuzzBigCorpus': [self.BASELINE, self.BASELINE],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as caught:
+                self.run_fuzz(tmp, script)
+            self.assertIn('no confirmed executions', str(caught.exception))
+            self.assertIn('FuzzBigCorpus-retry.log', str(caught.exception))
+            self.assertTrue((Path(tmp) / 'FuzzBigCorpus-baseline-only.log')
+                            .exists())
+            self.assertTrue((Path(tmp) / 'FuzzBigCorpus-retry.log').exists())
+            self.assertEqual(used_count(tmp, 'FuzzBigCorpus'), 2)
+
+    def test_crash_log_is_never_retried(self):
+        crash = ('fuzz: elapsed: 0s, gathering baseline coverage: '
+                 '0/378 completed\n'
+                 '--- FAIL: FuzzBigCorpus\nFAIL\n')
+        script = {'FuzzBigCorpus': [crash], 'FuzzNext': [self.GENERATED]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError) as caught:
+                self.run_fuzz(tmp, script)
+            self.assertIn('FuzzBigCorpus.log', str(caught.exception))
+            self.assertFalse((Path(tmp) / 'FuzzBigCorpus-baseline-only.log')
+                             .exists())
+            self.assertFalse((Path(tmp) / 'FuzzBigCorpus-retry.log').exists())
+
+    def test_zero_execution_progress_is_never_retried(self):
+        zero = ('fuzz: elapsed: 0s, gathering baseline coverage: 0/2 completed\n'
+                'fuzz: elapsed: 3s, execs: 0 (0/sec)\nPASS\nok  p 4.0s\n')
+        script = {'FuzzBigCorpus': [zero], 'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            with self.assertRaises(ValueError):
+                self.run_fuzz(tmp, script)
+            self.assertFalse((Path(tmp) / 'FuzzBigCorpus-retry.log').exists())
+
+
+def used_count(tmp, name):
+    return sum(1 for p in Path(tmp).iterdir()
+               if p.name.startswith(name) and p.name.endswith('.log')
+               and '-warm' not in p.name)
 
 
 class ConfigControls(unittest.TestCase):

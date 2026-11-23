@@ -182,3 +182,21 @@ def fuzz_executions(log):
     if not counts or max(map(int, counts)) == 0:
         raise ValueError('Fuzz run has no confirmed executions: ' + str(log))
     return max(map(int, counts))
+
+
+def baseline_only_fuzz_log(log):
+    """True when a completed fuzz run never got past seed-corpus baseline.
+
+    Matches exactly the evidence shape that earns the bounded retry: the
+    engine printed baseline coverage gathering progress, finished PASS, and
+    never confirmed a generated execution. Crashes, FAIL lines, build errors
+    and printed zero-execution progress all fail this check and stay red.
+    """
+    text = Path(log).read_text()
+    if 'FAIL' in text:
+        return False
+    if not re.search(r'^PASS$', text, flags=re.M):
+        return False
+    if not re.search(r'gathering baseline coverage:', text):
+        return False
+    return not re.search(r'execs:', text)

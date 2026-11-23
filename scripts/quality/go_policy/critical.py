@@ -101,7 +101,29 @@ def fuzz(root, package, functions, tags, out, deadline, override=None,
         log = out / (name + '.log')
         checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$', f'-fuzztime={seconds}s',
                                 './' + package], root, log, deadline)
-        executions[name] = results.fuzz_executions(log)
+        try:
+            executions[name] = results.fuzz_executions(log)
+            continue
+        except ValueError:
+            # Only a corpus-heavy run that spent its whole window gathering
+            # seed baseline coverage earns one bounded retry. Every other
+            # zero-execution shape is a real red and is re-raised untouched.
+            if not results.baseline_only_fuzz_log(log):
+                raise
+        # Preserve the baseline-only attempt under its own name and retry in
+        # a fresh log: primary evidence is never overwritten. The retry
+        # window grows within the same mode deadline and later targets
+        # recompute their fair share from the remaining time, so the total
+        # budget never extends.
+        baseline_log = out / (name + '-baseline-only.log')
+        log.rename(baseline_log)
+        retry_seconds = max(1, int(min(remaining(deadline) - 10,
+                                       BASELINE_RETRY_SCALE * seconds)))
+        retry_log = out / (name + '-retry.log')
+        checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$',
+                                 f'-fuzztime={retry_seconds}s', './' + package],
+                root, retry_log, deadline)
+        executions[name] = results.fuzz_executions(retry_log)
     return executions
 
 
@@ -118,6 +140,7 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
 
 BUDGET_KINDS = ('unit', 'fuzz', 'mutation')
 APPROVED_BUDGET = {'unit': 420, 'fuzz': 420, 'mutation': 300}
+BASELINE_RETRY_SCALE = 3
 
 
 def budget(config):
