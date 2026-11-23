@@ -31,8 +31,8 @@ import (
 	"github.com/reireirei/yabanin/pkg/budget"
 	"github.com/reireirei/yabanin/pkg/cache"
 	"github.com/reireirei/yabanin/pkg/classifier"
-	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/evalgate"
+	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/money"
 	"github.com/reireirei/yabanin/pkg/openai"
 	"github.com/reireirei/yabanin/pkg/provider"
@@ -148,8 +148,8 @@ func (c *g2RecordingCache) lastWrite() g2CacheWrite {
 // insert attempt before returning the scripted error.
 type g2VerdictCall struct {
 	orgID, requestID, prompt, cheapModel, premiumModel string
-	verdict    *evalgate.Verdict
-	confidence float64
+	verdict                                            *evalgate.Verdict
+	confidence                                         float64
 }
 
 type g2FailingVerdictStore struct {
@@ -436,10 +436,10 @@ func TestGWCovG2_TryChatModelUpstreamClientFailure(t *testing.T) {
 	cc.body = []byte(g2ValidRequestBody)
 
 	mi := resolver.ModelInfo{
-		ModelName:     "gpt-x",
-		Provider:      "no-such-provider-x",
+		ModelName:      "gpt-x",
+		Provider:       "no-such-provider-x",
 		UpstreamAPIKey: "sk-g2",
-		Enabled:       true,
+		Enabled:        true,
 	}
 
 	code, err := gw.tryChatModel(context.Background(), cc, mi, &chatExecution{}, new(atomic.Int32))
@@ -472,6 +472,16 @@ func TestGWCovG2_FinishChatHopUpstreamError(t *testing.T) {
 	}
 	if msg := err.Error(); msg != "upstream error 502" {
 		t.Errorf("error = %q, want the synthesized upstream error 502", msg)
+	}
+
+	// This test is bound as the static owner of the package's custom
+	// unknown-outcome carrier (its Error method), so it must pin that
+	// method's semantic output through the plain error interface: the
+	// documented contract prefix over the wrapped cause.
+	cause := errors.New("g2 hop lost mid-flight")
+	var carrier error = unknownOutcomeError(cause)
+	if msg := carrier.Error(); msg != "upstream outcome unknown: g2 hop lost mid-flight" {
+		t.Errorf("unknown-outcome carrier via error interface = %q, want the contract prefix over the cause", msg)
 	}
 
 	// Control: a sub-500 hop with no error is a success and captures the body.
@@ -758,11 +768,11 @@ func TestGWCovG2_EvalgateJudgeVerdictStoreFailure(t *testing.T) {
 	gw := &gateway{}
 	gw.log = g2DiscardLogger()
 	gw.res = &g2RecordingResolver{info: resolver.ModelInfo{
-		ModelName:     "gpt-4o",
-		Provider:      "openai",
-		UpstreamURL:   premiumSrv.URL, // httptest loopback passes the SSRF gate
+		ModelName:      "gpt-4o",
+		Provider:       "openai",
+		UpstreamURL:    premiumSrv.URL, // httptest loopback passes the SSRF gate
 		UpstreamAPIKey: "sk-g2",
-		Enabled:       true,
+		Enabled:        true,
 	}}
 	gw.pool = upstream.NewPool(upstream.Options{})
 	gw.invocations = &fakeInvocationStore{} // durable start/terminal succeed
