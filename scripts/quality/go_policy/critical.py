@@ -303,14 +303,17 @@ def applicability_lines(report):
 
 def run(args):
     root, out = args.root.resolve(), args.output.resolve()
-    if out.exists():
-        raise ValueError('Use a fresh output directory; evidence must not be overwritten')
-    out.mkdir(parents=True)
     config = json.loads((HERE / 'critical.json').read_text())
     validate_config(config)
     base = source.git(root, 'rev-parse', '--verify', '--end-of-options', args.base + '^{commit}').decode().strip()
-    before = source.snapshot(root)
+    # Resolve the binding before any output directory is created: a
+    # mismatch fails before side effects, so a corrected retry with the
+    # same --output is not blocked by an orphaned directory.
     override = seed_override_binding(base)
+    if out.exists():
+        raise ValueError('Use a fresh output directory; evidence must not be overwritten')
+    out.mkdir(parents=True)
+    before = source.snapshot(root)
     mode = scope.selector_mode()
     targets = scope.targets(root, base, config)
     report = {'base': base, 'source': before, 'config_sha256': source.digest(HERE / 'critical.json'),

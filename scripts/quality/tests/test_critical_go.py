@@ -332,6 +332,45 @@ class SeedBlockOverrideControls(unittest.TestCase):
         self.assertEqual(report['status'], 'failed')
         self.assertIn('simulated red seed verdict', report['error'])
 
+    def test_run_package_threads_override_into_run_mode(self):
+        # Pins the middle hop: a dropped argument between run_package and
+        # run_mode fails red by construction (override None restores the
+        # strict verdict); this control makes such a regression explicit.
+        import time
+        from unittest import mock
+        override = {'base': '4e98', 'activations': []}
+        seen = {}
+
+        def fake_run_mode(kind, root, package, functions, tags, out, deadline,
+                          gremlins, qualified, override=None):
+            seen['override'] = override
+            if override is None:
+                raise ValueError('override did not reach run_mode')
+            return {'status': 'passed'}
+
+        config = {'budget': {'schema_version': 1,
+                             'seconds_per_package': critical.APPROVED_BUDGET},
+                  'mutation_qualified_packages': [], 'build_tags': ['']}
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            with mock.patch.object(critical, 'run_mode', fake_run_mode), \
+                    mock.patch.object(critical, 'active_functions',
+                                      lambda *a: [TARGET]), \
+                    mock.patch.object(critical.conservative,
+                                      'resume_unit_deadline',
+                                      lambda package, seconds:
+                                          time.monotonic() + 3600):
+                value = critical.run_package(out, 'pkg/auth', [TARGET], config,
+                                             out / 'target', '/gremlins',
+                                             override)
+                self.assertIs(seen['override'], override)
+                self.assertEqual(value, {'unit:': {'status': 'passed'},
+                                         'fuzz:': {'status': 'passed'},
+                                         'mutation:': {'status': 'passed'}})
+                with self.assertRaises(ValueError):
+                    critical.run_package(out, 'pkg/auth', [TARGET], config,
+                                         out / 'target-negative', '/gremlins')
+
     def test_run_binding_mismatch_fails_closed_end_to_end(self):
         from unittest import mock
         with tempfile.TemporaryDirectory() as tmp:
@@ -410,8 +449,9 @@ class SeedOverrideManifestControls(unittest.TestCase):
             self.assertEqual(flag['base'], '4e98abc')
             self.assertEqual(flag['report'],
                              '/artifacts/quality/critical-go-1/report.json')
-            self.assertIn(flag['report_sha256'],
-                          'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+            self.assertEqual(flag['report_sha256'],
+                             'e3b0c44298fc1c149afbf4c8996fb92427'
+                             'ae41e4649b934ca495991b7852b855')
             self.assertIn('WARNING', captured.getvalue())
             self.assertIn('Preview3', flag['note'])
 
@@ -504,7 +544,6 @@ class SeedOverrideManifestControls(unittest.TestCase):
                                                     ['critical-go']))
 
 
-
 class WorkflowOverrideBindingControls(unittest.TestCase):
     """The CI binding for the Preview2 stopgap must stay conditional on the
     recorded task base: no unconditional relaxation for future bases, and
@@ -518,27 +557,37 @@ class WorkflowOverrideBindingControls(unittest.TestCase):
 
     def test_binding_sites_are_guarded_and_documented(self):
         text = self.workflow_text()
-        self.assertEqual(text.count(self.BASE), 2,
+        lines = text.splitlines()
+        base_lines = [i for i, line in enumerate(lines) if self.BASE in line]
+        self.assertEqual(len(base_lines), 2,
                          'the Preview2 base may appear at exactly the two '
                          'binding sites')
-        post_push = ('CRITICAL_SEED_BLOCK_OVERRIDE_BASE: ${{ github.event.before '
-                     "== '" + self.BASE + "' && github.event.before || '' }}")
-        self.assertIn(post_push, text,
-                      'post-push binding must render unmet guards as empty, '
-                      'which the gate treats as absent')
-        self.assertIn('if [ "$resolved" = "' + self.BASE + '" ]; then', text,
-                      'PR binding must resolve the actual merge-base and guard '
-                      'the export')
-        self.assertIn('Preview3', text,
-                      'the removal obligation must be documented in the '
-                      'workflow')
-        for line in text.splitlines():
-            if 'CRITICAL_SEED_BLOCK_OVERRIDE_BASE' not in line:
-                continue
-            self.assertTrue(
-                ('github.event.before ==' in line
-                 or 'export CRITICAL_SEED_BLOCK_OVERRIDE_BASE' in line),
-                'every override assignment must live inside a guard: ' + line)
+        # Post-push site: exactly one env assignment, carrying the guarded
+        # expression that renders '' (absent) for every other before-SHA.
+        env_lines = [i for i, line in enumerate(lines)
+                     if 'CRITICAL_SEED_BLOCK_OVERRIDE_BASE:' in line]
+        self.assertEqual(len(env_lines), 1)
+        self.assertIn("github.event.before == '" + self.BASE + "'",
+                      lines[env_lines[0]])
+        self.assertIn("&& github.event.before || ''", lines[env_lines[0]])
+        # PR site: exactly one export, and it must sit lexically inside the
+        # resolved-base if-guard so an unconditional leak fails this control.
+        export_lines = [i for i, line in enumerate(lines)
+                        if 'export CRITICAL_SEED_BLOCK_OVERRIDE_BASE' in line]
+        self.assertEqual(len(export_lines), 1)
+        guard_open = [i for i, line in enumerate(lines) if line.strip()
+                      == 'if [ "$resolved" = "' + self.BASE + '" ]; then']
+        self.assertEqual(len(guard_open), 1)
+        self.assertLess(guard_open[0], export_lines[0])
+        guard_close = min(i for i in range(guard_open[0] + 1, len(lines))
+                          if lines[i].strip() == 'fi')
+        self.assertLess(export_lines[0], guard_close)
+        # Preview3 removal must be documented next to each binding site.
+        for anchor in (env_lines[0], guard_open[0]):
+            window = '\n'.join(lines[max(0, anchor - 6):anchor + 6])
+            self.assertIn('Preview3', window,
+                          'removal obligation must be documented at the '
+                          'binding site')
 
 
 if __name__ == '__main__':

@@ -536,9 +536,10 @@ def seed_override_status(log):
         banner = base_re.search(line)
         if banner:
             base = banner.group(1)
-        if status_re.match(line):
+        hit = status_re.match(line)
+        if hit:
             matched = True
-            report = status_re.match(line).group(1).strip()
+            report = hit.group(1).strip()
         sha = sha_re.match(line)
         if sha:
             report_sha = sha.group(1)
