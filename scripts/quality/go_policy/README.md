@@ -139,9 +139,13 @@ versioned in `critical.json` (schema 2):
 
 Not-applicable entries are printed with their reasons and stored in
 `report.json`; they never fabricate fuzz executions, mutation kills or
-coverage, and strictness is unchanged where the infrastructure exists. The
-engine warms its instrumented binary inside the same fuzz budget before
-spending the remaining time on input generation. Build modes share the
+coverage, and strictness is unchanged where the infrastructure exists. There
+is no separate warm invocation: each fuzz budget first replays the seed
+corpus for coverage, then goes directly to bounded real `-fuzz` attempts that
+build and warm the instrumented binary themselves. Seed replay and generated
+executions remain mandatory: an attempt that only gathered seed baseline
+coverage earns one evidence-bounded retry and stays red if it still confirms
+no executions. Build modes share the
 budget, and only functions compiled in that mode are tested; a selected file
 absent from every configured mode blocks. A passing unrelated fuzz target or
 an empty test suite is insufficient.

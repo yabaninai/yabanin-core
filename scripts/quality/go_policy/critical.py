@@ -93,8 +93,6 @@ def fuzz(root, package, functions, tags, out, deadline, override=None,
               + str(record['uncovered_blocks']) + ' uncovered blocks deferred to Preview3')
     executions = {}
     for index, name in enumerate(names):
-        checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$', '-fuzztime=1x',
-                                './' + package], root, out / (name + '-warm.log'), deadline)
         seconds = max(1, int((remaining(deadline) - 10) / (len(names) - index)))
         if max_fuzz_seconds is not None:
             seconds = min(seconds, max_fuzz_seconds)

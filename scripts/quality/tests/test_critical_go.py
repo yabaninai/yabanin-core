@@ -175,13 +175,17 @@ class FuzzRetrySchedulingControls(unittest.TestCase):
         """Script per-target fuzz logs; record every -fuzztime window.
 
         script maps target name -> list of main-attempt log texts consumed in
-        order (a second entry exercises the retry). Warm and seed-profile
-        invocations always PASS and never consume scripted entries.
+        order (a second entry exercises the retry). The seed-profile
+        invocation always PASSes and never consumes scripted entries. There
+        is no warm invocation: fake_checked rejects any -fuzztime=1x
+        argument outright, so a reintroduced warm run fails every test here.
         """
         windows = []
         used = []
 
         def fake_checked(argv, root, log, deadline, env=None):
+            self.assertNotIn('-fuzztime=1x', argv,
+                             'the warm invocation must stay removed')
             for a in argv:
                 if a.startswith('-coverprofile='):
                     Path(a[len('-coverprofile='):]).write_text('mode: set\n')
@@ -245,6 +249,22 @@ class FuzzRetrySchedulingControls(unittest.TestCase):
         self.assertEqual([w for _, w in windows], [995, 16, 1984])
         self.assertLess(windows[1][1], 2100 - 100,
                         'retry must stay inside the original mode deadline')
+
+    def test_no_warm_invocation_and_scheduling_contract_unchanged(self):
+        # The per-target -fuzztime=1x warm run is gone: every fuzz budget
+        # goes to real attempts (fake_checked rejects any 1x argument), and
+        # the scheduling outcomes are identical to the warm-era contract:
+        # fair share, evidence-bounded retry, deadline clamp, later-share
+        # recompute. Zero-execution reds are covered unchanged by
+        # test_persistent_baseline_only_stays_red_with_both_logs.
+        script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            value, windows, used = self.run_fuzz(
+                tmp, script, clock=[100, 103, 106], deadline=2100)
+        self.assertEqual([w for _, w in windows], [995, 16, 1984])
+        self.assertEqual(value, {'FuzzBigCorpus': 512, 'FuzzNext': 7})
+        self.assertEqual(used, ['FuzzBigCorpus', 'FuzzBigCorpus', 'FuzzNext'])
 
     def test_retry_clamped_by_remaining_deadline(self):
         # When the remaining mode budget is TIGHTER than the evidence window,
