@@ -112,13 +112,19 @@ def fuzz(root, package, functions, tags, out, deadline, override=None,
                 raise
         # Preserve the baseline-only attempt under its own name and retry in
         # a fresh log: primary evidence is never overwritten. The retry
-        # window grows within the same mode deadline and later targets
-        # recompute their fair share from the remaining time, so the total
-        # budget never extends.
+        # window is evidence-based: the projected seed-corpus baseline cost
+        # taken from the attempt's own progress evidence, sized 1.25x + 2s
+        # so the corpus finishes with headroom to generate executions, and
+        # clamped by the remaining mode deadline. Later targets recompute
+        # their fair share from the remaining time, so the total budget
+        # never extends.
         baseline_log = out / (name + '-baseline-only.log')
         log.rename(baseline_log)
-        retry_seconds = max(1, int(min(remaining(deadline) - 10,
-                                       BASELINE_RETRY_SCALE * seconds)))
+        window = results.baseline_retry_window(baseline_log)
+        if window is None:
+            raise ValueError('Baseline-only fuzz attempt lacks usable '
+                             'progress evidence: ' + str(baseline_log))
+        retry_seconds = max(1, int(min(remaining(deadline) - 10, window)))
         retry_log = out / (name + '-retry.log')
         checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$',
                                  f'-fuzztime={retry_seconds}s', './' + package],
@@ -140,7 +146,6 @@ def mutation(root, package, functions, tags, out, deadline, gremlins):
 
 BUDGET_KINDS = ('unit', 'fuzz', 'mutation')
 APPROVED_BUDGET = {'unit': 420, 'fuzz': 420, 'mutation': 300}
-BASELINE_RETRY_SCALE = 3
 
 
 def budget(config):

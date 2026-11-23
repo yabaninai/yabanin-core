@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 """Validate real mutation and fuzz coverage against source-bound declarations."""
 import json
+import math
 from pathlib import Path
 import re
 
@@ -182,6 +183,38 @@ def fuzz_executions(log):
     if not counts or max(map(int, counts)) == 0:
         raise ValueError('Fuzz run has no confirmed executions: ' + str(log))
     return max(map(int, counts))
+
+
+def baseline_retry_window(log):
+    """Evidence-based bounded retry window for a baseline-only attempt.
+
+    Projects the seed-corpus baseline cost from the LAST progress line
+    (elapsed * total / completed) and sizes the whole retry at 1.25x that
+    projected total plus a 2s margin, so the corpus finishes with headroom
+    to generate real executions. Hand checks: 3s@78/288 -> 16s and
+    12s@332/378 -> 20s (the f496f5d critical-go evidence shapes). A
+    slow-first-seed shape — nothing completed but the engine visibly spent
+    elapsed>0 — is valid too and gets the bounded fallback 2*elapsed + 2s
+    (6s@0/25 -> 14s). Returns None when the evidence cannot support any
+    estimate — no progress line, elapsed 0 with zero completed, zero or
+    impossible totals — and such attempts earn no retry.
+    """
+    matches = re.findall(
+        r'fuzz: elapsed: (\d+)s, gathering baseline coverage: (\d+)/(\d+) completed',
+        Path(log).read_text())
+    if not matches:
+        return None
+    elapsed, completed, total = (int(value) for value in matches[-1])
+    if total <= 0:
+        return None
+    if completed <= 0:
+        if elapsed <= 0:
+            return None
+        return max(1, 2 * elapsed + 2)
+    if completed > total:
+        return None
+    projected = elapsed * total / completed
+    return max(1, math.ceil(1.25 * projected + 2))
 
 
 def baseline_only_fuzz_log(log):

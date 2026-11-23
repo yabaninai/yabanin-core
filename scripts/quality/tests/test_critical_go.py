@@ -106,6 +106,62 @@ class BaselineOnlyParserControls(unittest.TestCase):
         self.assertFalse(self.parser_case(text))
 
 
+class BaselineRetryWindowControls(unittest.TestCase):
+    """Hand-computed evidence checks for the baseline-only retry window."""
+
+    def line(self, elapsed, done, total):
+        return ('fuzz: elapsed: 0s, gathering baseline coverage: '
+                f'0/{total} completed\n'
+                f'fuzz: elapsed: {elapsed}s, gathering baseline coverage: '
+                f'{done}/{total} completed\n'
+                f'PASS\nok  example/pkg {elapsed}.1s\n')
+
+    def window(self, text):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'f.log'
+            path.write_text(text)
+            return results.baseline_retry_window(path)
+
+    def test_hand_computed_request_parse_shape(self):
+        # f496f5d critical-go evidence: 3s@78/288 -> ceil(1.25*3*288/78+2)=16
+        # (the fixed 3x scale gave only 9s and never finished the corpus).
+        self.assertEqual(self.window(self.line(3, 78, 288)), 16)
+
+    def test_hand_computed_endpoint_shape(self):
+        # 12s@332/378 -> ceil(1.25*12*378/332+2)=20 (3x scale gave 33s).
+        self.assertEqual(self.window(self.line(12, 332, 378)), 20)
+
+    def test_complete_baseline_collapses_to_bounded_margin(self):
+        # Baseline finished but no exec time was left: the remaining estimate
+        # is zero and the window collapses to the margin over actual elapsed
+        # (ceil(1.25*11+2)=16) — bounded, never absurd.
+        self.assertEqual(self.window(self.line(11, 288, 288)), 16)
+
+    def test_slow_first_seed_gets_bounded_fallback(self):
+        # GatewayFamily01 at the 8s probe budget: 0/25 completed at 0s and
+        # 6s, PASS, no execs — a valid slow-first-seed shape, not malformed.
+        # Fallback: 2*6+2 = 14 (the elapsed*total/completed path is
+        # undefined here).
+        self.assertEqual(self.window(self.line(6, 0, 25)), 14)
+
+    def test_zero_elapsed_zero_progress_earns_no_retry(self):
+        # Only the engine's 0s startup line: no spent time to extrapolate.
+        self.assertIsNone(self.window(self.line(0, 0, 288)))
+
+    def test_completed_over_total_earns_no_retry(self):
+        # Impossible evidence must never feed a retry window.
+        self.assertIsNone(self.window(self.line(3, 300, 288)))
+
+    def test_zero_total_earns_no_retry(self):
+        self.assertIsNone(self.window(self.line(3, 0, 0)))
+
+    def test_malformed_or_missing_progress_earns_no_retry(self):
+        self.assertIsNone(self.window('PASS\nok  p 1.0s\n'))
+        self.assertIsNone(self.window(
+            'fuzz: elapsed: xxs, gathering baseline coverage: a/b completed\n'
+            'PASS\n'))
+
+
 class FuzzRetrySchedulingControls(unittest.TestCase):
     BASELINE = ('fuzz: elapsed: 0s, gathering baseline coverage: 0/378 completed\n'
                 'fuzz: elapsed: 9s, gathering baseline coverage: 307/378 completed\n'
@@ -173,20 +229,34 @@ class FuzzRetrySchedulingControls(unittest.TestCase):
             self.assertFalse((Path(tmp) / 'FuzzBigCorpus.log').exists(),
                              'the primary log must be renamed, not overwritten')
 
-    def test_retry_window_grows_within_deadline_and_later_share_recomputes(self):
+    def test_retry_window_is_evidence_bounded_and_later_share_recomputes(self):
         # Fake clock: monotonic returns 100, 103, 106 (one reading per
         # scheduling decision); deadline = 2100. Expected by hand:
-        #   slice0 = (2100-100-10)//2 = 995
-        #   retry  = min(2100-103-10, 3*995) = 1987  -> bounded by remaining
-        #   slice1 = (2100-106-10)//1 = 1984         -> recomputed after retry
+        #   slice0 = (2100-100-10)//2 = 995          (fair share, unchanged)
+        #   retry  = min(2100-103-10, 16)   = 16     (evidence: 9s@307/378
+        #           projects 11.08s baseline -> ceil(1.25*11.08+2) = 16;
+        #           remaining would allow far more, evidence binds)
+        #   slice1 = (2100-106-10)//1 = 1984         (recomputed after retry)
         script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
                   'FuzzNext': [self.GENERATED_NEXT]}
         with tempfile.TemporaryDirectory() as tmp:
             _, windows, _ = self.run_fuzz(tmp, script, clock=[100, 103, 106],
                                           deadline=2100)
-        self.assertEqual([w for _, w in windows], [995, 1987, 1984])
+        self.assertEqual([w for _, w in windows], [995, 16, 1984])
         self.assertLess(windows[1][1], 2100 - 100,
                         'retry must stay inside the original mode deadline')
+
+    def test_retry_clamped_by_remaining_deadline(self):
+        # When the remaining mode budget is TIGHTER than the evidence window,
+        # the deadline clamps the retry (9s@307/378 evidence would ask 16).
+        # Clock 100, 103, 106; deadline 119: slice0 = (119-100-10)//2 = 4,
+        # retry = min(119-103-10, 16) = 6, slice1 = (119-106-10)//1 = 3.
+        script = {'FuzzBigCorpus': [self.BASELINE, self.GENERATED],
+                  'FuzzNext': [self.GENERATED_NEXT]}
+        with tempfile.TemporaryDirectory() as tmp:
+            _, windows, _ = self.run_fuzz(tmp, script, clock=[100, 103, 106],
+                                          deadline=119)
+        self.assertEqual([w for _, w in windows], [4, 6, 3])
 
     def test_persistent_baseline_only_stays_red_with_both_logs(self):
         script = {'FuzzBigCorpus': [self.BASELINE, self.BASELINE],
