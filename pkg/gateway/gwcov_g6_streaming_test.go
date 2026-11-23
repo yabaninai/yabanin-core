@@ -21,8 +21,8 @@ import (
 	"github.com/go-chi/chi/v5"
 	"github.com/reireirei/yabanin/pkg/adminstore"
 	"github.com/reireirei/yabanin/pkg/apiformat"
-	"github.com/reireirei/yabanin/pkg/evalgate"
 	"github.com/reireirei/yabanin/pkg/budget"
+	"github.com/reireirei/yabanin/pkg/evalgate"
 	routehint "github.com/reireirei/yabanin/pkg/gateway/internal/routehint"
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/resolver"
@@ -364,11 +364,11 @@ func TestGWCovG6_SuccessEvent_MissingDonePartialEnvelope(t *testing.T) {
 	r := &streamRun{
 		gw: gw, ctx: t.Context(), l: testLogger(),
 		reqID: "g6-req", sessionID: "g6-sess", orgID: testOrg,
-		dec:        routingDecision{From: "m1"},
-		finalInfo:  resolver.ModelInfo{ModelName: "g6m", Provider: "openai"},
-		history:    cap0,
-		sseTee:     &boundedBuffer{},
-		doneWatch:  dw,
+		dec:       routingDecision{From: "m1"},
+		finalInfo: resolver.ModelInfo{ModelName: "g6m", Provider: "openai"},
+		history:   cap0,
+		sseTee:    &boundedBuffer{},
+		doneWatch: dw,
 	}
 	base := r.successEvent(provider.Anthropic{}.ParseUsage([]byte(`{"input_tokens":3,"output_tokens":1}`)), provider.ExtendedUsage{}, 0, 0, false)
 	require.Contains(t, base.ProcessedResponse, "partial")
@@ -931,9 +931,9 @@ func TestGWCovG6_RealtimeFinish_ReplayFailure(t *testing.T) {
 		ram: []byte{}, spill: tf,
 	}
 	s := realtimeSettle{
-		rctx: t.Context(), // no identity: facts finish cleanly
-		w:    httptest.NewRecorder(),
-		l:    testLogger(),
+		rctx:  t.Context(), // no identity: facts finish cleanly
+		w:     httptest.NewRecorder(),
+		l:     testLogger(),
 		usage: provider.Anthropic{}.ParseUsage([]byte(`{"input_tokens":3,"output_tokens":1}`)),
 		tee:   &boundedBuffer{},
 		resp:  &http.Response{StatusCode: http.StatusOK, Header: make(http.Header)},
@@ -1137,4 +1137,44 @@ func TestGWCovG6_RealtimeCompletedResponseDone_BadShapes(t *testing.T) {
 	require.False(t, realtimeCompletedResponseDone([]byte("event: response.done\ndata: {not json}\n\n")))
 	require.False(t, realtimeCompletedResponseDone([]byte("event: response.done\ndata: {}\n\n")))
 	require.False(t, realtimeCompletedResponseDone([]byte("event: response.output_text\ndata: {\"response\":{\"status\":\"completed\"}}\n\n")))
+}
+
+// ---------------------------------------------------------------------------
+// Error-carrier contracts bound by the critical-go name binding: the binding
+// resolves interface-level Error() calls to every same-named production
+// method, so each carrier's exact semantic output is pinned here through the
+// plain error interface (contract text from each carrier's doc comment).
+// ---------------------------------------------------------------------------
+
+// TestGWCovG6_RealtimeErrorCarrierMessages pins the realtime relay's
+// terminal error carriers: a line/frame past the buffering limit, and the
+// terminal hold spool failing with its wrapped cause preserved.
+func TestGWCovG6_RealtimeErrorCarrierMessages(t *testing.T) {
+	var lineErr error = errRealtimeLineTooLarge{}
+	if got, want := lineErr.Error(), "upstream realtime SSE line or frame exceeds the buffering limit"; got != want {
+		t.Errorf("errRealtimeLineTooLarge via error interface = %q, want %q", got, want)
+	}
+
+	cause := errors.New("g6: spill file creation refused")
+	var holdErr error = errRealtimeHoldIO{err: cause}
+	if got, want := holdErr.Error(), "realtime terminal hold spool failed: g6: spill file creation refused"; got != want {
+		t.Errorf("errRealtimeHoldIO via error interface = %q, want %q", got, want)
+	}
+	if unwrapped := errors.Unwrap(holdErr); !errors.Is(unwrapped, cause) {
+		t.Errorf("errRealtimeHoldIO unwrap = %v, want the spool cause %v", unwrapped, cause)
+	}
+}
+
+// TestGWCovG6_TokenEndpointErrorNoStatusNoCause pins the degenerate arm of
+// the transient token-endpoint carrier: neither an HTTP status nor a cause
+// recorded, the contract line stays a plain transient-unreachable statement
+// and Unwrap reports no cause.
+func TestGWCovG6_TokenEndpointErrorNoStatusNoCause(t *testing.T) {
+	var carrier error = &tokenEndpointError{}
+	if got, want := carrier.Error(), "oauth token endpoint unreachable (transient)"; got != want {
+		t.Errorf("tokenEndpointError no-status/no-cause via error interface = %q, want %q", got, want)
+	}
+	if unwrapped := errors.Unwrap(carrier); unwrapped != nil {
+		t.Errorf("tokenEndpointError no-cause unwrap = %v, want nil", unwrapped)
+	}
 }
