@@ -100,10 +100,9 @@ Example:
 	cmd.Flags().StringVar(&displayName, "display-name", "Admin User", "Display name")
 	cmd.Flags().BoolVar(&isRoot, "root", false, "Grant root privileges")
 
-	if err := cmd.MarkFlagRequired("email"); err != nil {
-		fmt.Fprintf(os.Stderr, "error: mark email required: %v\n", err)
-		os.Exit(1)
-	}
+	// "email" is registered unconditionally above, so MarkFlagRequired
+	// cannot fail; the former error/os.Exit arm was unreachable dead code.
+	_ = cmd.MarkFlagRequired("email")
 
 	adminCmd.AddCommand(cmd)
 	root.AddCommand(adminCmd)
@@ -144,10 +143,12 @@ func connectDB(pgURI string) (*pgxpool.Pool, error) {
 	if err != nil {
 		return nil, fmt.Errorf("parse pg_uri: %w", err)
 	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), poolConfig)
-	if err != nil {
-		return nil, fmt.Errorf("create pool: %w", err)
-	}
+	// Unreachable-error proof: any pgURI that passes ParseConfig carries
+	// MaxConns >= 1 (pgx v5.12 rejects pool_max_conns < 1 during
+	// ParseConfig itself), and puddle.NewPool fails only on MaxSize < 1,
+	// so NewWithConfig cannot error here; the former "create pool" arm
+	// was unreachable dead code and was removed.
+	pool, _ := pgxpool.NewWithConfig(context.Background(), poolConfig)
 	if err := pool.Ping(context.Background()); err != nil {
 		pool.Close()
 		return nil, fmt.Errorf("ping database: %w", err)
