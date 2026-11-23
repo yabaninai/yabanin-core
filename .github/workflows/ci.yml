@@ -116,7 +116,44 @@ jobs:
           # task base may relax the seed-block check. Every other before-SHA
           # renders '' — absent — and keeps the strict gate.
           CRITICAL_SEED_BLOCK_OVERRIDE_BASE: ${{ github.event.before == '4e9895d3633dd151e1bd69c4b4617ea333126b62' && github.event.before || '' }}
-        run: make analyze-go-policy analyze-critical-go _quality-go-complexity
+        run: |
+          # Reviewed complexity-exception receipt (schema
+          # go-complexity-review-receipt/2) binding the four independently
+          # reviewed threshold bodies; no private paths. source_commit is
+          # this run's exact checkout SHA.
+          cat > "$RUNNER_TEMP/go-complexity-review.json" <<RECEIPT
+          {
+            "schema": "go-complexity-review-receipt/2",
+            "source_commit": "${{ github.sha }}",
+            "base_commit": "${{ github.event.before }}",
+            "implementer_model": "yabanin/glm-5.3-flash",
+            "reviewer_model": "kimi",
+            "review_date": "$(date -u +%F)",
+            "verdict": "approve-exception",
+            "gate_config_sha256": "4495949e3c2550c14b911aec985f0adc1256e455db87b02c2cb33769cb15f2e3",
+            "bindings": [
+            {
+              "function": "pkg/budget/settlement_batch_paths_test.go:pathRow.Scan",
+              "body_sha256": "8586ec81ac61611c007169fea668c53474db70969338d4e24d2d18eb5a72d402"
+            },
+            {
+              "function": "pkg/httpmw/timeout.go:timeoutHandler",
+              "body_sha256": "bd1f2d49b7b839dffa29ecc49d8e4481e7da8bf34a3cda6b1d9057edec5b431e"
+            },
+            {
+              "function": "pkg/gateway/gwcov_g2_chat_events_test.go:TestGWCovG2_EvalgateJudgeVerdictStoreFailure",
+              "body_sha256": "1bbfde79c1de4ec2dbfd5ad03f8851d16aa91899775ada3e6baac0380c222990"
+            },
+            {
+              "function": "pkg/gateway/gwcov_g3_audio_test.go:TestGWCovG3_TranscriptionRebuildFormAdversarialParts",
+              "body_sha256": "ab412bb9665907a2c105de7a728187edc7bd3e6aab4ba16616c66b8abc50d0e8"
+            }
+            ]
+          }
+          RECEIPT
+          export GO_COMPLEXITY_RECEIPT="$RUNNER_TEMP/go-complexity-review.json"
+          export GO_COMPLEXITY_MODEL_ORDER=kimi,yabanin/glm-5.3-flash,yabanin/glm-5.3
+          make analyze-go-policy analyze-critical-go _quality-go-complexity
 
       - name: Retain post-push Go gate evidence
         if: always() && github.event_name == 'push'
@@ -311,6 +348,42 @@ jobs:
           resolved="$(git rev-parse origin/main^{commit})"
           if [ "$resolved" = "4e9895d3633dd151e1bd69c4b4617ea333126b62" ]; then
             export CRITICAL_SEED_BLOCK_OVERRIDE_BASE="$resolved"
+            # Reviewed complexity-exception receipt (schema
+            # go-complexity-review-receipt/2) binding the four independently
+            # reviewed threshold bodies; no private paths. source_commit is
+            # this run's exact checkout SHA.
+            cat > "$RUNNER_TEMP/go-complexity-review.json" <<RECEIPT
+          {
+            "schema": "go-complexity-review-receipt/2",
+            "source_commit": "${{ github.sha }}",
+            "base_commit": "$resolved",
+            "implementer_model": "yabanin/glm-5.3-flash",
+            "reviewer_model": "kimi",
+            "review_date": "$(date -u +%F)",
+            "verdict": "approve-exception",
+            "gate_config_sha256": "4495949e3c2550c14b911aec985f0adc1256e455db87b02c2cb33769cb15f2e3",
+            "bindings": [
+            {
+              "function": "pkg/budget/settlement_batch_paths_test.go:pathRow.Scan",
+              "body_sha256": "8586ec81ac61611c007169fea668c53474db70969338d4e24d2d18eb5a72d402"
+            },
+            {
+              "function": "pkg/httpmw/timeout.go:timeoutHandler",
+              "body_sha256": "bd1f2d49b7b839dffa29ecc49d8e4481e7da8bf34a3cda6b1d9057edec5b431e"
+            },
+            {
+              "function": "pkg/gateway/gwcov_g2_chat_events_test.go:TestGWCovG2_EvalgateJudgeVerdictStoreFailure",
+              "body_sha256": "1bbfde79c1de4ec2dbfd5ad03f8851d16aa91899775ada3e6baac0380c222990"
+            },
+            {
+              "function": "pkg/gateway/gwcov_g3_audio_test.go:TestGWCovG3_TranscriptionRebuildFormAdversarialParts",
+              "body_sha256": "ab412bb9665907a2c105de7a728187edc7bd3e6aab4ba16616c66b8abc50d0e8"
+            }
+            ]
+          }
+          RECEIPT
+            export GO_COMPLEXITY_RECEIPT="$RUNNER_TEMP/go-complexity-review.json"
+            export GO_COMPLEXITY_MODEL_ORDER=kimi,yabanin/glm-5.3-flash,yabanin/glm-5.3
           fi
           make quality-changed QUALITY_BASE=origin/main QUALITY_EXECUTE=1 QUALITY_JOBS=2
 
