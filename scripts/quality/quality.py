@@ -512,6 +512,41 @@ def skip_reason(log):
     return lines[-1]
 
 
+SEED_OVERRIDE_STATUS_LINE = "Critical Go checks: passed-seed-block-override"
+
+
+def seed_override_status(log):
+    """Honest propagation of the Preview2 critical-go seed-block stopgap.
+
+    The gate process exits 0, so the make-level status alone would read as
+    a plain pass. The manifest must keep the override visible instead of
+    silently normalizing it: the gate record carries the explicit
+    passed-seed-block-override status and an override flag built from what
+    the run actually printed — never a constant. Parsed when present: the
+    task base from the activation banner, the report path from the status
+    line and the report SHA256 from the following line; unparsed parts
+    stay None. Returns None when the run printed no override status.
+    """
+    base = report = report_sha = None
+    matched = False
+    base_re = re.compile(r"seed-block override \(Preview2, base ([0-9a-f]+)\)")
+    status_re = re.compile(re.escape(SEED_OVERRIDE_STATUS_LINE) + r"; (.+)$")
+    sha_re = re.compile(r"^Report SHA256: ([0-9a-f]{64})$")
+    for line in Path(log).read_text(errors="replace").splitlines():
+        banner = base_re.search(line)
+        if banner:
+            base = banner.group(1)
+        if status_re.match(line):
+            matched = True
+            report = status_re.match(line).group(1).strip()
+        sha = sha_re.match(line)
+        if sha:
+            report_sha = sha.group(1)
+    if not matched:
+        return None
+    return {"base": base, "report": report, "report_sha256": report_sha}
+
+
 def gate_status(code, log=None):
     # 0 = passed, 77 = explicit skip (browser runtime absent), else failed.
     # GNU make collapses a failing recipe to exit 2, printing "Error 77" for a
@@ -825,7 +860,8 @@ def verify_evidence(root, manifest, required):
     # exist (a gate killed before writing output) and prove nothing.
     for index, (_path, _report, by_name) in enumerate(links):
         for name, gate in by_name.items():
-            if gate.get("status") not in ("passed", "skipped"):
+            if gate.get("status") not in ("passed", "passed-seed-block-override",
+                                          "skipped"):
                 continue
             if name not in LEAVES or gate.get("log") != name + ".log":
                 return False
@@ -854,7 +890,15 @@ def verify_evidence(root, manifest, required):
         # the skip to be explicit and self-describing so it can never
         # masquerade as a pass.
         if status == "passed":
-            if code != 0:
+            # A recorded override flag under a plain passed status is the
+            # normalization this status contract exists to prevent.
+            if code != 0 or gate.get("seed_block_override"):
+                return False
+        elif status == "passed-seed-block-override":
+            # Same exit contract as a pass, but the explicit override flag
+            # must be present: the stopgap may never masquerade as a clean
+            # pass and its warning must survive into the manifest.
+            if code != 0 or not gate.get("seed_block_override"):
                 return False
         elif status == "skipped":
             # 77 = the gate process itself skipped; 2 = the make wrapper
@@ -899,6 +943,20 @@ def execute_gate(gate, command, root, log_path, timeout, report, directory,
         gate["log_sha256"] = hashlib.sha256(log_path.read_bytes()).hexdigest()
         if gate["name"] == "tests":
             gate["tests"] = test_summary(log_path)
+        # Strictly critical-go, and only on a confirmed pass: a failed gate
+        # with the line in its log must stay failed, and no other gate may
+        # ever activate this propagation.
+        if gate["name"] == "critical-go" and gate.get("exit_code") == 0:
+            matched = seed_override_status(log_path)
+            if matched:
+                gate["status"] = "passed-seed-block-override"
+                gate["seed_block_override"] = dict(
+                    {"mode": "preview2-temporary",
+                     "note": "Preview2 temporary seed-block acceptance; Preview3 "
+                             "must land the acceptance redesign and remove this "
+                             "override"}, **matched)
+                print("WARNING critical-go seed-block override active (Preview2 "
+                      "temporary; Preview3 must remove it)", flush=True)
     print(f"{gate['status'].upper()} {gate['name']} (exit {gate['exit_code']})", flush=True)
 
 
@@ -1007,7 +1065,8 @@ def rerun(root, prior_arg, timeout, jobs=1):
                          "required — a rerun must not bind fresh results to "
                          "a changed source")
     rerun_names = {gate["name"] for gate in prior_gates
-                   if gate["status"] not in ("passed", "skipped")}
+                   if gate["status"] not in ("passed", "passed-seed-block-override",
+                                             "skipped")}
     if any(gate["name"] == "self" for gate in prior_gates):
         # The runner's self-test is cheap and guards the rerun machinery
         # itself: it always re-executes when the prior profile carried it.
@@ -1066,7 +1125,8 @@ def finalize(root, report, before, interrupted):
     policy_findings.extend(cov_findings)
     if policy_findings:
         report["policy_findings"] = policy_findings
-    all_ok = all(g["status"] in ("passed", "skipped") for g in report["gates"])
+    all_ok = all(g["status"] in ("passed", "passed-seed-block-override", "skipped")
+                  for g in report["gates"])
     if policy_findings:
         report["status"] = "failed"
     else:

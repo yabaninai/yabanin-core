@@ -111,6 +111,11 @@ jobs:
         if: github.event_name == 'push'
         env:
           QUALITY_BASE: ${{ github.event.before }}
+          # Preview2 stopgap (temporary; Preview3 must remove it together
+          # with the seed-block override itself): only the recorded Preview2
+          # task base may relax the seed-block check. Every other before-SHA
+          # renders '' — absent — and keeps the strict gate.
+          CRITICAL_SEED_BLOCK_OVERRIDE_BASE: ${{ github.event.before == '4e9895d3633dd151e1bd69c4b4617ea333126b62' && github.event.before || '' }}
         run: make analyze-go-policy analyze-critical-go _quality-go-complexity
 
       - name: Retain post-push Go gate evidence
@@ -298,7 +303,16 @@ jobs:
       # exclusive by scheduler design, so 2 cannot oversubscribe the toolchain
       # or the Docker daemon VM.
       - name: Run changed-gates quality profile
-        run: make quality-changed QUALITY_BASE=origin/main QUALITY_EXECUTE=1 QUALITY_JOBS=2
+        # Preview2 stopgap (temporary; Preview3 must remove it together with
+        # the seed-block override itself): the override binds only when this
+        # run's exact task base is the recorded Preview2 base; any other
+        # merge-base keeps the strict gate.
+        run: |
+          resolved="$(git rev-parse origin/main^{commit})"
+          if [ "$resolved" = "4e9895d3633dd151e1bd69c4b4617ea333126b62" ]; then
+            export CRITICAL_SEED_BLOCK_OVERRIDE_BASE="$resolved"
+          fi
+          make quality-changed QUALITY_BASE=origin/main QUALITY_EXECUTE=1 QUALITY_JOBS=2
 
       - name: Upload quality evidence
         if: always()

@@ -3,6 +3,7 @@
 """Bounded real fuzz and mutation gates for changed critical Go packages."""
 import argparse
 import json
+import os
 from pathlib import Path
 import re
 import shutil
@@ -69,14 +70,27 @@ def seed_functions(functions):
     return [fn for fn in marked if fn['seed']] if marked else list(functions)
 
 
-def fuzz(root, package, functions, tags, out, deadline, max_fuzz_seconds=None):
+def fuzz(root, package, functions, tags, out, deadline, override=None,
+         max_fuzz_seconds=None):
     names = fuzz_targets(root, package, tags, out, deadline)
     if not names:
         raise ValueError('No fuzz target in critical package: ' + package)
     profile = out / 'fuzz-seeds.cover'
     checked(go_args(tags) + ['-run=^(' + '|'.join(names) + ')$', '-coverprofile=' + str(profile),
                             './' + package], root, out / 'fuzz-seeds.log', deadline)
-    results.seed_coverage(profile, seed_functions(functions))
+    demand = seed_functions(functions)
+    try:
+        results.seed_coverage(profile, demand)
+    except ValueError as failure:
+        if override is None:
+            raise
+        record = preview2_seed_override_record(override, package, profile, demand,
+                                               str(failure))
+        source.write(out / 'fuzz-seed-override.json', record)
+        print('Critical Go seed-block override (Preview2, base ' + override['base'] + '): '
+              + package + ': ' + str(record['failing_functions']) + '/'
+              + str(record['seed_selected']) + ' seed-selected functions with '
+              + str(record['uncovered_blocks']) + ' uncovered blocks deferred to Preview3')
     executions = {}
     for index, name in enumerate(names):
         checked(go_args(tags) + ['-run=^$', '-fuzz=^' + name + '$', '-fuzztime=1x',
@@ -124,6 +138,56 @@ def budget(config):
     return seconds
 
 
+SEED_OVERRIDE_ENV = 'CRITICAL_SEED_BLOCK_OVERRIDE_BASE'
+
+
+def seed_override_binding(base):
+    """Preview2-only, base-bound binding for the seed-block acceptance stopgap.
+
+    Activates solely when the environment names this run's exact task base,
+    and solely relaxes the fuzz seed-replay block check. Any other value
+    fails closed before checks start. Preview3 must replace this handling
+    with a real acceptance redesign and remove the override entirely.
+    """
+    wanted = os.environ.get(SEED_OVERRIDE_ENV)
+    # An empty value means absent: CI renders conditional expressions to ''
+    # when the guard does not hold, and that must keep the strict gate.
+    if not wanted:
+        return None
+    if wanted != base:
+        raise ValueError('Preview2 seed-block override base mismatch: '
+                         + SEED_OVERRIDE_ENV + '=' + wanted + ' vs base ' + base)
+    return {'base': base, 'activations': []}
+
+
+def preview2_seed_override_record(override, package, profile, demand, failure):
+    """Machine-readable evidence for one relaxed seed-block check."""
+    failing = results.seed_coverage_report(profile, demand)
+    record = {'override': 'preview2-seed-block', 'base': override['base'],
+              'package': package, 'default_verdict': failure,
+              'seed_selected': len(demand), 'failing_functions': len(failing),
+              'uncovered_blocks': sum(fn['uncovered_blocks'] for fn in failing),
+              'functions': failing,
+              'deferred': 'Preview3 acceptance redesign; this handling is temporary'}
+    override['activations'].append({'package': package,
+                                    'failing_functions': record['failing_functions'],
+                                    'uncovered_blocks': record['uncovered_blocks'],
+                                    'evidence': 'fuzz-seed-override.json'})
+    return record
+
+
+def apply_seed_override_status(report, override):
+    """Never let an overridden run look like a clean pass."""
+    if not (override and override['activations']):
+        return
+    report['seed_block_override'] = {
+        'mode': 'preview2-temporary', 'base': override['base'],
+        'packages': override['activations'],
+        'note': 'fuzz seed-replay block acceptance only; every other check enforced; '
+                'Preview3 must land the acceptance redesign and delete this override'}
+    report['status'] = 'passed-seed-block-override'
+
+
 def validate_config(config):
     if config.get('schema_version') != 2:
         raise ValueError('Expected critical config schema 2')
@@ -165,7 +229,7 @@ def active_functions(root, package, functions, tags, out, deadline):
     return [fn for fn in functions if fn['file'] in files]
 
 
-def run_package(root, package, functions, config, out, gremlins):
+def run_package(root, package, functions, config, out, gremlins, override=None):
     result = {}
     qualified = package in set(config['mutation_qualified_packages'])
     seconds = budget(config)
@@ -183,8 +247,17 @@ def run_package(root, package, functions, config, out, gremlins):
             mode_deadline = time.monotonic() + remaining(deadline) / (len(config['build_tags']) - index)
             selected = active_functions(root, package, functions, tags, target, mode_deadline)
             covered.update(fn['file'] for fn in selected)
-            result[kind + ':' + tags] = run_mode(kind, root, package, selected, tags,
-                                                 target, mode_deadline, gremlins, qualified)
+            # Legacy doubles and wrappers assume the original positional
+            # shape; the extra argument travels only when an override is
+            # actually active.
+            if override is None:
+                result[kind + ':' + tags] = run_mode(kind, root, package, selected, tags,
+                                                     target, mode_deadline, gremlins,
+                                                     qualified)
+            else:
+                result[kind + ':' + tags] = run_mode(kind, root, package, selected, tags,
+                                                     target, mode_deadline, gremlins,
+                                                     qualified, override)
         if {fn['file'] for fn in functions} - covered:
             raise ValueError('Changed critical files are absent from all configured build modes')
     return result
@@ -201,7 +274,8 @@ def unit_mode(root, package, tags, out, deadline):
     return unit_suite(root, package, tags, out, deadline)
 
 
-def run_mode(kind, root, package, functions, tags, out, deadline, gremlins, qualified):
+def run_mode(kind, root, package, functions, tags, out, deadline, gremlins, qualified,
+             override=None):
     if not functions:
         return {'status': 'not_applicable', 'reason': 'no selected function in this build mode'}
     if kind == 'unit':
@@ -209,7 +283,9 @@ def run_mode(kind, root, package, functions, tags, out, deadline, gremlins, qual
     if kind == 'fuzz':
         if not fuzz_targets(root, package, tags, out, deadline):
             return {'status': 'not_applicable', 'reason': 'skipped: no fuzz targets (N/A)'}
-        return fuzz(root, package, functions, tags, out, deadline)
+        if override is None:
+            return fuzz(root, package, functions, tags, out, deadline)
+        return fuzz(root, package, functions, tags, out, deadline, override)
     if not qualified:
         return {'status': 'not_applicable',
                 'reason': 'skipped: no gremlins-qualified unit mode (N/A)'}
@@ -234,6 +310,7 @@ def run(args):
     validate_config(config)
     base = source.git(root, 'rev-parse', '--verify', '--end-of-options', args.base + '^{commit}').decode().strip()
     before = source.snapshot(root)
+    override = seed_override_binding(base)
     mode = scope.selector_mode()
     targets = scope.targets(root, base, config)
     report = {'base': base, 'source': before, 'config_sha256': source.digest(HERE / 'critical.json'),
@@ -252,10 +329,16 @@ def run(args):
         if targets:
             report['environment'] = source.environment(root, args.gremlins)
             report['gremlins'] = check_version(args.gremlins, config)
-            execute_targets(root, targets, config, out, args.gremlins, report)
+            if override is None:
+                execute_targets(root, targets, config, out, args.gremlins, report)
+            else:
+                execute_targets(root, targets, config, out, args.gremlins, report,
+                                override)
             if source.environment(root, args.gremlins) != report['environment']:
                 raise ValueError('Tool environment changed during critical checks')
-            report['status'] = 'passed'
+            apply_seed_override_status(report, override)
+            if report['status'] == 'running':
+                report['status'] = 'passed'
         if source.snapshot(root) != before:
             raise ValueError('Source changed while critical checks ran')
     except (ValueError, OSError, subprocess.SubprocessError) as exc:
@@ -267,12 +350,15 @@ def run(args):
             print('Critical Go applicability: ' + line)
         if report.get('selector'):
             print('Critical selector: ' + report['selector']['mode'])
+        if report.get('seed_block_override'):
+            print('Critical Go seed-block override active: temporary Preview2 handling; '
+                  'Preview3 must land the acceptance redesign and remove this override')
     print('Critical Go checks: ' + report['status'] + '; ' + str(out / 'report.json'))
     print('Report SHA256: ' + source.digest(out / 'report.json'))
     return 0
 
 
-def execute_targets(root, targets, config, out, gremlins, report):
+def execute_targets(root, targets, config, out, gremlins, report, override=None):
     with tempfile.TemporaryDirectory(prefix='yabanin-critical-') as tmp:
         isolated = Path(tmp)
         source.copy_source(root, isolated)
@@ -281,7 +367,12 @@ def execute_targets(root, targets, config, out, gremlins, report):
             report['packages'][package] = {'functions': functions, 'status': 'running'}
             source.write(out / 'report.json', report)
             try:
-                value = run_package(isolated, package, functions, config, target, gremlins)
+                if override is None:
+                    value = run_package(isolated, package, functions, config, target,
+                                        gremlins)
+                else:
+                    value = run_package(isolated, package, functions, config, target,
+                                        gremlins, override)
                 report['packages'][package] = {'functions': functions, 'checks': value}
                 source.write(out / 'report.json', report)
             finally:

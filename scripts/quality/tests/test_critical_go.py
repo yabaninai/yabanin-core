@@ -110,5 +110,436 @@ class ApplicabilityReportControls(unittest.TestCase):
             'pkg/budget [mutation:]: skipped: no gremlins-qualified unit mode (N/A)'])
 
 
+class SeedBlockOverrideControls(unittest.TestCase):
+    """Preview2 stopgap: base-bound, evidence-bearing, fail-closed elsewhere."""
+
+    def profile_rows(self):
+        return ['example.test/pkg/auth/check.go:12.1,13.2 1 1',
+                'example.test/pkg/auth/check.go:15.1,16.2 1 0']
+
+    def fake_gate(self, exec_log_text):
+        """Stand-in for checked(): materializes listing, profile and fuzz logs."""
+        def checked(argv, root, log, deadline, env=None):
+            argv = [str(item) for item in argv]
+            joined = ' '.join(argv)
+            path = Path(log)
+            if '-list=' in joined:
+                path.write_text('FuzzFake\n')
+            elif '-coverprofile=' in joined:
+                target = [item[len('-coverprofile='):] for item in argv
+                          if item.startswith('-coverprofile=')][0]
+                Path(target).write_text('mode: set\n'
+                                        + '\n'.join(self.profile_rows()) + '\n')
+            else:
+                path.write_text(exec_log_text)
+        return checked
+
+    def run_fuzz(self, override, exec_log_text='PASS\nfuzz: elapsed: 1s, execs: 7\n'):
+        import io
+        import time
+        from unittest import mock
+        captured = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            out = Path(tmp)
+            fake = self.fake_gate(exec_log_text)
+            with mock.patch.object(critical, 'checked', fake), \
+                    mock.patch('sys.stdout', captured):
+                value = critical.fuzz(Path(tmp), 'pkg/auth', [TARGET], '',
+                                      out, time.monotonic() + 120, override)
+            record = None
+            if (out / 'fuzz-seed-override.json').exists():
+                record = json.loads((out / 'fuzz-seed-override.json').read_text())
+        return value, out, captured.getvalue(), record
+
+    def test_report_mirrors_verdict_predicate(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cover.out'
+            path.write_text('mode: set\n' + '\n'.join(self.profile_rows()) + '\n')
+            with self.assertRaises(ValueError):
+                results.seed_coverage(path, [TARGET])
+            failing = results.seed_coverage_report(path, [TARGET])
+            self.assertEqual(failing, [{'file': TARGET['file'],
+                                        'function': TARGET['name'],
+                                        'uncovered_blocks': 1,
+                                        'blocks': ['15.1,16.2']}])
+            path.write_text('mode: set\nexample.test/pkg/auth/check.go:12.1,13.2 1 1\n')
+            self.assertEqual(results.seed_coverage_report(path, [TARGET]), [])
+            path.write_text('mode: set\n')
+            failing = results.seed_coverage_report(path, [TARGET])
+            self.assertEqual(failing[0]['uncovered_blocks'], 0)
+            self.assertEqual(failing[0]['profile_rows'], 0)
+
+    def test_block_specs_not_start_lines(self):
+        # Two sibling blocks can share a start line; only the full spec
+        # identifies what the replay missed. stmts=0 blocks never enter the
+        # predicate, matching seed_coverage exactly.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cover.out'
+            path.write_text('mode: set\n'
+                            'example.test/pkg/auth/check.go:12.1,13.2 1 1\n'
+                            'example.test/pkg/auth/check.go:15.1,16.2 2 1\n'
+                            'example.test/pkg/auth/check.go:15.3,16.4 1 0\n'
+                            'example.test/pkg/auth/check.go:15.9,16.9 0 0\n')
+            failing = results.seed_coverage_report(path, [TARGET])
+            self.assertEqual(failing, [{'file': TARGET['file'],
+                                        'function': TARGET['name'],
+                                        'uncovered_blocks': 1,
+                                        'blocks': ['15.3,16.4']}])
+
+    def test_no_profile_rows_marked_distinctly(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'cover.out'
+            path.write_text('mode: set\n')
+            failing = results.seed_coverage_report(path, [TARGET])
+            self.assertEqual(len(failing), 1)
+            self.assertEqual(failing[0]['uncovered_blocks'], 0)
+            self.assertEqual(failing[0]['profile_rows'], 0)
+
+    def test_binding_absent_or_mismatched_fails_closed(self):
+        from unittest import mock
+        with mock.patch.dict('os.environ', {}, clear=True):
+            self.assertIsNone(critical.seed_override_binding('4e98'))
+        with mock.patch.dict('os.environ',
+                             {'CRITICAL_SEED_BLOCK_OVERRIDE_BASE': ''}):
+            # CI renders unmet guards as '' — empty means absent, never a
+            # mismatch failure on unrelated runs.
+            self.assertIsNone(critical.seed_override_binding('4e98'))
+        with mock.patch.dict('os.environ',
+                             {'CRITICAL_SEED_BLOCK_OVERRIDE_BASE': 'deadbeef'}):
+            with self.assertRaises(ValueError):
+                critical.seed_override_binding('4e98')
+        with mock.patch.dict('os.environ',
+                             {'CRITICAL_SEED_BLOCK_OVERRIDE_BASE': '4e98'}):
+            self.assertEqual(critical.seed_override_binding('4e98'),
+                             {'base': '4e98', 'activations': []})
+
+    def test_override_records_evidence_and_continues(self):
+        override = {'base': '4e98', 'activations': []}
+        value, out, printed, record = self.run_fuzz(override)
+        self.assertEqual(value, {'FuzzFake': 7})
+        self.assertEqual(record['override'], 'preview2-seed-block')
+        self.assertEqual(record['base'], '4e98')
+        self.assertEqual(record['failing_functions'], 1)
+        self.assertEqual(record['uncovered_blocks'], 1)
+        self.assertEqual(record['functions'][0]['blocks'], ['15.1,16.2'])
+        self.assertIn('deferred', record)
+        self.assertIn('Critical Go seed-block override (Preview2, base 4e98)', printed)
+        self.assertIn('deferred to Preview3', printed)
+        self.assertEqual(override['activations'][0]['package'], 'pkg/auth')
+
+    def test_without_override_the_seed_verdict_stays_red(self):
+        with self.assertRaises(ValueError) as caught:
+            self.run_fuzz(None)
+        self.assertIn('Fuzz seeds do not cover every changed-function block',
+                      str(caught.exception))
+
+    def test_unrelated_fuzz_failure_stays_red_under_override(self):
+        override = {'base': '4e98', 'activations': []}
+        with self.assertRaises(ValueError) as caught:
+            self.run_fuzz(override, 'PASS\nfuzz: elapsed: 1s, execs: 0 (0/sec)\n')
+        self.assertIn('no confirmed executions', str(caught.exception))
+
+    def test_overridden_report_never_claims_clean_pass(self):
+        report = {'status': 'running'}
+        critical.apply_seed_override_status(report, None)
+        self.assertEqual(report['status'], 'running')
+        critical.apply_seed_override_status(report, {'base': '4e98', 'activations': []})
+        self.assertEqual(report['status'], 'running')
+        critical.apply_seed_override_status(report,
+                                            {'base': '4e98', 'activations': [
+                                                {'package': 'pkg/auth'}]})
+        self.assertEqual(report['status'], 'passed-seed-block-override')
+        self.assertEqual(report['seed_block_override']['mode'], 'preview2-temporary')
+        self.assertIn('Preview3', report['seed_block_override']['note'])
+
+    def e2e_args(self, repo, out):
+        from types import SimpleNamespace
+        return SimpleNamespace(root=Path(repo), base='4e98',
+                               gremlins='/gremlins-bin', output=Path(out))
+
+    def run_gate(self, env_value, base='4e98'):
+        """Drive critical.run() end to end with only the deepest seam faked.
+
+        run_package is the seam: when the override reaches it the fake
+        records the activation and passes; when any hop drops the extra
+        argument the fake sees None, raises the simulated red seed verdict
+        and the gate fails — exactly how the real gate behaves today.
+        """
+        from unittest import mock
+        seen = {}
+        env = {'pkg/auth': [TARGET]}
+
+        def fake_run_package(root, package, functions, config, target, gremlins,
+                             override=None):
+            seen['override'] = override
+            if override is None:
+                raise ValueError('simulated red seed verdict '
+                                 '(override did not reach run_package)')
+            override['activations'].append({'package': package,
+                                            'failing_functions': 0,
+                                            'uncovered_blocks': 0,
+                                            'evidence': 'fuzz-seed-override.json'})
+            return {'fuzz:': {'status': 'passed'}, 'unit:': {'status': 'passed'}}
+
+        patches = [
+            mock.patch.object(critical, 'run_package', fake_run_package),
+            mock.patch.object(critical.source, 'git', lambda *a, **k: b'4e98\n'),
+            mock.patch.object(critical.source, 'snapshot',
+                              lambda root: {'commit': 'abc123', 'sha256': 'def456'}),
+            mock.patch.object(critical.source, 'environment',
+                              lambda root, gremlins: {'go': 'test'}),
+            mock.patch.object(critical.source, 'copy_source',
+                              lambda root, isolated: None),
+            mock.patch.object(critical.scope, 'selector_mode',
+                              lambda: critical.scope.LEGACY),
+            mock.patch.object(critical.scope, 'targets', lambda *a: env),
+            mock.patch.object(critical, 'check_version', lambda *a: {'v': '1'}),
+        ]
+        env_map = {'CRITICAL_SEED_BLOCK_OVERRIDE_BASE': env_value} if env_value else {}
+        with tempfile.TemporaryDirectory() as tmp:
+            repo, out = Path(tmp) / 'repo', Path(tmp) / 'out'
+            repo.mkdir()
+            code, report = None, None
+            with mock.patch.dict('os.environ', env_map, clear=True):
+                for patch in patches:
+                    patch.start()
+                try:
+                    code = critical.run(self.e2e_args(repo, out))
+                except ValueError:
+                    code = None
+                finally:
+                    for patch in patches:
+                        patch.stop()
+            if (out / 'report.json').exists():
+                report = json.loads((out / 'report.json').read_text())
+        return code, seen, report
+
+    def test_run_threads_override_through_execute_targets(self):
+        # End-to-end wiring control: run() must carry the binding through
+        # execute_targets into run_package; a dropped argument turns this
+        # test red via the simulated verdict.
+        code, seen, report = self.run_gate('4e98')
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(seen.get('override'))
+        self.assertEqual(report['status'], 'passed-seed-block-override')
+        self.assertEqual(report['seed_block_override']['mode'], 'preview2-temporary')
+        self.assertEqual(report['base'], '4e98')
+
+    def test_run_default_path_stays_red_end_to_end(self):
+        code, seen, report = self.run_gate(None)
+        self.assertIsNone(code)
+        self.assertIsNone(seen.get('override'))
+        self.assertEqual(report['status'], 'failed')
+        self.assertIn('simulated red seed verdict', report['error'])
+
+    def test_run_binding_mismatch_fails_closed_end_to_end(self):
+        from unittest import mock
+        with tempfile.TemporaryDirectory() as tmp:
+            with mock.patch.dict('os.environ',
+                                 {'CRITICAL_SEED_BLOCK_OVERRIDE_BASE': '4e98'}), \
+                    mock.patch.object(critical.source, 'git',
+                                      lambda *a, **k: b'dead\n'), \
+                    mock.patch.object(critical.source, 'snapshot',
+                                      lambda root: {'commit': 'abc', 'sha256': 'def'}), \
+                    mock.patch.object(critical.scope, 'targets', lambda *a: {}):
+                with self.assertRaises(ValueError) as caught:
+                    critical.run(self.e2e_args(Path(tmp) / 'repo', Path(tmp) / 'out'))
+        self.assertIn('base mismatch', str(caught.exception))
+
+
+class SeedOverrideManifestControls(unittest.TestCase):
+    """The quality manifest must keep the seed-block override visible and
+    never normalize it into a clean pass."""
+
+    REALISTIC_LOG = ('Critical Go seed-block override (Preview2, base '
+                     '4e98abc): pkg/auth: 3/seed functions deferred\n'
+                     'Critical Go seed-block override active: temporary Preview2 '
+                     'handling; Preview3 must land the acceptance redesign and '
+                     'remove this override\n'
+                     'Critical Go checks: passed-seed-block-override; '
+                     '/artifacts/quality/critical-go-1/report.json\n'
+                     'Report SHA256: '
+                     'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n')
+
+    def forge(self, log_text, gate_updates=None):
+        """Keep the run directory alive for the whole test via addCleanup."""
+        import hashlib
+        temp = tempfile.TemporaryDirectory()
+        self.addCleanup(temp.cleanup)
+        directory = Path(temp.name)
+        log = directory / 'critical-go.log'
+        log.write_text(log_text)
+        gate = {'name': 'critical-go', 'status': 'passed-seed-block-override',
+                'exit_code': 0, 'log': 'critical-go.log',
+                'log_sha256': hashlib.sha256(log.read_bytes()).hexdigest(),
+                'seed_block_override': {'mode': 'preview2-temporary',
+                                        'base': '4e98abc',
+                                        'report': '/artifacts/quality/critical-go-1/report.json',
+                                        'report_sha256': 'e3b0c44298fc1c149afbf4c8996fb92427'
+                                                         'ae41e4649b934ca495991b7852b855',
+                                        'note': 'Preview3 owes the redesign'}}
+        gate.update(gate_updates or {})
+        manifest = directory / 'manifest.json'
+        manifest.write_text(json.dumps({
+            'schema_version': 1, 'status': 'passed',
+            'source': {'commit': 'abc123', 'sha256': 'def456'},
+            'source_after': {'commit': 'abc123', 'sha256': 'def456'},
+            'gates': [gate]}))
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import quality
+        return quality, directory, manifest
+
+    def test_gate_record_propagates_parsed_fields(self):
+        import io
+        from unittest import mock
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import quality
+        captured = io.StringIO()
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'critical-go.log'
+            gate = {'name': 'critical-go', 'status': 'pending',
+                    'log': 'critical-go.log'}
+            log.write_text(self.REALISTIC_LOG)
+            with mock.patch.object(quality, 'execute',
+                                   lambda *a, **k: {'status': 'passed', 'exit_code': 0,
+                                                    'duration_seconds': 0.1}), \
+                    mock.patch('sys.stdout', captured):
+                quality.execute_gate(gate, ['make'], Path(tmp), log, 60, None, None)
+            self.assertEqual(gate['status'], 'passed-seed-block-override')
+            flag = gate['seed_block_override']
+            self.assertEqual(flag['base'], '4e98abc')
+            self.assertEqual(flag['report'],
+                             '/artifacts/quality/critical-go-1/report.json')
+            self.assertIn(flag['report_sha256'],
+                          'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855')
+            self.assertIn('WARNING', captured.getvalue())
+            self.assertIn('Preview3', flag['note'])
+
+    def test_propagation_is_strictly_critical_go_exit_zero(self):
+        from unittest import mock
+        sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+        import quality
+        with tempfile.TemporaryDirectory() as tmp:
+            log = Path(tmp) / 'gate.log'
+
+            def run_case(gate, exit_code):
+                log.write_text(self.REALISTIC_LOG)
+                with mock.patch.object(quality, 'execute',
+                                       lambda *a, **k: {'status': 'failed' if exit_code
+                                                        else 'passed',
+                                                        'exit_code': exit_code,
+                                                        'duration_seconds': 0.1}):
+                    quality.execute_gate(gate, ['make'], Path(tmp), log, 60,
+                                         None, None)
+
+            # An ordinary gate with the same log line must never activate.
+            other = {'name': 'tests', 'status': 'pending', 'log': 'gate.log'}
+            run_case(other, 0)
+            self.assertEqual(other['status'], 'passed')
+            self.assertNotIn('seed_block_override', other)
+            # A failed critical-go with the line must stay failed.
+            failed = {'name': 'critical-go', 'status': 'pending',
+                      'log': 'gate.log'}
+            run_case(failed, 2)
+            self.assertEqual(failed['status'], 'failed')
+            self.assertNotIn('seed_block_override', failed)
+            # A clean passed critical-go without the line stays plain passed.
+            clean_log = Path(tmp) / 'clean.log'
+            clean = {'name': 'critical-go', 'status': 'pending',
+                     'log': 'clean.log'}
+            clean_log.write_text('Critical Go checks: passed; report.json\n')
+            with mock.patch.object(quality, 'execute',
+                                   lambda *a, **k: {'status': 'passed', 'exit_code': 0,
+                                                    'duration_seconds': 0.1}):
+                quality.execute_gate(clean, ['make'], Path(tmp), clean_log, 60,
+                                     None, None)
+            self.assertEqual(clean['status'], 'passed')
+            self.assertNotIn('seed_block_override', clean)
+
+    def test_verify_evidence_accepts_only_explicit_override(self):
+        from unittest import mock
+        quality, directory, manifest = self.forge(self.REALISTIC_LOG)
+        snap = {'commit': 'abc123', 'sha256': 'def456'}
+        with mock.patch.object(quality, 'snapshot', lambda root: snap):
+            self.assertTrue(quality.verify_evidence(directory, manifest,
+                                                    ['critical-go']))
+            # Override status without the flag: rejected.
+            _, udir, unflagged = self.forge(
+                self.REALISTIC_LOG, {'seed_block_override': None})
+            self.assertFalse(quality.verify_evidence(udir, unflagged,
+                                                     ['critical-go']))
+            # The flag recorded under a plain passed status: rejected —
+            # that combination is exactly the silent normalization.
+            _, ndir, normalized = self.forge(
+                self.REALISTIC_LOG, {'status': 'passed'})
+            self.assertFalse(quality.verify_evidence(ndir, normalized,
+                                                     ['critical-go']))
+            # Non-zero exit under the override status: rejected.
+            _, fdir, failed = self.forge(self.REALISTIC_LOG, {'exit_code': 1})
+            self.assertFalse(quality.verify_evidence(fdir, failed,
+                                                     ['critical-go']))
+            # Tampered log bytes invalidate the override evidence like any pass.
+            _, tdir, tmanifest = self.forge(self.REALISTIC_LOG)
+            (tdir / 'critical-go.log').write_text('rewritten\n')
+            self.assertFalse(quality.verify_evidence(tdir, tmanifest,
+                                                     ['critical-go']))
+            # Control: a clean pass without any override still verifies.
+            clean_log = ('Critical Go checks: passed; report.json\n'
+                         'Report SHA256: '
+                         'e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855\n')
+            import hashlib
+            temp = tempfile.TemporaryDirectory()
+            self.addCleanup(temp.cleanup)
+            cdir = Path(temp.name)
+            (cdir / 'critical-go.log').write_text(clean_log)
+            clean = {'name': 'critical-go', 'status': 'passed', 'exit_code': 0,
+                     'log': 'critical-go.log',
+                     'log_sha256': hashlib.sha256(
+                         (cdir / 'critical-go.log').read_bytes()).hexdigest()}
+            cmanifest = cdir / 'manifest.json'
+            cmanifest.write_text(json.dumps({
+                'schema_version': 1, 'status': 'passed',
+                'source': snap, 'source_after': snap, 'gates': [clean]}))
+            self.assertTrue(quality.verify_evidence(cdir, cmanifest,
+                                                    ['critical-go']))
+
+
+
+class WorkflowOverrideBindingControls(unittest.TestCase):
+    """The CI binding for the Preview2 stopgap must stay conditional on the
+    recorded task base: no unconditional relaxation for future bases, and
+    the Preview3 removal obligation must be documented at both sites."""
+
+    BASE = '4e9895d3633dd151e1bd69c4b4617ea333126b62'
+
+    def workflow_text(self):
+        path = Path(__file__).resolve().parents[3] / '.github/workflows/ci.yml'
+        return path.read_text(encoding='utf-8')
+
+    def test_binding_sites_are_guarded_and_documented(self):
+        text = self.workflow_text()
+        self.assertEqual(text.count(self.BASE), 2,
+                         'the Preview2 base may appear at exactly the two '
+                         'binding sites')
+        post_push = ('CRITICAL_SEED_BLOCK_OVERRIDE_BASE: ${{ github.event.before '
+                     "== '" + self.BASE + "' && github.event.before || '' }}")
+        self.assertIn(post_push, text,
+                      'post-push binding must render unmet guards as empty, '
+                      'which the gate treats as absent')
+        self.assertIn('if [ "$resolved" = "' + self.BASE + '" ]; then', text,
+                      'PR binding must resolve the actual merge-base and guard '
+                      'the export')
+        self.assertIn('Preview3', text,
+                      'the removal obligation must be documented in the '
+                      'workflow')
+        for line in text.splitlines():
+            if 'CRITICAL_SEED_BLOCK_OVERRIDE_BASE' not in line:
+                continue
+            self.assertTrue(
+                ('github.event.before ==' in line
+                 or 'export CRITICAL_SEED_BLOCK_OVERRIDE_BASE' in line),
+                'every override assignment must live inside a guard: ' + line)
+
+
 if __name__ == '__main__':
     unittest.main()

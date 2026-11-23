@@ -141,6 +141,42 @@ def seed_coverage(path, functions):
             raise ValueError('Fuzz seeds do not cover every changed-function block: ' + fn['file'] + ':' + fn['name'])
 
 
+def seed_coverage_report(path, functions):
+    """Uncovered-block evidence per seed-demanding function, without verdicts.
+
+    Mirrors the seed_coverage predicate exactly: a function fails when its
+    span holds no stmts>0 profile block at all or any block the replay
+    never executed. Blocks are identified by their full profile spec —
+    start lines alone can collide between sibling blocks — so counts stay
+    exact. A function whose span has no profile rows is reported with
+    profile_rows: 0; reporting zero uncovered blocks with no profile
+    evidence at all would not be a meaningful report. This parser keeps
+    the statement counts that coverage_blocks drops so the predicate
+    parity (stmts>0) is preserved. Used only by the Preview2 seed-block
+    override to record what it deferred; the default verdict and error
+    text stay untouched.
+    """
+    blocks = []
+    for line in Path(path).read_text().splitlines()[1:]:
+        match = re.fullmatch(r'(.+):(\d+)\.(\d+),(\d+)\.(\d+) (\d+) (\d+)', line)
+        if not match:
+            raise ValueError('Malformed block coverage: ' + line)
+        spec = match[2] + '.' + match[3] + ',' + match[4] + '.' + match[5]
+        blocks.append((match[1], int(match[2]), int(match[6]), int(match[7]), spec))
+    failing = []
+    for fn in functions:
+        in_range = [(count, spec) for file, line, stmts, count, spec in blocks
+                    if stmts > 0 and hits(fn, file, line)]
+        uncovered = sorted(spec for count, spec in in_range if count == 0)
+        if not in_range or uncovered:
+            entry = {'file': fn['file'], 'function': fn['name'],
+                     'uncovered_blocks': len(uncovered), 'blocks': uncovered}
+            if not in_range:
+                entry['profile_rows'] = 0
+            failing.append(entry)
+    return failing
+
+
 def fuzz_executions(log):
     counts = re.findall(r'execs:\s*(\d+)', Path(log).read_text())
     if not counts or max(map(int, counts)) == 0:
