@@ -418,7 +418,7 @@ func TestRT05_Stream_FallbackResponse_StoredUnderActualModel(t *testing.T) {
 	body := `{"model":"m1","stream":true,"messages":[{"role":"user","content":"rt05-sse-fb"}]}`
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	gw.serveStream(rec, r.Context(), rt06TestResolve(gw, "m1"), []byte(body), false,
+	gw.serveStream(rec, r.Context(), rt06TestResolve(r.Context(), gw, "m1"), []byte(body), false,
 		"sess", "org-a", "", "task", "req", testLogger(), routingDecision{From: "m1"}, "", 0, "", "", "", false)
 
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())

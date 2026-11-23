@@ -129,10 +129,10 @@ func g3PostTranscription(t *testing.T, gw *gateway, body []byte, contentType str
 // g3WAV synthesizes a small canonical PCM WAV (44-byte header + payload).
 // The gateway must not sniff it, but a well-formed container keeps the
 // upload fixture honest.
-func g3WAV(payloadBytes int) []byte {
+func g3WAV(payloadBytes uint32) []byte {
 	hdr := make([]byte, 44)
 	copy(hdr[0:4], "RIFF")
-	binary.LittleEndian.PutUint32(hdr[4:8], uint32(36+payloadBytes))
+	binary.LittleEndian.PutUint32(hdr[4:8], 36+payloadBytes)
 	copy(hdr[8:12], "WAVE")
 	copy(hdr[12:16], "fmt ")
 	binary.LittleEndian.PutUint32(hdr[16:20], 16)
@@ -143,10 +143,10 @@ func g3WAV(payloadBytes int) []byte {
 	hdr[32] = 2
 	hdr[34] = 16
 	copy(hdr[36:40], "data")
-	binary.LittleEndian.PutUint32(hdr[40:44], uint32(payloadBytes))
-	out := make([]byte, 0, 44+payloadBytes)
+	binary.LittleEndian.PutUint32(hdr[40:44], payloadBytes)
+	out := make([]byte, 0, int(44+payloadBytes))
 	out = append(out, hdr...)
-	for i := 0; i < payloadBytes; i++ {
+	for i := range int(payloadBytes) {
 		out = append(out, byte(i%251))
 	}
 	return out
@@ -192,9 +192,11 @@ type g3Route struct {
 func g3Routes() []g3Route {
 	return []g3Route{
 		{"speech", func(t *testing.T, gw *gateway) *httptest.ResponseRecorder {
+			t.Helper()
 			return g3PostSpeech(t, gw, `{"model":"tts","input":"g3 coverage","voice":"alloy"}`)
 		}},
 		{"transcriptions", func(t *testing.T, gw *gateway) *httptest.ResponseRecorder {
+			t.Helper()
 			body, contentType := g3Upload(t, "m", "g3.wav", g3WAV(512))
 			return g3PostTranscription(t, gw, body, contentType)
 		}},
@@ -255,7 +257,7 @@ func TestGWCovG3_SpeechBodyReadErrorCancelledContext(t *testing.T) {
 	bodyErr := errors.New("g3: wire reset mid-body")
 
 	// Control: same failure, live context → 400 malformed-body envelope.
-	live := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", g3ErrBody{err: bodyErr})
+	live := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/speech", g3ErrBody{err: bodyErr})
 	live.Header.Set("Content-Type", "application/json")
 	g3Identity(live)
 	liveRec := httptest.NewRecorder()
@@ -268,7 +270,7 @@ func TestGWCovG3_SpeechBodyReadErrorCancelledContext(t *testing.T) {
 	// Target: dead context → the handler must write nothing at all.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	dead := httptest.NewRequest(http.MethodPost, "/v1/audio/speech", g3ErrBody{err: bodyErr})
+	dead := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/speech", g3ErrBody{err: bodyErr})
 	dead.Header.Set("Content-Type", "application/json")
 	g3Identity(dead)
 	rec := httptest.NewRecorder()
@@ -297,7 +299,7 @@ func TestGWCovG3_TranscriptionBodyReadErrorCancelledContext(t *testing.T) {
 	const ct = "multipart/form-data; boundary=g3boundary"
 
 	// Control: same failure, live context → 400 malformed-body envelope.
-	live := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", g3ErrBody{err: bodyErr})
+	live := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/transcriptions", g3ErrBody{err: bodyErr})
 	live.Header.Set("Content-Type", ct)
 	g3Identity(live)
 	liveRec := httptest.NewRecorder()
@@ -310,7 +312,7 @@ func TestGWCovG3_TranscriptionBodyReadErrorCancelledContext(t *testing.T) {
 	// Target: dead context → the handler must write nothing at all.
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	dead := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", g3ErrBody{err: bodyErr})
+	dead := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/transcriptions", g3ErrBody{err: bodyErr})
 	dead.Header.Set("Content-Type", ct)
 	g3Identity(dead)
 	rec := httptest.NewRecorder()
@@ -481,7 +483,7 @@ func TestGWCovG3_SpeechResponseWithoutContentType(t *testing.T) {
 			t.Errorf("hijack: %v", err)
 			return
 		}
-		defer conn.Close()
+		defer func() { require.NoError(t, conn.Close()) }()
 		// 200 with a body and deliberately NO Content-Type header.
 		if _, err := fmt.Fprintf(rw, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\n\r\n%s", len(marker), marker); err != nil {
 			t.Errorf("raw write: %v", err)
@@ -536,7 +538,7 @@ func TestGWCovG3_TranscriptionRebuildFormAdversarialParts(t *testing.T) {
 
 			// The rebuilt stream round-trips: text fields survive (model
 			// rewritten) and file bytes are preserved verbatim.
-			req := httptest.NewRequest(http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(rebuilt))
+			req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/audio/transcriptions", bytes.NewReader(rebuilt))
 			req.Header.Set("Content-Type", extra.Get("Content-Type"))
 			mr, err := req.MultipartReader()
 			require.NoError(t, err)

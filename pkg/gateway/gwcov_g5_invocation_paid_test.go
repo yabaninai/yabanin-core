@@ -39,7 +39,7 @@ import (
 
 // g5DiscardLogger keeps failure logging out of test output.
 func g5DiscardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // g5errReader fails the first Read with the scripted error so readRouteBody
@@ -216,7 +216,7 @@ func TestGWCovG5_ShouldRetryTerminalCommitDivergentIsFatal(t *testing.T) {
 // gateway's MaxBytes cap answers the 413 payload-size refusal.
 func TestGWCovG5_ReadRouteBodyReadFailureAnswers400(t *testing.T) {
 	t.Run("generic read error answers 400", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil)
+		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/embeddings", nil)
 		r.Body = io.NopCloser(g5errReader{err: errors.New("connection reset")})
 		rec := httptest.NewRecorder()
 
@@ -228,7 +228,7 @@ func TestGWCovG5_ReadRouteBodyReadFailureAnswers400(t *testing.T) {
 	})
 
 	t.Run("max-bytes read error answers 413", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil)
+		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/embeddings", nil)
 		r.Body = io.NopCloser(g5errReader{err: fmt.Errorf("limited: %w", &http.MaxBytesError{Limit: 32})})
 		rec := httptest.NewRecorder()
 
@@ -254,7 +254,7 @@ func TestGWCovG5_ReservePlannedRequestPlanDenial(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	rctx, gate, ok := gw.reservePlannedRequest(context.Background(), rec,
-		httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil), "chat.completions", req)
+		httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil), "chat.completions", req)
 
 	require.False(t, ok, "an unpriced enforce plan must refuse")
 	require.Nil(t, gate)
@@ -301,7 +301,7 @@ func TestGWCovG5_ReservePlannedRequestReserveDenial(t *testing.T) {
 
 	rec := httptest.NewRecorder()
 	rctx, gate, ok := gw.reservePlannedRequest(context.Background(), rec,
-		httptest.NewRequest(http.MethodPost, "/v1/images/generations", nil), "images", req)
+		httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/images/generations", nil), "images", req)
 
 	require.False(t, ok, "a grant-denying enforce reserve must refuse")
 	require.Nil(t, gate)
@@ -435,7 +435,7 @@ func TestGWCovG5_ShadowParseUsageWithoutAdapter(t *testing.T) {
 // through untouched, records no decision JSON and writes nothing.
 func TestGWCovG5_PolicyPreUpstreamOrgless(t *testing.T) {
 	gw := &gateway{policyRuntime: &PolicyRuntime{mode: PolicyModeShadow}, log: g5DiscardLogger()}
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
 	body := []byte(`{"model":"m"}`)
 
 	gotBody, decisions, ok := gw.policyPreUpstream(httptest.NewRecorder(), r,

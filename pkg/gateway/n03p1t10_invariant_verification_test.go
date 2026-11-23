@@ -98,7 +98,7 @@ func t10HoldGateway(t *testing.T, url string) *gateway {
 // org and model (the parameterized twin of streamPolicyPostAsync).
 func t10PostAsyncAsOrg(t *testing.T, gw *gateway, orgID, model, body string) (*syncRecorder, chan struct{}) {
 	t.Helper()
-	info := rt06TestResolve(gw, model)
+	info := rt06TestResolve(t.Context(), gw, model)
 	r := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
 		"/v1/chat/completions", strings.NewReader(body))
 	ctx := withReservationGate(r.Context(), &reservationGate{

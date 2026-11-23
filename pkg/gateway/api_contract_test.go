@@ -117,7 +117,7 @@ func TestContract_SSEStreamShapes(t *testing.T) {
 	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	gw.serveStream(rec, r.Context(), rt06TestResolve(gw, "gpt-4o-mini"),
+	gw.serveStream(rec, r.Context(), rt06TestResolve(r.Context(), gw, "gpt-4o-mini"),
 		[]byte(`{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
 		false, "s1", "org", "", "", "req", gw.log, routingDecision{}, "", 0, "", "", "", false)
 

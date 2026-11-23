@@ -55,7 +55,7 @@ func streamCachePost(t *testing.T, gw *gateway, body string) *httptest.ResponseR
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 		"/v1/chat/completions", strings.NewReader(body))
 	rec := httptest.NewRecorder()
-	gw.serveStream(rec, r.Context(), rt06TestResolve(gw, "m1"), []byte(body), false,
+	gw.serveStream(rec, r.Context(), rt06TestResolve(r.Context(), gw, "m1"), []byte(body), false,
 		"sess", "org-a", "", "task", "req", testLogger(), routingDecision{From: "m1"}, "", 0, "", "", "", false)
 	return rec
 }
@@ -213,7 +213,7 @@ func TestStreamCache_CancelMidStreamNeverWritesPartialEntry(t *testing.T) {
 	time.AfterFunc(120*time.Millisecond, cancel)
 	defer cancel()
 	rec := httptest.NewRecorder()
-	gw.serveStream(rec, ctx, rt06TestResolve(gw, "m1"), []byte(body), false,
+	gw.serveStream(rec, ctx, rt06TestResolve(ctx, gw, "m1"), []byte(body), false,
 		"sess", "org-a", "", "task", "req", testLogger(), routingDecision{From: "m1"},
 		"", 0, "", "", "", false)
 

@@ -129,7 +129,7 @@ func TestGWCovG1_AgentBudgetPassWritesNothing(t *testing.T) {
 	rec := httptest.NewRecorder()
 	out := &admissionCore{AgentID: "agent-g1"}
 
-	ok := gw.checkAgentBudget(rec, httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil), out)
+	ok := gw.checkAgentBudget(rec, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/embeddings", nil), out)
 
 	require.True(t, ok, "a clean agent budget must admit")
 	require.Empty(t, rec.Body.String(), "the pass path writes nothing")
@@ -152,7 +152,7 @@ func TestGWCovG1_ResidencyRemapResolutionUnavailableAnswers503(t *testing.T) {
 		Info:  resolver.ModelInfo{ModelName: "gpt-4o-mini", Region: "SG", Provider: "openai"},
 	}
 
-	ok := gw.enforceResidency(rec, httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil), gw.log, out, false)
+	ok := gw.enforceResidency(rec, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/embeddings", nil), gw.log, out, false)
 
 	require.False(t, ok, "an unresolvable remap candidate must deny the request")
 	require.Equal(t, http.StatusServiceUnavailable, rec.Code)
@@ -170,7 +170,7 @@ func TestGWCovG1_ResidencyPackHeader(t *testing.T) {
 		}
 		rec := httptest.NewRecorder()
 		out := &admitted{OrgID: "org-g1", Info: resolver.ModelInfo{ModelName: "m", Region: "EU", Provider: "openai"}}
-		ok := gw.enforceResidency(rec, httptest.NewRequest(http.MethodPost, "/v1/embeddings", nil), gw.log, out, false)
+		ok := gw.enforceResidency(rec, httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/embeddings", nil), gw.log, out, false)
 		return rec, ok
 	}
 
@@ -228,6 +228,7 @@ func TestGWCovG1_JudgeTerminalFactsTransientRetrySettles(t *testing.T) {
 // wrapped store failure and the event is withheld from the consumer.
 func TestGWCovG1_JudgeTerminalFactsDeadlineAndPermanentFailure(t *testing.T) {
 	deadlineCase := func(t *testing.T) {
+		t.Helper()
 		up := &judgeHopUpstream{t: t, status: http.StatusOK, body: judgeHopOKBody}
 		store := &g1BlockFactsStore{
 			fakeInvocationStore: fakeInvocationStore{factsErr: &pgconn.PgError{Code: "40001"}},
@@ -248,6 +249,7 @@ func TestGWCovG1_JudgeTerminalFactsDeadlineAndPermanentFailure(t *testing.T) {
 	}
 
 	permanentCase := func(t *testing.T) {
+		t.Helper()
 		up := &judgeHopUpstream{t: t, status: http.StatusOK, body: judgeHopOKBody}
 		store := &fakeInvocationStore{factsErr: &pgconn.PgError{Code: "23505"}} // unique_violation: deterministic
 		client, req := g1JudgeClientOver(t, "", up.handler(), func(c *budgetedJudgeClient) { c.invocations = store })

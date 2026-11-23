@@ -104,12 +104,12 @@ func (r *g6RepeatReader) Read(p []byte) (int, error) {
 
 // g6SetFileSizeLimit caps writes through the filesystem so the terminal
 // hold's spill writes fail with EFBIG (realtime 752/757). Restored on cleanup.
-func g6SetFileSizeLimit(t *testing.T, soft int64) {
+func g6SetFileSizeLimit(t *testing.T, soft uint64) {
 	t.Helper()
 	var old syscall.Rlimit
 	require.NoError(t, syscall.Getrlimit(syscall.RLIMIT_FSIZE, &old))
 	require.NoError(t, syscall.Setrlimit(syscall.RLIMIT_FSIZE, &syscall.Rlimit{
-		Cur: uint64(soft), Max: old.Max,
+		Cur: soft, Max: old.Max,
 	}))
 	t.Cleanup(func() { _ = syscall.Setrlimit(syscall.RLIMIT_FSIZE, &old) })
 }
@@ -122,21 +122,19 @@ func g6AdmittedFactsErrCtx(t *testing.T, gw *gateway) context.Context {
 	id := newInvocationIdentity(testOrg, "g6-req", "g6-sess", "7", "9", "m1")
 	require.NoError(t, id.beginPaidDispatch(t.Context(), gw.invocations, invocationKindStream))
 	gw.invocations.(*fakeInvocationStore).factsErr = errG6Facts
-	return withInvocationIdentity(context.Background(), id)
+	return withInvocationIdentity(t.Context(), id)
 }
 
 // g6ServeStream mirrors streamPolicyPostAsync (resolver, info, gate, arg
 // list) but takes the caller's context so tests can carry an invocation
 // identity. Synchronous: waits for serveStream to return.
-func g6ServeStream(t *testing.T, gw *gateway, body string, ctx context.Context) *syncRecorder {
+func g6ServeStream(ctx context.Context, t *testing.T, gw *gateway, body string) *syncRecorder {
 	t.Helper()
 	gw.res = stubModelResolver{
 		"m1": {ModelName: "m1", Provider: "openai", UpstreamURL: gw.cfg.Provider, Enabled: true},
 	}
-	info := rt06TestResolve(gw, "m1")
-	r := httptest.NewRequestWithContext(ctx, http.MethodPost,
-		"/v1/chat/completions", strings.NewReader(body))
-	gateCtx := withReservationGate(r.Context(), &reservationGate{
+	info := rt06TestResolve(ctx, gw, "m1")
+	gateCtx := withReservationGate(ctx, &reservationGate{
 		plan: &budget.Plan{Mode: budget.ModeOff},
 		// Fully-populated wallet tuple: the terminal projection validates
 		// reservation tuples (allowance id, period) before the store seam.
@@ -145,13 +143,8 @@ func g6ServeStream(t *testing.T, gw *gateway, body string, ctx context.Context) 
 		}},
 	})
 	rec := newSyncRecorder()
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		gw.serveStream(rec, gateCtx, info, []byte(body), false, "sess", testOrg, "", "task", "req",
-			testLogger(), routingDecision{From: "m1"}, "", 0, "", "", "", false)
-	}()
-	<-done
+	gw.serveStream(rec, gateCtx, info, []byte(body), false, "sess", testOrg, "", "task", "req",
+		testLogger(), routingDecision{From: "m1"}, "", 0, "", "", "", false)
 	return rec
 }
 
@@ -245,7 +238,7 @@ func TestGWCovG6_StreamConnect_UnknownOutcomeRefusal(t *testing.T) {
 	}))
 	t.Cleanup(up.Close)
 	gw := streamTestGateway(up.URL)
-	rec := g6ServeStream(t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`, t.Context())
+	rec := g6ServeStream(t.Context(), t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)
 	require.Contains(t, rec.body(), "upstream outcome unknown; request was not retried")
 
 	t.Run("no upstream status defaults to 502", func(t *testing.T) {
@@ -281,7 +274,7 @@ func TestGWCovG6_StreamConnect_ExhaustionFactsFailure(t *testing.T) {
 	t.Cleanup(up.Close)
 	gw := streamTestGateway(up.URL)
 	ctx := g6AdmittedFactsErrCtx(t, gw)
-	rec := g6ServeStream(t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`, ctx)
+	rec := g6ServeStream(ctx, t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)
 	require.Equal(t, 1, g6FactsStore(gw).factsCalls)
 	require.NotEmpty(t, rec.body())
 }
@@ -303,8 +296,8 @@ func TestGWCovG6_StreamPolicyDenied_FactsFailureDropsTerminator(t *testing.T) {
 	up := newStreamPolicyUpstream(t, 0, streamChunkFrame("g6c", "g6 says g6denyword"))
 	gw := withUpstream(streamPolicyGateway(t, PolicyModeEnforce, streamDenyPrefixYAML("g6denyword")), up.srv.URL)
 	ctx := g6AdmittedFactsErrCtx(t, gw)
-	rec := g6ServeStream(t, gw,
-		`{"model":"m1","messages":[{"role":"user","content":"please say g6denyword"}]}`, ctx)
+	rec := g6ServeStream(ctx, t, gw,
+		`{"model":"m1","messages":[{"role":"user","content":"please say g6denyword"}]}`)
 	require.Equal(t, 1, g6FactsStore(gw).factsCalls)
 	require.NotContains(t, rec.body(), "[DONE]")
 	require.NotContains(t, rec.body(), "g6denyword")
@@ -328,7 +321,7 @@ func TestGWCovG6_StreamDrainFailure_FactsFailure(t *testing.T) {
 	t.Cleanup(up.Close)
 	gw := streamTestGateway(up.URL)
 	ctx := g6AdmittedFactsErrCtx(t, gw)
-	rec := g6ServeStream(t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`, ctx)
+	rec := g6ServeStream(ctx, t, gw, `{"model":"m1","messages":[{"role":"user","content":"hi"}]}`)
 	require.Equal(t, 1, g6FactsStore(gw).factsCalls)
 	require.Contains(t, rec.body(), "stream interrupted")
 }
@@ -478,6 +471,7 @@ func TestGWCovG6_Responses_PolicyDenied_Enforce(t *testing.T) {
 	t.Cleanup(up.Close)
 
 	newGateway := func(t *testing.T) *gateway {
+		t.Helper()
 		gw := g6NativeResponsesGateway(t, up.URL)
 		store := newFakePolicyStore()
 		store.add("org-test", adminstore.PolicyPipeline{
@@ -707,6 +701,7 @@ func TestGWCovG6_Messages_PolicyDenied_Enforce(t *testing.T) {
 	t.Cleanup(up.Close)
 
 	newGateway := func(t *testing.T) *gateway {
+		t.Helper()
 		gw := nativeMessagesGateway(t, up.URL)
 		store := newFakePolicyStore()
 		store.add("org-test", adminstore.PolicyPipeline{
@@ -817,7 +812,7 @@ func TestGWCovG6_RealtimeParse_BodyRefusals(t *testing.T) {
 	})
 
 	t.Run("read failure answers 400", func(t *testing.T) {
-		r := httptest.NewRequest(http.MethodPost, "/v1/realtime", g6ErrReader{})
+		r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/realtime", g6ErrReader{})
 		rec := httptest.NewRecorder()
 		_, _, ok := parseRealtimeRequest(rec, r)
 		require.False(t, ok)
@@ -954,7 +949,7 @@ func TestGWCovG6_RealtimeRelay_Aborts(t *testing.T) {
 		_, _, _, _, err := gw.realtimeRelay(t.Context(), w, w,
 			&g6RepeatReader{chunk: []byte(": g6\n\n"), remaining: realtimeStreamLimit + 1<<20}, noopCancel)
 		var tooLarge errRealtimeStreamTooLarge
-		require.True(t, errors.As(err, &tooLarge), "got %v", err)
+		require.ErrorAs(t, err, &tooLarge, "got %v", err)
 	})
 
 	t.Run("line limit abort", func(t *testing.T) {
@@ -962,7 +957,7 @@ func TestGWCovG6_RealtimeRelay_Aborts(t *testing.T) {
 		huge := "data: " + strings.Repeat("a", 9<<20) + "\n"
 		_, _, _, _, err := gw.realtimeRelay(t.Context(), w, w, strings.NewReader(huge), noopCancel)
 		var lineLarge errRealtimeLineTooLarge
-		require.True(t, errors.As(err, &lineLarge), "got %v", err)
+		require.ErrorAs(t, err, &lineLarge, "got %v", err)
 	})
 
 	t.Run("client write failure settles as cancel", func(t *testing.T) {
@@ -986,7 +981,7 @@ func TestGWCovG6_RealtimeRelay_Aborts(t *testing.T) {
 		_, _, term, _, err := gw.realtimeRelay(rctx, rec, rec,
 			strings.NewReader(done+huge), noopCancel)
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO), "got %v", err)
+		require.ErrorAs(t, err, &holdIO, "got %v", err)
 		require.Equal(t, budget.TerminationUpstreamErr, term)
 	})
 }
@@ -997,6 +992,7 @@ func TestGWCovG6_RealtimeRelay_Aborts(t *testing.T) {
 // line into a broken spool).
 func TestGWCovG6_RealtimeSink_SettleEndBranches(t *testing.T) {
 	closedSpill := func(t *testing.T) *os.File {
+		t.Helper()
 		tf, err := os.CreateTemp(t.TempDir(), "g6-hold-*")
 		require.NoError(t, err)
 		require.NoError(t, tf.Close())
@@ -1011,7 +1007,7 @@ func TestGWCovG6_RealtimeSink_SettleEndBranches(t *testing.T) {
 		require.False(t, overflow)
 		term, err := s.settleEnd(t.Context(), nil, io.EOF)
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO), "got %v", err)
+		require.ErrorAs(t, err, &holdIO, "got %v", err)
 		require.Equal(t, budget.TerminationUpstreamErr, term)
 	})
 
@@ -1034,7 +1030,7 @@ func TestGWCovG6_RealtimeSink_SettleEndBranches(t *testing.T) {
 		s.lines.Feed([]byte(": keep\r"))
 		err := s.settleTail()
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO), "got %v", err)
+		require.ErrorAs(t, err, &holdIO, "got %v", err)
 	})
 
 	t.Run("feedChunk routes hold failure", func(t *testing.T) {
@@ -1043,7 +1039,7 @@ func TestGWCovG6_RealtimeSink_SettleEndBranches(t *testing.T) {
 		s.hold.spill = closedSpill(t)
 		err := s.feedChunk([]byte(": keep\n"))
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO), "got %v", err)
+		require.ErrorAs(t, err, &holdIO, "got %v", err)
 	})
 
 	t.Run("oversize line aborts processLine", func(t *testing.T) {
@@ -1051,7 +1047,7 @@ func TestGWCovG6_RealtimeSink_SettleEndBranches(t *testing.T) {
 		line := []byte("data: " + strings.Repeat("a", apiformat.SSEStreamLineLimit+1024))
 		err := s.processLine(line)
 		var lineLarge errRealtimeLineTooLarge
-		require.True(t, errors.As(err, &lineLarge), "got %v", err)
+		require.ErrorAs(t, err, &lineLarge, "got %v", err)
 	})
 }
 
@@ -1073,7 +1069,7 @@ func TestGWCovG6_RealtimeHold_SpoolBranches(t *testing.T) {
 
 		require.NoError(t, tf.Close())
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(h.admit([]byte("y")), &holdIO))
+		require.ErrorAs(t, h.admit([]byte("y")), &holdIO)
 	})
 
 	t.Run("no spill creatable", func(t *testing.T) {
@@ -1082,7 +1078,7 @@ func TestGWCovG6_RealtimeHold_SpoolBranches(t *testing.T) {
 		h.ram = make([]byte, 64)
 		err := h.admit(make([]byte, realtimeTerminalHoldLimit+16))
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO))
+		require.ErrorAs(t, err, &holdIO)
 	})
 
 	t.Run("efbig on ram write", func(t *testing.T) {
@@ -1091,7 +1087,7 @@ func TestGWCovG6_RealtimeHold_SpoolBranches(t *testing.T) {
 		h.ram = make([]byte, 800*1024)
 		err := h.admit(make([]byte, 300*1024)) // ram+unit > 1 MiB triggers spilling
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO))
+		require.ErrorAs(t, err, &holdIO)
 	})
 
 	t.Run("efbig on unit write", func(t *testing.T) {
@@ -1100,7 +1096,7 @@ func TestGWCovG6_RealtimeHold_SpoolBranches(t *testing.T) {
 		h.ram = make([]byte, 600*1024)
 		err := h.admit(make([]byte, 600*1024))
 		var holdIO errRealtimeHoldIO
-		require.True(t, errors.As(err, &holdIO))
+		require.ErrorAs(t, err, &holdIO)
 	})
 
 	t.Run("nil receiver safety", func(t *testing.T) {

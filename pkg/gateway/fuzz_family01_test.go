@@ -864,25 +864,25 @@ func fam01Admit07(t *testing.T) {
 // later case inherits a configured cap.
 func fam01Admit08(t *testing.T) {
 	t.Helper()
-	os.Unsetenv(WorkloadBudgetEnvUSD)
-	defer os.Unsetenv(WorkloadBudgetEnvUSD)
+	require.NoError(t, os.Unsetenv(WorkloadBudgetEnvUSD))
+	defer func() { require.NoError(t, os.Unsetenv(WorkloadBudgetEnvUSD)) }()
 
 	require.Zero(t, int64(workloadCapFromEnv()),
 		"no configured cap keeps the ledger disabled")
 
-	os.Setenv(WorkloadBudgetEnvUSD, "nope")
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "nope"))
 	require.Zero(t, int64(workloadCapFromEnv()),
 		"an unparsable cap keeps the ledger disabled")
 
-	os.Setenv(WorkloadBudgetEnvUSD, "-5")
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "-5"))
 	require.Zero(t, int64(workloadCapFromEnv()),
 		"a non-positive cap keeps the ledger disabled")
 
-	os.Setenv(WorkloadBudgetEnvUSD, "1e30")
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "1e30"))
 	require.Zero(t, int64(workloadCapFromEnv()),
 		"an out-of-range quote keeps the ledger disabled")
 
-	os.Setenv(WorkloadBudgetEnvUSD, "1.25")
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "1.25"))
 	want, err := money.FromUSD(1.25)
 	require.NoError(t, err)
 	require.Equal(t, int64(want), int64(workloadCapFromEnv()),

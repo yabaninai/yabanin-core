@@ -48,7 +48,7 @@ import (
 
 // g2DiscardLogger drops records without the default handler's stderr noise.
 func g2DiscardLogger() *slog.Logger {
-	return slog.New(slog.NewTextHandler(io.Discard, nil))
+	return slog.New(slog.DiscardHandler)
 }
 
 // g2LogRecord is one captured record; g2LogHandler is a thread-safe
@@ -115,6 +115,11 @@ type g2CacheWrite struct {
 	tokensOut int
 }
 
+// errG2CacheMiss is the fake cache miss signal: serveChatCache handles
+// lookup errors exactly like misses (both forward to upstream), so the
+// sentinel keeps behavior identical to the previous literal (nil, nil).
+var errG2CacheMiss = errors.New("g2 synthetic cache miss")
+
 type g2RecordingCache struct {
 	mu     sync.Mutex
 	writes []g2CacheWrite
@@ -122,7 +127,7 @@ type g2RecordingCache struct {
 }
 
 func (c *g2RecordingCache) LookupWithResult(context.Context, cache.RouteIdentity, []byte) (*cache.CacheHit, error) {
-	return nil, nil
+	return nil, errG2CacheMiss
 }
 
 func (c *g2RecordingCache) Write(_ context.Context, ri cache.RouteIdentity, body, response json.RawMessage, tokensIn, tokensOut int) error {
@@ -248,7 +253,7 @@ const g2ValidRequestBody = `{"model":"gpt-4o-mini","messages":[{"role":"user","c
 
 func TestGWCovG2_ReadChatRequestBodyReadError(t *testing.T) {
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", nil)
 	r.Body = io.NopCloser(g2ErrReader{})
 
 	raw, req, ok := readChatRequest(w, r)
@@ -304,7 +309,7 @@ func TestGWCovG2_ApplyChatVerticalResultPatchFailures(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			w := httptest.NewRecorder()
-			r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body))
+			r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(tt.body))
 			cc := g2ChatContext(w, r)
 			cc.body = []byte(tt.body)
 
@@ -343,7 +348,7 @@ func TestGWCovG2_PrepareChatDispatchRefusesUnpricedModel(t *testing.T) {
 		budget.ModeEnforce, g2EnforceLoader, budget.AdmissionConfig{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 	cc.info = resolver.ModelInfo{ModelName: "gpt-4o-mini", Provider: "openai", Enabled: true}
@@ -391,7 +396,7 @@ func TestGWCovG2_ConfirmChatDispatchReservationStoreOutage(t *testing.T) {
 	)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 	cc.info = resolver.ModelInfo{ModelName: "gpt-4o-mini", Provider: "openai", Enabled: true}
@@ -431,7 +436,7 @@ func TestGWCovG2_TryChatModelUpstreamClientFailure(t *testing.T) {
 	gw.pool = upstream.NewPool(upstream.Options{})
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 
@@ -479,7 +484,7 @@ func TestGWCovG2_FinishChatHopUpstreamError(t *testing.T) {
 	// method's semantic output through the plain error interface: the
 	// documented contract prefix over the wrapped cause.
 	cause := errors.New("g2 hop lost mid-flight")
-	var carrier error = unknownOutcomeError(cause)
+	var carrier = unknownOutcomeError(cause)
 	if msg := carrier.Error(); msg != "upstream outcome unknown: g2 hop lost mid-flight" {
 		t.Errorf("unknown-outcome carrier via error interface = %q, want the contract prefix over the cause", msg)
 	}
@@ -504,7 +509,7 @@ func TestGWCovG2_RejectChatAttemptUnknownOutcome(t *testing.T) {
 	gw := &gateway{}
 	gw.log = g2DiscardLogger()
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 
 	lastErr := unknownOutcomeError(errors.New("g2 upstream connection lost"))
@@ -572,7 +577,7 @@ func TestGWCovG2_FinishChatCacheHitEffortAttribution(t *testing.T) {
 	gw.effortModels = []string{"gpt-4o"}
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 	cc.info = resolver.ModelInfo{ModelName: "gpt-4o-mini", Provider: "openai", Enabled: true}
@@ -602,7 +607,7 @@ func TestGWCovG2_FinishChatCacheHitWriteFailure(t *testing.T) {
 	lh := &g2LogHandler{}
 
 	w := newG2FailWriter()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.l = slog.New(lh)
 	cc.body = []byte(g2ValidRequestBody)
@@ -690,7 +695,7 @@ func TestGWCovG2_MaybeEvalgateSampleFallbackPremiumResolutionFailure(t *testing.
 	gw.res = res
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 	cc.classifierClass = string(classifier.ClassMedium)
@@ -721,7 +726,7 @@ func TestGWCovG2_MaybeEvalgateSampleFallbackPremiumResolutionFailure(t *testing.
 	gw2.log = g2DiscardLogger()
 	gw2.cfg.EvalgateSampleRate = 1
 	gw2.res = res2
-	cc2 := g2ChatContext(httptest.NewRecorder(), httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody)))
+	cc2 := g2ChatContext(httptest.NewRecorder(), httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody)))
 	cc2.classifierClass = string(classifier.ClassEasy)
 	ev2 := &eventpub.Event{}
 	gw2.maybeEvalgateSample(context.Background(), cc2, "gpt-4o-mini", resp, ev2)
@@ -783,7 +788,7 @@ func TestGWCovG2_EvalgateJudgeVerdictStoreFailure(t *testing.T) {
 	gw.publisher = fuzzDeadRedis(t)
 
 	w := httptest.NewRecorder()
-	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 	cc := g2ChatContext(w, r)
 	cc.body = []byte(g2ValidRequestBody)
 
@@ -824,7 +829,7 @@ func TestGWCovG2_EvalgateJudgeVerdictStoreFailure(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGWCovG2_WriteChatCacheAsyncSkipAndFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 	resp := []byte(g2ValidCompletion)
 
 	t.Run("invalid provider token counts skip the write", func(t *testing.T) {
@@ -834,7 +839,7 @@ func TestGWCovG2_WriteChatCacheAsyncSkipAndFailure(t *testing.T) {
 		gw.cache = rc
 
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 		cc := g2ChatContext(w, r)
 		cc.body = []byte(g2ValidRequestBody)
 
@@ -854,7 +859,7 @@ func TestGWCovG2_WriteChatCacheAsyncSkipAndFailure(t *testing.T) {
 		gw.cache = rc
 
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 		cc := g2ChatContext(w, r)
 		cc.l = slog.New(lh)
 		cc.body = []byte(g2ValidRequestBody)
@@ -918,7 +923,7 @@ func TestGWCovG2_WriteChatJSONClientWriteFailure(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestGWCovG2_FinishPolicyDeniedJSONAccountingFailure(t *testing.T) {
-	ctx := context.Background()
+	ctx := t.Context()
 
 	t.Run("terminal facts failure withholds the response", func(t *testing.T) {
 		store := &fakeInvocationStore{factsErr: errors.New("g2 terminal facts boom")}
@@ -933,7 +938,7 @@ func TestGWCovG2_FinishPolicyDeniedJSONAccountingFailure(t *testing.T) {
 		gctx := withInvocationIdentity(ctx, h)
 
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 		r.Header.Set("X-Session-Key-Id", "2")
 		cc := g2ChatContext(w, r)
 		cc.body = []byte(g2ValidRequestBody)
@@ -970,7 +975,7 @@ func TestGWCovG2_FinishPolicyDeniedJSONAccountingFailure(t *testing.T) {
 		gctx := withInvocationIdentity(ctx, h)
 
 		w := httptest.NewRecorder()
-		r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
+		r := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(g2ValidRequestBody))
 		cc := g2ChatContext(w, r)
 		cc.body = []byte(g2ValidRequestBody)
 		cc.invocation = h

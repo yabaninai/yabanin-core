@@ -107,7 +107,7 @@ func TestGWCovG7_ResponsesNativeEmptyProviderDefaultsToOpenAI(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "/v1/responses", gotPath.Load(),
 		"served by the native path, not the /v1/chat/completions translation adapter")
-	require.Equal(t, `{"g7":"native-ok"}`, rec.Body.String())
+	require.JSONEq(t, `{"g7":"native-ok"}`, rec.Body.String())
 }
 
 // TestGWCovG7_HopTerminationClassification pins the total three-way settle

@@ -969,6 +969,7 @@ type sseGenFrameCase struct {
 // Trailing zero bytes avoid the c[3] frame-shape arms; a nullChoice entry
 // must end at c[3]=0x20 to activate the null-choice-member arm.
 func sseGenPercentPayload(t *testing.T, tc sseGenFrameCase) []byte {
+	t.Helper()
 	payload := append([]byte{0x80}, []byte(tc.args)...) // denied, named, resolvable
 	for len(payload) < 4 {                              // sseGenFrames emits whole 4-byte groups only
 		payload = append(payload, 0x00)
