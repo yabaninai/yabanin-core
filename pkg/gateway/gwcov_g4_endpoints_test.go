@@ -52,9 +52,9 @@ func (g4ErrReader) Read([]byte) (int, error) { return 0, errors.New("g4: body re
 // requireStreamFlusher must refuse a streaming dispatch on a non-flusher.
 type g4NoFlush struct{ rec *httptest.ResponseRecorder }
 
-func (w *g4NoFlush) Header() http.Header       { return w.rec.Header() }
+func (w *g4NoFlush) Header() http.Header         { return w.rec.Header() }
 func (w *g4NoFlush) Write(p []byte) (int, error) { return w.rec.Write(p) }
-func (w *g4NoFlush) WriteHeader(code int)      { w.rec.WriteHeader(code) }
+func (w *g4NoFlush) WriteHeader(code int)        { w.rec.WriteHeader(code) }
 
 // g4Gateway builds the strict-key gateway over one stub model row and a live
 // fake invocation store, mirroring the package's endpoint-test harness.
@@ -412,7 +412,7 @@ func TestGWCovG4_Completions_StreamClientCancelSettlesClientCancel(t *testing.T)
 	}
 	require.True(t, sawFrame, "the relayed frame must reach the client before the walk-away")
 
-	cancel() // the client walks away mid-drain
+	cancel()                       // the client walks away mid-drain
 	_, _ = io.Copy(io.Discard, br) // drain what still arrives; the context death ends it
 
 	select {

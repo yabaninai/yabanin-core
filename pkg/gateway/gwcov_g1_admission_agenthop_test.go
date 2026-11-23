@@ -30,8 +30,8 @@ import (
 
 	"github.com/reireirei/yabanin/pkg/budget"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
-	"github.com/reireirei/yabanin/pkg/policy"
 	"github.com/reireirei/yabanin/pkg/pipeline/llmjudge"
+	"github.com/reireirei/yabanin/pkg/policy"
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
@@ -165,7 +165,7 @@ func TestGWCovG1_ResidencyRemapResolutionUnavailableAnswers503(t *testing.T) {
 func TestGWCovG1_ResidencyPackHeader(t *testing.T) {
 	newCase := func(pack string) (*httptest.ResponseRecorder, bool) {
 		gw := &gateway{
-			log:              slog.Default(),
+			log:               slog.Default(),
 			residencyEnforcer: fakeResidency{dec: policy.Decision{Allowed: true, Region: "EU", PackID: pack}},
 		}
 		rec := httptest.NewRecorder()

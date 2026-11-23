@@ -944,63 +944,121 @@ func TestSSEGenDeniedCountContract(t *testing.T) {
 // with the denied name and exact argument payload intact — and the gate
 // must still filter that denied call (bytes suppressed, exactly one counted
 // denial) instead of falling through its unparseable-passthrough arm.
+// sseGenJSONDoc mirrors the tool-call frame shape the generator emits.
+type sseGenJSONDoc struct {
+	Choices []struct {
+		Delta struct {
+			ToolCalls []map[string]any `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// sseGenFrameCase is one percent-payload table entry: args is the raw
+// denied payload tail, wantArgs the exact arguments string the generator
+// must carry through JSON, and nullChoice marks the entry that also
+// activates the null-choice-member arm via 0x20 at c[3].
+type sseGenFrameCase struct {
+	args       string
+	wantArgs   string
+	nullChoice bool
+}
+
+// sseGenPercentPayload builds the denied, named, resolvable control input
+// for one table case: the 0x80 lead byte, then args, zero-padded to
+// exactly one 4-byte group so the round-trip maps frame-to-payload.
+// Trailing zero bytes avoid the c[3] frame-shape arms; a nullChoice entry
+// must end at c[3]=0x20 to activate the null-choice-member arm.
+func sseGenPercentPayload(t *testing.T, tc sseGenFrameCase) []byte {
+	payload := append([]byte{0x80}, []byte(tc.args)...) // denied, named, resolvable
+	for len(payload) < 4 {                              // sseGenFrames emits whole 4-byte groups only
+		payload = append(payload, 0x00)
+	}
+	if len(payload) != 4 {
+		t.Fatalf("args %q: control payload exceeds one frame group", tc.args)
+	}
+	if tc.nullChoice && payload[3] != 0x20 {
+		t.Fatalf("args %q: null-choice case must set 0x20 at c[3]", tc.args)
+	}
+	return payload
+}
+
+// assertSSEGenFramePayload decodes one generated SSE frame: it must be
+// valid JSON whose tool call carries the denied name with exactly the
+// table's wanted arguments (JSON round-trip control).
+func assertSSEGenFramePayload(t *testing.T, fr, wantArgs string) {
+	t.Helper()
+	line := strings.TrimSuffix(strings.TrimPrefix(fr, "data: "), "\n\n")
+	if !json.Valid([]byte(line)) {
+		t.Fatalf("generated frame is not valid JSON: %q", fr)
+	}
+	var doc sseGenJSONDoc
+	if err := json.Unmarshal([]byte(line), &doc); err != nil {
+		t.Fatalf("frame does not decode: %v", err)
+	}
+	var call map[string]any
+	for _, ch := range doc.Choices {
+		if len(ch.Delta.ToolCalls) > 0 {
+			call = ch.Delta.ToolCalls[0]
+		}
+	}
+	if call == nil {
+		t.Fatalf("frame carries no tool call: %q", fr)
+	}
+	fn, _ := call["function"].(map[string]any)
+	if fn == nil || fn["name"] != "secret_tool" {
+		t.Fatalf("denied name lost or mangled: %v", fn)
+	}
+	if fn["arguments"] != wantArgs {
+		t.Fatalf("arguments mangled: %q != %q", fn["arguments"], wantArgs)
+	}
+}
+
+// assertSSEGenDeniedFrames runs the JSON round-trip control across every
+// generated frame of one table case.
+func assertSSEGenDeniedFrames(t *testing.T, tc sseGenFrameCase, frames []string) {
+	t.Helper()
+	if len(frames) == 0 {
+		t.Fatalf("args %q: no generated frames to validate", tc.args)
+	}
+	for _, fr := range frames {
+		assertSSEGenFramePayload(t, fr, tc.wantArgs)
+	}
+}
+
+// assertSSEGenDeniedCall drives the real gate over the built payload: the
+// denied bytes must never leak and the denied call must count exactly once.
+func assertSSEGenDeniedCall(t *testing.T, payload []byte) {
+	t.Helper()
+	_, out, count, _ := sseGenDrive(t, payload)
+	if strings.Contains(out, "secret_tool") {
+		t.Fatalf("denied bytes leaked: %q", out)
+	}
+	if count != 1 {
+		t.Fatalf("denied call not counted exactly once: %d", count)
+	}
+}
+
+// TestSSEGenJSONValidAndDeniedFilter drives one 4-byte percent payload per
+// table case through the generator: every frame must round-trip as valid
+// JSON with the denied name and arguments intact, denied bytes must never
+// leak, and the denied call must count exactly once.
 func TestSSEGenJSONValidAndDeniedFilter(t *testing.T) {
-	// Every payload stays within one 4-byte group (zero padding completes
-	// the group) so the round-trip below maps frame-to-payload exactly, and
-	// trailing bytes avoid the c[3] frame-shape arms; the last case sets
-	// 0x20 at c[3], activating the null-choice-member arm on top of the
-	// percent payload.
-	for _, args := range []string{"% ", "%s", "%!", "%w", "0%\x03", "% \x20"} {
-		payload := append([]byte{0x80}, []byte(args)...) // denied, named, resolvable
-		for len(payload) < 4 {                           // sseGenFrames emits whole 4-byte groups only
-			payload = append(payload, 0x00)
-		}
-		if len(payload) != 4 {
-			t.Fatalf("args %q: control payload exceeds one frame group", args)
-		}
-		frames, sawDenied := sseGenFrames(payload)
-		if !sawDenied {
-			t.Fatalf("args %q: denied call was not declared countable", args)
-		}
-		wantArgs := string(payload[1:])
-		for _, fr := range frames {
-			line := strings.TrimSuffix(strings.TrimPrefix(fr, "data: "), "\n\n")
-			if !json.Valid([]byte(line)) {
-				t.Fatalf("args %q: generated frame is not valid JSON: %q", args, fr)
+	for _, tc := range []sseGenFrameCase{
+		{args: "% ", wantArgs: "% \x00"},
+		{args: "%s", wantArgs: "%s\x00"},
+		{args: "%!", wantArgs: "%!\x00"},
+		{args: "%w", wantArgs: "%w\x00"},
+		{args: "0%\x03", wantArgs: "0%\x03"},
+		{args: "% \x20", wantArgs: "% \x20", nullChoice: true},
+	} {
+		t.Run(tc.args, func(t *testing.T) {
+			payload := sseGenPercentPayload(t, tc)
+			frames, sawDenied := sseGenFrames(payload)
+			if !sawDenied {
+				t.Fatalf("args %q: denied call was not declared countable", tc.args)
 			}
-			var doc struct {
-				Choices []struct {
-					Delta struct {
-						ToolCalls []map[string]any `json:"tool_calls"`
-					} `json:"delta"`
-				} `json:"choices"`
-			}
-			if err := json.Unmarshal([]byte(line), &doc); err != nil {
-				t.Fatalf("args %q: frame does not decode: %v", args, err)
-			}
-			var call map[string]any
-			for _, ch := range doc.Choices {
-				if len(ch.Delta.ToolCalls) > 0 {
-					call = ch.Delta.ToolCalls[0]
-				}
-			}
-			if call == nil {
-				t.Fatalf("args %q: frame carries no tool call: %q", args, fr)
-			}
-			fn, _ := call["function"].(map[string]any)
-			if fn == nil || fn["name"] != "secret_tool" {
-				t.Fatalf("args %q: denied name lost or mangled: %v", args, fn)
-			}
-			if fn["arguments"] != wantArgs {
-				t.Fatalf("args %q: arguments mangled: %q != %q", args, fn["arguments"], wantArgs)
-			}
-		}
-		_, out, count, _ := sseGenDrive(t, payload)
-		if strings.Contains(out, "secret_tool") {
-			t.Fatalf("args %q: denied bytes leaked: %q", args, out)
-		}
-		if count != 1 {
-			t.Fatalf("args %q: denied call not counted exactly once: %d", args, count)
-		}
+			assertSSEGenDeniedFrames(t, tc, frames)
+			assertSSEGenDeniedCall(t, payload)
+		})
 	}
 }

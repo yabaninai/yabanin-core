@@ -23,6 +23,48 @@ import critical
 import critical_conservative
 import critical_scope
 
+# Fixture repos mint their own base commits and never inherit a product
+# quality run's ambient Preview2 override: clear it at import time so every
+# control below runs strict regardless of the outer environment
+# (full-quality 20261123T154718Z-695cf83b failed 14 fixture controls on
+# exactly this leakage; seed_override_binding fails closed on mismatch).
+os.environ.pop(critical.SEED_OVERRIDE_ENV, None)
+
+
+class AmbientOverrideIsolationControls(unittest.TestCase):
+    """An ambient product override variable must fail fixture repos closed.
+
+    Fixture repos carry their own base SHAs; seed_override_binding must
+    keep rejecting an ambient Preview2 base instead of relaxing their
+    gates, while a matching base keeps binding and a cleared environment
+    keeps the strict default.
+    """
+
+    FIXTURE_BASE = 'fixture-own-base-sha'
+    PRODUCT_BASE = '4e9895d3633dd151e1bd69c4b4617ea333126b62'
+
+    def test_ambient_product_base_fails_fixture_strictly(self):
+        os.environ[critical.SEED_OVERRIDE_ENV] = self.PRODUCT_BASE
+        try:
+            with self.assertRaises(ValueError) as caught:
+                critical.seed_override_binding(self.FIXTURE_BASE)
+        finally:
+            os.environ.pop(critical.SEED_OVERRIDE_ENV, None)
+        self.assertIn('base mismatch', str(caught.exception))
+
+    def test_matching_base_still_binds(self):
+        os.environ[critical.SEED_OVERRIDE_ENV] = self.FIXTURE_BASE
+        try:
+            binding = critical.seed_override_binding(self.FIXTURE_BASE)
+        finally:
+            os.environ.pop(critical.SEED_OVERRIDE_ENV, None)
+        self.assertEqual(binding,
+                         {'base': self.FIXTURE_BASE, 'activations': []})
+
+    def test_cleared_env_keeps_strict_binding(self):
+        os.environ.pop(critical.SEED_OVERRIDE_ENV, None)
+        self.assertIsNone(critical.seed_override_binding(self.FIXTURE_BASE))
+
 # Frozen pre-fix helper and consumer blobs for the original-leg
 # controls, embedded zlib+base64 so every control runs from a clean
 # source archive or shallow checkout with no git history. Each entry is
