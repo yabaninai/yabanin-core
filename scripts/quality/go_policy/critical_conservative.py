@@ -218,22 +218,33 @@ class Side:
         self._indexes = None
         self._prodindex = None
         self._reverse_edges = None
+        self._functions = None
+        self._test_units = None
 
     def functions(self):
-        """All production function units with their file, in stable order."""
-        rows = []
-        for path in self.production:
-            rows.extend(dict(u, file=path) for u in self.files[path]['units'] if u['name'])
-        return rows
+        """All production function units with their file, in stable order.
+
+        Memoized once per immutable Side snapshot like indexes(): rows
+        are read-only shared copies, so repeated calls never rebuild.
+        """
+        if self._functions is None:
+            rows = []
+            for path in self.production:
+                rows.extend(dict(u, file=path) for u in self.files[path]['units'] if u['name'])
+            self._functions = rows
+        return self._functions
 
     def declarations(self, path):
         return [u for u in self.files[path]['units'] if not u['name']]
 
     def test_units(self):
-        rows = []
-        for path in self.tests:
-            rows.extend(dict(u, file=path) for u in self.files[path]['units'] if u['name'])
-        return rows
+        """All named test units with their file, in stable order; see functions()."""
+        if self._test_units is None:
+            rows = []
+            for path in self.tests:
+                rows.extend(dict(u, file=path) for u in self.files[path]['units'] if u['name'])
+            self._test_units = rows
+        return self._test_units
 
     def indexes(self):
         """Cached closure index; materialized once per side snapshot."""
@@ -2104,11 +2115,17 @@ def base_counterpart(row, previous, renames):
 
 
 def rows_named(side, *names):
-    """Base production rows carrying any of these function names."""
+    """Base production rows carrying any of these function names.
+
+    Reads the cached prodindex name groups instead of rescanning the
+    whole production side per call. Callers resolve candidates by
+    membership and ambiguity, never by order, so group order does not
+    matter; every call still returns a fresh list over shared rows.
+    """
+    by_key, by_name = side.prodindex()
     rows = []
-    for base in side.functions():
-        if base['name'] in names:
-            rows.append(base)
+    for name in dict.fromkeys(names):
+        rows.extend(by_name.get(name, ()))
     return rows
 
 
