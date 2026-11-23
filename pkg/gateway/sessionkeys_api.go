@@ -482,10 +482,9 @@ func parseOwnUsageParams(raw string) (ownUsageParams, error) {
 		}
 		filter[norm] = values[0]
 	}
-	p.filter, err = json.Marshal(filter)
-	if err != nil {
-		return p, err
-	}
+	// filter is map[string]string: every Go string is JSON-encodable
+	// (invalid UTF-8 coerces to U+FFFD), so Marshal cannot fail.
+	p.filter, _ = json.Marshal(filter)
 	if group := query.Get("group_by"); group != "" {
 		p.groupExpr, err = usageGroupExpression(group)
 	}

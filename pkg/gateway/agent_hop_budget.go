@@ -656,14 +656,13 @@ func chargeHopWorkload(ctx context.Context, org string, costUSD float64) {
 // hopTermination resolves the hop's settle termination: an upstream error
 // wins (even when usage is known — the hop's terminal class is the wire
 // failure); otherwise the parent request's completion termination applies.
+// completionTermination's range is confined to the valid Finalize set, so
+// no defensive fallthrough is needed.
 func hopTermination(ctx context.Context, callErr error) string {
-	if callErr != nil && budget.ValidTermination(budget.TerminationUpstreamErr) {
+	if callErr != nil {
 		return string(budget.TerminationUpstreamErr)
 	}
-	if term := completionTermination(ctx); budget.ValidTermination(term) {
-		return string(term)
-	}
-	return ""
+	return string(completionTermination(ctx))
 }
 
 // commitHopTerminal is the judge-hop seam of the finishRequest funnel

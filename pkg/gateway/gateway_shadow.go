@@ -101,11 +101,11 @@ func (gw *gateway) buildShadowJob(ctx context.Context, body []byte, model, orgID
 	}
 	m["model"] = sc.Model
 	m["stream"] = false
-	shadowBody, err := json.Marshal(m)
-	if err != nil {
-		l.Debug("shadow: body rewrite failed", "error", err)
-		return shadow.Job{}
-	}
+	// m holds only json.Unmarshal decode products (all finite floats: NaN,
+	// Infinity and 1e999-range numbers fail Unmarshal above and degrade to
+	// the empty map) plus one config string and one bool - Marshal cannot
+	// fail on this type set.
+	shadowBody, _ := json.Marshal(m)
 
 	// Usage parsing + cost use the shadow model's own adapter (the shadow
 	// target is what produced the tokens; its adapter knows its schema).

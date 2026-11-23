@@ -304,10 +304,9 @@ func writeResponsesStreamFailedCode(w http.ResponseWriter, code, message string)
 			"output": []any{},
 		},
 	}
-	raw, err := json.Marshal(payload)
-	if err != nil {
-		return
-	}
+	// The frame is a literal tree of strings and empty containers with no
+	// float values, cycles or custom marshalers - Marshal cannot fail.
+	raw, _ := json.Marshal(payload)
 	if _, err := fmt.Fprintf(w, "event: response.failed\ndata: %s\n\n", raw); err != nil {
 		return
 	}

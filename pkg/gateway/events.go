@@ -157,15 +157,13 @@ func publishAttempt(ctx context.Context, p *eventpub.RedisPublisher, l *slog.Log
 	const (
 		maxRetries = 3
 		baseDelay  = 50 * time.Millisecond
-		maxDelay   = 300 * time.Millisecond
 	)
 	var err error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
-			delay := baseDelay << uint(attempt-1) // safe: attempt is bounded by maxRetries (3)
-			if delay > maxDelay {
-				delay = maxDelay
-			}
+			// attempt <= maxRetries (3) caps the shift at <<2: the ladder
+			// tops out at 200ms and needs no upper clamp.
+			delay := baseDelay << uint(attempt-1)
 			time.Sleep(delay)
 		}
 		attemptCtx, cancel := context.WithTimeout(ctx, 2*time.Second)

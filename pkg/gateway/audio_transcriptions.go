@@ -133,7 +133,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer cancel()
-	rebuilt, extra, err := audioRebuildForm(parts, admitted.Info.ModelName)
+	rebuilt, extra, err := audioRebuild(parts, admitted.Info.ModelName)
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to encode upstream request")
@@ -353,6 +353,12 @@ func audioFormMetadata(parts []audioFormPart, file *audioFormPart) []byte {
 	}
 	return out
 }
+
+// audioRebuild is the handler's rebuild seam: a package variable so tests
+// can force the defensive encode failure the bytes.Buffer-backed multipart
+// writer cannot produce by itself (audioRebuildForm's write targets cannot
+// return errors under the pinned toolchain).
+var audioRebuild = audioRebuildForm
 
 // audioRebuildForm re-encodes the collected parts into the upstream multipart
 // stream: the model field value is replaced with the resolved registry model
