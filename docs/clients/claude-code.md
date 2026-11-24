@@ -67,9 +67,11 @@ gateway key above and the gateway authenticates upstream with the org key.
 ## Limits
 
 - Translation drops `thinking`, hosted tools, and `cache_control`.
-- Native Anthropic mode forwards model `tool_use` blocks without org
-  tool-policy gating; deny policies strip tool calls on the translated route
-  only.
+- Org tool policies gate the model's tool calls on both routes: deny
+  policies strip denied calls on the translated route, and native Anthropic
+  mode strips denied `tool_use` blocks from the reply (buffered and
+  streaming) while keeping the surviving call indices contiguous and
+  rewriting a stranded `tool_use` finish to `end_turn`.
 - Fixture coverage is not a live Claude Code run.
 
 ## Check

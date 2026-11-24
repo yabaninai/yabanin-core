@@ -14,30 +14,28 @@ import (
 	"github.com/reireirei/yabanin/pkg/toolpolicy"
 )
 
-// Characterization controls for the Claude Code Messages contract
-// (docs/clients/claude-code.md, docs/compatibility.md): they pin the CURRENT
-// native-route behavior this documentation describes — the documented native
-// tool-gating limitation, the anthropic-version/beta header contract,
-// unknown-field forwarding, and the response-header passthrough allowlist.
-// They bind documented facts to producer behavior at this base; they do not
-// claim live-binary compatibility (the Claude Code CLI row stays
-// `not verified`).
+// Contract controls for the Claude Code Messages contract
+// (docs/clients/claude-code.md, docs/compatibility.md): they bind documented
+// facts to producer behavior — native tool-policy enforcement (the SSE and
+// edge-case controls live in messages_claude_toolgate_test.go), the
+// anthropic-version/beta header contract, unknown-field forwarding, and the
+// response-header passthrough allowlist. They do not claim live-binary
+// compatibility (the Claude Code CLI row stays `not verified`).
 
 // ccNativeMessageBody is a minimal valid native /v1/messages reply the mock
 // anthropic upstream serves for the header and passthrough controls.
 const ccNativeMessageBody = `{"id":"msg_1","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"ok"}],"stop_reason":"end_turn","usage":{"input_tokens":1,"output_tokens":1}}`
 
-// TestMessagesNative_ToolUseNotToolGated pins the documented native
-// limitation end to end on one gateway with one wired deny engine: a
-// `bash` deny policy strips the tool call on the translated chat route
-// (TOOL-02, chat surface) while the SAME engine does not touch the native
-// Anthropic reply — the native relay forwards `tool_use` ungated
-// (docs/clients/claude-code.md "Native Anthropic mode does not apply tool
-// gating"; producer anchors pkg/gateway/messages_native.go — no toolgate
-// reference — versus pkg/gateway/chat.go gateChatToolCalls on the chat
-// surface).
-func TestMessagesNative_ToolUseNotToolGated(t *testing.T) {
-	const nativeBody = `{"id":"msg_2","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"working"},{"type":"tool_use","id":"toolu_1","name":"bash","input":{"cmd":"ls"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}`
+// TestMessagesNative_ToolPolicyEnforced pins the native-surface TOOL-02
+// contract end to end on one gateway with one wired deny engine: a `bash`
+// deny policy strips the denied tool_use block from the native Anthropic
+// reply while the allowed calculator survives with its id and input intact
+// and the stop_reason stays tool_use (a survivor keeps the client tool loop
+// alive); the SAME engine strips the tool call on the translated chat route,
+// proving the engine was active for these requests. The ledger bills the
+// ORIGINAL usage exactly once (CP-C02-02, docs/clients/claude-code.md).
+func TestMessagesNative_ToolPolicyEnforced(t *testing.T) {
+	const nativeBody = `{"id":"msg_2","type":"message","role":"assistant","model":"claude-upstream","content":[{"type":"text","text":"working"},{"type":"tool_use","id":"toolu_1","name":"bash","input":{"cmd":"ls"}},{"type":"tool_use","id":"toolu_2","name":"calculator","input":{"expr":"2+2"}}],"stop_reason":"tool_use","usage":{"input_tokens":3,"output_tokens":4}}`
 	const adaptedBody = `{"id":"c1","object":"chat.completion","model":"m","choices":[{"index":0,"message":{"role":"assistant","content":"","tool_calls":[{"id":"c1","type":"function","function":{"name":"bash","arguments":"{}"}},{"id":"c2","type":"function","function":{"name":"calculator","arguments":"{}"}}]},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`
 
 	var nativePathHit bool
@@ -61,31 +59,21 @@ func TestMessagesNative_ToolUseNotToolGated(t *testing.T) {
 	}
 	gw.toolPolicies = toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
 
-	// Native branch: the wired deny policy does not reach the native relay.
+	terminal, events := ccCaptureNativeLedger(t)
+
+	// Native branch: the deny policy removes the bash tool_use; the allowed
+	// calculator (id + input) and the text block survive untouched.
 	rec := postMessages(t, gw, `{"model":"claude-3-5-sonnet","max_tokens":8,"messages":[{"role":"user","content":"Hi"}]}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("native status %d %s", rec.Code, rec.Body.String())
-	}
 	if !nativePathHit {
 		t.Fatal("native branch was not served")
 	}
-	if !strings.Contains(rec.Body.String(), `"type":"tool_use"`) || !strings.Contains(rec.Body.String(), `"name":"bash"`) {
-		t.Fatalf("native tool_use must be forwarded ungated (documented limitation): %s", rec.Body.String())
-	}
+	ccAssertNativeGated(t, rec)
+	ccAssertNativeLedger(t, terminal(), events(), 3, 4)
 
 	// Adapted contrast on the same gateway and engine: the identical deny
-	// strips the call on the translated chat route, proving the engine was
-	// active for these requests.
+	// strips the call on the translated chat route.
 	rec = postMessages(t, gw, `{"model":"m","max_tokens":8,"messages":[{"role":"user","content":"Hi"}]}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("adapted status %d %s", rec.Code, rec.Body.String())
-	}
-	if strings.Contains(rec.Body.String(), `"bash"`) {
-		t.Fatalf("denied tool_call must be stripped on the translated route: %s", rec.Body.String())
-	}
-	if !strings.Contains(rec.Body.String(), `"calculator"`) {
-		t.Fatalf("allowed tool_call must survive the gate: %s", rec.Body.String())
-	}
+	ccAssertAdaptedGate(t, rec)
 }
 
 // ccHeaderObserver captures the anthropic headers an upstream mock received.

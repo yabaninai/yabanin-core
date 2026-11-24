@@ -1,0 +1,649 @@
+package cli
+
+// TOOL-02 native twin: tool-use gating on the Anthropic-native Messages
+// surface (docs/clients/claude-code.md). The chat surface strips denied
+// tool_calls (toolgate.go); this file applies the same org policy to the
+// native wire, where the model declares tool_use content blocks:
+//
+//   - JSON surface (messagesNativeJSON): denied tool_use blocks are
+//     removed from content, and a "tool_use" stop_reason whose every call
+//     was denied is rewritten to "end_turn" so a client tool loop is
+//     never stranded. Nothing changed → byte identity.
+//   - SSE surface (messagesNativeStream): a frame-level gate sits between
+//     the upstream body and the terminal-hold relay. A denied block's
+//     frames are suppressed whole (the client never sees one byte), the
+//     content_block indices of everything after the removal point are
+//     renumbered so the visible stream stays contiguous, and the
+//     message_delta stop_reason is rewritten under the same all-denied
+//     rule. An allowed tool_use is held until content_block_stop, where
+//     its accumulated input runs through the same args guard as the chat
+//     path (GuardDeclaredArgs) before a single frame is released.
+//
+// The engine decides lazily: until a frame actually declares a tool_use,
+// bytes pass through untouched (no policies → zero parsing, byte
+// identity). Failure modes mirror the chat canon: malformed or
+// interleaved frames inside an unresolved run DISCARD the run
+// fail-closed (never released unchecked, never converted into an allowed
+// call), a truncated stream discards the unresolved run, and a cancelled
+// context fails open (D-15) — held allowed frames release verbatim,
+// decided denials stay dropped. Usage accounting is untouched by design:
+// the relay's usage comes from message_start/message_delta, which the
+// gate never rewrites except the stop_reason member.
+
+import (
+	"bufio"
+	"bytes"
+	"context"
+	"encoding/json"
+	"io"
+	"log/slog"
+
+	"github.com/reireirei/yabanin/pkg/apiformat"
+	"github.com/reireirei/yabanin/pkg/metrics"
+	"github.com/reireirei/yabanin/pkg/toolpolicy"
+)
+
+// ---- JSON surface ----
+
+// gateNativeToolUseJSON strips tool_use content blocks the org policy
+// denies from a buffered native Messages reply. Byte identity is
+// preserved when nothing is denied; the denied tool names are returned
+// for logging (the per-tool metric is the tracking surface).
+func (gw *gateway) gateNativeToolUseJSON(ctx context.Context, orgID, subject string, body []byte) ([]byte, []string) {
+	if gw.toolPolicies == nil || !gw.toolPolicies.HasDenyPolicies(ctx, orgID) {
+		return body, nil
+	}
+	doc, blocks, ok := nativeMessageBlocks(body)
+	if !ok {
+		return body, nil
+	}
+	kept, denied, keptTools := gw.filterNativeBlocks(ctx, orgID, subject, blocks)
+	if len(denied) == 0 {
+		return body, nil
+	}
+	content, err := json.Marshal(kept)
+	if err != nil {
+		return body, denied // never fail the response over a filter bug
+	}
+	doc["content"] = content
+	if !keptTools {
+		nativeStripToolFinish(doc)
+	}
+	out, err := json.Marshal(doc)
+	if err != nil {
+		return body, denied
+	}
+	return out, denied
+}
+
+// nativeMessageBlocks decodes the raw message envelope and its content
+// block array. ok=false means the body is not a shaped native message —
+// the gate passes it through untouched.
+func nativeMessageBlocks(body []byte) (doc map[string]json.RawMessage, blocks []json.RawMessage, ok bool) {
+	doc = map[string]json.RawMessage{}
+	if err := json.Unmarshal(body, &doc); err != nil {
+		return nil, nil, false // not a message body — pass through untouched
+	}
+	if err := json.Unmarshal(doc["content"], &blocks); err != nil || len(blocks) == 0 {
+		return nil, nil, false
+	}
+	return doc, blocks, true
+}
+
+// nativeStripToolFinish repairs a stranded finish: with every declared
+// call denied, a "tool_use" stop_reason would strand the consumer's tool
+// loop, so it normalizes to "end_turn" (the SSE twin rewrites the
+// message_delta the same way).
+func nativeStripToolFinish(doc map[string]json.RawMessage) {
+	if reason, _ := nativeStopReason(doc["stop_reason"]); reason == "tool_use" {
+		doc["stop_reason"] = json.RawMessage(`"end_turn"`)
+	}
+}
+
+// nativeDeniedWarn logs the org-scoped enforcement summary once per reply
+// (chat parity); empty denials stay silent.
+func nativeDeniedWarn(l *slog.Logger, orgID string, denied []string) {
+	if len(denied) == 0 {
+		return
+	}
+	l.Warn("tool policy denied native tool_use", "org", orgID, "tools", toolNamesFromDenied(denied))
+}
+
+// filterNativeBlocks applies the policy to every content block: denied
+// tool_use blocks drop (counted per tool), everything else passes. keptTools
+// reports whether a tool_use block survived — the stop_reason rewrite must
+// not strand a loop that still has a live call.
+func (gw *gateway) filterNativeBlocks(ctx context.Context, orgID, subject string, blocks []json.RawMessage) (kept []json.RawMessage, denied []string, keptTools bool) {
+	kept = make([]json.RawMessage, 0, len(blocks))
+	for _, raw := range blocks {
+		drop, name, isTool := gw.nativeBlockAllowed(ctx, orgID, subject, raw)
+		if drop {
+			if name != "" {
+				denied = append(denied, name)
+				metrics.ToolPolicyDeniedTotal.WithLabelValues(orgID, name).Inc()
+			}
+			continue
+		}
+		kept = append(kept, raw)
+		keptTools = keptTools || isTool
+	}
+	return kept, denied, keptTools
+}
+
+// nativeBlockAllowed runs the decision for one content block. Non-tool_use
+// members and members that do not parse pass; a nameless tool_use is an
+// ambiguous executable declaration and fails closed (chat filterToolCall
+// parity); a named tool_use faces the deny decision and the declared-args
+// guard under the same server="*" addressing as the chat surface.
+func (gw *gateway) nativeBlockAllowed(ctx context.Context, orgID, subject string, raw json.RawMessage) (drop bool, name string, isTool bool) {
+	var block nativeBlockHead
+	if json.Unmarshal(raw, &block) != nil {
+		return false, "", false
+	}
+	if block.Type != "tool_use" {
+		return false, "", false
+	}
+	if block.Name == "" {
+		return true, "", true
+	}
+	if d := gw.toolPolicies.Decide(ctx, orgID, subject, block.Name); d.Action == toolpolicy.ActionDeny {
+		return true, block.Name, true
+	}
+	args := block.Input
+	if len(args) == 0 {
+		args = json.RawMessage(`{}`)
+	}
+	if rep := gw.toolPolicies.GuardDeclaredArgs(ctx, orgID, subject, block.Name, args); rep.Denied {
+		return true, block.Name, true
+	}
+	return false, block.Name, true
+}
+
+// nativeBlockHead is the policy-visible shape of one content block.
+type nativeBlockHead struct {
+	Type  string          `json:"type"`
+	Name  string          `json:"name"`
+	Input json.RawMessage `json:"input"`
+}
+
+// nativeStopReason reads the top-level stop_reason member of a raw
+// message body.
+func nativeStopReason(raw json.RawMessage) (string, bool) {
+	var reason string
+	if err := json.Unmarshal(raw, &reason); err != nil {
+		return "", false
+	}
+	return reason, true
+}
+
+// ---- SSE surface ----
+
+// nativeToolRun is one open tool_use content block: from its
+// content_block_start until its content_block_stop the gate holds every
+// frame of the run. deny runs (decided at the start, or by the args guard
+// at the stop) are swallowed whole; allowed runs release at the stop,
+// after the args guard passed. shift is the removal count at absorb time;
+// release maps the run's wire index to the visible one with it.
+type nativeToolRun struct {
+	rawIdx int
+	shift  int
+	name   string
+	frames [][]byte     // buffered wire frames (start + deltas), verbatim
+	args   bytes.Buffer // accumulated input_json_delta partials
+	deny   bool         // decided denied: swallow everything of this run
+}
+
+// nativeToolGateReader is the SSE-surface tool gate for the native
+// Messages relay: an io.Reader over the (idle-wrapped) upstream body that
+// emits gated frames to relayAnthropicSSE. Until a frame declares a
+// tool_use, bytes pass through untouched; once the gate activates (deny
+// policies exist), frames are routed per event type. The relay downstream
+// keeps its own parser, terminal hold and accounting — this reader only
+// transforms the frame stream.
+type nativeToolGateReader struct {
+	src     *apiformat.SSELineReader
+	frames  apiformat.SSEFrameBuffer
+	engine  *toolpolicy.Engine
+	orgID   string
+	subject string
+	// ctx is the request context: a client disconnect or the stream
+	// ceiling must stop any hold (D-15) — the surface fails open, as the
+	// chat SSE gate pins it.
+	ctx    context.Context
+	out    []byte // gated frames awaiting Read
+	eofErr error  // set once the upstream ended (latched)
+
+	active  bool // deny policies confirmed: frames are routed
+	dead    bool // no deny policies: pure passthrough for the rest of the stream
+	shift   int  // removed content indices (everything after shifts down)
+	hold    *nativeToolRun
+	seenCnt int // tool_use blocks declared across the response
+	keptCnt int // tool_use blocks that survived
+}
+
+// newNativeToolGateReader wraps src for the native stream relay.
+func newNativeToolGateReader(ctx context.Context, src io.Reader, engine *toolpolicy.Engine, orgID, subject string) *nativeToolGateReader {
+	return &nativeToolGateReader{
+		src:    apiformat.NewSSELineReader(bufio.NewReader(src), apiformat.SSEStreamLineLimit),
+		engine: engine, orgID: orgID, subject: subject, ctx: ctx,
+	}
+}
+
+// Read returns gated bytes, pulling and transforming upstream frames as
+// needed. An error ends the stream (EOF for a clean end).
+func (g *nativeToolGateReader) Read(p []byte) (int, error) {
+	for len(g.out) == 0 {
+		if g.eofErr != nil {
+			return 0, g.eofErr
+		}
+		if err := g.pull(); err != nil {
+			g.eofErr = err
+			if len(g.out) == 0 {
+				return 0, err
+			}
+			break
+		}
+	}
+	n := copy(p, g.out)
+	g.out = g.out[n:]
+	return n, nil
+}
+
+// pull reads and routes one upstream frame, or ends the stream: a clean
+// end or a cut propagates the reader's error to the relay (which owns the
+// torn-tail and terminal synthesis), after the gate settles its hold.
+func (g *nativeToolGateReader) pull() error {
+	frame, err := g.nextFrame()
+	if err == nil {
+		g.route(frame)
+		return nil
+	}
+	g.endStream(frame)
+	return err
+}
+
+// endStream settles the hold at an upstream end. A cancelled context
+// fails open (D-15): an allowed run's frames release verbatim, a decided
+// denial stays dropped. Otherwise an unresolved run is discarded
+// fail-closed — a partial accumulation was never guardable — and the
+// trailing bytes only pass when no run was open (preserving the relay's
+// cut semantics for the tail).
+func (g *nativeToolGateReader) endStream(trailing []byte) {
+	if g.ctx.Err() != nil {
+		if g.hold != nil && !g.hold.deny {
+			for _, frame := range g.hold.frames {
+				g.out = append(g.out, frame...)
+			}
+		}
+		g.hold = nil
+		g.dead = true // nothing is held from here on
+	}
+	if g.hold != nil {
+		g.hold = nil
+		return
+	}
+	g.out = append(g.out, trailing...)
+}
+
+// nextFrame assembles the next complete upstream event (verbatim lines
+// plus the separator). At the stream's end it returns the buffered
+// verbatim lines and the trailing partial together with the error, so the
+// relay sees exactly the tail it would have seen without the gate.
+func (g *nativeToolGateReader) nextFrame() ([]byte, error) {
+	for {
+		line, err := g.src.ReadLine()
+		if err == nil {
+			blank, overflow := g.frames.Add(line, apiformat.SSEStreamLineLimit)
+			if overflow {
+				return nil, apiformat.ErrSSELineLimit
+			}
+			if blank {
+				// The separator line itself is not buffered (see
+				// SSEFrameBuffer.Add): compose it verbatim so LF, CRLF
+				// and CR upstreams all stay byte-identical.
+				return append(g.frames.Take(), line...), nil
+			}
+			continue
+		}
+		rest := g.frames.Take()
+		rest = append(rest, line...) // unterminated trailing partial (may be empty)
+		return rest, err
+	}
+}
+
+// route dispatches one frame. While inactive, every frame is scanned for a
+// tool_use declaration (decoded member values, so escaped spellings cannot
+// hide one); a stream whose org has no deny policies latches dead and
+// passes everything verbatim from then on.
+func (g *nativeToolGateReader) route(frame []byte) {
+	if g.dead {
+		g.forward(frame)
+		return
+	}
+	name, payload, hasData := parseNativeSSEFrame(frame)
+	if !g.active {
+		if !hasData || !declaresNativeToolUse(payload) {
+			g.forward(frame)
+			return
+		}
+		if g.engine == nil || !g.engine.HasDenyPolicies(g.ctx, g.orgID) {
+			g.dead = true
+			g.forward(frame)
+			return
+		}
+		g.active = true
+	}
+	g.gateFrame(frame, name, payload)
+}
+
+// gateFrame routes an active frame by event name.
+func (g *nativeToolGateReader) gateFrame(frame []byte, name string, payload []byte) {
+	switch name {
+	case "content_block_start":
+		g.blockStart(frame, payload)
+	case "content_block_delta":
+		g.blockDelta(frame, payload)
+	case "content_block_stop":
+		g.blockStop(frame, payload)
+	case "message_delta":
+		g.messageDelta(frame, payload)
+	default:
+		g.passThrough(frame, payload)
+	}
+}
+
+// passThrough forwards a frame the gate does not otherwise act on
+// (terminals, pings, unknown event types, unparseable payloads). A frame
+// arriving inside an unresolved run violates the sequential block
+// protocol: the run resolves fail-closed first, so nothing unguarded ever
+// escapes around the hold.
+func (g *nativeToolGateReader) passThrough(frame []byte, payload []byte) {
+	if g.hold != nil {
+		g.discardHold()
+	}
+	g.emitShifted(frame, payload)
+}
+
+// blockStart decides a tool_use block at its declaration: a denial drops
+// the run at once (its deltas and stop swallow later); an allowed run
+// holds its frames until content_block_stop, where the args guard runs.
+func (g *nativeToolGateReader) blockStart(frame []byte, payload []byte) {
+	var doc struct {
+		Index int             `json:"index"`
+		Block nativeBlockHead `json:"content_block"`
+	}
+	if json.Unmarshal(payload, &doc) != nil {
+		g.passThrough(frame, payload)
+		return
+	}
+	if g.hold != nil {
+		g.discardHold() // overlapping runs violate the protocol: fail closed
+	}
+	if doc.Block.Type != "tool_use" {
+		g.emitShifted(frame, payload)
+		return
+	}
+	if doc.Block.Name == "" {
+		g.denyRun(doc.Index, "") // nameless executable declaration: fail closed
+		return
+	}
+	g.seenCnt++
+	if d := g.engine.Decide(g.ctx, g.orgID, g.subject, doc.Block.Name); d.Action == toolpolicy.ActionDeny {
+		g.denyRun(doc.Index, doc.Block.Name)
+		return
+	}
+	g.hold = &nativeToolRun{rawIdx: doc.Index, shift: g.shift, name: doc.Block.Name, frames: [][]byte{frame}}
+}
+
+// blockDelta accumulates one input_json_delta of the held run, swallows
+// the deltas of a decided-deny run, and forwards deltas of ordinary
+// blocks with the visible index. Anything else arriving mid-run
+// violates the protocol and resolves the run fail-closed.
+func (g *nativeToolGateReader) blockDelta(frame []byte, payload []byte) {
+	var doc struct {
+		Index int `json:"index"`
+		Delta struct {
+			Type        string `json:"type"`
+			PartialJSON string `json:"partial_json"`
+		} `json:"delta"`
+	}
+	if json.Unmarshal(payload, &doc) != nil {
+		g.passThrough(frame, payload)
+		return
+	}
+	if g.hold == nil {
+		g.emitShifted(frame, payload)
+		return
+	}
+	if doc.Index != g.hold.rawIdx || doc.Delta.Type != "input_json_delta" {
+		g.discardHold()
+		g.emitShifted(frame, payload)
+		return
+	}
+	if g.hold.deny {
+		return // swallowed whole with its run
+	}
+	g.hold.args.WriteString(doc.Delta.PartialJSON)
+	g.hold.frames = append(g.hold.frames, frame)
+}
+
+// blockStop resolves the held run at its content_block_stop: the args
+// guard runs over the COMPLETE accumulation, a denial drops the run
+// (before the client ever saw a fragment), an allow releases the buffered
+// frames with their visible indices.
+func (g *nativeToolGateReader) blockStop(frame []byte, payload []byte) {
+	var doc struct {
+		Index int `json:"index"`
+	}
+	if json.Unmarshal(payload, &doc) != nil {
+		g.passThrough(frame, payload)
+		return
+	}
+	if g.hold != nil && doc.Index == g.hold.rawIdx {
+		g.hold.frames = append(g.hold.frames, frame) // the stop belongs to the release set
+		g.resolveHold()
+		return
+	}
+	if g.hold != nil {
+		g.discardHold()
+	}
+	g.emitShifted(frame, payload)
+}
+
+// resolveHold settles the open allowed run at its content_block_stop.
+func (g *nativeToolGateReader) resolveHold() {
+	run := g.hold
+	g.hold = nil
+	if run.deny {
+		return // swallowed whole; the removal counted at the deny decision
+	}
+	args := json.RawMessage(run.args.Bytes())
+	if len(args) == 0 {
+		args = json.RawMessage(`{}`)
+	}
+	if rep := g.engine.GuardDeclaredArgs(g.ctx, g.orgID, g.subject, run.name, args); rep.Denied {
+		g.denyRun(run.rawIdx, run.name)
+		return
+	}
+	g.keptCnt++
+	for _, frame := range run.frames {
+		_, payload, _ := parseNativeSSEFrame(frame)
+		g.emitShifted(frame, payload)
+	}
+}
+
+// messageDelta rewrites a stranded stop_reason: a "tool_use" finish whose
+// every declared call was denied would strand the consumer's tool loop,
+// so it normalizes to "end_turn" (the JSON surface pins the same
+// contract). A survivor anywhere in the stream keeps the loop alive.
+func (g *nativeToolGateReader) messageDelta(frame []byte, payload []byte) {
+	var doc struct {
+		Delta struct {
+			StopReason string `json:"stop_reason"`
+		} `json:"delta"`
+	}
+	if json.Unmarshal(payload, &doc) != nil {
+		g.forward(frame)
+		return
+	}
+	if g.hold != nil {
+		g.discardHold() // a finish inside an unresolved run violates the protocol
+	}
+	if doc.Delta.StopReason == "tool_use" && g.seenCnt > 0 && g.keptCnt == 0 {
+		if out, ok := rewriteNativeStopReason(frame, payload); ok {
+			g.forward(out)
+			return
+		}
+	}
+	g.forward(frame)
+}
+
+// denyRun drops a tool_use block at wire index rawIdx: the removal counts
+// immediately (everything after shifts down) and a deny marker run
+// swallows the block's remaining frames. Nameless declarations fail
+// closed without a metric label (chat parity).
+func (g *nativeToolGateReader) denyRun(rawIdx int, name string) {
+	g.shift++
+	g.hold = &nativeToolRun{rawIdx: rawIdx, deny: true}
+	if name != "" {
+		metrics.ToolPolicyDeniedTotal.WithLabelValues(g.orgID, name).Inc()
+	}
+}
+
+// discardHold drops the unresolved run fail-closed: an allowed run whose
+// frames were buffered was never guardable and releases nothing.
+func (g *nativeToolGateReader) discardHold() {
+	if g.hold == nil {
+		return
+	}
+	if !g.hold.deny {
+		g.shift++
+	}
+	g.hold = nil
+}
+
+// emitShifted forwards a frame, renumbering its content_block index when
+// removals happened before it. Unmodified frames pass byte-identically.
+func (g *nativeToolGateReader) emitShifted(frame []byte, payload []byte) {
+	if g.shift > 0 {
+		if out, ok := rewriteNativeIndex(frame, payload, g.shift); ok {
+			g.forward(out)
+			return
+		}
+	}
+	g.forward(frame)
+}
+
+func (g *nativeToolGateReader) forward(frame []byte) { g.out = append(g.out, frame...) }
+
+// parseNativeSSEFrame splits one complete frame into its event name and
+// joined data payload (the apiformat.SSEEvent semantics).
+func parseNativeSSEFrame(frame []byte) (name string, payload []byte, hasData bool) {
+	var parts [][]byte
+	for _, line := range bytes.Split(frame, []byte("\n")) {
+		content := bytes.TrimSuffix(line, []byte("\r"))
+		if ev, ok := bytes.CutPrefix(content, []byte("event:")); ok {
+			name = string(bytes.TrimSpace(ev))
+			continue
+		}
+		if data, ok := bytes.CutPrefix(content, []byte("data:")); ok {
+			if len(data) > 0 && data[0] == ' ' {
+				data = data[1:]
+			}
+			parts = append(parts, data)
+		}
+	}
+	if len(parts) == 0 {
+		return name, nil, false
+	}
+	return name, bytes.Join(parts, []byte("\n")), true
+}
+
+// rewriteNativeIndex renumbers a frame's top-level index member for the
+// shifted visible stream. Frames without an index (or with one that
+// predates the removals) pass unchanged.
+func rewriteNativeIndex(frame []byte, payload []byte, shift int) ([]byte, bool) {
+	var doc map[string]any
+	if json.Unmarshal(payload, &doc) != nil {
+		return frame, false
+	}
+	idx, ok := doc["index"].(float64)
+	if !ok || int(idx) < shift {
+		return frame, false
+	}
+	doc["index"] = float64(int(idx) - shift)
+	name, _, _ := parseNativeSSEFrame(frame)
+	return rebuildNativeFrame(name, doc), true
+}
+
+// rewriteNativeStopReason rewrites a message_delta's stop_reason member to
+// end_turn, preserving the rest of the frame (usage rides message_delta).
+func rewriteNativeStopReason(frame []byte, payload []byte) ([]byte, bool) {
+	var doc map[string]any
+	if json.Unmarshal(payload, &doc) != nil {
+		return frame, false
+	}
+	delta, _ := doc["delta"].(map[string]any)
+	if delta == nil {
+		return frame, false
+	}
+	delta["stop_reason"] = "end_turn"
+	name, _, _ := parseNativeSSEFrame(frame)
+	return rebuildNativeFrame(name, doc), true
+}
+
+// rebuildNativeFrame re-encodes a transformed frame with the SSE envelope.
+func rebuildNativeFrame(name string, doc map[string]any) []byte {
+	enc, err := json.Marshal(doc)
+	if err != nil {
+		return nil // never fail the stream over a filter bug
+	}
+	var out []byte
+	if name != "" {
+		out = append(out, "event: "...)
+		out = append(out, name...)
+		out = append(out, '\n')
+	}
+	out = append(out, "data: "...)
+	out = append(out, enc...)
+	return append(out, '\n', '\n')
+}
+
+// declaresNativeToolUse reports whether a JSON payload carries the
+// "tool_use" block type anywhere, reading decoded string VALUES (the
+// native protocol names blocks through content_block.type). Over-detection
+// is harmless — activation only turns filtering on.
+func declaresNativeToolUse(payload []byte) bool {
+	dec := json.NewDecoder(bytes.NewReader(payload))
+	tok, err := dec.Token()
+	if err != nil {
+		return false
+	}
+	if open, ok := tok.(json.Delim); !ok || (open != '{' && open != '[') {
+		return false
+	}
+	return scanToolUseValues(dec)
+}
+
+// scanToolUseValues walks the decoded payload for a "tool_use" string
+// value (activation scan; see declaresNativeToolUse).
+func scanToolUseValues(dec *json.Decoder) bool {
+	for dec.More() {
+		tok, err := dec.Token()
+		if err != nil {
+			return false
+		}
+		switch t := tok.(type) {
+		case string:
+			if t == "tool_use" {
+				return true
+			}
+		case json.Delim:
+			if (t == '{' || t == '[') && scanToolUseValues(dec) {
+				return true
+			}
+		}
+	}
+	_, _ = dec.Token() // consume the container's closing delimiter
+	return false
+}
