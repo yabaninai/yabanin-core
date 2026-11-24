@@ -107,6 +107,8 @@ import os
 import re
 import subprocess
 import sys
+import tarfile
+import zlib
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
 
@@ -115,6 +117,7 @@ sys.path.insert(0, str(ROOT / "scripts/quality"))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import license_check  # noqa: E402  (reuse: FORBIDDEN, source_files, source_fingerprint)
 import oci_build_receipt
+import mock_release_receipt
 import dashboard_evidence  # noqa: E402  (single recorded token equivalence)
 
 EVIDENCE_REL = "artifacts/release-evidence/release-evidence.json"
@@ -2228,37 +2231,54 @@ def _mock_alpine_version(root: Path):
     return m.group(1) if m else None
 
 
+def _mock_alpine_proof_failures(root: Path, ev: dict) -> list:
+    try:
+        if not mock_release_receipt.present(root):
+            return ["PENDING gap: mock-provider alpine package, license and source "
+                    "proof missing for the final image"]
+        rows = (ev.get("distribution") or {}).get("quickstart_images") or []
+        row = oci_build_receipt.only(
+            (row for row in rows if isinstance(row, dict) and row.get("name") == "mock-provider"),
+            "missing or ambiguous mock-provider quickstart image",
+        )
+        head = (ev.get("freshness") or {}).get("head")
+        oci_build_receipt.check_image(
+            root, "mock-provider", row["image_id"], row["platform"], head, pinned_builders(root),
+        )
+        mock_release_receipt.verify(root, row["image_id"], row["platform"])
+    except (ValueError, KeyError, TypeError, AttributeError, OSError, EOFError,
+            tarfile.TarError, zlib.error, RuntimeError) as error:
+        return [f"containers: mock-provider alpine proof: {error}"]
+    return []
+
+
+def _mock_alpine_record_failures(root, ev, records, mock_version):
+    matches = [row for row in records if row.get("role") == _ALPINE_MOCK_ROLE]
+    if not matches and not (root / mock_release_receipt.MANIFEST).is_file():
+        return []
+    if len(matches) != 1:
+        return ["containers: missing or ambiguous mock-provider Alpine base record"]
+    version = str(matches[0].get("version") or "")
+    if mock_version is not None and version != mock_version:
+        return [f"containers: mock-provider alpine record version {version!r} "
+                f"is not the Dockerfile pin alpine:{mock_version}"]
+    return _mock_alpine_proof_failures(root, ev)
+
+
 def _container_gaps(root: Path, ev: dict) -> list:
-    fails = []
-    mock_from = _mock_alpine_version(root)
-    for r in ev.get("containers", []):
-        # R2: the mock-image blocker fires on the RECORD ROLE, not on a
-        # filename substring -- renaming the apk inventory artifact must
-        # not clear the gap
-        if str(r.get("role") or "") == _ALPINE_MOCK_ROLE:
-            # R3: the record must match the Dockerfile's own alpine pin
-            # and keep the role text -- editing the version or laundering
-            # the role to dodge the mock gap is a hard failure, not a
-            # silently narrowed blocker
-            if mock_from is not None and str(r.get("version") or "") != mock_from:
-                fails.append(f"containers: mock-provider alpine record version "
-                             f"{r.get('version')!r} is not the Dockerfile pin "
-                             f"alpine:{mock_from}")
-            fails.append("PENDING gap: mock-provider alpine 3.21 base has only an apk "
-                         "inventory, no license text corpus; closing requires mapping "
-                         "the installed Alpine package versions to delivered "
-                         "licenses and the matching source companion")
-        elif (mock_from is not None
-              and str(r.get("version") or "") == mock_from
-              and "alpine" in str(r.get("repo_ref") or "")
-              and str(r.get("index_digest") or "").startswith("sha256:")):
-            # R3: the mock alpine at the Dockerfile's pin wearing a
-            # DIFFERENT role is the blocker laundered, not a different
-            # base image
-            fails.append(f"containers: alpine {mock_from} record evades the "
+    mock_version = _mock_alpine_version(root)
+    records = ev.get("containers", [])
+    fails = _mock_alpine_record_failures(root, ev, records, mock_version)
+    for row in records:
+        if (mock_version is not None
+            and row.get("role") != _ALPINE_MOCK_ROLE
+            and row.get("version") == mock_version
+            and "alpine" in str(row.get("repo_ref") or "")
+            and str(row.get("index_digest") or "").startswith("sha256:")):
+            fails.append(f"containers: alpine {mock_version} record evades the "
                          f"mock-provider role binding ({_ALPINE_MOCK_ROLE!r} "
                          "expected for the apk inventory blocker)")
-        fails.extend(_revision_gap_lines(root, r, ev))
+        fails.extend(_revision_gap_lines(root, row, ev))
     return fails
 
 
@@ -2465,6 +2485,8 @@ def review_failures(ev: dict) -> list:
                 fails.append(f"reviews: {area}.{key} empty")
         if not isinstance(rec.get("approved"), bool):
             fails.append(f"reviews: {area}.approved must be a boolean")
+        elif rec["approved"] and not license_check.has_review_details(rec):
+            fails.append(f"reviews: {area} approval requires completed review details")
     return fails
 
 
@@ -2496,10 +2518,9 @@ def verify(root: Path, ev: dict, with_fingerprint: bool,
 
 
 def pending_reviews() -> dict:
-    note = ("PENDING scoped human review; machine-generated placeholder, "
-            "not an approval or rights clearance")
+    note = license_check.PENDING_REVIEW_NOTE
     return {area: {"approved": False, "owner": note, "reason": note,
-                   "evidence": "see machine facts in this file; review not yet performed"}
+                   "evidence": license_check.PENDING_REVIEW_EVIDENCE}
             for area in AREAS}
 
 
@@ -2589,7 +2610,7 @@ def collect_containers() -> list:
     base(cfg["alpine-mock-runtime"], "alpine", "runtime base (mock image)",
          "Alpine 3.21 packages per apk inventory",
          "artifacts/release-evidence/apk-mock.txt",
-         {"note": "full 3.21 text corpus not assembled; recorded as a pending gap"})
+         {"note": "verified against final image layers and the Alpine source companion when retained"})
     base(cfg["node-dashboard-builder"], "node", "build stage (not retained)", "MIT (Node)",
          "artifacts/release-evidence/upstream/node/LICENSE",
          {"notice_forbidden_contexts": [
@@ -2609,7 +2630,160 @@ def collect_containers() -> list:
     return out
 
 
-def collect_distribution() -> dict:
+# Discovery must never load rootfs layers or other large blobs into Python:
+# index.json and index blobs are small JSON documents, bounded hard by this.
+_RECEIPT_SNIFF_LIMIT = 1 << 20
+_RECEIPT_INDEX_MEDIA_TYPE = "application/vnd.oci.image.index.v1+json"
+
+
+def _receipt_layout_candidates(store: Path):
+    """(layout_present, candidate digests) for a retained OCI layout.
+
+    Absent index.json -> (False, None): the legacy metadata-only
+    fallback may run. A present but unreadable, oversize or malformed
+    index.json is a defective layout: (True, []) fails closed -- never a
+    silent fallback to orphan blobs. A candidate must declare the index
+    mediaType, a bounded descriptor size, and an on-disk blob of exactly
+    that size, so check_image never loads a layer-sized candidate
+    however the layout describes it."""
+    index_json = store / "index.json"
+    if not index_json.is_file():
+        return False, None
+    try:
+        if index_json.stat().st_size > _RECEIPT_SNIFF_LIMIT:
+            return True, []
+        manifests = json.loads(index_json.read_bytes())["manifests"]
+    except (OSError, ValueError, TypeError, KeyError):
+        return True, []
+    out = []
+    if isinstance(manifests, list):
+        for desc in manifests:
+            if not isinstance(desc, dict):
+                continue
+            digest, size = desc.get("digest"), desc.get("size")
+            if (not isinstance(digest, str)
+                    or not re.fullmatch(r"sha256:[0-9a-f]{64}", digest)
+                    or digest in out):
+                continue
+            blob_file = store / digest[7:]
+            if (desc.get("mediaType") != _RECEIPT_INDEX_MEDIA_TYPE
+                    or type(size) is not int
+                    or not 0 < size <= _RECEIPT_SNIFF_LIMIT
+                    or not blob_file.is_file()
+                    or blob_file.stat().st_size != size):
+                continue
+            out.append(digest)
+    return True, out
+
+
+def _receipt_sniffed_candidates(store: Path) -> list:
+    """Index-shaped blobs of a metadata-only store (no layout retained).
+
+    Size-capped and mediaType-checked before any verification read: a
+    rootfs-layer-sized file is classified by stat alone and never read."""
+    out = []
+    for blob_file in sorted(store.iterdir()):
+        name = blob_file.name
+        if (not re.fullmatch(r"[0-9a-f]{64}", name) or not blob_file.is_file()
+                or blob_file.stat().st_size > _RECEIPT_SNIFF_LIMIT):
+            continue
+        try:
+            record = json.loads(blob_file.read_bytes())
+        except (OSError, ValueError):
+            continue
+        if (isinstance(record, dict)
+                and record.get("mediaType") == _RECEIPT_INDEX_MEDIA_TYPE
+                and record.get("schemaVersion") == 2):
+            out.append("sha256:" + name)
+    return out
+
+
+def collect_quickstart_build(root: Path, head: str):
+    """Retained BuildKit receipts -> the bound quickstart image record.
+
+    Generator side of the receipt verifier: per subject the retained
+    store must yield EXACTLY ONE index that oci_build_receipt.check_image
+    accepts for THIS candidate (platform, head, build recipe, pinned
+    bases); zero, several, or verifier inputs that cannot be re-derived
+    leave the images unbound -- absence stays the recorded PENDING gap,
+    never an invented row. Candidates come from the retained layout's
+    index.json when present, else from size-capped sniffing of
+    index-shaped blobs (metadata-only stores stay compatible).
+
+    Capture (authorized bounded docker-build lane only; never run or
+    fabricated here): per subject, at the exact candidate head,
+      docker buildx build --provenance=mode=max \\
+        --file <recipe> <context> --output=type=oci,dest=/tmp/<role>.oci.tar
+      tar -xf /tmp/<role>.oci.tar -C /tmp/<role>-layout
+    Retain the METADATA CHAIN ONLY into artifacts/release-evidence/
+    build-receipts/<role>/: oci-layout, index.json, and the index/
+    manifest/config/attestation/statement blobs reachable from the
+    index.json descriptors, excluding the platform image manifests'
+    rootfs layers entries ONLY -- the attestation manifest's layers
+    carry the in-toto statement and must be retained. Rootfs layers
+    are neither retained nor read back; the retained bytes are
+    engine-produced (unsigned -- BuildKit provenance is not a
+    signature).
+
+    Readback (offline, no engine): 'release_evidence.py generate' binds
+    the rows; 'verify' re-checks every descriptor digest plus the
+    BuildKit-recorded revision/context/dockerfile, platform and pinned
+    bases against the live tree. Candidate discovery: a retained
+    index.json is authoritative -- its index descriptors (index
+    mediaType, bounded size, on-disk blob of exactly that size) are the
+    only candidates, and a present-but-defective layout binds nothing;
+    only a cleanly absent layout falls back to sniffing index-shaped
+    blobs (metadata-only stores stay compatible).
+
+    Scope: each bound id is the OCI INDEX digest -- not the engine's
+    per-platform image ID (the config digest 'docker inspect' reports)
+    -- and which image a STARTED compose service ran is a separate
+    engine-side check (deployment lane), not asserted here."""
+    services, errors = _compose_model(root)
+    if errors:
+        return None
+    pins = pinned_builders(root)
+    rows, subjects, platforms = [], {}, {}
+    for role in _QUICKSTART_IMAGE_SUBJECTS:
+        store = root / oci_build_receipt.STORE / role
+        candidates = []
+        if store.is_dir():
+            layout_present, candidates = _receipt_layout_candidates(store)
+            if not layout_present:
+                candidates = _receipt_sniffed_candidates(store)
+        bound = []
+        for image_id in candidates:
+            try:
+                oci_build_receipt.check_image(root, role, image_id,
+                                              _QS_PLATFORM, head, pins)
+            except (ValueError, KeyError, AttributeError, TypeError,
+                    OSError, RuntimeError):
+                continue
+            bound.append(image_id)
+        if len(bound) != 1:
+            return None
+        subjects[role] = bound[0]
+        platforms[role] = _QS_PLATFORM
+        # the verifier schema names the bound OCI index digest "image_id"
+        rows.append({"name": role, "image_id": bound[0], "platform": _QS_PLATFORM})
+    tree = subprocess.run(["git", "-C", str(root), "rev-parse", "--verify",
+                           f"{head}^{{tree}}"], check=False, capture_output=True,
+                          text=True)
+    if tree.returncode:
+        return None
+    return {"quickstart_images": rows,
+            "quickstart_build": {"head": head,
+                                 "tree_sha256": tree.stdout.strip(),
+                                 "inputs": {"compose_build_services":
+                                            sorted(s for s, svc in services.items()
+                                                   if svc["build"]),
+                                            "pinned_builders":
+                                            sorted(list(p) for p in pins)},
+                                 "platforms": platforms,
+                                 "subjects": subjects}}
+
+
+def collect_distribution(head: str | None = None) -> dict:
     dist = ROOT / "dist/release"
     sums = {}
     for line in (dist / "SHA256SUMS").read_text().splitlines():
@@ -2624,27 +2798,52 @@ def collect_distribution() -> dict:
                          "buildinfo_sha256": sha256_file(dist / f"{name}.buildinfo"),
                          "notices_payload": str(payload.relative_to(ROOT)),
                          "notices_files": len(inv.get("files", []))})
-    return {"binaries": binaries,
-            "notice_draft": "dist/release/THIRD-PARTY-NOTICES.md",
-            "notice_draft_sha256": sha256_file(dist / "THIRD-PARTY-NOTICES.md"),
-            "notice_draft_identifier_only": True,
-            "full_texts_via": "artifacts/release-evidence/image-notices/<binary>/ (build-info driven)",
-            "recipe_sha256": sha256_file(dist / "recipe.json"),
-            "unsigned": True,
-            "quickstart_images": [],
-            "quickstart_images_note": "not docker-built in this evidence lane; binding via "
-                                      "Dockerfile pins + base digests only; exact image "
-                                      "digests pending a bounded docker-build follow-up",
-            "pulled_images_verified_via_registry": [
-                "pgvector/pgvector:pg16", "redis:7.2-alpine",
-                "gcr.io/distroless/static-debian12:nonroot"]}
+    out = {"binaries": binaries,
+           "notice_draft": "dist/release/THIRD-PARTY-NOTICES.md",
+           "notice_draft_sha256": sha256_file(dist / "THIRD-PARTY-NOTICES.md"),
+           "notice_draft_identifier_only": True,
+           "full_texts_via": "artifacts/release-evidence/image-notices/<binary>/ (build-info driven)",
+           "recipe_sha256": sha256_file(dist / "recipe.json"),
+           "unsigned": True,
+           "pulled_images_verified_via_registry": [
+               "pgvector/pgvector:pg16", "redis:7.2-alpine",
+               "gcr.io/distroless/static-debian12:nonroot"]}
+    if head is None:
+        head = git_out("rev-parse", "HEAD").strip()
+    bound = collect_quickstart_build(ROOT, head)
+    if bound is None:
+        # No genuine retained receipts for this head: the rows stay empty and
+        # the build record absent -- verify reports the PENDING gap, never a
+        # self-consistent invented record.
+        out["quickstart_images"] = []
+        out["quickstart_build"] = None
+        out["quickstart_images_note"] = ("no BuildKit receipts retained for this "
+                                         "head under artifacts/release-evidence/"
+                                         "build-receipts/; exact image digests "
+                                         "pending the bounded docker-build "
+                                         "evidence lane")
+    else:
+        out.update(bound)
+        out["quickstart_images_note"] = ("bound to retained BuildKit receipt "
+                                         "metadata (artifacts/release-evidence/"
+                                         "build-receipts/<subject>/): the OCI "
+                                         "index digest per subject (not the "
+                                         "engine's per-platform image ID), "
+                                         "re-verified offline against this "
+                                         "candidate's head, platform, build "
+                                         "recipe and pinned bases; the images "
+                                         "of STARTED compose services are an "
+                                         "independent engine-side check, not "
+                                         "asserted here")
+    return out
 
 
 def generate() -> int:
     assets = load_json(ARTS / "dashboard-assets.json")
+    head = git_out("rev-parse", "HEAD").strip()
     ev = {"schema": "yabanin.release-evidence/1",
           "task_base": TASK_BASE,
-          "head": git_out("rev-parse", "HEAD").strip(),
+          "head": head,
           "generated_at": datetime.now(timezone.utc).isoformat(),
           "freshness": git_state(),
           "containers": collect_containers(),
@@ -2663,7 +2862,7 @@ def generate() -> int:
           "assets_gaps": assets.get("unresolved", []),
           "provenance": {"base": TASK_BASE, "added": provenance_added(),
                          "note": "DCO signoff presence is not proof of employer rights"},
-          "distribution": collect_distribution(),
+          "distribution": collect_distribution(head),
           "notice_reconciliation": {"notice_sha256": sha256_file(ROOT / "NOTICE"),
                                     "enterprise_reference_removed": True,
                                     "basis": "root LICENSING.md: project-authored Core "

@@ -69,11 +69,40 @@ func (s *detailSeamStore) GetRequestDetail(ctx context.Context, orgID, requestID
 	return d, err
 }
 
-func (s *detailSeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+// GetRequestDetailRow is the grant path's pre-consume read (0031): the row-key
+// pinned lookup that decides 404 vs 500 before the consume. The seam flags
+// and stage recording mirror the GetRequestDetail override.
+func (s *detailSeamStore) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	s.record("read")
+	s.mu.Lock()
+	rowGone, failRead, badBody := s.rowGone, s.failRead, s.badBody
+	s.mu.Unlock()
+	switch {
+	case rowGone:
+		return nil, adminstore.ErrNotFound
+	case failRead:
+		return nil, context.DeadlineExceeded
+	}
+	d, err := s.mockStore.GetRequestDetailRow(ctx, orgID, rowKey)
+	if badBody && err == nil {
+		// Invalid raw JSON forces the writeJSON encode to fail AFTER the 200
+		// header is committed (the post-disclosure failure shape).
+		d.Response = json.RawMessage(`{"truncated`)
+	}
+	return d, err
+}
+
+// GetRequestDetailRowInCorrelation is the inspector's correlation-scoped
+// row-key read; the grant-path seam flags do not apply, so it delegates.
+func (s *detailSeamStore) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*adminstore.RequestDetail, error) {
+	return s.mockStore.GetRequestDetailRowInCorrelation(ctx, orgID, requestID, rowKey)
+}
+
+func (s *detailSeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 // runRootDetail invokes the detail handler as root with a concrete target.
@@ -407,9 +436,15 @@ func TestDetailGrantAuditIsValidJSONForHostileRequestID(t *testing.T) {
 	rec := runRootDetail(h, "/api/organizations/org-1/requests/req-1?payload_grant="+token)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 
-	missing := runRootDetail(h, "/api/organizations/org-1/requests/req%01%1b%FF?payload_grant="+token)
-	require.Equal(t, http.StatusNotFound, missing.Code)
+	// A FRESH grant carries the hostile attempt: peek binds the token to
+	// req-1, so the mismatched route denies before any row lookup and never
+	// burns this token — the exercise is the hostile request_id itself
+	// reaching the journal as a valid-JSON denial record.
+	hostile := issueExportGrant(t, h, `{"ttl_seconds":60,"org_id":"org-1","request_id":"req-1"}`)
+	missing := runRootDetail(h, "/api/organizations/org-1/requests/req%01%1b%FF?payload_grant="+hostile)
+	require.Equal(t, http.StatusForbidden, missing.Code, missing.Body.String())
 
+	matched := false
 	for _, r := range store.auditRecords {
 		if !strings.HasPrefix(r.Action, "request_detail") {
 			continue
@@ -417,5 +452,17 @@ func TestDetailGrantAuditIsValidJSONForHostileRequestID(t *testing.T) {
 		require.True(t, json.Valid([]byte(r.Details)),
 			"journal details must be valid JSON for a hostile request_id, got %q", r.Details)
 		require.NotContains(t, r.Details, token, "the bearer grant token must never reach the journal")
+		require.NotContains(t, r.Details, hostile, "the bearer grant token must never reach the journal")
+		var d requestDetailAuditDetail
+		if json.Unmarshal([]byte(r.Details), &d) == nil &&
+			d.Outcome == "grant_invalid_or_unavailable" &&
+			strings.HasPrefix(d.RequestID, "req\x01\x1b") {
+			matched = true
+		}
 	}
+	// The loop alone may pass vacuously: explicitly require the hostile
+	// denial record (the two control bytes survive the JSON round trip; the
+	// trailing 0xFF byte marshals as the U+FFFD replacement rune).
+	require.True(t, matched,
+		"the hostile request_id denial must exist as a journalled request_detail.denied record")
 }

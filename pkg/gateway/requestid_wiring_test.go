@@ -75,11 +75,12 @@ func reqidUnitServer(t *testing.T, u *reqidRecordingUpstream) *httptest.Server {
 		FallbackModel: "stub-model",
 	}
 	gw := &gateway{
-		cfg:  cfg,
-		log:  slog.New(slog.DiscardHandler),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"stub-model": {ModelName: "stub-model", Provider: "openai", UpstreamURL: u.srv.URL, Enabled: true}},
-		pool: upstream.NewPool(upstream.Options{BaseURL: u.srv.URL}),
+		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
+		cfg:         cfg,
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
+		res:         stubModelResolver{"stub-model": {ModelName: "stub-model", Provider: "openai", UpstreamURL: u.srv.URL, Enabled: true}},
+		pool:        upstream.NewPool(upstream.Options{BaseURL: u.srv.URL}),
 	}
 	router, _, _ := newGatewayHTTPRouter(gw.cfg, gw.log)
 	gw.routes(router)
@@ -96,6 +97,7 @@ func reqidUnitPost(t *testing.T, srv *httptest.Server, requestID string) (int, s
 		srv.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"stub-model","messages":[{"role":"user","content":"hi"}]}`))
 	require.NoError(t, err)
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	if requestID != "" {
@@ -175,6 +177,7 @@ func TestRequestIDWiring_HeaderPresentOnErrorPaths(t *testing.T) {
 		srv.URL+"/v1/chat/completions",
 		strings.NewReader(`{"model":"stub-model","messages":[{"role":"user","content":"hi"}]}`))
 	require.NoError(t, err)
+	req2.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req2.Header.Set("Authorization", "Bearer wrong-key")
 	req2.Header.Set("Content-Type", "application/json")
 	req2.Header.Set("X-Request-ID", "reqid-unit-401")

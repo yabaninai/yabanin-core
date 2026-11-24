@@ -31,7 +31,13 @@ func (m *mockStore) CreateRequestPayloadGrantScope(orgID, requestID, rootID, sco
 	if _, err := rand.Read(token[:]); err != nil {
 		return adminstore.RequestPayloadGrant{}, err
 	}
-	grant := adminstore.RequestPayloadGrant{ID: "grant-a", Token: hex.EncodeToString(token[:]), OrgID: orgID, RequestID: requestID, RootID: rootID, ExpiresAt: now.Add(ttl), Scope: scope}
+	// 0031: issuance binds the grant to the single physical row carrying
+	// the correlation. The fixture carrier is (org-1, req-1) under row key
+	// 1; any other correlation has no carrier here.
+	if orgID != "org-1" || requestID != "req-1" {
+		return adminstore.RequestPayloadGrant{}, adminstore.ErrRequestPayloadGrantTargetMissing
+	}
+	grant := adminstore.RequestPayloadGrant{ID: "grant-a", Token: hex.EncodeToString(token[:]), OrgID: orgID, RequestID: requestID, RootID: rootID, RowKey: 1, ExpiresAt: now.Add(ttl), Scope: scope}
 	mockPayloadGrantMu.Lock()
 	defer mockPayloadGrantMu.Unlock()
 	if mockPayloadGrants[m] == nil {
@@ -49,19 +55,37 @@ func (m *mockStore) CreateRequestPayloadGrantScope(orgID, requestID, rootID, sco
 	return grant, nil
 }
 
-func (m *mockStore) ConsumeRequestPayloadGrant(token, orgID, requestID, rootID string, now time.Time) bool {
-	return m.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, adminstore.RequestPayloadScopeRead, now) == nil
-}
-
-func (m *mockStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+// PeekRequestPayloadGrantTarget resolves a grant's bound row without
+// consuming it: an unknown, expired, wrong-org/request/grantee or legacy
+// unbound grant answers the same generic invalid error as the durable store.
+func (m *mockStore) PeekRequestPayloadGrantTarget(_ context.Context, token, orgID, requestID, rootID string, now time.Time) (int64, error) {
 	mockPayloadGrantMu.Lock()
 	defer mockPayloadGrantMu.Unlock()
 	grant, ok := mockPayloadGrants[m][token]
-	if !ok || !now.Before(grant.ExpiresAt) || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || grant.Scope != scope {
-		return adminstore.ErrInvalidRequestPayloadGrant
+	if !ok || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || !now.Before(grant.ExpiresAt) || grant.RowKey <= 0 {
+		return 0, adminstore.ErrInvalidRequestPayloadGrant
+	}
+	return grant.RowKey, nil
+}
+
+func (m *mockStore) ConsumeRequestPayloadGrant(token, orgID, requestID, rootID string, now time.Time) bool {
+	rowKey, err := m.PeekRequestPayloadGrantTarget(context.Background(), token, orgID, requestID, rootID, now)
+	if err != nil {
+		return false
+	}
+	_, err = m.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, adminstore.RequestPayloadScopeRead, now)
+	return err == nil
+}
+
+func (m *mockStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
+	mockPayloadGrantMu.Lock()
+	defer mockPayloadGrantMu.Unlock()
+	grant, ok := mockPayloadGrants[m][token]
+	if !ok || !now.Before(grant.ExpiresAt) || grant.OrgID != orgID || grant.RequestID != requestID || grant.RootID != rootID || grant.Scope != scope || grant.RowKey <= 0 || grant.RowKey != rowKey {
+		return adminstore.RequestPayloadGrant{}, adminstore.ErrInvalidRequestPayloadGrant
 	}
 	delete(mockPayloadGrants[m], token)
-	return nil
+	return grant, nil
 }
 
 func (m *mockStore) RevokeRequestPayloadGrant(token, rootID string) error {

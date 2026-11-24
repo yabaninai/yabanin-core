@@ -16,25 +16,82 @@ import (
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
-func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
+// completionsRequest is the validated client shape of the legacy
+// completions route.
+type completionsRequest struct {
+	Model     string `json:"model"`
+	Stream    bool   `json:"stream"`
+	MaxTokens *int   `json:"max_tokens"`
+}
+
+// parseCompletionsRequest reads and validates the client request. Unlike
+// the 413-refusing routes, a body read failure here answers plain 400 (this
+// legacy surface never distinguished the gateway payload cap).
+func parseCompletionsRequest(w http.ResponseWriter, r *http.Request) (completionsRequest, []byte, bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "request body too large or malformed")
-		return
+		return completionsRequest{}, nil, false
 	}
-	var req struct {
-		Model     string `json:"model"`
-		Stream    bool   `json:"stream"`
-		MaxTokens *int   `json:"max_tokens"`
-	}
+	var req completionsRequest
 	if err := json.Unmarshal(body, &req); err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
-		return
+		return completionsRequest{}, nil, false
 	}
 	if req.Model == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+		return completionsRequest{}, nil, false
+	}
+	return req, body, true
+}
+
+// completionsPolicyGuards runs the OP-8 unified policy stage pre-upstream
+// plus this route's pre-reservation refusals: a client route hint foreign
+// to the serving provider, and stream_prefix/stream_final policies this
+// surface cannot honor (shadow mode never refuses; a cold policy store
+// stays fail-open). ok is false once the refusal was written.
+func (gw *gateway) completionsPolicyGuards(w http.ResponseWriter, r *http.Request, admitted admitted, stream bool) (guarded []byte, policyEvent, providerName string, ok bool) {
+	guarded, policyEvent, ok = gw.policyPreUpstream(w, r, "completions", admitted.Info.ModelName, admitted.Info.Provider, admitted.Body)
+	if !ok {
+		return nil, "", "", false
+	}
+	// Serving provider of the single-candidate client pool (hoisted for
+	// the hint check below and the dispatch).
+	providerName = admitted.Info.Provider
+	if providerName == "" {
+		providerName = "openai"
+	}
+	if !gw.enforceSingularRouteHint(w, r, providerName) {
+		return nil, "", "", false
+	}
+	if stream && gw.unenforceableStreamPolicies(r.Context(), admitted.OrgID, admitted.Info.ModelName) {
+		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"stream policies are not enforced on legacy completions streams", "stream_policy_unsupported_surface")
+		return nil, "", "", false
+	}
+	return guarded, policyEvent, providerName, true
+}
+
+// requireStreamFlusher refuses a streaming dispatch before the durable
+// start when the writer cannot flush (chat streamRun.admit canon — fail
+// before anything durable, with zero provider arrivals).
+func requireStreamFlusher(w http.ResponseWriter, gate *reservationGate, stream bool) bool {
+	if !stream {
+		return true
+	}
+	if _, ok := w.(http.Flusher); !ok {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
+		return false
+	}
+	return true
+}
+
+func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	req, body, ok := parseCompletionsRequest(w, r)
+	if !ok {
 		return
 	}
 
@@ -46,13 +103,7 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"completions are not supported for this provider", "completions_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "completions", "completions are not supported for this provider") {
 		return
 	}
 
@@ -60,124 +111,136 @@ func (gw *gateway) completions(w http.ResponseWriter, r *http.Request) {
 	// reservation and the forward). One call site for both branches of this
 	// endpoint (streaming hooks arrive with OP-4); the decision record rides
 	// rctx into the finisher's event.
-	guarded, policyEvent, ok := gw.policyPreUpstream(w, r, "completions", admitted.Info.ModelName, admitted.Info.Provider, admitted.Body)
+	guarded, policyEvent, providerName, ok := gw.completionsPolicyGuards(w, r, admitted, req.Stream)
 	if !ok {
 		return
 	}
 	admitted.Body = guarded
-	// Serving provider of the single-candidate client pool (hoisted for the
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	// hint foreign to the serving provider refuses here, before any
-	// reservation.
-	if !gw.enforceSingularRouteHint(w, r, providerName) {
-		return
-	}
-
-	// N03-P03-T09: the streaming-policy seam exists only in the chat
-	// serveStream, so stream_prefix/stream_final policies attached to the
-	// "completions" endpoint cannot be honored on this surface. Refuse
-	// explicitly (before any reservation) instead of relaying a silently
-	// unprotected stream; shadow mode never refuses, and a cold policy
-	// store stays fail-open exactly like the seam's own plan lookup.
-	if req.Stream && gw.unenforceableStreamPolicies(r.Context(), admitted.OrgID, admitted.Info.ModelName) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"stream policies are not enforced on legacy completions streams", "stream_policy_unsupported_surface")
-		return
-	}
 
 	// NEXT-18c (ADR-0001 §5.1): pre-check, then reserve — this pipeline has
 	// no cache branch, so both stages run back-to-back before the upstream
 	// call. The gate rides the request-derived context for the finalize
-	// stages below.
-	rctx := withPolicyEvent(r.Context(), policyEvent)
-	gate, ok := gw.reservationPlan(w, r, "completions",
-		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
-			admitted.Info, admitted.Body, reservationMaxTokens(req.MaxTokens), false))
+	// stages below. One admission serves BOTH transports below; the kind
+	// binds to the one actually dispatched.
+	rctx, gate, ok := gw.reservePaidDispatch(withPolicyEvent(r.Context(), policyEvent), w, r, "completions", admitted, reservationMaxTokens(req.MaxTokens), false)
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
-		return
-	}
 
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
+	client, upstreamBody, apiKey, providerName, upstreamURL, ok := gw.paidUpstreamClient(l, w, gate, admitted, providerName)
+	if !ok {
 		return
 	}
-	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	if !requireStreamFlusher(w, gate, req.Stream) {
+		return
+	}
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindForChat(req.Stream)) {
+		return
+	}
 
 	if req.Stream {
 		// W-TIMEOUT: streams carry no whole-request deadline; the transport's
 		// ResponseHeaderTimeout plus the idle watchdog below bound them.
-		gw.completionsStream(w, r, gate, admitted, client, upstreamBody, apiKey, providerName, upstreamURL, started, l)
+		gw.completionsStream(w, r, rctx, gate, admitted, client, upstreamBody, apiKey, providerName, upstreamURL, started, l)
 		return
 	}
 
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
+	gw.relayCompletionsJSON(rctx, completionsJSONDispatch{
+		r: r, w: w, l: l, gate: gate, admitted: admitted,
+		client: client, upstreamBody: upstreamBody, apiKey: apiKey,
+		body: body, providerName: providerName, upstreamURL: upstreamURL,
+		started: started,
+	})
+}
+
+// completionsJSONDispatch carries the non-streaming dispatch inputs that
+// outlive the shared pipeline stages.
+type completionsJSONDispatch struct {
+	r            *http.Request
+	w            http.ResponseWriter
+	l            *slog.Logger
+	gate         *reservationGate
+	admitted     admitted
+	client       *upstream.Client
+	upstreamBody []byte
+	apiKey       string
+	body         []byte // the client's raw body (usage-estimate fallback)
+	providerName string
+	upstreamURL  string
+	started      time.Time
+}
+
+// relayCompletionsJSON performs the paid non-streaming /v1/completions
+// dispatch and settle: bounded read, adapter usage parsing, the OP-8
+// post-upstream policy hook (a deny answers 400 with the settle already
+// run), the durable finishCompletion settle and the byte-honest reply.
+func (gw *gateway) relayCompletionsJSON(rctx context.Context, d completionsJSONDispatch) {
+	ctx, cancel := bufferedUpstreamContext(rctx, d.admitted.Info.UpstreamTimeout)
 	defer cancel()
-	resp, err := client.Do(ctx, "/v1/completions", upstreamBody, apiKey, false, nil)
+	resp, err := d.client.Do(ctx, "/v1/completions", d.upstreamBody, d.apiKey, false, nil)
 	if err != nil {
-		closeUpstream(l, resp)
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
+		closeUpstream(d.l, resp)
+		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		apierrors.Write(d.w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
 		return
 	}
 	defer resp.Body.Close()
-	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit))
+	limited, err := io.ReadAll(io.LimitReader(resp.Body, embeddingsResponseLimit+1))
 	if err != nil {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(d.w, "failed to read upstream response")
 		return
 	}
 	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
+		apierrors.Write(d.w, status, errType, "upstream request failed")
 		return
 	}
-	usage := completionsUsage(limited, body, client.Adapter())
+	if len(limited) > embeddingsResponseLimit {
+		d.gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(d.w, "upstream response too large")
+		return
+	}
+	usage := completionsUsage(limited, d.body, d.client.Adapter())
 	// OP-8: post-upstream policy hook. Usage was parsed from the ORIGINAL
 	// body (the tokens were consumed); a mask replaces what the client and
 	// the finisher see; a deny answers 400 instead of the upstream body.
 	if gw.policyRuntime != nil {
-		masked, postEvent, denied := gw.policyPostUpstream(r, "completions", admitted.Info.ModelName, admitted.Info.Provider, limited)
+		masked, postEvent, denied := gw.policyPostUpstream(d.r, "completions", d.admitted.Info.ModelName, d.admitted.Info.Provider, limited)
 		if postEvent != "" {
 			rctx = withPolicyEvent(rctx, appendPolicyEvents(policyEventFrom(rctx), postEvent))
 		}
 		if denied {
-			gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusBadRequest, started, resp)
-			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			if ferr := gw.finishCompletion(d.w, rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusBadRequest, d.started, resp); ferr != nil {
+				// The client envelope is already the policy denial; the
+				// withheld event is logged loudly (finishRequestLogged
+				// canon).
+				d.l.Error("terminal facts commit failed; event withheld from consumer", "error", ferr)
+			}
+			apierrors.WriteWithCode(d.w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 				"response blocked by organization policy", policyDenyErrorCode)
 			return
 		}
 		limited = masked
 	}
-	gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp)
+	if ferr := gw.finishCompletion(d.w, rctx, d.admitted, usage, d.providerName, d.upstreamURL, http.StatusOK, d.started, resp); ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		d.l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(d.w)
+		return
+	}
 	// N03-P06-T02: provider prompt-cache transparency on the legacy
 	// completions JSON path (absent for estimated usage — never fabricated).
-	setPromptCacheHeader(w, usage)
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(limited)
+	setPromptCacheHeader(d.w, usage)
+	d.w.Header().Set("Content-Type", "application/json")
+	d.w.WriteHeader(http.StatusOK)
+	_, _ = d.w.Write(limited)
 }
 
-func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, providerName, upstreamURL string, started time.Time, l *slog.Logger) {
+func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, rctx context.Context, gate *reservationGate, admitted admitted, client *upstream.Client, upstreamBody []byte, apiKey, providerName, upstreamURL string, started time.Time, l *slog.Logger) {
 	upstreamBody, clientWantsUsage := ensureStreamUsage(upstreamBody, providerName, gw.streamUsageProviders)
 
 	w.Header().Set("Content-Type", "text/event-stream")
@@ -186,13 +249,15 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	w.Header().Set("X-Accel-Buffering", "no")
 	w.Header().Set("Proxy-Cache", "bypass")
 
-	flusher, ok := w.(http.Flusher)
-	if !ok {
-		apierrors.Write(w, http.StatusNotImplemented, apierrors.ErrorCodeAPI, "streaming not supported by server")
-		return
-	}
+	// The caller checked the stream capability BEFORE the durable start,
+	// so the writer is a Flusher by construction (a non-flusher writer
+	// never reaches this function — it answered 501 with no admission).
+	flusher, _ := w.(http.Flusher)
 
-	streamCtx, cancelStream := context.WithCancel(r.Context())
+	// The stream context derives from the request-derived rctx (identity,
+	// gate, policy record ride it into the finisher) — client
+	// cancellation still propagates from the parent request context.
+	streamCtx, cancelStream := context.WithCancel(rctx)
 	defer cancelStream()
 
 	resp, err := client.Do(streamCtx, "/v1/completions", upstreamBody, apiKey, true, nil)
@@ -223,20 +288,51 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	handler := provider.NewStreamHandlerWithOptions("openai", admitted.Info.ModelName, provider.StreamOptions{
 		SuppressUsageOnlyChunk: !clientWantsUsage,
 		RequestBytes:           len(upstreamBody),
+		// Legacy completions canon: a complete JSON data line that lost
+		// only its blank separator to a transport cut is still dispatched
+		// whole before the drain-failure error frame ([DONE], torn lines,
+		// cancellation and policy-wrapped chat stay excluded — provider
+		// scoping). The other three relays implement the same salvage at
+		// the gateway frame buffer (apiformat.SSEFrameBuffer).
+		RecoverLegacyCompletionLine: true,
 	})
 	// N03-P01: watch the terminal — a late failure after the client already
-	// saw the [DONE] terminator must not emit a second terminal event.
-	watch := newSSETerminalWatch(w)
+	// saw the [DONE] terminator must not emit a second terminal event. The
+	// tail tracker sits under the watch so a torn last event is closed
+	// before the drain-failure error frame composes (chat F2 canon).
+	tail := &ssePassthroughTail{w: w}
+	watch := newSSETerminalWatch(tail)
+	// Central binding (Preview2 durable accounting, chat drain canon): an
+	// admitted invocation holds the client-facing [DONE] until its terminal
+	// facts commit — release happens exactly once after the durable write;
+	// a failed write drops the terminator and surfaces the typed accounting
+	// error frame instead.
+	if h := invocationIdentityFrom(rctx); h != nil && h.Admitted() && gw.invocations != nil {
+		watch.armDoneHold()
+	}
 	usage, drainErr := handler.HandleStream(streamCtx, watch, flusher, resp)
+	gw.settleCompletionsStream(rctx, w, l, gate, admitted, providerName, upstreamURL, started, resp, watch, tail, usage, drainErr)
+}
+
+// settleCompletionsStream applies the stream drain outcome: a drain failure
+// drops the held [DONE], settles the escrow with zero spend and closes with
+// the plain error frame (NEXT-18c: no analytics event on this path — the
+// reconciler's grace sweep owns the admitted-without-facts row); a failed
+// terminal-facts commit replaces the held terminator with the
+// accounting_commit_failed frame (chat stream canon — deliberately NO
+// safe-retry language: the work already ran under this invocation
+// identity); success releases the held [DONE] exactly once after the
+// durable write.
+func (gw *gateway) settleCompletionsStream(rctx context.Context, w http.ResponseWriter, l *slog.Logger, gate *reservationGate, admitted admitted, providerName, upstreamURL string, started time.Time, resp *http.Response, watch *sseTerminalWatch, tail *ssePassthroughTail, usage provider.Usage, drainErr error) {
 	if drainErr != nil {
-		// NEXT-18c: no analytics event on this path — settle the escrow with
-		// zero spend; the idle return sweeps it.
+		watch.failDoneHold()
 		term := budget.TerminationUpstreamErr
-		if r.Context().Err() != nil {
+		if rctx.Err() != nil {
 			term = budget.TerminationClientCancel
 		}
 		gate.finalizeNoEvent(term)
 		if !watch.sawDone() {
+			tail.complete()
 			writeSSEError(w, apierrors.ErrorCodeAPI, "stream drain failed")
 		}
 		return
@@ -244,7 +340,19 @@ func (gw *gateway) completionsStream(w http.ResponseWriter, r *http.Request, gat
 	// N03-P06-T02: stream headers committed long ago; outcome rides the
 	// trailer once HandleStream returns final usage.
 	setPromptCacheTrailer(w, usage)
-	gw.finishCompletion(w, r.Context(), admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp)
+	if ferr := gw.finishCompletion(w, rctx, admitted, usage, providerName, upstreamURL, http.StatusOK, started, resp); ferr != nil {
+		// Central binding: the held terminator is dropped and replaced by
+		// the accounting error frame — deliberately NO safe-retry language:
+		// the work already ran under this invocation identity (chat stream
+		// canon).
+		watch.failDoneHold()
+		writeSSEErrorWithCode(w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(rctx), "error", ferr)
+		return
+	}
+	watch.releaseDoneHold()
 }
 
 func closeUpstream(l *slog.Logger, resp *http.Response) {
@@ -275,7 +383,12 @@ func completionsUsage(body, request []byte, adapter provider.Provider) provider.
 	return provider.Usage{PromptTokens: n, TotalTokens: n, Source: provider.UsageSourceEstimated}
 }
 
-func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, providerName, upstreamURL string, status int, started time.Time, resp *http.Response) {
+// finishCompletion settles the legacy completions response durably — the
+// usage record, terminal facts and the reservation — and returns the
+// terminal-facts commit error so each transport can apply its canon:
+// buffered callers withhold the upstream body, the stream caller drops
+// the held [DONE] and closes with the accounting error frame.
+func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, admitted admitted, usage provider.Usage, providerName, upstreamURL string, status int, started time.Time, resp *http.Response) error {
 	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
 	gw.accountUsage(ctx, w, usageRecord{
 		orgID:      admitted.OrgID,
@@ -285,7 +398,7 @@ func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, 
 		costUSD:    ext.EstimatedCostUSD,
 		priceKnown: ext.PriceKnown,
 	})
-	gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:      "request.completed",
 			RequestID:      admitted.RequestID,
@@ -329,10 +442,11 @@ func (gw *gateway) finishCompletion(w http.ResponseWriter, ctx context.Context, 
 		termination: completionTermination(ctx),
 		// NEXT-18c: settle the reservation and stamp tuples + termination
 		// (§5.3 Finalize). Resale is not computed on this pipeline; the
-		// wallet actual falls back to the base quote — the consumer's own
-		// rule.
+		// wallet actual falls back to the base quote — the consumer's
+		// own rule.
 		eventNote: true,
 	}, nil)
+	return ferr
 }
 
 // completionTermination classifies a finished completion for the Finalize

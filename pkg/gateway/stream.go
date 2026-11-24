@@ -12,6 +12,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -190,9 +191,21 @@ type streamRun struct {
 	// clientSawDone records whether the terminal "data: [DONE]" frame was
 	// already delivered to the client during the drain (N03-P01): a late
 	// drain failure after the terminator must not emit a second terminal
-	// event. Set by the terminal watch installed in drain and read by the
-	// finishers on the same goroutine.
+	// event. Fed by doneWatch (innermost, installed in wrapWriters) and
+	// read by the finishers on the same goroutine.
 	clientSawDone bool
+	// clientTerminalDelivered reads the watch live: the streaming-policy
+	// seam releases its held prefix after drain returns (finishStream),
+	// so a drain-time snapshot can miss a terminator delivered moments
+	// later. Same-goroutine discipline as the field above.
+	// doneWatch observes the client-bound bytes below every wrapper
+	// (cache record, history capture, policy seam, tool gate): nil in
+	// hand-assembled test chains that skip wrapWriters. For admitted
+	// invocations it also carries the facts-ordered DONE hold — while
+	// armed it buffers the terminator and seen only flips when the frame
+	// actually reaches this client-facing seam. Its methods are
+	// nil-receiver safe.
+	doneWatch *sseTerminalWatch
 
 	// connection-phase results (connect).
 	finalInfo        resolver.ModelInfo
@@ -532,6 +545,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	flusher, ok = r.w.(http.Flusher)
 	if !ok {
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		apierrors.Write(r.w, http.StatusNotImplemented, apierrors.ErrorCodeAPI,
 			"streaming not supported by server")
 		return flusher, false
@@ -548,6 +562,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	if err != nil {
 		r.l.Warn("guard hooks denied stream request", "error", err)
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		writeSSEError(r.w, "guard_denied", "request blocked by guard hooks: sensitive data detected")
 		return flusher, false
 	}
@@ -564,6 +579,7 @@ func (r *streamRun) admit(info resolver.ModelInfo) (flusher http.Flusher, ok boo
 	if err := r.gw.checkBreaker(); err != nil {
 		r.l.Error("circuit breaker open, rejecting stream", "error", err)
 		reservationGateFrom(r.ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		writeSSEError(r.w, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
 		return flusher, false
 	}
@@ -666,8 +682,9 @@ func (r *streamRun) finishConnectFailure() {
 	// parity of the admit-time rejection: the same 503 SSE frame, no
 	// analytics event, the escrow settles locally. No endpoint was dialed,
 	// so this is not an upstream failure to record.
-	if r.lastCode == http.StatusServiceUnavailable && int(r.openHops.Load()) == len(r.attempts) {
+	if allCircuitsOpen(r.lastCode, int(r.openHops.Load()), len(r.attempts)) {
 		r.gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		r.gw.voidUndispatchedInvocation(r.ctx, r.l)
 		r.l.Error("circuit breaker open, rejecting stream (all candidate endpoints open)",
 			"attempts", len(r.attempts))
 		writeSSEError(r.w, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
@@ -680,7 +697,7 @@ func (r *streamRun) finishConnectFailure() {
 		"error", r.lastErr, "attempts", len(r.attempts))
 
 	// PB1: Lineage attestation for streaming error path.
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base: eventBase{
 			EventType:       "request.failed",
 			RequestID:       r.reqID,
@@ -717,6 +734,14 @@ func (r *streamRun) finishConnectFailure() {
 		// event (§5.3 Finalize); no usage accrued on the connection phase.
 		termination: budget.TerminationUpstreamErr,
 	}, nil)
+	// The client's stream already ended in an error envelope — its held
+	// [DONE] (if any) must never follow a failure; drop it and log the
+	// withheld event loudly.
+	r.doneWatch.failDoneHold()
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
 
 	_, errType, _, errMsg := r.gw.mapProviderUpstream(r.finalInfo.Provider, r.lastCode, r.lastErr)
 	// RATELIMIT-FALLBACK P2: on a decision-bearing upstream rate limit,
@@ -742,6 +767,14 @@ func (r *streamRun) finishConnectFailure() {
 // storing never lands in the shared cache.
 func (r *streamRun) wrapWriters() http.Flusher {
 	var flusher http.Flusher
+	// The terminal watch rides INNERMOST, over the raw response writer:
+	// every wrapper above may rewrite client-bound bytes (the policy seam
+	// reframes fused terminators into a standalone [DONE], the tool gate
+	// drops denied fragments, the passthrough tail appends separator
+	// bytes), so only a watch below all of them records exactly the
+	// terminals the client actually received (N03-P01).
+	r.doneWatch = newSSETerminalWatch(r.w)
+	r.w = r.doneWatch
 	recordCache := r.gw.cache != nil && r.orgID != "" && !r.cacheDisabled && r.gw.cfg.CacheStreamEnabled
 	if recordCache {
 		// STREAM-01: the capture is bounded — an arbitrarily long upstream
@@ -801,18 +834,30 @@ func (r *streamRun) wrapWriters() http.Flusher {
 	return flusher
 }
 
-// ssePassthroughTail observes the client-facing tail of the passthrough
-// relay: whether the bytes written so far end inside an SSE event (a data
-// line was written but its blank frame separator has not). Writes pass
-// through unchanged — the passthrough relay stays bit-for-bit; only
-// completePassthroughTail ever appends, exactly one LF, at drain-failure
-// composition time. Single-goroutine by construction: drain and the
-// end-of-stream composition run on the serveStream goroutine.
+// ssePassthroughTail observes the client-facing tail of a passthrough
+// relay: whether the bytes actually written so far end inside an SSE
+// event (a data line was written but its blank frame separator has not).
+// Writes pass through unchanged — the passthrough relays stay
+// bit-for-bit; only complete ever appends, and only at terminal-frame
+// composition time (drain failure or stream-interruption synthesis).
+// Terminator state is derived from a small trailing-byte window of the
+// cumulative stream, so it survives arbitrary write fragmentation —
+// including a CRLF or a lone-CR terminator split across writes — and a
+// partially failed write (the tracker only records the bytes the client
+// actually received). Single-goroutine by construction: drain and the
+// end-of-stream composition run on the serve goroutine of the owning
+// endpoint.
 type ssePassthroughTail struct {
 	w     http.ResponseWriter
-	total int64 // bytes passed through (0 = nothing streamed: nothing torn)
-	lfRun int   // trailing consecutive LF count of the cumulative stream, capped at 2
+	total int64  // bytes the client actually received (0 = nothing streamed: nothing torn)
+	tail  []byte // trailing window of the cumulative stream, ≤ tailWindow bytes
+	run   int    // trailing line-terminator run of the cumulative stream, capped at 2
+	hang  bool   // the stream's last byte is a CR whose LF successor is still unknown
 }
+
+// tailWindow covers the state the terminator scan needs: two full CRLF
+// terminators plus the carried lone CR.
+const tailWindow = 8
 
 func (t *ssePassthroughTail) Header() http.Header  { return t.w.Header() }
 func (t *ssePassthroughTail) WriteHeader(code int) { t.w.WriteHeader(code) }
@@ -823,46 +868,92 @@ func (t *ssePassthroughTail) Flush() {
 }
 
 func (t *ssePassthroughTail) Write(p []byte) (int, error) {
-	t.total += int64(len(p))
-	if n := len(p); n > 0 {
-		// Trailing LF run of the cumulative stream. A write that is
-		// entirely LFs extends the previous run — the passthrough handler
-		// writes a line and its terminator as separate calls, so the
-		// "\n\n" separator can split across writes.
-		run := 0
-		for i := n - 1; i >= 0 && p[i] == '\n'; i-- {
-			run++
+	n, err := t.w.Write(p)
+	if n > 0 {
+		// Record only what the client received: a short or failed write
+		// must not leave the tracker asserting bytes (e.g. a frame
+		// separator) that never reached the wire.
+		t.total += int64(n)
+		t.tail = append(t.tail, p[:n]...)
+		if len(t.tail) > tailWindow {
+			t.tail = t.tail[len(t.tail)-tailWindow:]
 		}
-		if run == n {
-			t.lfRun = min(t.lfRun+run, 2)
-		} else {
-			t.lfRun = min(run, 2)
+		t.run, t.hang = analyzeTailTerminators(t.tail)
+	}
+	return n, err
+}
+
+// analyzeTailTerminators scans the cumulative tail window once, forward,
+// under the SSE line-terminator grammar: '\n' is a terminator, '\r' is
+// one half of CRLF or a terminator in its own right. A CR counts as a
+// terminator immediately and hangs pending — a following LF pairs with
+// it (one terminator, no second count), any other byte leaves it a
+// resolved lone CR. Content resets the run. The run caps at two: that is
+// all complete() needs to know about a frame separator.
+func analyzeTailTerminators(p []byte) (run int, hang bool) {
+	for i := 0; i < len(p); i++ {
+		switch p[i] {
+		case '\n':
+			if hang {
+				hang = false // the pending CR pairs with this LF
+				continue
+			}
+			if run < 2 {
+				run++
+			}
+		case '\r':
+			if run < 2 {
+				run++
+			}
+			hang = true
+		default:
+			run, hang = 0, false
 		}
 	}
-	return t.w.Write(p)
+	return run, hang
 }
 
 // torn reports a streamed tail that ends mid-event: at least one byte was
-// written and the trailing LF run is shorter than the "\n\n" frame
-// separator.
+// written and the trailing line-terminator run is shorter than the two
+// terminators of a frame separator.
 func (t *ssePassthroughTail) torn() bool {
-	return t.total > 0 && t.lfRun < 2
+	return t.total > 0 && t.run < 2
+}
+
+// complete closes a torn SSE event by appending exactly the missing bytes
+// of the frame separator. A cut mid-line (run 0) takes two LFs — the
+// partial line ends and the separator follows; a dangling line with its
+// terminator already counted (run 1, no hanging CR) takes one LF. A tail
+// ending in a hanging CR (run 1, hang) takes two: the first LF pairs
+// into the line's CRLF, the second is the separator — appending a single
+// LF there would close the line but leave the event pending, which an
+// SSE client discards at stream end. Nil and untorn tails are no-ops, so
+// terminal-frame composers can call it unconditionally. Writing through
+// the tracker marks the tail complete, making repeated calls no-ops too.
+func (t *ssePassthroughTail) complete() {
+	if t == nil || !t.torn() {
+		return
+	}
+	if t.hang || t.run == 0 {
+		_, _ = io.WriteString(t, "\n\n")
+		return
+	}
+	_, _ = io.WriteString(t, "\n")
 }
 
 // completePassthroughTail closes a torn SSE event on the passthrough relay
-// right before the drain-failure notification composes its error frame: one
-// LF turns a dangling "data: …\n" tail into its whole event, byte-exact
-// against the upstream stream, so the error frame starts at an event
-// boundary instead of gluing into a half-written event (the line-buffered
-// relay contract). Never reached on the policy-seam path: there the
-// assembly buffer drops the never-processed partial instead
-// (sseStreamPolicyWriter.finishStream) — completing it would emit raw,
-// unmutated upstream content that passed no policy stage.
+// right before the drain-failure notification composes its error frame, so
+// the error frame starts at an event boundary instead of gluing into a
+// half-written event (the line-buffered relay contract). Never reached on
+// the policy-seam path: there the assembly buffer drops the
+// never-processed partial instead (sseStreamPolicyWriter.finishStream) —
+// completing it would emit raw, unmutated upstream content that passed no
+// policy stage.
 func (r *streamRun) completePassthroughTail() {
-	if r.streamPolicy != nil || r.sseTail == nil || !r.sseTail.torn() {
+	if r.streamPolicy != nil {
 		return
 	}
-	_, _ = io.WriteString(r.sseTail, "\n")
+	r.sseTail.complete()
 }
 
 // streamIdentityRequest carries the stream stage's trusted identity headers
@@ -1002,12 +1093,26 @@ func (r *streamRun) finishStreamPolicyDenied(usage provider.Usage, ttftMs int64,
 	if hasTTFT {
 		deniedBase.FirstTokenMs = ttftMs
 	}
-	r.gw.finishRequest(r.ctx, requestFinish{
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
 		base:        deniedBase,
 		info:        r.finalInfo,
 		resp:        r.streamResp,
 		termination: budget.TerminationPolicyDenied,
 	}, nil)
+	// The seam's AbortFrame rode the armed hold — its error frame is
+	// already on the wire and its [DONE] is the held terminator: release
+	// it after the denial's facts commit so the client's error frame is
+	// properly terminated (it follows an error, never a success). A
+	// failed facts write drops it instead — the client must NOT observe
+	// a terminator for an unaccounted denial — and the withheld event is
+	// logged loudly.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
 }
 
 // drain pipes the committed upstream stream to the client through the
@@ -1036,14 +1141,39 @@ func (r *streamRun) drain(flusher http.Flusher) (usage provider.Usage, drainErr 
 	// RM-03: when the gateway injected include_usage on the client's behalf
 	// (clientWantsUsage == false), suppress the trailing usage-only chunk
 	// from the client bytes; usage is still parsed for tokens/cost/budgets.
-	// The terminal watch rides the outermost writer so every producer's
-	// [DONE] (passthrough, translation, policy flush) marks the delivery.
-	watch := newSSETerminalWatch(r.w)
+	// The terminal watch (doneWatch, innermost in wrapWriters) records
+	// every producer's [DONE] — passthrough, translation, policy flush.
+	// Paths that assemble streamRun directly (split-drain units, legacy
+	// endpoints) skip wrapWriters; drain guarantees the watch exists the
+	// same way, wrapping the writer it was handed.
+	if r.doneWatch == nil {
+		r.doneWatch = newSSETerminalWatch(r.w)
+		r.w = r.doneWatch
+	}
+	// Central binding (Preview2 durable accounting): an admitted
+	// invocation holds the client-facing [DONE] until its terminal facts
+	// commit in finishSuccess — release happens exactly once after the
+	// durable write; a failed write drops the terminator and surfaces the
+	// typed accounting error frame instead.
+	if h := invocationIdentityFrom(r.ctx); h != nil && h.Admitted() && r.gw.invocations != nil {
+		r.doneWatch.armDoneHold()
+	}
 	handler := provider.NewStreamHandlerWithOptions(r.finalInfo.Provider, r.finalInfo.ModelName,
 		provider.StreamOptions{SuppressUsageOnlyChunk: !r.clientWantsUsage, RequestBytes: len(r.body)})
-	usage, drainErr = handler.HandleStream(r.streamCtx, watch, flusher, r.streamResp)
-	r.clientSawDone = watch.sawDone()
+	usage, drainErr = handler.HandleStream(r.streamCtx, r.w, flusher, r.streamResp)
+	r.clientSawDone = r.doneWatch.sawDone()
 	return usage, drainErr
+}
+
+// clientTerminalDelivered reports whether the client's stream ended at a
+// [DONE] terminator — live from the innermost watch, not the drain-time
+// snapshot: the streaming-policy seam may release its held prefix (and
+// its reframed terminator) after drain returns.
+func (r *streamRun) clientTerminalDelivered() bool {
+	if r.doneWatch != nil && r.doneWatch.sawDone() {
+		return true
+	}
+	return r.clientSawDone
 }
 
 // streamCacheChunk mirrors the chat.completion.chunk fields the stream cache
@@ -1395,39 +1525,9 @@ func (r *streamRun) writeStreamCacheAsync(usage provider.Usage) {
 // delivery: client notification, budget accounting for the consumed prefix,
 // and the request.failed event with the actual (partial) usage.
 func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttftMs int64, hasTTFT bool) {
-	// N03-P06-T02: the partial usage parsed before the break is still the
-	// real upstream usage, so the prompt-cache trailer reports it the same
-	// way accountUsage records it below. Best-effort transparency — no-ops
-	// on wrapper writers; absent when no provider usage was parsed.
 	setPromptCacheTrailer(r.w, usage)
-	// Best-effort: notify the client that the stream ended abnormally.
-	// writeSSEError emits an error frame + [DONE] terminator. An idle
-	// watchdog abort is reported distinctly so clients (and logs) can
-	// tell a stalled upstream from a mid-flight transport failure.
-	idleAbort := r.streamIdle != nil && r.streamIdle.Fired()
-	errDetail := fmt.Sprintf("stream drain failed: %v", drainErr)
-	if idleAbort {
-		errDetail = "upstream stream idle timeout"
-	}
-	r.l.Warn("stream drain ended with error",
-		"error", drainErr, "model", r.finalInfo.ModelName, "idle_abort", idleAbort)
-	// N03-P01: when the client already received the [DONE] terminator, the
-	// stream is over on the wire — a late failure must not emit a second
-	// terminal event (an error frame + duplicate [DONE] after [DONE] is an
-	// invalid stream per pkg/apiformat.ValidateChatStream). The failure is
-	// still logged here and reported as request.failed below.
-	if !r.clientSawDone {
-		if idleAbort {
-			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
-		} else {
-			writeSSEError(r.w, apierrors.ErrorCodeAPI, "stream interrupted")
-		}
-	}
-
-	// G3: record final token usage against task/session budgets even on
-	// drain error — the prefix was consumed, so it counts. No settled
-	// price exists for a partial stream: the session spend reports
-	// (0, false) like the pre-consolidation path.
+	idleAbort, errDetail := r.notifyDrainFailure(drainErr)
+	// Count the delivered prefix in budgets without settling a partial price.
 	r.gw.accountUsage(r.ctx, r.w, usageRecord{
 		orgID:         r.orgID,
 		taskID:        r.taskID,
@@ -1435,19 +1535,158 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		affinityModel: r.finalInfo.ModelName,
 		usage:         usage,
 	})
-
 	ext := provider.ComputeCost(usage, r.finalInfo.Provider, r.finalInfo.ModelName)
-
-	// Compute resale cost for streaming error path.
 	drainResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
+	base := r.drainFailureEvent(usage, ext, drainResale, errDetail, idleAbort, ttftMs, hasTTFT)
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
+		base:        base,
+		info:        r.finalInfo,
+		resp:        r.streamResp,
+		termination: r.drainFailureTermination(idleAbort),
+	}, nil)
+	if ferr != nil {
+		r.l.Error("terminal facts commit failed after errored stream; event withheld from consumer",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+	}
+}
 
-	// Observability parity with the non-stream path: the counterfactual
-	// baseline is premium-pool cost for tier-routed requests, actual
-	// spend otherwise. Leaving it 0 collapsed SUM(counterfactual) to ~0
-	// and made the savings percentage explode negative on
-	// streaming-heavy traffic.
-	drainBase := eventBase{
-		EventType:             "request.failed",
+func (r *streamRun) notifyDrainFailure(drainErr error) (bool, string) {
+	idleAbort := r.streamIdle != nil && r.streamIdle.Fired()
+	errDetail := fmt.Sprintf("stream drain failed: %v", drainErr)
+	if idleAbort {
+		errDetail = "upstream stream idle timeout"
+	}
+	r.l.Warn("stream drain ended with error",
+		"error", drainErr, "model", r.finalInfo.ModelName, "idle_abort", idleAbort)
+	// Disarm the held terminator before writing an error frame that ends with DONE.
+	r.doneWatch.failDoneHold()
+	// Skip a replacement terminal if DONE already reached the client.
+	if !r.clientTerminalDelivered() {
+		if idleAbort {
+			writeSSEError(r.w, apierrors.ErrorCodeAPI, "upstream stream idle timeout")
+		} else {
+			writeSSEError(r.w, apierrors.ErrorCodeAPI, "stream interrupted")
+		}
+	}
+	return idleAbort, errDetail
+}
+
+func (r *streamRun) drainFailureEvent(usage provider.Usage, ext provider.ExtendedUsage, resale float64, errDetail string, idleAbort bool, ttftMs int64, hasTTFT bool) eventBase {
+	base := eventBase{
+		EventType:           "request.failed",
+		RequestID:           r.reqID,
+		SessionID:           r.sessionID,
+		UpstreamPayload:     boundedSample(r.sentBody, upstreamCaptureLimit),
+		UpstreamResponse:    r.sseTee.String(),
+		OrgID:               r.orgID,
+		TeamID:              r.teamID,
+		APIKeyID:            eventKeyID(r.ctx),
+		SessionKeyID:        eventSessionID(r.ctx),
+		ModelRequested:      r.dec.From, // client request, before routing
+		ModelUsed:           r.finalInfo.ModelName,
+		UpstreamURL:         r.gw.upstreamURL(r.finalInfo),
+		StatusCode:          http.StatusOK,
+		DurationMs:          eventpub.ComputeDurationMs(r.start),
+		TokensIn:            usage.PromptTokens,
+		TokensOut:           usage.CompletionTokens,
+		CacheReadTokens:     usage.CacheReadTokens,
+		CacheCreationTokens: usage.CacheCreationTokens,
+		EstimatedCostUSD:    ext.EstimatedCostUSD,
+		Endpoint:            endpointFrom(r.ctx, "chat.completions"),
+		UsageSource:         usageSourceOrNone(usage.Source),
+		CostStatus:          costStatus(false, usage.Source, ext.PriceKnown),
+		// Use the same premium-pool baseline as successful tier-routed requests.
+		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
+		ResaleCostUSD:         resale,
+		Method:                "POST",
+		Error:                 errDetail,
+		TierUsed:              r.tierUsed,
+		ClassifierClass:       r.classifierClass,
+		ClassifierConfidence:  r.classifierConfidence,
+		ClassifierSource:      r.classifierSource,
+		RoutingDecision:       r.gw.decisionJSON(r.dec.Source, r.dec),
+		AttemptCount:          len(r.attempts),
+		RetryCount:            r.totalRetries,
+		Labels:                labelsFrom(r.ctx),
+		Policy:                r.streamPolicyJSON(),
+	}
+	if hasTTFT {
+		base.FirstTokenMs = ttftMs
+	}
+	if r.history != nil {
+		// Preserve the interruption cause in the partial response record.
+		reason := responseHistoryReasonUpstreamError
+		switch {
+		case idleAbort:
+			reason = responseHistoryReasonIdleTimeout
+		case r.ctx.Err() != nil:
+			reason = responseHistoryReasonClientCancel
+		}
+		base.ProcessedResponse = r.history.finishEnvelope(responseHistoryStatusPartial, reason).marshal()
+	}
+	return base
+}
+
+func (r *streamRun) drainFailureTermination(idleAbort bool) budget.Termination {
+	if idleAbort {
+		return budget.TerminationIdleTimeout
+	}
+	if r.ctx.Err() != nil {
+		return budget.TerminationClientCancel
+	}
+	return budget.TerminationUpstreamErr
+}
+
+// finishSuccess finalizes a fully drained stream: breaker success, budget
+// accounting, and the request.completed event.
+func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsage, ttftMs int64, hasTTFT bool) {
+	r.gw.recordBreakerSuccess()
+	setPromptCacheTrailer(r.w, usage)
+	r.recordStreamEvalgateSkip()
+	r.gw.accountUsage(r.ctx, r.w, usageRecord{
+		orgID:         r.orgID,
+		taskID:        r.taskID,
+		sessionID:     r.sessionID,
+		affinityModel: r.finalInfo.ModelName,
+		usage:         usage,
+		costUSD:       ext.EstimatedCostUSD,
+		priceKnown:    ext.PriceKnown,
+	})
+	streamResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
+	base := r.successEvent(usage, ext, streamResale, ttftMs, hasTTFT)
+	_, ferr := r.gw.finishRequest(r.ctx, requestFinish{
+		base:        base,
+		info:        r.finalInfo,
+		resp:        r.streamResp,
+		termination: budget.TerminationCompleted,
+	}, nil)
+	// Release the held DONE only after the durable terminal record commits.
+	if ferr != nil {
+		r.doneWatch.failDoneHold()
+		writeSSEErrorWithCode(r.w, apierrors.ErrorCodeAPI, accountingCommitFailedCode,
+			"stream completed but its durable usage record could not be committed; NOT safe to retry — support reconciles the charge")
+		r.l.Error("terminal facts commit failed after paid stream; [DONE] withheld from client",
+			"invocation_id", invocationIDFromCtx(r.ctx), "error", ferr)
+		return
+	}
+	r.doneWatch.releaseDoneHold()
+}
+
+func (r *streamRun) recordStreamEvalgateSkip() {
+	// A bounded SSE capture is not a complete judgeable cheap response.
+	if r.gw.judge == nil || r.gw.evalStore == nil || r.orgID == "" {
+		return
+	}
+	if r.classifierClass != "medium" || !(r.classifierConfidence < 0.7) || !(r.gw.cfg.EvalgateSampleRate > 0) {
+		return
+	}
+	r.l.Debug("evalgate: full cheap response unavailable for streaming request, judge skipped",
+		"org_id", r.orgID, "request_id", r.reqID)
+}
+
+func (r *streamRun) successEvent(usage provider.Usage, ext provider.ExtendedUsage, resale float64, ttftMs int64, hasTTFT bool) eventBase {
+	base := eventBase{
+		EventType:             "request.completed",
 		RequestID:             r.reqID,
 		SessionID:             r.sessionID,
 		UpstreamPayload:       boundedSample(r.sentBody, upstreamCaptureLimit),
@@ -1456,7 +1695,7 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		TeamID:                r.teamID,
 		APIKeyID:              eventKeyID(r.ctx),
 		SessionKeyID:          eventSessionID(r.ctx),
-		ModelRequested:        r.dec.From, // the client's original request, not the routed model
+		ModelRequested:        r.dec.From, // client request, before routing
 		ModelUsed:             r.finalInfo.ModelName,
 		UpstreamURL:           r.gw.upstreamURL(r.finalInfo),
 		StatusCode:            http.StatusOK,
@@ -1470,120 +1709,7 @@ func (r *streamRun) finishDrainFailure(usage provider.Usage, drainErr error, ttf
 		UsageSource:           usageSourceOrNone(usage.Source),
 		CostStatus:            costStatus(false, usage.Source, ext.PriceKnown),
 		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
-		ResaleCostUSD:         drainResale,
-		Method:                "POST",
-		Error:                 errDetail,
-		TierUsed:              r.tierUsed,
-		ClassifierClass:       r.classifierClass,
-
-		ClassifierConfidence: r.classifierConfidence,
-		ClassifierSource:     r.classifierSource,
-		RoutingDecision:      r.gw.decisionJSON(r.dec.Source, r.dec),
-		AttemptCount:         len(r.attempts),
-		RetryCount:           r.totalRetries,
-		Labels:               labelsFrom(r.ctx),
-		Policy:               r.streamPolicyJSON(),
-	}
-	if hasTTFT {
-		drainBase.FirstTokenMs = ttftMs
-	}
-	// FIX-20: the partial capture still becomes the envelope — the client
-	// DID receive a prefix, and the contract demands an explicit status with
-	// the interrupt reason. Reason mapping mirrors the termination class
-	// below: idle timeout, client cancel, upstream error otherwise. A
-	// budget-truncated capture sets truncated=true independently.
-	if r.history != nil {
-		reason := responseHistoryReasonUpstreamError
-		switch {
-		case idleAbort:
-			reason = responseHistoryReasonIdleTimeout
-		case r.ctx.Err() != nil:
-			reason = responseHistoryReasonClientCancel
-		}
-		drainBase.ProcessedResponse = r.history.finishEnvelope(responseHistoryStatusPartial, reason).marshal()
-	}
-	// NEXT-18c (§5.3 Finalize): partial usage bills under the reserve
-	// tuples (enforce mode, ADR §6/D5); the termination class tells the
-	// consumer whether the interrupt was client-driven or upstream.
-	term := budget.TerminationUpstreamErr
-	switch {
-	case idleAbort:
-		term = budget.TerminationIdleTimeout
-	case r.ctx.Err() != nil:
-		term = budget.TerminationClientCancel
-	}
-	r.gw.finishRequest(r.ctx, requestFinish{
-		base:        drainBase,
-		info:        r.finalInfo,
-		resp:        r.streamResp,
-		termination: term,
-	}, nil)
-}
-
-// finishSuccess finalizes a fully drained stream: breaker success, budget
-// accounting, and the request.completed event.
-func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsage, ttftMs int64, hasTTFT bool) {
-	r.gw.recordBreakerSuccess()
-
-	// N03-P06-T02: SSE headers were committed with the first relayed byte,
-	// but the prompt-cache outcome derives from the trailing usage chunk —
-	// deliver it as an HTTP trailer, mirroring the JSON header
-	// (finalizeChatJSON). Usage is final here; absent when none was parsed.
-	setPromptCacheTrailer(r.w, usage)
-
-	// P5.9/TP-04: Evalgate sampling for streaming. The cheap response was
-	// relayed straight to the client and the SSE tee is a bounded capture,
-	// so no full comparable cheap answer exists here. Never fabricate a
-	// judge pair from placeholder text: skip judging and record the reason.
-	if r.gw.judge != nil && r.gw.evalStore != nil && r.orgID != "" {
-		isMediumLowConf := r.classifierClass == "medium" && r.classifierConfidence < 0.7
-		if isMediumLowConf && r.gw.cfg.EvalgateSampleRate > 0 {
-			r.l.Debug("evalgate: full cheap response unavailable for streaming request, judge skipped",
-				"org_id", r.orgID, "request_id", r.reqID)
-		}
-	}
-
-	// G3: record final token usage against task/session budgets (success
-	// path), correct the TPM reservation and warm the session affinity.
-	r.gw.accountUsage(r.ctx, r.w, usageRecord{
-		orgID:         r.orgID,
-		taskID:        r.taskID,
-		sessionID:     r.sessionID,
-		affinityModel: r.finalInfo.ModelName,
-		usage:         usage,
-		costUSD:       ext.EstimatedCostUSD,
-		priceKnown:    ext.PriceKnown,
-	})
-
-	// Compute resale cost for streaming success path.
-	streamResale := r.gw.resaleCostUSD(r.ctx, r.orgID, r.finalInfo.Provider, r.finalInfo.ModelName, usage)
-
-	successBase := eventBase{
-		EventType:           "request.completed",
-		RequestID:           r.reqID,
-		SessionID:           r.sessionID,
-		UpstreamPayload:     boundedSample(r.sentBody, upstreamCaptureLimit),
-		UpstreamResponse:    r.sseTee.String(),
-		OrgID:               r.orgID,
-		TeamID:              r.teamID,
-		APIKeyID:            eventKeyID(r.ctx),
-		SessionKeyID:        eventSessionID(r.ctx),
-		ModelRequested:      r.dec.From, // the client's original request, not the routed model
-		ModelUsed:           r.finalInfo.ModelName,
-		UpstreamURL:         r.gw.upstreamURL(r.finalInfo),
-		StatusCode:          http.StatusOK,
-		DurationMs:          eventpub.ComputeDurationMs(r.start),
-		TokensIn:            usage.PromptTokens,
-		TokensOut:           usage.CompletionTokens,
-		CacheReadTokens:     usage.CacheReadTokens,
-		CacheCreationTokens: usage.CacheCreationTokens,
-		EstimatedCostUSD:    ext.EstimatedCostUSD,
-		Endpoint:            endpointFrom(r.ctx, "chat.completions"),
-		UsageSource:         usageSourceOrNone(usage.Source),
-		CostStatus:          costStatus(false, usage.Source, ext.PriceKnown),
-		// Savings baseline: premium-pool cost when tier-routed, actual otherwise.
-		CounterfactualCostUSD: r.gw.effectiveCounterfactual(r.ctx, r.dec.From, r.tierUsed, r.classifierClass, usage, ext.EstimatedCostUSD),
-		ResaleCostUSD:         streamResale,
+		ResaleCostUSD:         resale,
 		Method:                "POST",
 		TierUsed:              r.tierUsed,
 		ClassifierClass:       r.classifierClass,
@@ -1592,33 +1718,23 @@ func (r *streamRun) finishSuccess(usage provider.Usage, ext provider.ExtendedUsa
 		RoutingDecision:       r.gw.decisionJSON(r.dec.Source, r.dec),
 		AttemptCount:          len(r.attempts),
 		RetryCount:            r.totalRetries,
-		UsedOrgKey:            r.usedOrgKey, // W-BYOK-CORE: BYOK attribution (no secret material)
+		UsedOrgKey:            r.usedOrgKey, // attribution only; no credential material
 		OrgCredentialRef:      r.orgCredRef,
 		Labels:                labelsFrom(r.ctx),
 		Policy:                r.streamPolicyJSON(),
 	}
 	if hasTTFT {
-		successBase.FirstTokenMs = ttftMs
+		base.FirstTokenMs = ttftMs
 	}
-	// FIX-20: the processed-response envelope of what the client received.
-	// A stream that ended cleanly without the [DONE] terminator is honest
-	// about it: partial + missing_done_frame. A budget-truncated capture is
-	// upgraded to partial + capture_limit inside finishEnvelope.
 	if r.history != nil {
 		status, reason := responseHistoryStatusComplete, ""
-		if !r.clientSawDone {
+		// A terminal held for accounting is still part of the delivered stream.
+		if !r.clientTerminalDelivered() && !r.doneWatch.doneHoldPending() {
 			status, reason = responseHistoryStatusPartial, responseHistoryReasonMissingDoneFram
 		}
-		successBase.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
+		base.ProcessedResponse = r.history.finishEnvelope(status, reason).marshal()
 	}
-	// NEXT-18c: settle the reservation with the actual spend (§5.3
-	// Finalize) and stamp the tuples + completed termination on the event.
-	r.gw.finishRequest(r.ctx, requestFinish{
-		base:        successBase,
-		info:        r.finalInfo,
-		resp:        r.streamResp,
-		termination: budget.TerminationCompleted,
-	}, nil)
+	return base
 }
 
 // cachedCompletion is the minimal shape of a chat.completion document stored
@@ -1794,15 +1910,30 @@ var sseDoneFrames = [][]byte{
 	[]byte("data:[DONE]"),  // no-space terminator (same payload per ValidateChatStream)
 }
 
-// isSSEDoneFrame reports whether p — a single Write on the client writer —
-// is exactly a [DONE] terminator line, optionally wrapped in the frame's
-// newlines. A JSON chunk line never trims to a terminator shape, so a
-// content delta merely mentioning "data: [DONE]" cannot trip the detection.
+// isSSEDoneFrame reports whether p — a single Write on the client writer
+// — carries the [DONE] terminator line: a standalone terminator frame
+// (optionally wrapped in the frame's newlines), a frame whose final line
+// is the terminator (a malformed upstream gluing [DONE] to an unfinished
+// event), or a batched blob with the terminator anywhere inside it (a
+// streaming-policy hold release, or a contract-violating upstream sending
+// frames after its own terminator — the relay stays byte-faithful and the
+// client's stream still ended at the terminator). The match is
+// line-exact — the validator's own rule — so a JSON chunk line merely
+// mentioning "data: [DONE]" inside its payload can never trip it.
 func isSSEDoneFrame(p []byte) bool {
-	trimmed := bytes.TrimSpace(p)
-	for _, frame := range sseDoneFrames {
-		if bytes.Equal(trimmed, frame) {
-			return true
+	for len(p) > 0 {
+		i := bytes.IndexByte(p, '\n')
+		var line []byte
+		if i < 0 {
+			line, p = p, nil
+		} else {
+			line, p = p[:i], p[i+1:]
+		}
+		line = bytes.TrimSuffix(line, []byte("\r"))
+		for _, frame := range sseDoneFrames {
+			if bytes.Equal(line, frame) {
+				return true
+			}
 		}
 	}
 	return false
@@ -1811,17 +1942,37 @@ func isSSEDoneFrame(p []byte) bool {
 // sseTerminalWatch wraps the client writer for the duration of a stream
 // drain and records whether the terminal "data: [DONE]" frame reached the
 // client (N03-P01: a late failure after the terminator must not emit a
-// second terminal event). Producers emit the terminator either as the bare
-// line (the OpenAI passthrough writes line and newline separately) or as
-// the whole frame ("data: [DONE]\n\n"); both trim to the same payload, in
-// the spaced and the no-space form (the shapes ValidateChatStream accepts
-// as the terminator). A JSON chunk line never trims to a terminator shape,
-// so a content delta merely mentioning "data: [DONE]" cannot trip the
-// detection.
+// second terminal event). It wraps the RAW response writer innermost, so
+// every producer's terminator — the passthrough handler, a translation
+// relay, the streaming-policy seam's reframed standalone [DONE], the tail
+// completion — marks the delivery exactly when the bytes actually reach
+// the client (a rewriter above it may split, drop or reframe the handler's
+// own writes, so a watch placed above the rewriters would miss terminals
+// the client did receive and count ones it did not). A glued terminator
+// (an unfinished event whose final data field is [DONE]) ends the client's
+// stream too and counts; a JSON chunk line never ends with a bare
+// terminator line, so a content delta merely mentioning "data: [DONE]"
+// cannot trip the detection.
+//
+// Preview2 durable accounting adds the facts-ordered hold: when armed
+// (admitted invocation), the FIRST recognized terminator — anywhere in a
+// write, including batched behind prior frames, whose delivery order is
+// preserved — is buffered instead of forwarded, and `seen` flips only
+// when the frame is actually written through this seam (at release, or
+// immediately on unarmed streams): a fully formed [DONE] observed before
+// the terminal facts commit is held, never counted as delivered.
+// Duplicate upstream terminators leaked during the hold are dropped, so
+// the client sees exactly one terminator, and only after the facts commit.
 type sseTerminalWatch struct {
 	http.ResponseWriter
 	flusher http.Flusher
 	seen    atomic.Bool
+
+	heldMu  sync.Mutex
+	armed   bool
+	held    []byte
+	prefix  []byte // possible terminator split across writes, at most one marker
+	midLine bool   // an ordinary, already forwarded line has no delimiter yet
 }
 
 // newSSETerminalWatch wraps w; the watch itself stays a Flusher for
@@ -1834,11 +1985,156 @@ func newSSETerminalWatch(w http.ResponseWriter) *sseTerminalWatch {
 // sawDone reports whether the [DONE] terminator was written to the client.
 func (sw *sseTerminalWatch) sawDone() bool { return sw.seen.Load() }
 
-func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
-	if !sw.seen.Load() && isSSEDoneFrame(p) {
-		sw.seen.Store(true)
+// armDoneHold makes the watch buffer the terminal [DONE] frame instead of
+// forwarding it: stream success is ordered after the terminal-facts
+// commit (central binding), so the client's terminator waits.
+func (sw *sseTerminalWatch) armDoneHold() {
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = true
+}
+
+// releaseDoneHold writes the held [DONE] frame after the facts committed.
+// It runs exactly once: the hold disarms (a later release or re-arm is a
+// no-op path-ordering bug, not a second terminator) and the delivery
+// finally flips `seen`. Nil-receiver safe: unwatched/free streams never
+// arm.
+func (sw *sseTerminalWatch) releaseDoneHold() {
+	if sw == nil {
+		return
 	}
-	return sw.ResponseWriter.Write(p)
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	if !sw.armed {
+		return
+	}
+	sw.armed = false
+	if sw.held == nil {
+		// An incomplete ordinary line retains its original wire bytes.
+		if len(sw.prefix) != 0 {
+			_, _ = sw.ResponseWriter.Write(sw.prefix)
+		}
+		sw.prefix = nil
+		return
+	}
+	n, err := sw.ResponseWriter.Write(sw.held)
+	sw.seen.Store(n == len(sw.held) && err == nil)
+	sw.held = nil
+	if sw.flusher != nil {
+		sw.flusher.Flush()
+	}
+}
+
+// doneHoldPending reports whether a terminator is captured and awaiting
+// its facts-ordered release. Nil-receiver safe.
+func (sw *sseTerminalWatch) doneHoldPending() bool {
+	if sw == nil {
+		return false
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	return sw.armed && sw.held != nil
+}
+
+// failDoneHold drops the held [DONE] frame: the client must NOT observe a
+// success terminator for an unaccounted stream. Nil-receiver safe.
+func (sw *sseTerminalWatch) failDoneHold() {
+	if sw == nil {
+		return
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	sw.armed = false
+	sw.held = nil
+	sw.prefix = nil
+}
+
+func (sw *sseTerminalWatch) Write(p []byte) (int, error) {
+	if len(p) == 0 {
+		return 0, nil
+	}
+	sw.heldMu.Lock()
+	defer sw.heldMu.Unlock()
+	if !sw.armed {
+		n, err := sw.ResponseWriter.Write(p)
+		if !sw.seen.Load() && isSSEDoneFrame(p[:n]) {
+			sw.seen.Store(true)
+		}
+		return n, err
+	}
+	total := 0
+	for len(p) > 0 && sw.held == nil {
+		end := bytes.IndexAny(p, "\r\n")
+		line, separator := p, []byte(nil)
+		if end >= 0 {
+			line = p[:end]
+			separator = p[end : end+1]
+			if bytes.HasPrefix(p[end:], []byte("\r\n")) {
+				separator = p[end : end+2]
+			}
+		}
+		n, err := sw.writeHeldLine(line, separator)
+		total += n
+		if err != nil {
+			return total, err
+		}
+		p = p[n:]
+	}
+	// Once a terminal is held, the client's SSE stream has no further
+	// events. Ignore trailing upstream bytes, including duplicate markers.
+	return total + len(p), nil
+}
+
+// writeHeldLine streams ordinary lines immediately. Only a prefix that can
+// still become an exact terminator needs storage across Write boundaries.
+func (sw *sseTerminalWatch) writeHeldLine(line, separator []byte) (int, error) {
+	consumed := len(line) + len(separator)
+	if !sw.midLine && sw.captureTerminal(line, separator) {
+		return consumed, nil
+	}
+	if len(sw.prefix) > 0 {
+		_, err := writeSSEBytes(sw.ResponseWriter, sw.prefix)
+		if err != nil {
+			return 0, err
+		}
+		sw.prefix = nil
+	}
+	sw.midLine = len(separator) == 0
+	// line and separator are consecutive slices of the original write.
+	return writeSSEBytes(sw.ResponseWriter, line[:consumed])
+}
+
+func writeSSEBytes(w io.Writer, p []byte) (int, error) {
+	n, err := w.Write(p)
+	if err == nil && n != len(p) {
+		err = io.ErrShortWrite
+	}
+	return n, err
+}
+
+func (sw *sseTerminalWatch) captureTerminal(line, separator []byte) bool {
+	for _, marker := range sseDoneFrames {
+		if !bytes.HasPrefix(marker, sw.prefix) || !bytes.HasPrefix(marker[len(sw.prefix):], line) {
+			continue
+		}
+		if len(separator) == 0 {
+			sw.prefix = append(sw.prefix, line...)
+			return true
+		}
+		if len(sw.prefix)+len(line) == len(marker) {
+			sw.held = append([]byte(nil), marker...)
+			// A split CRLF is indistinguishable from CR until the next write.
+			// Normalize CR to LF for downstream clients that use a line scanner.
+			if len(separator) == 1 {
+				sw.held = append(sw.held, '\n', '\n')
+			} else {
+				sw.held = append(sw.held, "\r\n\r\n"...)
+			}
+			sw.prefix = nil
+			return true
+		}
+	}
+	return false
 }
 
 // Flush forwards to the wrapped writer's flusher.

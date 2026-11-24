@@ -29,8 +29,10 @@ import (
 // — the header stays empty through admissionCore): the workload cap must
 // still enforce per-key in the missing-org namespace, 429 with zero upstream
 // traffic and zero events. Unknown/missing org is a tenant, not a bypass.
+// (Paid dispatch under a missing org is separately refused by durable
+// accounting — the per-key discriminator below relies on that boundary.)
 func TestAdmissionRoutes_WorkloadMissingOrgNamespaceEnforced(t *testing.T) {
-	gw, hits, events := newAdmissionMatrixGateway(t)
+	gw, hits, events := newAdmissionMatrixGatewayMissingOrg(t)
 	ledger := presetWorkloadLedger(t, 100)
 	ledger.Charge("", "ci", money.MicroUSD(100)) // the missing-org "ci" window is saturated
 
@@ -43,11 +45,14 @@ func TestAdmissionRoutes_WorkloadMissingOrgNamespaceEnforced(t *testing.T) {
 	require.Zero(t, events.Load(), "an admission denial settles no event")
 
 	// The refusal is per-key, not a global lockout: another workload in the
-	// same missing-org namespace admits normally.
+	// same missing-org namespace clears the workload gate — visible because
+	// the response is the durable-accounting refusal (503), not a workload
+	// denial (429 workload_budget_exceeded).
 	rec = postMatrixRequest(t, gw, "/v1/chat/completions", "application/json",
 		`{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{"X-Yabanin-Workload": "other"})
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String())
+	require.NotContains(t, rec.Body.String(), "workload_budget_exceeded")
 }
 
 // TestAdmissionRoutes_WorkloadOrgHeaderCannotHijackNamespace is the
@@ -57,16 +62,20 @@ func TestAdmissionRoutes_WorkloadMissingOrgNamespaceEnforced(t *testing.T) {
 // resolver leaves the request in the missing-org namespace). The control
 // charge proves the request truly lives in "" — the spoof lands nowhere.
 func TestAdmissionRoutes_WorkloadOrgHeaderCannotHijackNamespace(t *testing.T) {
-	gw, hits, _ := newAdmissionMatrixGateway(t)
+	gw, hits, _ := newAdmissionMatrixGatewayMissingOrg(t)
 	ledger := presetWorkloadLedger(t, 100)
 	ledger.Charge("org-victim", "ci", money.MicroUSD(100)) // the victim's window is saturated
 
 	rec := postMatrixRequest(t, gw, "/v1/chat/completions", "application/json",
 		`{"model":"m","messages":[{"role":"user","content":"hi"}]}`,
 		map[string]string{"X-Org-Id": "org-victim", "X-Yabanin-Workload": "ci"})
-	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String(),
+	// Durable accounting refuses an org-less paid dispatch before the wire
+	// (503 history_unavailable). The refusal is accounting, NOT workload
+	// (429 via the victim's window): the spoof cannot land in org-victim.
+	require.Equal(t, http.StatusServiceUnavailable, rec.Code, rec.Body.String(),
 		"the caller-asserted org must not enter the victim's saturated window")
-	require.Equal(t, int64(1), hits.Load())
+	require.Contains(t, rec.Body.String(), "history_unavailable")
+	require.Equal(t, int64(0), hits.Load())
 
 	// Control: saturating the namespace the request ACTUALLY lands in ("")
 	// now denies the identical request — the earlier pass was real routing,

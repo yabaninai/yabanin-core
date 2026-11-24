@@ -431,6 +431,11 @@ func TestN07P5T03_SpeechInputContentTypeLenient(t *testing.T) {
 	defer server.Close()
 
 	gw := newAudioGateway(t, audioTestModel(server.URL))
+	// The route stack stays in scope (content-type rerouting is the
+	// contract under test), so initialize legitimate paid auth: resolve
+	// the bearer to a test org like production org-key auth — durable
+	// accounting fail-closes an org-less paid dispatch (503).
+	gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-lenient", nil))
 	var ev atomic.Value
 	ev.Store((*eventpub.Event)(nil))
 	gw.eventNote = func(e *eventpub.Event) { ev.Store(e) }

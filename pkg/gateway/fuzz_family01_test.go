@@ -2,17 +2,20 @@
 //
 // Two halves in ONE fuzz target:
 //
-//   - Registry replay: the eleven frozen one-byte seeds 0x01..0x0b select
-//     ADMIN-01..04, ADMIT-01..04, HOP-01..03. The CI fuzz-seed gate replays
+//   - Registry replay: the sixteen frozen one-byte seeds 0x01..0x10 select
+//     ADMIN-01..04, ADMIT-01..09, HOP-01..03. The CI fuzz-seed gate replays
 //     exactly the seed corpus, so the expensive stands (testdb Postgres)
 //     live only here, in fixed seeds, gated on Docker.
 //
 //     ADMIN-01..04  pkg/gateway/admin_create_user.go  (CLI happy/dup, flag+env
 //     password arms, password-file arms, connectDB parse/ping)
-//     ADMIT-01..04  pkg/gateway/admission.go          (resolution outage,
+//     ADMIT-01..09  pkg/gateway/admission.go          (resolution outage,
 //     unknown/reject+event, fallback resolve, task/workload tag
 //     validation, whitelist, team/agent budgets, workload cap,
-//     token budget, fair shed, dead-context silence)
+//     token budget, fair shed, dead-context silence, guard deny +
+//     projection rebuild, task default + spend skip + agent clean,
+//     fair success + no-hint shed + chat event, cap env contract,
+//     residency remap shapes + the RT-02 final gate)
 //     HOP-01..03    pkg/gateway/agent_hop_budget.go   (hop guards, settle
 //     oracles, §5 admission matrix off/shadow/enforce)
 //
@@ -74,6 +77,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/budget"
 	"github.com/reireirei/yabanin/pkg/config"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
+	"github.com/reireirei/yabanin/pkg/guardhooks"
 	"github.com/reireirei/yabanin/pkg/labels"
 	"github.com/reireirei/yabanin/pkg/money"
 	"github.com/reireirei/yabanin/pkg/pipeline"
@@ -88,8 +92,8 @@ import (
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
-// FuzzGatewayFamily01 dispatches the eleven frozen one-byte registry seeds
-// 0x01..0x0b (ADMIN-01..04, ADMIT-01..04, HOP-01..03 in order) and routes
+// FuzzGatewayFamily01 dispatches the sixteen frozen one-byte registry seeds
+// 0x01..0x10 (ADMIN-01..04, ADMIT-01..09, HOP-01..03 in order) and routes
 // every other payload — including the empty one — into the generated
 // contract fam01Generated. The empty input is not skipped: the ADMIN arm
 // independently expects the empty bootstrap password to be refused, and the
@@ -101,10 +105,12 @@ var fam01Registry = map[byte]func(*testing.T){
 	1: fam01Admin01, 2: fam01Admin02, 3: fam01Admin03, 4: fam01Admin04,
 	5: fam01Admit01, 6: fam01Admit02, 7: fam01Admit03, 8: fam01Admit04,
 	9: fam01Hop01, 10: fam01Hop02, 11: fam01Hop03,
+	12: fam01Admit05, 13: fam01Admit06, 14: fam01Admit07,
+	15: fam01Admit08, 16: fam01Admit09,
 }
 
 func FuzzGatewayFamily01(f *testing.F) {
-	for i := byte(1); i <= 11; i++ {
+	for i := byte(1); i <= 16; i++ {
 		f.Add([]byte{i})
 	}
 	f.Add([]byte("custard-model-42"))
@@ -188,6 +194,38 @@ func (r fam01SelectiveResolver) Resolve(_ context.Context, name string) resolver
 
 func (r fam01SelectiveResolver) ResolveChecked(ctx context.Context, name string) (resolver.ModelInfo, error) {
 	return r.Resolve(ctx, name), nil
+}
+
+// fam01OutageResolver answers known entries normally but fails the checked
+// lookup for the names in outage — a registry degraded for exactly one
+// model. It drives the remap re-resolution refusal: the primary candidate
+// resolves, the remapped candidate's lookup fails, and admit() must deny
+// instead of swapping to an unresolved target.
+type fam01OutageResolver struct {
+	known  map[string]resolver.ModelInfo
+	outage map[string]bool
+}
+
+func (r fam01OutageResolver) Resolve(_ context.Context, name string) resolver.ModelInfo {
+	return r.known[name]
+}
+
+func (r fam01OutageResolver) ResolveChecked(_ context.Context, name string) (resolver.ModelInfo, error) {
+	if r.outage[name] {
+		return resolver.ModelInfo{}, errors.New("registry unavailable for " + name)
+	}
+	return r.known[name], nil
+}
+
+// fam01SelectiveAccess answers its allow-table and denies everything else.
+// It drives the admission/final-gate asymmetry: the admission whitelist
+// checks the REQUESTED name (whitelistModel on a non-alias) while the
+// RT-02 final gate re-checks the RESOLVED candidate, so a key allowed for
+// "m" must not admit a renamed candidate it never saw.
+type fam01SelectiveAccess struct{ allowed map[string]bool }
+
+func (f fam01SelectiveAccess) Check(_ context.Context, _, _, model string) (bool, error) {
+	return f.allowed[model], nil
 }
 
 // fam01CoreCtx drives admissionCore directly (no route stack, so the
@@ -481,6 +519,8 @@ func fam01Admit01(t *testing.T) {
 	ev := fam01FindEvent(events(), "request.invalid")
 	require.NotNil(t, ev, "the unknown-model rejection must publish request.invalid")
 	require.Equal(t, "m", ev.ModelRequested)
+	require.Equal(t, int64(http.StatusNotFound), ev.StatusCode,
+		"the refusal event carries the exact wire status for the typed refusal history")
 	restore()
 
 	// Unknown model + fallback → resolved core carries the fallback.
@@ -630,15 +670,16 @@ func fam01Admit04(t *testing.T) {
 	t.Helper()
 	const embBody = `{"model":"m","input":"x"}`
 
-	// Workload cap: preset a 100-µUSD window, saturate the ("", "w1")
-	// window (the auth middleware strips client X-Org-Id in strict APIKey
-	// mode, so a routed matrix request admits under org ""), and the next
-	// request on that workload is refused 429.
+	// Workload cap: preset a 100-µUSD window, saturate matrix-org's "w1"
+	// window (the matrix fixture resolves the bearer to matrix-org and the
+	// auth middleware strips client X-Org-Id copies, so a routed matrix
+	// request admits under the resolved org), and the next request on
+	// that workload is refused 429.
 	gw, _, _ := newAdmissionMatrixGateway(t)
 	presetWorkloadLedger(t, 100)
 	l := workloadLedgerShared.Load()
 	require.NotNil(t, l)
-	l.Charge("", "w1", money.MicroUSD(100))
+	l.Charge("matrix-org", "w1", money.MicroUSD(100))
 	rec := postMatrixRequest(t, gw, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Workload": "w1"})
 	require.Equal(t, http.StatusTooManyRequests, rec.Code, rec.Body.String())
@@ -646,10 +687,10 @@ func fam01Admit04(t *testing.T) {
 	workloadLedgerShared.Store(nil)
 
 	// Token budget: task scope at cap → 429 + Retry-After 60. The org
-	// component is the auth-stamped "" (client X-Org-Id is stripped).
+	// component is the auth-stamped resolved org (matrix-org).
 	gw2, _, _ := newAdmissionMatrixGateway(t)
 	gw2.tokenBudget = NewTokenBudget(1000, 0, time.Minute)
-	gw2.tokenBudget.Record(TaskBudgetScope, "", "tk9", 1000)
+	gw2.tokenBudget.Record(TaskBudgetScope, "matrix-org", "tk9", 1000)
 	rec2 := postMatrixRequest(t, gw2, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Task": "tk9"})
 	require.Equal(t, http.StatusTooManyRequests, rec2.Code, rec2.Body.String())
@@ -663,7 +704,7 @@ func fam01Admit04(t *testing.T) {
 		Capacity: 1, MaxPerTenant: 1, QueueLimit: 0,
 		WaitTimeout: 50 * time.Millisecond, ShedRetryAfter: 90 * time.Second,
 	})
-	held, err := gw3.fair.Admit(context.Background(), "", "w1")
+	held, err := gw3.fair.Admit(context.Background(), "matrix-org", "w1")
 	require.NoError(t, err)
 	rec3 := postMatrixRequest(t, gw3, "/v1/embeddings", "application/json", embBody,
 		map[string]string{"X-Yabanin-Workload": "w1"})
@@ -672,6 +713,265 @@ func fam01Admit04(t *testing.T) {
 	require.Equal(t, "rate_limit_exceeded", errorType(t, rec3))
 	require.Equal(t, "60", rec3.Header().Get("Retry-After"), "Retry-After is capped at 60s")
 	require.Contains(t, rec3.Body.String(), "gateway capacity reached")
+}
+
+// --- ADMIT-05: guard-hook deny + chat projection rebuild ----------------
+
+// fam01Admit05 covers the shared guard sequence's refusal arms: the U1
+// egress guard hooks in deny mode (a refusal before any resolution, with
+// no upstream traffic) and the RT-04 typed-projection rebuild failing on a
+// guarded body that is not a valid chat completion request.
+func fam01Admit05(t *testing.T) {
+	t.Helper()
+
+	// Deny-mode hooks refuse the request at the shared core, before
+	// resolution: 400 guard_denied, zero upstream hits.
+	gw, _, hits := newAdmissionMatrixGateway(t)
+	gw.guardHooks = guardhooks.New(guardhooks.ModeDeny)
+	rec := postMatrixRequest(t, gw, "/v1/embeddings", "application/json",
+		`{"model":"m","input":"card 4242 4242 4242 4242"}`, nil)
+	require.Equal(t, http.StatusBadRequest, rec.Code, rec.Body.String())
+	require.Equal(t, "guard_denied", errorType(t, rec))
+	require.Zero(t, hits.Load(), "a guard-denied request must not reach the wire")
+
+	// The chat projection rebuild re-derives the typed request from the
+	// GUARDED body (chat's Rebuild is a JSON decode). A body that fails
+	// the rebuild is refused before resolution and publishes nothing.
+	gw2, _, _ := newAdmissionMatrixGateway(t)
+	rec2, _, ok2 := fam01CoreCtx(t, gw2, context.Background(), admissionCoreInput{
+		Model: "m",
+		Body:  []byte(`{"broken":`),
+		Rebuild: func(body []byte) error {
+			var wire struct {
+				Model string `json:"model"`
+			}
+			return json.Unmarshal(body, &wire)
+		},
+	}, nil)
+	require.False(t, ok2)
+	require.Equal(t, http.StatusBadRequest, rec2.Code, rec2.Body.String())
+	require.Equal(t, "invalid_request_error", errorType(t, rec2))
+	require.Contains(t, rec2.Body.String(), "malformed JSON")
+}
+
+// --- ADMIT-06: task default, spend skip, clean agent budget -------------
+
+// fam01Admit06 covers the admitted-side arms of the tasking and spend
+// stages: the deployment-level task default for untagged requests, the
+// count_tokens spend opt-out bypassing a budget that would deny, and a
+// funded agent budget.
+func fam01Admit06(t *testing.T) {
+	t.Helper()
+
+	// No X-Yabanin-Task header → the deployment default tags the request.
+	gw, _, _ := newAdmissionMatrixGateway(t)
+	gw.taskTag = "dep-fam01"
+	_, core, ok := fam01CoreCtx(t, gw, context.Background(), admissionCoreInput{Model: "m"}, nil)
+	require.True(t, ok)
+	require.Equal(t, "dep-fam01", core.TaskID,
+		"an untagged request carries the deployment default task")
+
+	// SkipSpendChecks (count_tokens is not spend): the team budget would
+	// deny this identity, the opted-out request is admitted untouched.
+	gw2, _, _ := newAdmissionMatrixGateway(t)
+	gw2.budgetEnforcer = fakeTeamBudget{err: budget.ErrBudgetExceeded}
+	_, _, ok2 := fam01CoreCtx(t, gw2, context.Background(),
+		admissionCoreInput{Model: "m", SkipSpendChecks: true},
+		map[string]string{"X-Team-Id": "t7"})
+	require.True(t, ok2, "the spend opt-out must bypass the team budget")
+
+	// A funded agent budget admits the request.
+	gw3, _, _ := newAdmissionMatrixGateway(t)
+	gw3.agentEnforcer = fakeAgentBudget{}
+	_, _, ok3 := fam01CoreCtx(t, gw3, context.Background(), admissionCoreInput{Model: "m"},
+		map[string]string{"X-Agent-Id": "a1"})
+	require.True(t, ok3, "an agent within its budget is admitted")
+}
+
+// --- ADMIT-07: fair success, no-hint shed, chat budget event ------------
+
+// fam01Admit07 covers the fair-admission success path (the ticket rides
+// the admitted core), the no-hint shed shape (a controller without a
+// configured hint: no Retry-After header, no "retry in" suffix), and the
+// chat-shaped team-budget event stamping the key owner.
+func fam01Admit07(t *testing.T) {
+	t.Helper()
+	const embBody = `{"model":"m","input":"x"}`
+
+	// Success: the admitted core holds its fair slot; released explicitly
+	// so the shared fuzz t carries no held capacity into later cases.
+	gw, _, _ := newAdmissionMatrixGateway(t)
+	gw.fair = router.NewFairAdmission(router.FairAdmissionConfig{
+		Capacity: 2, MaxPerTenant: 2, QueueLimit: 1,
+		WaitTimeout: 50 * time.Millisecond, ShedRetryAfter: 90 * time.Second,
+	})
+	_, core, ok := fam01CoreCtx(t, gw, context.Background(), admissionCoreInput{Model: "m"}, nil)
+	require.True(t, ok)
+	require.NotNil(t, core.FairTicket, "an admitted request holds its fair slot")
+	core.FairTicket.Release()
+
+	// Shed without a configured hint: 429, NO Retry-After header, and the
+	// message without the retry window.
+	gw2, _, _ := newAdmissionMatrixGateway(t)
+	gw2.fair = router.NewFairAdmission(router.FairAdmissionConfig{
+		Capacity: 1, MaxPerTenant: 1, QueueLimit: 0,
+		WaitTimeout: 50 * time.Millisecond,
+	})
+	held, err := gw2.fair.Admit(context.Background(), "matrix-org", "w1")
+	require.NoError(t, err)
+	rec2 := postMatrixRequest(t, gw2, "/v1/embeddings", "application/json", embBody,
+		map[string]string{"X-Yabanin-Workload": "w1"})
+	held.Release()
+	require.Equal(t, http.StatusTooManyRequests, rec2.Code, rec2.Body.String())
+	require.Equal(t, "rate_limit_exceeded", errorType(t, rec2))
+	require.Empty(t, rec2.Header().Get("Retry-After"),
+		"a controller with no hint must omit Retry-After")
+	require.Contains(t, rec2.Body.String(), "gateway capacity reached")
+	require.NotContains(t, rec2.Body.String(), "retry in",
+		"the no-hint shed message omits the retry window")
+
+	// The chat-shaped budget refusal stamps the key owner on the event;
+	// the non-chat shape omits it.
+	hdr := map[string]string{"X-Team-Id": "t8", "X-User-Id": "u8"}
+	gw3, _, _ := newAdmissionMatrixGateway(t)
+	gw3.budgetEnforcer = fakeTeamBudget{err: budget.ErrBudgetExceeded}
+	events, restore := fam01CaptureEvents(t)
+	_, _, ok3 := fam01CoreCtx(t, gw3, context.Background(),
+		admissionCoreInput{Model: "m", BudgetEventUser: true}, hdr)
+	require.False(t, ok3)
+	ev := fam01FindEvent(events(), "request.budget_exceeded")
+	require.NotNil(t, ev, "a team-budget refusal must publish request.budget_exceeded")
+	require.Equal(t, "u8", ev.UserID, "the chat-shaped event stamps the key owner")
+	restore()
+
+	gw4, _, _ := newAdmissionMatrixGateway(t)
+	gw4.budgetEnforcer = fakeTeamBudget{err: budget.ErrBudgetExceeded}
+	events4, restore4 := fam01CaptureEvents(t)
+	_, _, ok4 := fam01CoreCtx(t, gw4, context.Background(),
+		admissionCoreInput{Model: "m"}, hdr)
+	require.False(t, ok4)
+	ev4 := fam01FindEvent(events4(), "request.budget_exceeded")
+	require.NotNil(t, ev4)
+	require.Empty(t, ev4.UserID, "the non-chat budget event omits the user")
+	restore4()
+}
+
+// --- ADMIT-08: workload cap environment contract ------------------------
+
+// fam01Admit08 pins workloadCapFromEnv: unparsable, non-positive and
+// out-of-range quotes select the disabled ledger, a valid quote converts
+// exactly. The env variable is unset again before the arm returns so no
+// later case inherits a configured cap.
+func fam01Admit08(t *testing.T) {
+	t.Helper()
+	require.NoError(t, os.Unsetenv(WorkloadBudgetEnvUSD))
+	defer func() { require.NoError(t, os.Unsetenv(WorkloadBudgetEnvUSD)) }()
+
+	require.Zero(t, int64(workloadCapFromEnv()),
+		"no configured cap keeps the ledger disabled")
+
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "nope"))
+	require.Zero(t, int64(workloadCapFromEnv()),
+		"an unparsable cap keeps the ledger disabled")
+
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "-5"))
+	require.Zero(t, int64(workloadCapFromEnv()),
+		"a non-positive cap keeps the ledger disabled")
+
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "1e30"))
+	require.Zero(t, int64(workloadCapFromEnv()),
+		"an out-of-range quote keeps the ledger disabled")
+
+	require.NoError(t, os.Setenv(WorkloadBudgetEnvUSD, "1.25"))
+	want, err := money.FromUSD(1.25)
+	require.NoError(t, err)
+	require.Equal(t, int64(want), int64(workloadCapFromEnv()),
+		"a valid quote converts exactly")
+}
+
+// --- ADMIT-09: residency remap shapes + the RT-02 final gate ------------
+
+// fam01Admit09 drives admit() directly (residency and the final-candidate
+// gate live in the admit wrapper, not the shared core): the NoRemap
+// refusal for remap-incompatible endpoints, a remap followed through its
+// re-resolution (candidate swap + region/pack headers), the remapped
+// candidate's resolution outage, and the final gate denying a renamed
+// candidate the admission whitelist never saw.
+func fam01Admit09(t *testing.T) {
+	t.Helper()
+	const embBody = `{"model":"m","input":"x"}`
+	admitReq := func() (*http.Request, *httptest.ResponseRecorder) {
+		req := httptest.NewRequestWithContext(t.Context(), http.MethodPost,
+			"/v1/embeddings", strings.NewReader(embBody))
+		req.Header.Set("X-Org-Id", "o1")
+		return req, httptest.NewRecorder()
+	}
+	resolved := map[string]resolver.ModelInfo{
+		"m":   {ModelName: "fim", Provider: "openai", Enabled: true},
+		"rm1": {ModelName: "rm1-target", Provider: "openai", Enabled: true},
+	}
+
+	// A remap on a remap-incompatible endpoint is a refusal, not a swap.
+	gw, _, _ := newAdmissionMatrixGateway(t)
+	gw.residencyEnforcer = fakeResidency{dec: policy.Decision{
+		Allowed: true, RemappedModel: "rm1", Region: "EU", Reason: "region pin"}}
+	gw.res = fam01SelectiveResolver{known: resolved}
+	req, rec := admitReq()
+	_, ok := gw.admit(rec, req,
+		admitInput{Endpoint: "embeddings", Model: "m", Body: []byte(embBody), NoRemap: true})
+	require.False(t, ok)
+	require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+	require.Equal(t, "residency_policy_violation", errorType(t, rec))
+	require.Contains(t, rec.Body.String(), "cannot be remapped")
+
+	// A remap the endpoint accepts is followed through its re-resolution:
+	// the candidate becomes the remapped target and the region + pack
+	// headers ride the response.
+	gw2, _, _ := newAdmissionMatrixGateway(t)
+	gw2.residencyEnforcer = fakeResidency{dec: policy.Decision{
+		Allowed: true, RemappedModel: "rm1", Region: "EU", PackID: "pack-eu", Reason: "region pin"}}
+	gw2.res = fam01SelectiveResolver{known: resolved}
+	req2, rec2 := admitReq()
+	out2, ok2 := gw2.admit(rec2, req2,
+		admitInput{Endpoint: "embeddings", Model: "m", Body: []byte(embBody)})
+	require.True(t, ok2, rec2.Body.String())
+	require.Equal(t, "rm1-target", out2.Info.ModelName, "the candidate is the remapped target")
+	require.Equal(t, "EU", rec2.Header().Get("X-Residency-Region"))
+	require.Equal(t, "pack-eu", rec2.Header().Get("X-Residency-Pack"))
+
+	// The remapped candidate's resolution fails → 503; admit must deny
+	// instead of swapping to an unresolved target.
+	gw3, _, _ := newAdmissionMatrixGateway(t)
+	gw3.residencyEnforcer = fakeResidency{dec: policy.Decision{
+		Allowed: true, RemappedModel: "rm-bad", Region: "EU", Reason: "region pin"}}
+	gw3.res = fam01OutageResolver{
+		known: map[string]resolver.ModelInfo{
+			"m": {ModelName: "fim", Provider: "openai", Enabled: true},
+		},
+		outage: map[string]bool{"rm-bad": true},
+	}
+	req3, rec3 := admitReq()
+	_, ok3 := gw3.admit(rec3, req3,
+		admitInput{Endpoint: "embeddings", Model: "m", Body: []byte(embBody)})
+	require.False(t, ok3)
+	require.Equal(t, http.StatusServiceUnavailable, rec3.Code, rec3.Body.String())
+	require.Equal(t, "model_registry_unavailable", errorType(t, rec3))
+
+	// RT-02: the admission whitelist checked the REQUESTED name while the
+	// final gate re-checks the RESOLVED candidate — a key allowed for "m"
+	// must not admit a renamed candidate it never saw.
+	gw4, _, _ := newAdmissionMatrixGateway(t)
+	gw4.wl = fam01SelectiveAccess{allowed: map[string]bool{"m": true}}
+	gw4.res = fam01SelectiveResolver{known: map[string]resolver.ModelInfo{
+		"m": {ModelName: "renamed", Provider: "openai", Enabled: true},
+	}}
+	req4, rec4 := admitReq()
+	_, ok4 := gw4.admit(rec4, req4,
+		admitInput{Endpoint: "embeddings", Model: "m", Body: []byte(embBody)})
+	require.False(t, ok4)
+	require.Equal(t, http.StatusForbidden, rec4.Code, rec4.Body.String())
+	require.Equal(t, "permission_denied_error", errorType(t, rec4))
+	require.Contains(t, rec4.Body.String(), "renamed")
 }
 
 // --- HOP-01: budgeted judge client guards ------------------------------
@@ -899,7 +1199,7 @@ func fam01SafeName(seed []byte) string {
 
 // fam01Generated is the ACTIVE half of the fuzz contract: any non-seed
 // payload (the empty input included — len != 1 or first byte outside
-// 0x01..0x0b) drives three varying-input oracles, one per family. The
+// 0x01..0x10) drives three varying-input oracles, one per family. The
 // empty payload is a deliberate boundary: the ADMIN arm must see the
 // empty bootstrap password refused, while ADMIT/HOP fold it to the
 // constant fallback name. Each arm derives its input purely
@@ -971,6 +1271,8 @@ func fam01GeneratedAdmit(t *testing.T, name string) {
 	ev := fam01FindEvent(events(), "request.invalid")
 	require.NotNil(t, ev, "the unknown-model rejection must publish request.invalid")
 	require.Equal(t, name, ev.ModelRequested, "the event carries the exact requested name")
+	require.Equal(t, int64(http.StatusNotFound), ev.StatusCode,
+		"the refusal event carries the exact wire status for the typed refusal history")
 }
 
 // fam01GeneratedHop sends one judge hop whose TARGET is the derived name and
@@ -1003,6 +1305,9 @@ func fam01GeneratedHop(t *testing.T, ref string) {
 		budget.NewAdmission(nil, budget.ScopedRateSource{}, nil, "fam01-gen", budget.ModeOff, nil, budget.AdmissionConfig{}),
 		budget.NewLoopBudget(2, time.Minute),
 		nil, nil, judgeHopLogger(t),
+		// Preview2 durable accounting (additive option — the positional
+		// signature stays source-compatible).
+		WithJudgeInvocationStore(&fakeInvocationStore{}),
 	)
 	req := judgeHopRequest(ref)
 

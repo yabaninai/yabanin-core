@@ -117,6 +117,30 @@ const (
 		FROM claimed
 		ORDER BY id`
 
+	// claimReadyJobsQueryInvocation is the 0028+ projection: same lease
+	// semantics, plus the invocation identity so the resale deduction can
+	// key its idempotency on the billed invocation rather than the shared
+	// client request id. Picked by probe (settlementInvocationSchema);
+	// pre-0028 schemas keep the legacy projection above.
+	claimReadyJobsQueryInvocation = `WITH claimed AS (
+			UPDATE settlement_jobs SET
+				status = 'processing',
+				attempts = attempts + 1,
+				lease_until = now() + make_interval(secs => $1),
+				updated_at = now()
+			WHERE id IN (
+				SELECT id FROM settlement_jobs
+				WHERE status IN ('pending', 'retry') AND next_attempt_at <= now()
+				ORDER BY created_at, id
+				LIMIT $2
+				FOR UPDATE SKIP LOCKED
+			)
+			RETURNING id, org_id, request_id, charge_kind, amount_micro_usd, amount_cents, payload, attempts, invocation_id
+		)
+		SELECT id, org_id, request_id, charge_kind, amount_micro_usd, amount_cents, payload, attempts, invocation_id
+		FROM claimed
+		ORDER BY id`
+
 	// recoverExpiredLeases returns processing jobs whose executor died
 	// (lease deadline passed) to the retry queue. The attempts counter
 	// already includes the dead attempt; the normal retry budget and
@@ -135,11 +159,11 @@ const (
 	// decrement applied ($2 NULL — legacy/ledger-only settle — keeps the
 	// payload untouched), so the NEXT-18e reconcile sums the released
 	// remainder from keys that are atomic with status='settled'.
-	// W-LOGG: the update is conditioned on status='processing' — the state
-	// the claim lease holds — and the caller checks the affected row count:
-	// a lease lost to the expired-lease recovery between claim and settle
-	// must roll the whole settlement transaction back instead of settling
-	// (or double-settling) a job another worker already owns.
+	// W-LOGG: the update is conditioned on status='processing' AND the
+	// claim's fencing token (attempts) — a lease lost to recovery or a
+	// NEWER claim must roll the whole settlement transaction back instead
+	// of settling (or double-settling) a job another worker owns; a
+	// re-claim bumps attempts, so a stale token can never match.
 	markSettledQuery = `UPDATE settlement_jobs SET
 			status = 'settled',
 			lease_until = NULL,
@@ -147,7 +171,7 @@ const (
 			updated_at = now(),
 			payload = CASE WHEN $2::bigint IS NULL THEN payload
 				ELSE jsonb_set(COALESCE(payload, '{}'::jsonb), '{` + budget.ReconcileSettleKey + `}', to_jsonb($2::bigint), true) END
-		WHERE id = $1 AND status = 'processing'`
+		WHERE id = $1 AND status = 'processing' AND attempts = $3`
 
 	// settlementAdvisoryLockQuery is the per-org money-writer lock (§5.3):
 	// the same key DeductMicro, Grant, Return, SettleDecrement and the
@@ -155,20 +179,27 @@ const (
 	// never interleave with them on one scope row.
 	settlementAdvisoryLockQuery = `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`
 
+	// markRetryQuery and markRequiresAttentionQuery are fenced the same
+	// way as the settle mark: only the worker whose claim token
+	// (attempts) still matches AND whose 'processing' state still stands
+	// may transition the job. A stale worker that lost its lease to
+	// recovery or a newer claim can never undo a settled/processing job
+	// owned by someone else; a zero-row update means ownership moved on
+	// and the rightful owner (or lease expiry) decides the disposition.
 	markRetryQuery = `UPDATE settlement_jobs SET
 			status = 'retry',
 			next_attempt_at = now() + make_interval(secs => $2),
 			lease_until = NULL,
 			last_error = $3,
 			updated_at = now()
-		WHERE id = $1`
+		WHERE id = $1 AND status = 'processing' AND attempts = $4`
 
 	markRequiresAttentionQuery = `UPDATE settlement_jobs SET
 			status = 'requires_attention',
 			lease_until = NULL,
 			last_error = $2,
 			updated_at = now()
-		WHERE id = $1`
+		WHERE id = $1 AND status = 'processing' AND attempts = $3`
 
 	settlementBacklogQuery = `SELECT status, count(*) FROM settlement_jobs
 		WHERE status IN ('pending', 'retry', 'processing', 'requires_attention', 'pending_price', 'unknown')
@@ -359,8 +390,12 @@ type settlementJob struct {
 	AmountMicro money.MicroUSD
 	AmountCents int64
 	Payload     []byte
-	Attempts    int
+	Attempts    int32
 	NextBackoff time.Duration // filled at claim time for observability
+	// InvocationID is the billed invocation identity on 0028+ schemas
+	// (nil for legacy-domain rows); it keys the resale deduction's
+	// idempotency check instead of the shared client request id.
+	InvocationID *string
 }
 
 // SettlementWorker drains and settles settlement_jobs. Run owns one
@@ -379,6 +414,10 @@ type SettlementWorker struct {
 	lastCleanup  time.Time
 	lastSettled  time.Time
 	cleanupNower func() time.Time
+
+	invocationMu       sync.Mutex
+	invocationResolved bool
+	hasInvocationCol   bool
 }
 
 // NewSettlementWorker builds the worker over a database pool, the credit
@@ -447,24 +486,38 @@ func (w *SettlementWorker) tick(ctx context.Context) {
 		if len(jobs) == 0 {
 			break
 		}
-		// NEXT-18d (§5.5): jobs of one org apply as ONE batch transaction —
-		// ledger, spend upserts, job transitions and the reserve decrement
-		// commit together, semantically equivalent to the sequential
-		// per-job execution. Singletons and any failed batch fall back to
-		// the per-job executor, which is the reference semantics.
 		for _, group := range groupJobsByOrg(jobs) {
-			if len(group) > 1 && w.executeOrgBatch(ctx, group) {
-				continue
-			}
-			for i := range group {
-				w.executeJob(ctx, &group[i])
-			}
+			w.settleOrgGroup(ctx, group)
 		}
 	}
 
 	w.publishBacklog(ctx)
 	w.cleanupInbox(ctx)
 	w.cleanupSettledJobs(ctx)
+}
+
+// settleOrgGroup applies one org's claimed jobs. NEXT-18d (§5.5): jobs of
+// one org apply as ONE batch transaction — ledger, spend upserts, job
+// transitions and the reserve decrement commit together, semantically
+// equivalent to the sequential per-job execution. Singletons and any
+// pre-commit failed batch fall back to the per-job executor, which is the
+// reference semantics. Two outcomes must never reach the per-job path:
+// a fencing loss (orgBatchStale) — a newer worker re-claimed these jobs,
+// so THIS worker must not touch them again; and an uncertain commit
+// (orgBatchUncertain) — the batch may have landed, so re-execution could
+// re-charge recorded debt. Fenced lease recovery settles both: the
+// rightful owner settles re-claimed jobs; committed groups are terminal
+// and no-op on recovery; uncommitted jobs return via expired lease.
+func (w *SettlementWorker) settleOrgGroup(ctx context.Context, group []settlementJob) {
+	if len(group) > 1 {
+		switch w.executeOrgBatch(ctx, group) {
+		case orgBatchCommitted, orgBatchStale, orgBatchUncertain:
+			return
+		}
+	}
+	for i := range group {
+		w.executeJob(ctx, &group[i])
+	}
 }
 
 // settleAllowanceLink decodes the reserve linkage an intent payload carries
@@ -509,76 +562,153 @@ func groupJobsByOrg(jobs []settlementJob) [][]settlementJob {
 	return groups
 }
 
+// orgBatchResult is one org-group's batch outcome.
+type orgBatchResult int
+
+const (
+	// orgBatchFallback: nothing committed; the caller re-runs the group
+	// through the per-job executor (rollback makes that safe).
+	orgBatchFallback orgBatchResult = iota
+	// orgBatchCommitted: every disposition is durable.
+	orgBatchCommitted
+	// orgBatchStale: this worker lost the claim to a newer fencing token
+	// (budget.ErrStaleSettlementToken). Nothing committed, and the caller
+	// must NOT fall back to per-job execution — that would apply unfenced
+	// writes to jobs another worker owns. The rightful owner settles the
+	// re-claimed jobs; unaffected ones return via lease expiry.
+	orgBatchStale
+	// orgBatchUncertain: the batch commit's durable outcome is
+	// unobservable (budget.ErrCommitUncertain — transport or response
+	// loss, not a server-rejected commit). The commit may have landed, so
+	// per-job re-execution could re-charge a wallet the ledger may have
+	// just recorded as uncollectable debt. Leave the group alone: jobs a
+	// landed commit already made terminal no-op on recovery, a truly
+	// rolled-back group re-executes under the fenced re-claim.
+	orgBatchUncertain
+)
+
 // executeOrgBatch applies one org's claimed jobs through the §5.5 batch
-// executor and reports the committed dispositions. It returns true when the
-// batch transaction committed (the jobs are terminal — no per-job work is
-// left); false means the caller must fall back to the per-job executor
-// (nothing committed on an error path, so re-execution is safe).
-func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) bool {
+// executor and reports the committed dispositions. It reports orgBatchCommitted
+// when the batch transaction committed (the jobs are terminal — no per-job
+// work is left); orgBatchFallback means the caller must fall back to the
+// per-job executor (nothing committed on an error path, so re-execution is
+// safe); orgBatchStale means ownership was lost to a newer claim and the
+// jobs must be left alone entirely; orgBatchUncertain means the commit's
+// durable outcome is unobservable and the group must be left to fenced
+// lease recovery instead of any re-execution.
+func (w *SettlementWorker) executeOrgBatch(ctx context.Context, group []settlementJob) orgBatchResult {
+	entries := settlementBatchEntries(group)
+	dispositions, err := budget.SettleOrgBatch(ctx, w.db, group[0].OrgID,
+		w.batchWalletFloorCents(), entries,
+		budget.BatchSpenders{Agent: w.agentSpender})
+	if err != nil {
+		return w.classifyOrgBatchFailure(group, err)
+	}
+	metrics.SettlementBatchSize.Observe(float64(len(entries)))
+	w.logOrgBatchDispositions(group, dispositions)
+	return orgBatchCommitted
+}
+
+func settlementBatchEntries(group []settlementJob) []budget.SettleEntry {
 	entries := make([]budget.SettleEntry, 0, len(group))
 	for _, job := range group {
 		link := decodeSettleAllowanceLink(job.Payload)
+		invocation := ""
+		if job.InvocationID != nil {
+			// NULL remains in the legacy request-keyed domain; a present
+			// claim identity keys both deduction idempotency and ledger dedupe.
+			invocation = *job.InvocationID
+		}
 		entries = append(entries, budget.SettleEntry{
-			JobID:       job.ID,
-			RequestID:   job.RequestID,
-			Kind:        job.ChargeKind,
-			Amount:      job.AmountMicro,
-			Payload:     job.Payload,
+			JobID: job.ID,
+			// The claim's post-increment attempts value fences stale workers.
+			FencingToken: job.Attempts,
+			RequestID:    job.RequestID, InvocationID: invocation,
+			Kind: job.ChargeKind, Amount: job.AmountMicro, Payload: job.Payload,
 			AllowanceID: link.AllowanceID,
 			Bound:       money.MicroUSD(link.BoundMicroUSD),
 		})
 	}
+	return entries
+}
 
-	// The wallet floor is the credit store's — the exact floor the per-job
-	// DeductMicro path enforces; the config field only covers deployments
-	// without a configured store.
-	floorCents := w.cfg.WalletFloorCents
+func (w *SettlementWorker) batchWalletFloorCents() int64 {
+	// Match the per-job deduction floor whenever a credit store is present.
 	if w.creditStore != nil {
-		floorCents = w.creditStore.GracePeriodCents()
+		return w.creditStore.GracePeriodCents()
 	}
+	return w.cfg.WalletFloorCents
+}
 
-	dispositions, err := budget.SettleOrgBatch(ctx, w.db, group[0].OrgID, floorCents, entries, budget.BatchSpenders{Agent: w.agentSpender})
-	if err != nil {
-		w.logger.Warn("settlement org batch failed — falling back to per-job execution",
+func (w *SettlementWorker) classifyOrgBatchFailure(group []settlementJob, err error) orgBatchResult {
+	if errors.Is(err, budget.ErrStaleSettlementToken) {
+		// A newer owner holds the claims; only that owner may settle them.
+		w.logger.Warn("settlement org batch abandoned — claim lost to a newer worker",
 			slog.String("org_id", group[0].OrgID),
 			slog.Int("jobs", len(group)),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return orgBatchStale
 	}
-	metrics.SettlementBatchSize.Observe(float64(len(entries)))
+	if errors.Is(err, budget.ErrCommitUncertain) {
+		// The commit may have landed. Never re-run the group or fall back to
+		// per-job writes; fenced lease recovery resolves the outcome.
+		w.logger.Error("settlement org batch commit uncertain — no fallback, lease recovery decides",
+			slog.String("org_id", group[0].OrgID),
+			slog.Int("jobs", len(group)),
+			slog.String("error", err.Error()),
+		)
+		return orgBatchUncertain
+	}
+	// Every other batch error is pre-commit, so rollback makes per-job
+	// fallback safe.
+	w.logger.Warn("settlement org batch failed — falling back to per-job execution",
+		slog.String("org_id", group[0].OrgID),
+		slog.Int("jobs", len(group)),
+		slog.String("error", err.Error()),
+	)
+	return orgBatchFallback
+}
 
+func (w *SettlementWorker) logOrgBatchDispositions(group []settlementJob, dispositions map[int64]budget.BatchDisposition) {
 	for _, job := range group {
 		d := dispositions[job.ID]
 		if d.Settled {
-			metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "settled").Inc()
-			w.logger.Info("settlement job settled (batch)",
-				slog.Int64("job_id", job.ID),
-				slog.String("charge_kind", job.ChargeKind),
-				slog.String("org_id", job.OrgID),
-				slog.String("request_id", job.RequestID),
-				slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-				slog.Int64("reserve_decrement_micro_usd", d.DecrementMicroUSD),
-			)
+			logOrgBatchSettled(w.logger, job, d)
 			continue
 		}
-		if d.Reason == budget.ReasonInsufficientCredits {
-			metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
-		}
-		if d.Reason == budget.ReasonNoWallet {
-			metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet").Inc()
-		}
-		metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "requires_attention").Inc()
-		w.logger.Error("settlement job requires attention (batch) — parked as durable debt/diagnostic",
-			slog.Int64("job_id", job.ID),
-			slog.String("charge_kind", job.ChargeKind),
-			slog.String("org_id", job.OrgID),
-			slog.String("request_id", job.RequestID),
-			slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-			slog.String("reason", d.Reason),
-		)
+		logOrgBatchAttention(w.logger, job, d)
 	}
-	return true
+}
+
+func logOrgBatchSettled(logger *slog.Logger, job settlementJob, d budget.BatchDisposition) {
+	metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "settled").Inc()
+	logger.Info("settlement job settled (batch)",
+		slog.Int64("job_id", job.ID),
+		slog.String("charge_kind", job.ChargeKind),
+		slog.String("org_id", job.OrgID),
+		slog.String("request_id", job.RequestID),
+		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
+		slog.Int64("reserve_decrement_micro_usd", d.DecrementMicroUSD),
+	)
+}
+
+func logOrgBatchAttention(logger *slog.Logger, job settlementJob, d budget.BatchDisposition) {
+	if d.Reason == budget.ReasonInsufficientCredits {
+		metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
+	}
+	if d.Reason == budget.ReasonNoWallet {
+		metrics.CreditDeductionSkippedTotal.WithLabelValues("no_wallet").Inc()
+	}
+	metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "requires_attention").Inc()
+	logger.Error("settlement job requires attention (batch) — parked as durable debt/diagnostic",
+		slog.Int64("job_id", job.ID),
+		slog.String("charge_kind", job.ChargeKind),
+		slog.String("org_id", job.OrgID),
+		slog.String("request_id", job.RequestID),
+		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
+		slog.String("reason", d.Reason),
+	)
 }
 
 func (w *SettlementWorker) recoverExpiredLeases(ctx context.Context) error {
@@ -611,7 +741,20 @@ func (w *SettlementWorker) expirePendingPrice(ctx context.Context) {
 }
 
 func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, error) {
-	rows, err := w.db.Query(ctx, claimReadyJobsQuery, w.cfg.LeaseTTL.Seconds(), w.cfg.BatchSize)
+	// Resolve the claim projection BEFORE claiming anything: a transient
+	// probe failure must not claim under an unknown schema — the legacy
+	// projection drops invocation_id and would settle invoked jobs under
+	// the shared request identity. The probe runs on the pool with no
+	// transaction held; only its successful result is cached.
+	withInvocation, err := w.settlementInvocationSchema(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("resolve settlement schema before claim: %w", err)
+	}
+	query := claimReadyJobsQuery
+	if withInvocation {
+		query = claimReadyJobsQueryInvocation
+	}
+	rows, err := w.db.Query(ctx, query, w.cfg.LeaseTTL.Seconds(), w.cfg.BatchSize)
 	if err != nil {
 		return nil, fmt.Errorf("claim settlement jobs: %w", err)
 	}
@@ -621,14 +764,37 @@ func (w *SettlementWorker) claimBatch(ctx context.Context) ([]settlementJob, err
 	for rows.Next() {
 		var job settlementJob
 		var amountMicro int64
-		if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts); err != nil {
+		if withInvocation {
+			if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts, &job.InvocationID); err != nil {
+				return nil, fmt.Errorf("scan settlement job: %w", err)
+			}
+		} else if err := rows.Scan(&job.ID, &job.OrgID, &job.RequestID, &job.ChargeKind, &amountMicro, &job.AmountCents, &job.Payload, &job.Attempts); err != nil {
 			return nil, fmt.Errorf("scan settlement job: %w", err)
 		}
 		job.AmountMicro = money.MicroUSD(amountMicro)
-		job.NextBackoff = w.backoff(job.Attempts)
+		job.NextBackoff = w.backoff(int(job.Attempts))
 		jobs = append(jobs, job)
 	}
 	return jobs, rows.Err()
+}
+
+// settlementInvocationSchema resolves (per worker) whether the claim may
+// project invocation_id. It shares the stream consumer's probe query so
+// both surfaces agree on the live schema within one process. Only a
+// successful probe is cached; a transient failure propagates and the next
+// tick re-probes — no job is ever claimed under an unknown schema.
+func (w *SettlementWorker) settlementInvocationSchema(ctx context.Context) (bool, error) {
+	w.invocationMu.Lock()
+	defer w.invocationMu.Unlock()
+	if w.invocationResolved {
+		return w.hasInvocationCol, nil
+	}
+	has, err := probeSettlementInvocationColumn(ctx, w.db)
+	if err != nil {
+		return false, err
+	}
+	w.invocationResolved, w.hasInvocationCol = true, has
+	return has, nil
 }
 
 // executeJob runs one claimed job and records the outcome. Only a committed
@@ -640,7 +806,7 @@ func (w *SettlementWorker) executeJob(ctx context.Context, job *settlementJob) {
 		return
 	}
 
-	disposition, reason := w.classifyFailure(err, job.Attempts)
+	disposition, reason := w.classifyFailure(err, int(job.Attempts))
 	if disposition == "retry" {
 		metrics.SettlementJobsTotal.WithLabelValues(job.ChargeKind, "retry").Inc()
 		w.markRetry(ctx, job, err)
@@ -675,9 +841,13 @@ func (w *SettlementWorker) executeResaleDeduction(ctx context.Context, job *sett
 	}
 	var payload resaleChargePayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode resale payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode resale payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
-	return w.deductor.ProcessDeduction(ctx, job.OrgID, payload.Model, job.RequestID, job.AmountMicro, money.QuotePositive, payload.TokensIn, payload.TokensOut)
+	invocation := ""
+	if job.InvocationID != nil {
+		invocation = *job.InvocationID
+	}
+	return w.deductor.ProcessDeductionInvocation(ctx, job.OrgID, payload.Model, job.RequestID, invocation, job.AmountMicro, money.QuotePositive, payload.TokensIn, payload.TokensOut)
 }
 
 // beginMoneyTx opens a settlement transaction under the per-org advisory
@@ -725,7 +895,7 @@ func (w *SettlementWorker) markSettledWithRelease(ctx context.Context, tx pgx.Tx
 	if decrement > 0 {
 		decAmt = decrement
 	}
-	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt)
+	tag, err := tx.Exec(ctx, markSettledQuery, job.ID, decAmt, job.Attempts)
 	if err != nil {
 		return fmt.Errorf("mark settled: %w", err)
 	}
@@ -749,7 +919,7 @@ func (w *SettlementWorker) executeAgentSpend(ctx context.Context, job *settlemen
 	}
 	var payload agentSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode agent spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode agent spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.AgentID == "" {
 		return fmt.Errorf("%w: agent spend job %d carries no agent id", ErrPoisonJob, job.ID)
@@ -780,7 +950,7 @@ func (w *SettlementWorker) executeAgentSpend(ctx context.Context, job *settlemen
 func (w *SettlementWorker) executeTeamSpend(ctx context.Context, job *settlementJob) error {
 	var payload teamSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode team spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode team spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.TeamID == "" {
 		return fmt.Errorf("%w: team spend job %d carries no team id", ErrPoisonJob, job.ID)
@@ -815,7 +985,7 @@ func (w *SettlementWorker) executeTeamSpend(ctx context.Context, job *settlement
 func (w *SettlementWorker) executeSessionSpend(ctx context.Context, job *settlementJob) error {
 	var payload sessionSpendPayload
 	if err := json.Unmarshal(job.Payload, &payload); err != nil {
-		return fmt.Errorf("%w: decode session spend payload for job %d: %v", ErrPoisonJob, job.ID, err)
+		return fmt.Errorf("%w: decode session spend payload for job %d: %w", ErrPoisonJob, job.ID, err)
 	}
 	if payload.SessionKeyID == "" {
 		return fmt.Errorf("%w: session spend job %d carries no session key id", ErrPoisonJob, job.ID)
@@ -891,7 +1061,8 @@ func (w *SettlementWorker) settle(ctx context.Context, job *settlementJob) {
 }
 
 func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, execErr error) {
-	if _, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr)); err != nil {
+	tag, err := w.db.Exec(ctx, markRetryQuery, job.ID, job.NextBackoff.Seconds(), truncateErr(execErr), job.Attempts)
+	if err != nil {
 		// The lease will expire and recovery re-queues the job — the retry
 		// is not lost, only delayed past the lease TTL.
 		w.logger.Error("settlement retry mark failed (lease recovery will requeue)",
@@ -900,22 +1071,57 @@ func (w *SettlementWorker) markRetry(ctx context.Context, job *settlementJob, ex
 		)
 		return
 	}
+	if tag.RowsAffected() == 0 {
+		// Fenced out: the claim token no longer matches (lease recovered
+		// or a newer worker re-claimed) — this worker must not transition
+		// a job it no longer owns; the rightful owner decides.
+		w.logger.Warn("settlement retry mark skipped — claim lost",
+			slog.Int64("job_id", job.ID),
+			slog.Int64("attempts", int64(job.Attempts)),
+		)
+		return
+	}
 	w.logger.Warn("settlement job failed, will retry",
 		slog.Int64("job_id", job.ID),
 		slog.String("charge_kind", job.ChargeKind),
 		slog.String("org_id", job.OrgID),
 		slog.String("request_id", job.RequestID),
-		slog.Int("attempts", job.Attempts),
+		slog.Int64("attempts", int64(job.Attempts)),
 		slog.Duration("backoff", job.NextBackoff),
 		slog.String("error", execErr.Error()),
 	)
 }
 
 func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settlementJob, execErr error, reason string) {
-	if _, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, truncateErr(execErr)); err != nil {
+	// Durable parity with the batch executor (writeTerminalStates) only
+	// where the classification has a documented batch disposition code AND
+	// a pinned assertion: insufficient_credits and request_identity_
+	// conflict. Every other terminal outcome keeps the raw bounded
+	// diagnostic (poison guard text, no-wallet text, invocation sentinel,
+	// retry-budget exhaustion) — the classifier's reason and the full
+	// error stay in the parked log below either way.
+	durable := truncateErr(execErr)
+	switch reason {
+	case budget.ReasonInsufficientCredits, budget.ReasonIdentityConflict:
+		durable = reason
+	}
+	tag, err := w.db.Exec(ctx, markRequiresAttentionQuery, job.ID, durable, job.Attempts)
+	if err != nil {
 		w.logger.Error("settlement requires-attention mark failed",
 			slog.Int64("job_id", job.ID),
 			slog.String("error", err.Error()),
+		)
+		return
+	}
+	if tag.RowsAffected() == 0 {
+		// Fenced out: the claim token no longer matches — parking a job
+		// another worker owns would be exactly the unfenced undo the
+		// fencing contract forbids; the rightful owner re-executes and
+		// re-classifies (money writes are idempotent, so no charge is
+		// lost or doubled by skipping this mark).
+		w.logger.Warn("settlement requires-attention mark skipped — claim lost",
+			slog.Int64("job_id", job.ID),
+			slog.Int64("attempts", int64(job.Attempts)),
 		)
 		return
 	}
@@ -925,7 +1131,7 @@ func (w *SettlementWorker) markRequiresAttention(ctx context.Context, job *settl
 		slog.String("org_id", job.OrgID),
 		slog.String("request_id", job.RequestID),
 		slog.Int64("amount_micro_usd", int64(job.AmountMicro)),
-		slog.Int("attempts", job.Attempts),
+		slog.Int64("attempts", int64(job.Attempts)),
 		slog.String("reason", reason),
 		slog.String("error", execErr.Error()),
 	)
@@ -950,6 +1156,12 @@ func (w *SettlementWorker) classifyFailure(err error, attempts int) (disposition
 		// durable debt, not a retryable condition and not a silent zero.
 		metrics.CreditDeductionSkippedTotal.WithLabelValues("insufficient").Inc()
 		return "requires_attention", "insufficient_credits"
+	case errors.Is(err, credits.ErrChargeIdentityConflict):
+		// A usage row under this invocation identity already exists with a
+		// different org or amount — a permanent integrity conflict. Must be
+		// classified before the unique-violation case: the conflict wraps
+		// SQLSTATE 23505 but is NOT the legacy request-id conflict.
+		return "requires_attention", "invocation_identity_conflict"
 	case isUniqueViolation(err):
 		// A usage ledger row for this request already exists under a
 		// DIFFERENT org (the idempotency index is global on request_id) —

@@ -32,13 +32,20 @@ func newSettlementLiveEnv(t *testing.T) (context.Context, *pgxpool.Pool) {
 	t.Helper()
 	ctx, pool, _ := newInboxLiveEnv(t)
 	setupCreditTables(ctx, t, pool)
-	// Stand hygiene: some package tests tear the credits tables down and
-	// this helper recreates them WITHOUT the production idempotency index.
-	// The AF-06 acceptance (same request id, foreign org) is defined against
-	// the real schema, so the migrated shape is enforced here.
-	_, err := pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_request_id
+	// Stand hygiene: enforce the production usage idempotency domains of
+	// migration 0028 (the migrated stand already carries them). The AF-06
+	// acceptance (same legacy request id, foreign org) conflicts through
+	// the legacy domain, which keeps the pre-0029 global-on-request_id
+	// semantics for NULL-invocation rows. The 0029-contracted global index
+	// must NOT be re-created: invocation rows legitimately share one
+	// client request id.
+	_, err := pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_legacy
 		ON credit_transactions (request_id)
-		WHERE request_id IS NOT NULL AND type = 'usage'`)
+		WHERE request_id IS NOT NULL AND invocation_id IS NULL AND type = 'usage'`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_invocation
+		ON credit_transactions (invocation_id)
+		WHERE invocation_id IS NOT NULL AND type = 'usage'`)
 	require.NoError(t, err)
 	return ctx, pool
 }
@@ -376,7 +383,8 @@ func TestSettlementLive_InsufficientFundsBecomesDurableDebt(t *testing.T) {
 
 	status, _, lastErr := jobStatus(ctx, t, pool, jobID)
 	assert.Equal(t, "requires_attention", status)
-	assert.Contains(t, lastErr, "insufficient credits", "the durable record names the reason")
+	assert.Equal(t, budget.ReasonInsufficientCredits, lastErr,
+		"the durable record carries the classified reason (durable parity with the batch executor)")
 
 	balance, _ := requireWalletState(ctx, t, pool, af06OrgA)
 	assert.Equal(t, int64(-100), balance, "floor is not bypassed: wallet untouched")
@@ -442,7 +450,8 @@ func TestSettlementLive_SameRequestOtherOrgDoesNotStealCharge(t *testing.T) {
 	assert.Equal(t, "settled", statusA)
 	statusB, _, lastErrB := jobStatus(ctx, t, pool, jobB)
 	assert.Equal(t, "requires_attention", statusB, "identity conflict is a diagnostic, not a charge")
-	assert.Contains(t, strings.ToLower(lastErrB), "duplicate", "last_error names the unique violation")
+	assert.Equal(t, "request_identity_conflict", lastErrB,
+		"last_error carries the classified disposition reason (durable parity with the batch executor); the raw unique-violation text stays in the worker log")
 
 	rowsA, microA := ledgerUsage(ctx, t, pool, af06OrgA, "req-af06-shared")
 	assert.Equal(t, int64(1), rowsA)

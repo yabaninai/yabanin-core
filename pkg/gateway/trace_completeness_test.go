@@ -444,7 +444,7 @@ func TestFinishRequestStampsTraceCompleteness(t *testing.T) {
 
 	t.Run("unknown_without_evidence", func(t *testing.T) {
 		id := traceStampTestID(t, "finish-unknown")
-		ev := gw.finishRequest(context.Background(), requestFinish{
+		ev, _ := gw.finishRequest(context.Background(), requestFinish{
 			base: eventBase{EventType: "request.completed", RequestID: id},
 		}, nil)
 		require.JSONEq(t, `{"v":1,"c":"unknown"}`, ev.Labels[traceStampLabelKey])
@@ -456,14 +456,14 @@ func TestFinishRequestStampsTraceCompleteness(t *testing.T) {
 		id := traceStampTestID(t, "finish-full")
 		traceStampDeclare(id, 1)
 		traceStampObservePublished(id)
-		ev := gw.finishRequest(context.Background(), requestFinish{
+		ev, _ := gw.finishRequest(context.Background(), requestFinish{
 			base: eventBase{EventType: "request.completed", RequestID: id},
 		}, nil)
 		require.JSONEq(t, `{"v":1,"c":"full"}`, ev.Labels[traceStampLabelKey])
 	})
 
 	t.Run("requestless_events_unstamped", func(t *testing.T) {
-		ev := gw.finishRequest(context.Background(), requestFinish{
+		ev, _ := gw.finishRequest(context.Background(), requestFinish{
 			base: eventBase{EventType: "request.completed"},
 		}, nil)
 		require.Nil(t, ev.Labels)

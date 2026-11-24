@@ -1,9 +1,10 @@
 # Durable Request History Admission — Operator Runbook
 
-Configure the gateway to reject requests when durable request history cannot
-accept writes, or explicitly allow requests while reporting possible history
-loss. This admission check is one part of a deployment's durability design; it
-does not independently guarantee recovery from every database or storage failure.
+The gateway has two admission checks. A paid provider dispatch requires a
+confirmed start in PostgreSQL. An optional Redis probe can reject requests
+earlier when loggerd reports history loss or its event stream backs up.
+Sections 1–5 describe the Redis probe. Section 6 covers paid dispatch and
+recovery after the provider has received a request.
 
 Related surfaces: the loggerd consumer's durable-buffer backpressure gate
 (`services/loggerd/consumer/history_buffer.go`, armed automatically in
@@ -15,7 +16,7 @@ RPO/RTO table this gate implements at the admission boundary.
 
 | Env / YAML | Default | Meaning |
 | --- | --- | --- |
-| `YABANIN_HISTORY_ADMISSION` / `history_admission_enabled` | `false` | Arms the gateway-side probe. **Off by default**: the request path stays bit-for-bit and no probe round-trips are paid until the deployment explicitly opts in. |
+| `YABANIN_HISTORY_ADMISSION` / `history_admission_enabled` | `false` | Arms the gateway-side probe. The Redis probe is off by default. Paid dispatch still requires a confirmed PostgreSQL write. |
 | `YABANIN_HISTORY_MODE` / `history_mode` | `""` (= `reject`) | Outage policy: `reject` refuses new requests while durable history cannot guarantee writes (fail-closed); `allow_loss` serves through the outage with the loss surfaced in logs and the admission decision (explicit opt-in). Any other value fails gateway startup — a typo must be fixed, never silently resolved to deny-everything. |
 | `YABANIN_HISTORY_PROBE_MAX_ENTRIES` / `history_probe_max_entries` | `500000` | Stream-depth bound (entries) for the probe's direct `XLen` check: at or above it the stream counts as saturated even when loggerd's signal key is missing. The default matches the loggerd consumer's `DefaultHistoryBufferMaxEntries` (pinned by test). `0` = signal-only probing; negative values fail startup. |
 
@@ -91,9 +92,49 @@ reservations off still get history-gated admission.
   relax any other fail-closed leg (rights, spend accounting and mandatory
   audit remain denied on their own failures).
 - The probe adds 1–2 Redis round-trips per admitted request while armed
-  (same budget class as the §7.2 admission-overhead envelope). Un-armed
-  deployments pay nothing.
+  (same budget class as the §7.2 admission-overhead envelope). Disabling the probe removes those Redis calls.
 - Deployment-level only: per-org §9 reservations modes are unaffected
   (the history gate composes before them); shadow-mode reservations still
   get terminal history refusals, because durable history is not a
   per-org billing choice.
+
+## 6. Paid dispatch and recovery in Preview 2
+
+The gateway creates an invocation ID for accounting. A client-supplied
+`X-Request-ID` is a correlation value. A new client request can carry the
+same value and incur a separate charge.
+
+| Client observation | What happened | Client or operator action |
+| --- | --- | --- |
+| HTTP 503, `history_unavailable`, with a message that the paid call was not sent | The gateway could not confirm the durable start for that call. This applies even when the optional history probe is disabled or uses `allow_loss`. | Restore gateway write access to PostgreSQL. For a single refused call, retry after recovery. |
+| `accounting_commit_failed` after provider dispatch | The gateway could not confirm the terminal usage record. Buffered errors include `X-Should-Retry: false` for clients that honor the hint. A streaming client can receive the error after HTTP 200 and some content. The provider may already have charged for the work. | Stop automatic retries. Retain the organization ID, request ID and time of the failure. Check the invocation before issuing any new request. |
+| Connection lost with no final response | The client has no reliable evidence of how far the request progressed. | Use the same lookup before deciding whether to retry. |
+
+An operator with authorized database access can inspect the attempt with
+this read-only query in `psql`. Set the `org_id` and `request_id` variables
+to the affected tenant and client correlation value. Multiple rows can
+represent separate attempts, including a detached shadow call.
+
+```sql
+SELECT a.invocation_id, a.kind, a.state, a.admitted_at, a.resolved_at,
+       a.resolve_reason, f.committed_at AS terminal_facts_at
+FROM request_admissions AS a
+LEFT JOIN request_terminal_facts AS f
+  ON f.invocation_id = a.invocation_id AND f.org_id = a.org_id
+WHERE a.org_id = :'org_id' AND a.client_request_id = :'request_id'
+ORDER BY a.admitted_at, a.invocation_id;
+```
+
+An `admitted` row records the start and can still be in flight. A
+`voided` row records a proven local refusal. When terminal facts are
+present, loggerd can recover the accounting from PostgreSQL under the same
+invocation ID, including after a gateway restart or missed Redis delivery.
+A `reconciled` admission records processed accounting. Check the
+invocation's settlement job and usage transaction for the final debit.
+
+After the 15-minute grace period, loggerd can mark an admission without
+terminal facts `unresolved` with reason `grace_elapsed_no_terminal_facts`.
+Keep this attempt open for investigation. Missing evidence establishes
+neither zero usage nor a billable amount. Later authoritative terminal
+facts can still reconcile the same invocation. Recovery does not resend
+the provider request.

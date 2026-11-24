@@ -10,6 +10,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/redis/go-redis/v9"
@@ -118,6 +119,10 @@ func (m *mockRedis) DEL(ctx context.Context, keys ...string) *redis.IntCmd {
 type mockDB struct {
 	ExecFn     func(ctx context.Context, query string, args ...any) (pgconn.CommandTag, error)
 	QueryRowFn func(ctx context.Context, query string, args ...any) pgx.Row
+	// BeginTxFn, when set, replaces the default mockTx slice — for tests
+	// proving a read is routed through the delivery transaction rather
+	// than the pool (e.g. schema probes under MaxConns=1).
+	BeginTxFn func(ctx context.Context) (InboxTx, error)
 
 	// Transactional event_inbox model (AF-04): claims are visible inside
 	// their own transaction, become globally visible on Commit and are
@@ -133,7 +138,10 @@ type mockDB struct {
 	holders   map[string]*mockTx
 }
 
-func (m *mockDB) BeginTx(_ context.Context) (InboxTx, error) {
+func (m *mockDB) BeginTx(ctx context.Context) (InboxTx, error) {
+	if m.BeginTxFn != nil {
+		return m.BeginTxFn(ctx)
+	}
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	if m.committed == nil {
@@ -260,6 +268,10 @@ func (r *fakeRow) Scan(dest ...any) error {
 				*v = r.vals[i].(string)
 			case *any:
 				*v = r.vals[i]
+			case *int:
+				if n, ok := r.vals[i].(int); ok {
+					*v = n
+				}
 			}
 		}
 	}
@@ -520,7 +532,10 @@ func TestHandleRequestComplete_NonUUIDSessionIDHashed(t *testing.T) {
 	require.NoError(t, err)
 
 	require.Len(t, values, 43) // +upstream_request, +upstream_response, +observability parity
-	assert.Equal(t, goldenOpenCodeSession, values[0])
+	// The stored id is the registry id offered by the org-scoped mapping
+	// (0032): deterministic per (org, raw), never the verbatim non-UUID
+	// string (the LG-U1 invariant).
+	assert.Equal(t, uuid.NewSHA1(nsRequestLogsUUID, []byte(testOrgUUID+"\x00"+"ses_f7c8cea03ffeQF8w3WLp7oRA9w")).String(), values[0])
 	// Legacy/absent observability fields must land as NULL ("unknown"),
 	// not as fake zeros that would poison TTFT/retry aggregates.
 	assert.Nil(t, values[30], "first_token_ms")
@@ -640,13 +655,13 @@ func TestHandleRequestComplete_AllFieldsForwarded(t *testing.T) {
 	err := consumer.handleRequestComplete(context.Background(), msg)
 	require.NoError(t, err)
 
-	require.Len(t, values, 43)                                          // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0])                         // session_id
-	assert.Equal(t, testOrgUUID, values[1])                             // org_id
-	assert.Equal(t, "claude-3", values[2])                              // model_requested
-	assert.Equal(t, "claude-3-opus", values[3])                         // model_used
-	assert.Equal(t, "https://api.anthropic.com/v1/messages", values[4]) // upstream_url
-	assert.Equal(t, "POST", values[5])                                  // method
+	require.Len(t, values, 43)                                                    // +upstream_request, +upstream_response
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
+	assert.Equal(t, testOrgUUID, values[1])                                       // org_id
+	assert.Equal(t, "claude-3", values[2])                                        // model_requested
+	assert.Equal(t, "claude-3-opus", values[3])                                   // model_used
+	assert.Equal(t, "https://api.anthropic.com/v1/messages", values[4])           // upstream_url
+	assert.Equal(t, "POST", values[5])                                            // method
 }
 
 func TestHandleRequestComplete_MissingSessionID(t *testing.T) {
@@ -937,14 +952,14 @@ func TestHandleRequestComplete_StringFields(t *testing.T) {
 	err := consumer.handleRequestComplete(context.Background(), msg)
 	require.NoError(t, err)
 
-	require.Len(t, values, 43)                  // +upstream_request, +upstream_response
-	assert.Equal(t, testSessionUUID, values[0]) // session_id
-	assert.Equal(t, testOrgUUID, values[1])     // org_id
-	assert.Equal(t, int64(200), values[6])      // status_code from string "200"
-	assert.Equal(t, int64(2500), values[7])     // duration_ms from string "2500"
-	assert.Equal(t, int64(200), values[8])      // tokens_in from string "200"
-	assert.Equal(t, int64(500), values[9])      // tokens_out from string "500"
-	assert.Equal(t, "hit", values[12])          // cache_hit_type
+	require.Len(t, values, 43)                                                    // +upstream_request, +upstream_response
+	assert.Equal(t, sessionRegistryUUID(testOrgUUID, testSessionUUID), values[0]) // org-scoped registry id
+	assert.Equal(t, testOrgUUID, values[1])                                       // org_id
+	assert.Equal(t, int64(200), values[6])                                        // status_code from string "200"
+	assert.Equal(t, int64(2500), values[7])                                       // duration_ms from string "2500"
+	assert.Equal(t, int64(200), values[8])                                        // tokens_in from string "200"
+	assert.Equal(t, int64(500), values[9])                                        // tokens_out from string "500"
+	assert.Equal(t, "hit", values[12])                                            // cache_hit_type
 	// Verify cost/similarity fields are non-zero (the bug was they were always 0)
 	assert.InDelta(t, 0.97, values[13], 0.001)   // cache_similarity from string "0.97"
 	assert.InDelta(t, 0.050, values[14], 0.0001) // counterfactual_cost_usd from string "0.050"

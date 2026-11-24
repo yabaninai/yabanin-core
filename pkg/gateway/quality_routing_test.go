@@ -51,6 +51,8 @@ func qualityTestGateway(t *testing.T, mode string, src fallbackrouter.QualitySou
 		pool:        upstream.NewPool(upstream.Options{BaseURL: "http://up.example"}),
 		retryPolicy: retry.Policy{MaxAttempts: 1},
 		log:         slog.Default(),
+		// Explicit in-memory invocation store (see streamTestGateway).
+		invocations: &fakeInvocationStore{},
 	}
 	reg := classifier.NewRegistry(classifier.NewRuleTier())
 	gw.classifier = classifier.NewRegistryWithDBCacheSilent(

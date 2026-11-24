@@ -1131,6 +1131,7 @@
     "setupRequestIdPlaceholder": "Paste the X-Request-ID your client sent",
     "setupRequestIdVerify": "Verify",
     "setupRequestNotFound": "No request with that ID in this organization.",
+    "setupRequestUnavailable": "Couldn't check that ID just now — request history is temporarily unavailable. Press Verify to retry.",
     "skippedNote": "This flow was skipped for this organization. The steps below still reflect the live state.",
     "flagUnavailable": "Progress cannot be saved on this deployment; the flow still works and checks again on your next visit.",
     "stateChecking": "Checking…",

@@ -30,14 +30,22 @@ func responsesTestGateway(t *testing.T, upstreamURL string) *gateway {
 		"gpt-5-codex": {ModelName: "gpt-5-codex", Provider: "openai", UpstreamURL: upstreamURL, Enabled: true},
 	}
 	return &gateway{
-		cfg:                  cfg,
-		log:                  slog.Default(),
-		auth:                 NewAuthMiddleware(cfg, nil),
+		cfg: cfg,
+		log: slog.Default(),
+		// Preview2: durable terminal facts require a tenant; resolve the
+		// bearer key to a test org exactly like production org-key auth
+		// so route-riding fixtures admit with a real principal (tests
+		// scripting auth faults replace this after construction).
+		auth:                 NewAuthMiddleware(cfg, newTestResolver("org-test", nil)),
 		res:                  res,
 		pool:                 upstream.NewPool(upstream.Options{}),
 		fallback:             router.NewFallbackExecutor(res, 3, slog.Default()),
 		retryPolicy:          retry.DefaultPolicy(),
 		streamUsageProviders: map[string]bool{"openai": true},
+		// Preview2 durable accounting: isolated tests wire an explicit
+		// fake store so the fail-closed confirmed start admits; tests
+		// scripting admission/facts faults replace this after construction.
+		invocations: &fakeInvocationStore{},
 	}
 }
 

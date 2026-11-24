@@ -46,7 +46,7 @@ func TestErrorCapturesResponseHeaders_Verbatim(t *testing.T) {
 			defer srv.Close()
 
 			client := newTestClient(t, srv)
-			_, _, _, err := client.forward(t.Context(), []byte(`{}`), "gpt-4", "test-key", 0, false)
+			_, err := client.ForwardJSON(t.Context(), []byte(`{}`), "gpt-4", "test-key")
 			require.Error(t, err)
 
 			var uerr *Error
@@ -75,7 +75,7 @@ func TestErrorCapturesHeaders_MessageTextUnchanged(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestClient(t, srv)
-	_, _, _, err := client.forward(t.Context(), []byte(`{}`), "gpt-4", "test-key", 0, false)
+	_, err := client.ForwardJSON(t.Context(), []byte(`{}`), "gpt-4", "test-key")
 	require.Error(t, err)
 	assert.Equal(t, "upstream error 429: busy", err.Error())
 
@@ -96,7 +96,7 @@ func TestErrorCapturesHeaders_ThroughWrapping(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestClient(t, srv)
-	_, _, _, err := client.forward(t.Context(), []byte(`{}`), "gpt-4", "test-key", 0, false)
+	_, err := client.ForwardJSON(t.Context(), []byte(`{}`), "gpt-4", "test-key")
 	require.Error(t, err)
 	wrapped := fmt.Errorf("hop m2: %w", err)
 
@@ -146,7 +146,7 @@ func TestErrorCapturesHeaders_ImmutableAfterClone(t *testing.T) {
 	defer srv.Close()
 
 	client := newTestClient(t, srv)
-	_, _, _, err := client.forward(t.Context(), []byte(`{}`), "gpt-4", "test-key", 0, false)
+	_, err := client.ForwardJSON(t.Context(), []byte(`{}`), "gpt-4", "test-key")
 	require.Error(t, err)
 
 	var uerr *Error

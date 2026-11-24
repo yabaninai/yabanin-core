@@ -115,9 +115,10 @@ func (l *jointEventLog) byEndpoint(name string) *eventpub.Event {
 func jointGateway(t *testing.T, up *httptest.Server) (*gateway, *jointEventLog) {
 	t.Helper()
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: up.URL},
-		log:  slog.New(slog.DiscardHandler),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		invocations: &fakeInvocationStore{}, // explicit in-memory store (see streamTestGateway)
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: up.URL},
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
 		res: stubModelResolver{
 			"chat-m":  {ModelName: "fim", Provider: "openai", UpstreamURL: up.URL, UpstreamAPIKey: "up-key", Enabled: true},
 			"tts":     {ModelName: "tts-1", Provider: "openai", UpstreamURL: up.URL, UpstreamAPIKey: "up-key", Enabled: true},

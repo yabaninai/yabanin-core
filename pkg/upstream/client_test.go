@@ -6,16 +6,19 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/reireirei/yabanin/pkg/provider"
 	"github.com/reireirei/yabanin/pkg/requestid"
 	"github.com/reireirei/yabanin/pkg/retry"
+	"github.com/reireirei/yabanin/pkg/ssrf"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -178,6 +181,29 @@ func TestForwardJSON_UpstreamReadError(t *testing.T) {
 		assert.NotNil(t, respBody)
 	} else {
 		assert.Error(t, err)
+	}
+}
+
+func TestUpstreamGuardRetainsRequestValuesAfterCancellation(t *testing.T) {
+	type markerKey struct{}
+	ctx, cancel := context.WithCancel(context.WithValue(t.Context(), markerKey{}, "request-marker"))
+	cancel()
+
+	client, err := NewClient("https://provider.example", []string{"https://provider.example"})
+	require.NoError(t, err)
+	stop := errors.New("stop after checking guard context")
+	client.ssrfAllowList, err = ssrf.NewAllowListWithResolver([]string{"provider.example"},
+		func(guardCtx context.Context, host string) ([]net.IP, error) {
+			require.Equal(t, "provider.example", host)
+			require.Equal(t, "request-marker", guardCtx.Value(markerKey{}))
+			require.NoError(t, guardCtx.Err())
+			return nil, stop
+		})
+	require.NoError(t, err)
+	resp, err := client.Do(ctx, "/v1/models", nil, "", false, nil)
+	require.ErrorIs(t, err, stop)
+	if resp != nil {
+		require.NoError(t, resp.Body.Close())
 	}
 }
 
@@ -792,4 +818,25 @@ func TestStream_TranslateRequestErrorIsTypedNotSent(t *testing.T) {
 	var ns *retry.RequestNotSentError
 	require.ErrorAs(t, serr, &ns)
 	assert.Contains(t, serr.Error(), "translate stream request")
+}
+
+func TestForwardJSONAdmitsOnlyPreparedRequests(t *testing.T) {
+	var arrivals atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { arrivals.Add(1) }))
+	defer server.Close()
+	client, err := newTestClientWithAdapter(Options{BaseURL: server.URL, ProviderName: "anthropic"})
+	require.NoError(t, err)
+	refused := errors.New("accounting unavailable")
+	attempts := 0
+	admit := func(context.Context) error { attempts++; return refused }
+	_, err = client.ForwardJSONWithAdmission(t.Context(), []byte("not-json"), "m", "key", admit)
+	require.ErrorAs(t, err, new(*retry.RequestNotSentError))
+	require.Zero(t, attempts)
+	valid := []byte(`{"model":"m","messages":[{"role":"user","content":"text"}]}`)
+	_, err = client.ForwardJSONWithAdmission(t.Context(), valid, "m", "key", admit)
+	require.ErrorIs(t, err, refused)
+	require.Equal(t, 1, attempts)
+	_, err = client.ForwardJSONWithAdmission(t.Context(), valid, "m", "key", nil)
+	require.Error(t, err)
+	require.Zero(t, arrivals.Load())
 }

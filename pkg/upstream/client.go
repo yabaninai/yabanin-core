@@ -7,8 +7,10 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httptrace"
 	"net/url"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/reireirei/yabanin/pkg/provider"
@@ -207,7 +209,7 @@ func (c *Client) Adapter() provider.Provider { return c.adapter }
 // header_observed / provider_attested evidence tiers; Clone detaches the
 // headers from resp's lifetime (the body is closed before return).
 func (c *Client) ForwardJSONWithHeaders(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration) (http.Header, []byte, error) {
-	hdr, respBody, _, err := c.forward(ctx, body, model, apiKey, timeout, false)
+	hdr, respBody, _, err := c.forward(ctx, body, model, apiKey, timeout, false, nil)
 	return hdr, respBody, err
 }
 
@@ -216,36 +218,75 @@ func (c *Client) ForwardJSONWithHeaders(ctx context.Context, body []byte, model 
 // went to the model" evidence the request explorer shows next to the
 // client's original payload (tier routing / effort injection visible).
 func (c *Client) ForwardJSONCapturing(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration) (http.Header, []byte, []byte, error) {
-	return c.forward(ctx, body, model, apiKey, timeout, true)
+	return c.forward(ctx, body, model, apiKey, timeout, true, nil)
 }
 
-func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration, capture bool) (http.Header, []byte, []byte, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
-		return nil, nil, nil, err
+// ForwardJSONWithAdmission admits a paid request after local preparation
+// succeeds and immediately before its HTTP round trip.
+func (c *Client) ForwardJSONWithAdmission(ctx context.Context, body []byte, model, apiKey string, admit func(context.Context) error) ([]byte, error) {
+	if admit == nil {
+		return nil, errors.New("paid upstream request requires admission")
 	}
+	_, response, _, err := c.forward(ctx, body, model, apiKey, 0, false, admit)
+	return response, err
+}
 
+// preparePayload runs the outbound payload pipeline shared by both
+// request paths: adapter translation, then the model policy. A
+// translation refusal wraps the typed not-sent proof (N07-P01-T05) —
+// it happens before any transport activity, so the retry classifier,
+// the fallback chain and the gateway render act on the fact, with the
+// adapter's exact reason kept in the message (I51). An empty model
+// skips the override (native passthrough keeps every field the client
+// sent); otherwise OverrideModelRaw patches only the model key, since
+// a map round-trip re-encodes every other field through float64 and
+// corrupts extension integers beyond 2^53 (N07-P01-T04). Adapters that
+// pin a canonical served-model name re-assert it afterwards (W-PROV):
+// the override would otherwise clobber the TranslateRequest-time
+// rewrite. op names the hop in error messages.
+func (c *Client) preparePayload(body []byte, model, op string) ([]byte, error) {
 	reqBody, err := c.adapter.TranslateRequest(body)
 	if err != nil {
-		// Typed not-sent proof (N07-P01-T05): a translate refusal happens
-		// before any transport activity, so the retry classifier, the
-		// fallback chain and the gateway render can act on the fact instead
-		// of guessing from an untyped error. The adapter's exact reason
-		// stays in the message (I51).
-		return nil, nil, nil, fmt.Errorf("translate request: %w", &retry.RequestNotSentError{Err: err})
+		return nil, fmt.Errorf("translate %s: %w", op, &retry.RequestNotSentError{Err: err})
 	}
 	if model != "" {
-		// OverrideModelRaw patches only the model key; the map[string]interface{}
-		// round-trip of the legacy overrideModel re-encodes every other field
-		// through float64 and silently corrupts extension integers beyond 2^53
-		// (N07-P01-T04 explicit pass-through). Native passthrough endpoints
-		// already use the raw variant for the same reason.
 		reqBody = OverrideModelRaw(reqBody, model)
 	}
-	// Post-override hook (W-PROV): adapters that must pin a canonical
-	// served-model name re-assert it after the gateway's override, which
-	// would otherwise clobber the TranslateRequest-time rewrite.
 	if fin, ok := c.adapter.(provider.ModelFinalizer); ok {
 		reqBody = fin.FinalizeModel(reqBody, model)
+	}
+	return reqBody, nil
+}
+
+// hopRequest assembles one upstream request after payload preparation:
+// adapter request construction, the egress policy on the final URL and
+// request-id propagation. Adapter construction failures carry the
+// "create request" / "create stream request" op wording; egress policy
+// failures propagate bare so their upstream-facing text stays exact.
+func (c *Client) hopRequest(ctx context.Context, reqBody []byte, path string, stream bool, apiKey string) (*http.Request, error) {
+	req, err := c.adapter.PrepareRequest(ctx, c.baseURL, path, reqBody, apiKey, stream)
+	if err != nil {
+		if stream {
+			return nil, fmt.Errorf("create stream request: %w", err)
+		}
+		return nil, fmt.Errorf("create request: %w", err)
+	}
+	if err := c.checkRequestURL(req.URL); err != nil {
+		return nil, err
+	}
+	if id := requestid.FromContext(ctx); id != "" {
+		req.Header.Set(requestid.RequestIDHeader, string(id))
+	}
+	return req, nil
+}
+
+func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey string, timeout time.Duration, capture bool, admit func(context.Context) error) (http.Header, []byte, []byte, error) {
+	if err := c.checkSSRF(ctx); err != nil {
+		return nil, nil, nil, err
+	}
+	reqBody, err := c.preparePayload(body, model, "request")
+	if err != nil {
+		return nil, nil, nil, err
 	}
 	var sent []byte
 	if capture {
@@ -262,18 +303,23 @@ func (c *Client) forward(ctx context.Context, body []byte, model string, apiKey 
 	ctx, cancel := context.WithTimeout(ctx, t)
 	defer cancel()
 
-	req, err := c.adapter.PrepareRequest(ctx, c.baseURL, c.adapter.Path(false), reqBody, apiKey, false)
+	req, err := c.hopRequest(ctx, reqBody, c.adapter.Path(false), false, apiKey)
 	if err != nil {
-		return nil, nil, nil, fmt.Errorf("create request: %w", err)
-	}
-	if err := c.checkRequestURL(req.URL); err != nil {
 		return nil, nil, nil, err
 	}
-	if id := requestid.FromContext(ctx); id != "" {
-		req.Header.Set(requestid.RequestIDHeader, string(id))
-	}
 
-	resp, err := c.client.Do(req)
+	// Admission runs immediately before the HTTP round trip, after all
+	// local preparation succeeded.
+	if admit != nil {
+		if err := admit(ctx); err != nil {
+			return nil, nil, nil, err
+		}
+	}
+	return c.sendForward(req, sent)
+}
+
+func (c *Client) sendForward(req *http.Request, sent []byte) (http.Header, []byte, []byte, error) {
+	resp, err := c.doRequest(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, nil, nil, errors.New("upstream request timeout")
@@ -325,6 +371,32 @@ func (c *Client) ForwardJSON(ctx context.Context, body []byte, model string, api
 	return b, err
 }
 
+// streamTransportFailure classifies a failed stream round trip. The
+// deadline, the client disconnect and any other transport failure carry
+// distinct caller-facing meanings downstream, so each keeps its exact
+// message.
+func streamTransportFailure(err error) error {
+	if errors.Is(err, context.DeadlineExceeded) {
+		return errors.New("upstream stream deadline exceeded")
+	}
+	if errors.Is(err, context.Canceled) {
+		return errors.New("client disconnected")
+	}
+	return fmt.Errorf("upstream stream failed: %w", err)
+}
+
+// streamResponseStatus drains and closes a non-200 stream response into
+// its typed Error. A body that fails while being read is reported as
+// such rather than presented as provider error text.
+func streamResponseStatus(resp *http.Response) *Error {
+	bodyRead, err := io.ReadAll(resp.Body)
+	_ = resp.Body.Close() // error path: body already discarded
+	if err != nil {
+		return &Error{Status: resp.StatusCode, Body: "failed to read body", Header: resp.Header.Clone()}
+	}
+	return &Error{Status: resp.StatusCode, Body: string(bodyRead), Header: resp.Header.Clone()}
+}
+
 // Stream returns the upstream response body for SSE streaming. The caller
 // controls the lifetime of the request via ctx: a deadline on ctx bounds total
 // stream time, ctx cancellation propagates to upstream on client disconnect.
@@ -334,54 +406,26 @@ func (c *Client) ForwardJSON(ctx context.Context, body []byte, model string, api
 // the caller is responsible for translating events via the provider's
 // stream translator (P3.13 wires this in serveStream).
 func (c *Client) Stream(ctx context.Context, data []byte, apiKey string) (*http.Response, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := c.checkSSRF(ctx); err != nil {
+		return nil, err
+	}
+	reqBody, err := c.preparePayload(data, "", "stream request")
+	if err != nil {
 		return nil, err
 	}
 
-	reqBody, err := c.adapter.TranslateRequest(data)
+	req, err := c.hopRequest(ctx, reqBody, c.adapter.Path(true), true, apiKey)
 	if err != nil {
-		// Typed not-sent proof (N07-P01-T05) — same contract as forward():
-		// the refusal is structural proof nothing was sent, with the exact
-		// adapter reason preserved.
-		return nil, fmt.Errorf("translate stream request: %w", &retry.RequestNotSentError{Err: err})
-	}
-	// Post-override hook (W-PROV): keep the canonical served-model invariant
-	// on the streaming path too (the gateway overrides before Stream).
-	if fin, ok := c.adapter.(provider.ModelFinalizer); ok {
-		reqBody = fin.FinalizeModel(reqBody, "")
-	}
-
-	req, err := c.adapter.PrepareRequest(ctx, c.baseURL, c.adapter.Path(true), reqBody, apiKey, true)
-	if err != nil {
-		return nil, fmt.Errorf("create stream request: %w", err)
-	}
-	if err := c.checkRequestURL(req.URL); err != nil {
 		return nil, err
 	}
-	if id := requestid.FromContext(ctx); id != "" {
-		req.Header.Set(requestid.RequestIDHeader, string(id))
-	}
 
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
-		if errors.Is(err, context.DeadlineExceeded) {
-			return nil, errors.New("upstream stream deadline exceeded")
-		}
-		if errors.Is(err, context.Canceled) {
-			return nil, errors.New("client disconnected")
-		}
-		return nil, fmt.Errorf("upstream stream failed: %w", err)
+		return nil, streamTransportFailure(err)
 	}
-
 	if resp.StatusCode != http.StatusOK {
-		bodyRead, err := io.ReadAll(resp.Body)
-		_ = resp.Body.Close() // error path: body already discarded
-		if err != nil {
-			return nil, &Error{Status: resp.StatusCode, Body: "failed to read body", Header: resp.Header.Clone()}
-		}
-		return nil, &Error{Status: resp.StatusCode, Body: string(bodyRead), Header: resp.Header.Clone()}
+		return nil, streamResponseStatus(resp)
 	}
-
 	return resp, nil
 }
 
@@ -413,7 +457,7 @@ func overrideModel(body []byte, model string) []byte {
 // response; the caller owns and must close resp.Body. extra headers are
 // applied after the adapter's: a key with an empty value deletes the header.
 func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string, stream bool, extra http.Header) (*http.Response, error) {
-	if err := c.checkSSRF(); err != nil { //nolint:contextcheck // SSRF guard runs on a bounded background ctx (QG2-D3 threads request ctx)
+	if err := c.checkSSRF(ctx); err != nil {
 		return nil, err
 	}
 	req, err := c.adapter.PrepareRequest(ctx, c.baseURL, path, body, apiKey, stream)
@@ -427,7 +471,7 @@ func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string
 		req.Header.Set(requestid.RequestIDHeader, string(id))
 	}
 	applyExtraHeaders(req, extra)
-	resp, err := c.client.Do(req)
+	resp, err := c.doRequest(req)
 	if err != nil {
 		if errors.Is(err, context.DeadlineExceeded) {
 			return nil, errors.New("upstream request timeout")
@@ -438,6 +482,20 @@ func (c *Client) Do(ctx context.Context, path string, body []byte, apiKey string
 		return nil, fmt.Errorf("upstream request failed: %w", err)
 	}
 	return resp, nil
+}
+
+func (c *Client) doRequest(req *http.Request) (*http.Response, error) {
+	var wrote atomic.Bool
+	trace := &httptrace.ClientTrace{
+		WroteRequest: func(httptrace.WroteRequestInfo) {
+			wrote.Store(true)
+		},
+	}
+	resp, err := c.client.Do(req.WithContext(httptrace.WithClientTrace(req.Context(), trace)))
+	if err != nil && wrote.Load() {
+		return resp, &retry.RequestMayHaveBeenSentError{Err: err}
+	}
+	return resp, err
 }
 
 // applyExtraHeaders overlays extra onto req. An empty value removes the header.
@@ -532,7 +590,7 @@ func ValidateBaseURL(raw string) error {
 }
 
 // checkSSRF validates the configured upstream against the mandatory policy.
-func (c *Client) checkSSRF() error {
+func (c *Client) checkSSRF(ctx context.Context) error {
 	// c.baseURL is a full URL ("https://api.openai.com" or "http://127.0.0.1:53265").
 	// Extract the hostname before handing off to the allow-list, which compares
 	// against bare hostnames ("api.openai.com", "127.0.0.1") — using SplitHostPort
@@ -541,7 +599,7 @@ func (c *Client) checkSSRF() error {
 	if err != nil {
 		return fmt.Errorf("ssrf: invalid baseURL %q: %w", c.baseURL, err)
 	}
-	return validateURL(c.ssrfAllowList, c.allowedSchemes, parsed)
+	return validateURL(ctx, c.ssrfAllowList, c.allowedSchemes, parsed)
 }
 
 func (c *Client) checkRequestURL(target *url.URL) error {
@@ -572,9 +630,9 @@ func isHTTPURL(target *url.URL) bool {
 	return target != nil && (target.Scheme == "http" || target.Scheme == "https") && target.Hostname() != "" && target.User == nil
 }
 
-func validateURL(allowList ssrf.AllowList, allowedSchemes map[string]map[string]struct{}, target *url.URL) error {
+func validateURL(ctx context.Context, allowList ssrf.AllowList, allowedSchemes map[string]map[string]struct{}, target *url.URL) error {
 	if err := checkAllowedURL(allowList, allowedSchemes, target); err != nil {
 		return err
 	}
-	return allowList.ValidateUpstream(target.Hostname())
+	return allowList.ValidateUpstreamWithContext(ctx, target.Hostname())
 }

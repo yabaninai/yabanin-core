@@ -41,14 +41,32 @@ func newAdmissionMatrixGateway(t *testing.T) (*gateway, *atomic.Int64, *atomic.I
 	t.Cleanup(server.Close)
 
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key"},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+		cfg: config.Gateway{AuthMode: "strict", APIKey: "test-key"},
+		log: slog.Default(),
+		// Preview2: durable terminal facts require a tenant; resolve the
+		// bearer key to a test org exactly like production org-key auth
+		// (the matrix rides the real routes).
+		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("matrix-org", nil)),
 		res:  stubModelResolver{"m": {ModelName: "fim", Provider: "openai", UpstreamURL: server.URL, Enabled: true}},
 		pool: upstream.NewPool(upstream.Options{}),
+		// Preview2 durable accounting: fake store so the fail-closed
+		// confirmed start admits.
+		invocations: &fakeInvocationStore{},
 	}
 	gw.eventNote = func(*eventpub.Event) { events.Add(1) }
 	return gw, &hits, &events
+}
+
+// newAdmissionMatrixGatewayMissingOrg is the explicit missing-org variant of
+// newAdmissionMatrixGateway for the negatives that pin the org-less tenant:
+// strict api-key auth WITHOUT a resolver, so the identity carries no org
+// through admissionCore. Only the workload negative controls may use it —
+// every other matrix case keeps the resolved matrix-org tenant.
+func newAdmissionMatrixGatewayMissingOrg(t *testing.T) (*gateway, *atomic.Int64, *atomic.Int64) {
+	t.Helper()
+	gw, hits, events := newAdmissionMatrixGateway(t)
+	gw.auth = NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil)
+	return gw, hits, events
 }
 
 func postMatrixRequest(t *testing.T, gw *gateway, path, contentType, body string, extra map[string]string) *httptest.ResponseRecorder {
@@ -152,6 +170,9 @@ func TestEndpointAdmission_ControlWithoutTaskHeader(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			gw, hits, _ := newAdmissionMatrixGateway(t)
+			// This control must reach the wire, so give it a resolved
+			// tenant: durable accounting refuses org-less paid dispatch.
+			gw.auth = NewAuthMiddleware(gw.cfg, newTestResolver("org-test", nil))
 			rec := postMatrixRequest(t, gw, tc.path, "application/json", tc.body, nil)
 			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 			require.Equal(t, int64(1), hits.Load())

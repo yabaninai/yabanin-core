@@ -252,7 +252,7 @@ func TestLocalIntegration_GuardedPool_PrivateEndpointNeedsExactPin(t *testing.T)
 
 	pinned, err := pool.Get("http://10.20.30.40:8081", "vllm")
 	require.NoError(t, err, "an explicitly pinned RFC1918 endpoint must construct through the guarded pool (D-4)")
-	require.NoError(t, pinned.checkSSRF(),
+	require.NoError(t, pinned.checkSSRF(t.Context()),
 		"the exact pin must pass the request-time validate layer of the pool-built client")
 
 	stranger, serr := pool.Get("http://192.168.1.50:8080", "vllm")

@@ -79,4 +79,57 @@ describe('usePermissions /api/me cache (IMP-31)', () => {
     calls[1]!.resolve({ id: 'a5', name: 'Next Session', is_root: false })
     assert.equal((await second)?.id, 'a5')
   })
+
+  // Reverse-order delivery reproduction (member-session-reload artifact):
+  // after reset + a newer successful flight, a delayed older response must
+  // not repopulate the cache with the retired identity, latch a failure, or
+  // clear a newer flight.
+
+  it('stale success after reset cannot repopulate the cache with the retired identity', async () => {
+    const stale = requestMe() // older session's flight
+    resetMeCache() // logout/login boundary retires it
+    const fresh = requestMe()
+    assert.equal(calls.length, 2)
+    calls[1]!.resolve({ id: 'member-new', name: 'Current', is_root: false })
+    assert.equal((await fresh)?.id, 'member-new')
+
+    // The retired flight completes last: it must be discarded.
+    calls[0]!.resolve({ id: 'root-old', name: 'Retired', is_root: true })
+    assert.equal(await stale, null, 'retired flight adopted its payload')
+    const cached = await requestMe()
+    assert.equal(calls.length, 2, 'no extra fetch after the stale completion')
+    assert.equal(cached?.id, 'member-new', 'stale response repopulated cachedMe')
+  })
+
+  it('stale failure after reset does not latch unavailability for the new session', async () => {
+    const stale = requestMe()
+    resetMeCache()
+    const fresh = requestMe()
+    calls[1]!.resolve({ id: 'member-new', name: 'Current', is_root: false })
+    await fresh
+    calls[0]!.reject(new TypeError('retired failure'))
+    await stale
+
+    const cached = await requestMe()
+    assert.equal(calls.length, 2, 'no refire: the new session stays cached')
+    assert.equal(cached?.id, 'member-new', 'retired failure latched unavailable and lost the cache')
+  })
+
+  it('a retired flight cannot clear a newer in-flight request', async () => {
+    const stale = requestMe()
+    resetMeCache()
+    const first = requestMe()
+    const second = requestMe()
+    assert.equal(calls.length, 2)
+    calls[0]!.resolve({ id: 'root-old', name: 'Retired', is_root: true }) // stale completes first
+    await stale
+    // first still guards its flight: the next caller must dedupe onto it,
+    // not start a third request (which would mean inflight was cleared).
+    const third = requestMe()
+    assert.equal(calls.length, 2, 'retired finally cleared the newer flight')
+    calls[1]!.resolve({ id: 'member-new', name: 'Current', is_root: false })
+    assert.equal((await first)?.id, 'member-new')
+    assert.equal((await second)?.id, 'member-new')
+    assert.equal((await third)?.id, 'member-new')
+  })
 })

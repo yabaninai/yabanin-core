@@ -170,6 +170,10 @@ func wait(ctx context.Context, delay time.Duration) {
 // while establishing a connection. Write/read errors are intentionally not
 // accepted: a timeout or reset after request bytes were written is unknown.
 func DefinitelyNotSent(err error) bool {
+	var mayHaveBeenSent *RequestMayHaveBeenSentError
+	if errors.As(err, &mayHaveBeenSent) {
+		return false
+	}
 	var dnsErr *net.DNSError
 	if errors.As(err, &dnsErr) {
 		return true

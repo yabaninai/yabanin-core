@@ -14,6 +14,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgxpool"
+
 	"github.com/reireirei/yabanin/pkg/classifier"
 	"github.com/reireirei/yabanin/pkg/config"
 	"github.com/reireirei/yabanin/pkg/evalgate"
@@ -96,6 +98,10 @@ func evalgateTestGateway(t *testing.T, primaryURL, judgeURL string, store verdic
 		log:         slog.Default(),
 		judge:       evalgate.NewJudge(judgeURL, nil),
 		evalStore:   store,
+		// Preview2 durable accounting: the production constructor wires
+		// NewPGInvocationStore(w.pool); isolated chat fixtures wire the
+		// fake so the fail-closed confirmed start admits.
+		invocations: &fakeInvocationStore{},
 	}
 	reg := classifier.NewRegistry(classifier.NewRuleTier())
 	gw.classifier = classifier.NewRegistryWithDBCacheSilent(
@@ -160,13 +166,9 @@ func TestTP04_NonStreamValidResponseStillJudged(t *testing.T) {
 	judgeSrv, _, judgeBody := judgeHitServer(t, &judgeHits)
 	store := newFakeVerdictStore()
 
-	primary := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		_, _ = w.Write(completeResp("gpt-4o-mini"))
-	}))
-	t.Cleanup(primary.Close)
+	primary := newRT03Upstream(t, nil)
 
-	gw := evalgateTestGateway(t, primary.URL, judgeSrv.URL, store)
+	gw := evalgateTestGateway(t, primary.srv.URL, judgeSrv.URL, store)
 
 	body := nonStreamBody("gpt-4o-mini", mediumPrompt)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(string(body)))
@@ -184,11 +186,14 @@ func TestTP04_NonStreamValidResponseStillJudged(t *testing.T) {
 	if got := store.count(); got != 1 {
 		t.Fatalf("stored verdicts = %d, want 1", got)
 	}
-	// The cheap side of the pair must be the real response text, never a
-	// placeholder.
-	if prompt := judgeBody(); !strings.Contains(prompt, "Response A (from a cheaper/faster model)") ||
-		strings.Contains(prompt, "[streaming response") {
-		t.Fatalf("judge prompt must compare the real cheap response: %s", prompt)
+	var wire struct{ Messages []struct{ Content string } }
+	if err := json.Unmarshal([]byte(judgeBody()), &wire); err != nil || len(wire.Messages) != 1 {
+		t.Fatalf("invalid judge request: %v", err)
+	}
+	for _, pair := range []string{"Response A (from a cheaper/faster model):\nok-from-gpt-4o-mini\n", "Response B (from a premium/higher-quality model):\nok-from-gpt-4o\n"} {
+		if !strings.Contains(wire.Messages[0].Content, pair) {
+			t.Errorf("missing answer text %q in %q", pair, wire.Messages[0].Content)
+		}
 	}
 }
 
@@ -303,8 +308,8 @@ func TestTP04_ComparableCheapResponse(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if _, ok := comparableCheapResponse([]byte(tc.body)); ok != tc.want {
-				t.Fatalf("comparableCheapResponse(%s) = %v, want %v", tc.name, ok, tc.want)
+			if _, ok := comparableResponseText([]byte(tc.body)); ok != tc.want {
+				t.Fatalf("comparableResponseText(%s) = %v, want %v", tc.name, ok, tc.want)
 			}
 		})
 	}
@@ -404,5 +409,32 @@ func TestTP03_JudgeErrorSkipsInsertVerdict(t *testing.T) {
 	}
 	if got := store.count(); got != 0 {
 		t.Fatalf("InsertVerdict calls = %d, want 0 (judge error must not reach the store)", got)
+	}
+}
+
+func TestEvalgateConfiguredEvaluatorModelReachesProvider(t *testing.T) {
+	for _, tc := range []struct{ configured, want string }{{"custom-evaluator", "custom-evaluator"}, {"", "gpt-4o-mini"}} {
+		t.Run(tc.want, func(t *testing.T) {
+			arrived := make(chan string, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				var req struct{ Model string }
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Error(err)
+				}
+				arrived <- req.Model
+				http.Error(w, "fixture refusal", http.StatusServiceUnavailable)
+			}))
+			defer server.Close()
+			wire := gatewayWiring{cfg: config.Gateway{EvalgateURL: server.URL, EvalgateModel: tc.configured}, l: slog.Default(), pool: &pgxpool.Pool{}}
+			var gw gateway
+			buildGatewayObservability(t.Context(), &wire, &gw, nil)
+			_, call, err := gw.judge.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+			if err == nil || call.Status != http.StatusServiceUnavailable {
+				t.Fatalf("unexpected call: %+v, %v", call, err)
+			}
+			if model := <-arrived; model != tc.want || call.Model != tc.want {
+				t.Fatalf("configured %q: provider received %q, recorded %q", tc.configured, model, call.Model)
+			}
+		})
 	}
 }

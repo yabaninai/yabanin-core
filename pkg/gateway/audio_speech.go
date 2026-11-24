@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"net/http"
 	"strings"
 	"time"
@@ -28,50 +29,71 @@ const audioResponseLimit = 64 << 20
 // Content-Type. Admission, reservation (out_cap=0), limits and the event
 // contract mirror the embeddings pipeline; usage is "none" (D2 — no audio
 // pricing exists, no invented per-minute/per-character cost).
-func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
+// speechRequest is the validated /v1/audio/speech JSON probe: the fields
+// the admission, reservation and settlement phases need. The stream flag
+// is validated during the read but never forwarded — SSE audio is outside
+// the v1 subset (M5/D5).
+type speechRequest struct {
+	Model string `json:"model"`
+	Input string `json:"input"`
+	Voice string `json:"voice"`
+}
+
+// readSpeechRequest decodes and validates the /v1/audio/speech request
+// body. ok=false means the caller already answered the client.
+func readSpeechRequest(w http.ResponseWriter, r *http.Request) (req speechRequest, body []byte, ok bool) {
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// N3: the client walked away mid-body — the response target is
 			// gone and writing the envelope would race the server's conn
 			// teardown.
-			return
+			return req, nil, false
 		}
 		writeAudioBodyError(w, err)
-		return
+		return req, nil, false
 	}
-	var req struct {
-		Model  string `json:"model"`
-		Input  string `json:"input"`
-		Voice  string `json:"voice"`
-		Stream bool   `json:"stream"`
+	var probe struct {
+		speechRequest
+		Stream bool `json:"stream"`
 	}
-	if err := json.Unmarshal(body, &req); err != nil {
+	if err := json.Unmarshal(body, &probe); err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
-		return
+		return req, nil, false
 	}
 	// M5/D5: SSE audio streaming is outside the v1 subset — reject before
 	// any admission or upstream work (upstream call count stays 0).
-	if req.Stream || audioWantsEventStream(r) {
+	if probe.Stream || audioWantsEventStream(r) {
 		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 			"audio streaming is not supported", apierrors.CodeUnsupportedFeature)
-		return
+		return req, nil, false
 	}
-	if req.Model == "" {
+	if probe.Model == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
-		return
+		return req, nil, false
 	}
-	if req.Input == "" {
+	if probe.Input == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "input is required")
-		return
+		return req, nil, false
 	}
-	if req.Voice == "" {
+	if probe.Voice == "" {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "voice is required")
+		return req, nil, false
+	}
+	return probe.speechRequest, body, true
+}
+
+// JSON in, upstream binary audio out byte-identical with the upstream
+// Content-Type. Admission, reservation (out_cap=0), limits and the event
+// contract mirror the embeddings pipeline; usage is "none" (D2 — no audio
+// pricing exists, no invented per-minute/per-character cost).
+func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	req, body, ok := readSpeechRequest(w, r)
+	if !ok {
 		return
 	}
-
 	admitted, ok := gw.admit(w, r, admitInput{
 		Endpoint: "audio.speech",
 		Model:    req.Model,
@@ -81,13 +103,7 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"speech is not supported for this provider", "speech_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "speech", "speech is not supported for this provider") {
 		return
 	}
 
@@ -97,7 +113,8 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	// tokens) keeps the token-free estimate path and is refused in enforce
 	// mode as unpriced (fail-closed, I3).
 	rctx := r.Context()
-	gate, ok := gw.reservationPlan(w, r, "audio.speech",
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
+	rctx, gate, ok := gw.reservePlannedRequest(rctx, w, r, "audio.speech",
 		withUnitDemand(
 			gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 				admitted.Info, admitted.Body, nil, true),
@@ -105,35 +122,17 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
+
+	ctx, cancel, client, apiKey, upstreamURL, ok := gw.mediaDispatch(w, rctx, l, gate, admitted)
+	if !ok {
 		return
 	}
-
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
 	defer cancel()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
+	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
 		return
 	}
-	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
+
 	resp, err := client.Do(ctx, "/v1/audio/speech", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -143,30 +142,54 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	audio, over, err := readAudioResponse(resp.Body)
-	if err != nil {
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+	audio, ok := readMediaResponse(w, rctx, gate, resp, audioResponseLimit, "upstream response exceeds the audio size limit")
+	if !ok {
 		return
 	}
-	if over {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response exceeds the audio size limit")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
-		return
-	}
-	if rctx.Err() != nil {
-		// N3: the client walked away mid-response — settle the escrow with
-		// zero spend and publish no request.completed success event.
-		gate.finalizeNoEvent(budget.TerminationClientCancel)
-		return
-	}
+	gw.finishAudioSpeech(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, req.Input, audio)
+}
 
+// providerName resolves the upstream provider an admitted media request
+// dispatches to: the admission-resolved provider, defaulting to the
+// OpenAI-compat base.
+func providerName(admitted admitted) string {
+	if admitted.Info.Provider == "" {
+		return "openai"
+	}
+	return admitted.Info.Provider
+}
+
+// mediaDispatch prepares the paid upstream dispatch shared by the media
+// pipelines (speech, transcriptions, images): the whole-request timeout
+// context, the upstream client for the resolved provider, and its
+// addressing and key material. The pool failure finalizes the reservation
+// gate and answers the client; ok=false means the caller is done.
+func (gw *gateway) mediaDispatch(w http.ResponseWriter, rctx context.Context, l *slog.Logger, gate *reservationGate, admitted admitted) (ctx context.Context, cancel context.CancelFunc, client *upstream.Client, apiKey, upstreamURL string, ok bool) {
+	timeout := admitted.Info.UpstreamTimeout
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	ctx, cancel = context.WithTimeout(rctx, timeout)
+	apiKey = admitted.Info.UpstreamAPIKey
+	if apiKey == "" {
+		apiKey = gw.getUpstreamAPIKey()
+	}
+	upstreamURL = gw.upstreamURL(admitted.Info)
+	client, err := gw.pool.Get(upstreamURL, providerName(admitted))
+	if err != nil {
+		l.Warn("upstream client unavailable", "provider", providerName(admitted), "error", err.Error())
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
+		cancel()
+		return nil, nil, nil, "", "", false
+	}
+	return ctx, cancel, client, apiKey, upstreamURL, true
+}
+
+// finishAudioSpeech settles the served speech response durably — D2/T02
+// pricing, the usage record, terminal facts — then writes the audio bytes
+// byte-identical with the upstream Content-Type.
+func (gw *gateway) finishAudioSpeech(rctx context.Context, w http.ResponseWriter, l *slog.Logger, admitted admitted, prov, upstreamURL string, resp *http.Response, started time.Time, input string, audio []byte) {
 	// D2: token usage does not exist for speech — TokensIn/TokensOut stay 0
 	// and the usage source is "none". T02: when the pinned unit catalog
 	// prices the model per character, the cost is rate × unicode input
@@ -174,11 +197,11 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 	// legacy unknown price (cost_status "no_usage"), never a fabricated
 	// zero-priced success.
 	usage := provider.Usage{Source: provider.UsageSourceNone}
-	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
+	ext := provider.ComputeCost(usage, prov, admitted.Info.ModelName)
 	unitPriced := false
 	if !ext.PriceKnown {
-		if entry, ok := gw.unitPrice(providerName, admitted.Info.ModelName, pricing.UnitPerCharacter); ok {
-			ext.EstimatedCostUSD = entry.Rate * float64(utf8.RuneCountInString(req.Input))
+		if entry, ok := gw.unitPrice(prov, admitted.Info.ModelName, pricing.UnitPerCharacter); ok {
+			ext.EstimatedCostUSD = entry.Rate * float64(utf8.RuneCountInString(input))
 			ext.PriceKnown = true
 			unitPriced = true
 		}
@@ -192,7 +215,7 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	gw.finishRequest(rctx, requestFinish{
+	_, ferr := gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,
@@ -223,11 +246,31 @@ func (gw *gateway) audioSpeech(w http.ResponseWriter, r *http.Request) {
 			ProviderEntityJurisdiction: admitted.Info.Provider,
 			Labels:                     labelsFrom(rctx),
 		},
-		info:        admitted.Info,
-		resp:        resp,
+		info: admitted.Info,
+		resp: resp,
+		// N3 + owner review 0574aa1: the provider fully served and was paid
+		// for its 200 (an interrupted read returned above with no fabricated
+		// usage). Whether the client transport is still alive only picks the
+		// termination outcome (completionTermination → client_cancel) and
+		// whether success bytes are written below — the KNOWN usage settles
+		// durably either way (terminal facts ride the WithoutCancel funnel).
 		termination: completionTermination(rctx),
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
+	if rctx.Err() != nil {
+		// N3: the client walked away after the provider was paid — no
+		// success bytes to the dead transport; the settlement above already
+		// carries the known usage with the cancellation recorded.
+		return
+	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
@@ -267,17 +310,26 @@ func audioUsage(body []byte) (int64, int64, string) {
 	return in, out, provider.UsageSourceProvider
 }
 
-// readAudioResponse reads up to audioResponseLimit bytes and reports whether
-// the upstream payload exceeds the cap (one extra byte is read to detect it).
-func readAudioResponse(body io.Reader) (data []byte, over bool, err error) {
-	data, err = io.ReadAll(io.LimitReader(body, audioResponseLimit+1))
+// Read one extra byte so a truncated upstream response cannot be served as a success.
+func readMediaResponse(w http.ResponseWriter, rctx context.Context, gate *reservationGate, resp *http.Response, limit int64, oversizedMessage string) ([]byte, bool) {
+	data, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil {
-		return nil, false, err
+		gate.finalizeNoEvent(mediaTermination(rctx))
+		writePaidBodyError(w, "failed to read upstream response")
+		return nil, false
 	}
-	if len(data) > audioResponseLimit {
-		return nil, true, nil
+	if int64(len(data)) > limit {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		writePaidBodyError(w, oversizedMessage)
+		return nil, false
 	}
-	return data, false, nil
+	if resp.StatusCode != http.StatusOK {
+		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
+		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
+		apierrors.Write(w, status, errType, "upstream request failed")
+		return nil, false
+	}
+	return data, true
 }
 
 // writeAudioBodyError maps a request-body read failure: the 10 MiB gateway

@@ -18,13 +18,13 @@ type OrgOriginalRetention struct {
 	Inherited bool   `json:"inherited"`
 }
 
-// GetOrgOriginalRetention returns the org override and effective setting.
-func (s *Store) GetOrgOriginalRetention(ctx context.Context, orgID string) (*OrgOriginalRetention, error) {
-	if s.db == nil {
-		return nil, fmt.Errorf("database not available")
-	}
+// getOrgOriginalRetentionOn resolves the org override and effective setting
+// on the given executor — the pool or a read snapshot transaction — so a
+// disclosure boundary can evaluate retention inside the same point-in-time
+// snapshot as the data it governs.
+func getOrgOriginalRetentionOn(ctx context.Context, ex exportQueryRunner, orgID string) (*OrgOriginalRetention, error) {
 	var setting OrgOriginalRetention
-	err := s.db.QueryRow(ctx, `
+	err := ex.QueryRow(ctx, `
 		SELECT id::text, retain_original_text
 		FROM organizations WHERE id = $1`, orgID,
 	).Scan(&setting.OrgID, &setting.Enabled)
@@ -40,6 +40,14 @@ func (s *Store) GetOrgOriginalRetention(ctx context.Context, orgID string) (*Org
 		setting.Effective = *setting.Enabled
 	}
 	return &setting, nil
+}
+
+// GetOrgOriginalRetention returns the org override and effective setting.
+func (s *Store) GetOrgOriginalRetention(ctx context.Context, orgID string) (*OrgOriginalRetention, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	return getOrgOriginalRetentionOn(ctx, s.db, orgID)
 }
 
 // UpdateOrgOriginalRetention sets an explicit org override; nil restores

@@ -33,11 +33,11 @@ type jwkPair struct {
 	pub  jose.JSONWebKey // public (JWKS)
 }
 
-func mustRSAJWK(t *testing.T, kid string) jwkPair {
-	t.Helper()
+func mustRSAJWK(tb testing.TB, kid string) jwkPair {
+	tb.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
-		t.Fatalf("rsa keygen: %v", err)
+		tb.Fatalf("rsa keygen: %v", err)
 	}
 	priv := jose.JSONWebKey{Key: key, KeyID: kid, Algorithm: string(jose.RS256), Use: "sig"}
 	return jwkPair{priv: priv, pub: priv.Public()}
@@ -82,8 +82,8 @@ func (g *jwksGate) enter() {
 	<-g.release
 }
 
-func newJWKSServer(t *testing.T, keys ...jwkPair) *jwksServer {
-	t.Helper()
+func newJWKSServer(tb testing.TB, keys ...jwkPair) *jwksServer {
+	tb.Helper()
 	s := &jwksServer{}
 	for _, k := range keys {
 		s.keys = append(s.keys, k.pub)
@@ -97,7 +97,7 @@ func newJWKSServer(t *testing.T, keys ...jwkPair) *jwksServer {
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(set)
 	}))
-	t.Cleanup(s.srv.Close)
+	tb.Cleanup(s.srv.Close)
 	return s
 }
 
@@ -113,16 +113,16 @@ func (s *jwksServer) setKeys(keys ...jwkPair) {
 func (s *jwksServer) fetchCount() int64 { return s.fetches.Load() }
 
 // signToken serializes one signed compact JWT with the given claims.
-func signToken(t *testing.T, k jwkPair, claims map[string]any) string {
-	t.Helper()
+func signToken(tb testing.TB, k jwkPair, claims map[string]any) string {
+	tb.Helper()
 	signer, err := jose.NewSigner(jose.SigningKey{Algorithm: jose.SignatureAlgorithm(k.priv.Algorithm), Key: k.priv.Key},
 		(&jose.SignerOptions{}).WithType("JWT").WithHeader("kid", k.priv.KeyID))
 	if err != nil {
-		t.Fatalf("signer: %v", err)
+		tb.Fatalf("signer: %v", err)
 	}
 	raw, err := jwt.Signed(signer).Claims(claims).Serialize()
 	if err != nil {
-		t.Fatalf("sign: %v", err)
+		tb.Fatalf("sign: %v", err)
 	}
 	return raw
 }
@@ -140,8 +140,8 @@ func baseClaims() map[string]any {
 	}
 }
 
-func newTestJWTAuth(t *testing.T, srv *jwksServer, mutate func(*JWTWiring)) *JWTAuthenticator {
-	t.Helper()
+func newTestJWTAuth(tb testing.TB, srv *jwksServer, mutate func(*JWTWiring)) *JWTAuthenticator {
+	tb.Helper()
 	w := JWTWiring{
 		JWKSURL:       srv.srv.URL,
 		Issuer:        "https://idp.example",
@@ -154,7 +154,7 @@ func newTestJWTAuth(t *testing.T, srv *jwksServer, mutate func(*JWTWiring)) *JWT
 	}
 	a := NewJWTAuthenticator(w, nil)
 	if a == nil {
-		t.Fatal("authenticator nil")
+		tb.Fatal("authenticator nil")
 	}
 	// Deterministic refresh timing; the jitter path has its own assertions.
 	a.cache.jitter = func(int) int { return 0 }

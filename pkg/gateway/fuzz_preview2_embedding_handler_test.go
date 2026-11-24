@@ -97,11 +97,12 @@ func fuzzEmbeddingsForwarded(t *testing.T, in string) {
 
 	info := resolver.ModelInfo{ModelName: "embed-a", Provider: "openai", UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true}
 	gw := &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-		log:  slog.Default(),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+		log:         slog.Default(),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-fuzz", nil)),
+		invocations: &fakeInvocationStore{},
+		res:         stubModelResolver{"m": info},
+		pool:        upstream.NewPool(upstream.Options{}),
 	}
 	var ev *eventpub.Event
 	gw.eventNote = func(e *eventpub.Event) { ev = e }
@@ -111,7 +112,7 @@ func fuzzEmbeddingsForwarded(t *testing.T, in string) {
 
 	validateEmbeddingsForwardedContent(t, &wire, "embed-a", text)
 
-	if ev == nil || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
+	if ev == nil || ev.OrgID != "org-fuzz" || ev.InvocationID == "" || ev.Endpoint != "embeddings" || ev.TokensIn != 3 || ev.TokensOut != 0 || ev.UsageSource != "provider" {
 		t.Fatalf("event %+v", ev)
 	}
 }
@@ -157,7 +158,7 @@ func TestEmbeddingsFinishRequestHookOrder(t *testing.T) {
 	defer restore()
 	gw.eventNote = func(*eventpub.Event) { order = append(order, "event_note") }
 
-	finEv := gw.finishRequest(context.Background(), requestFinish{
+	finEv, _ := gw.finishRequest(context.Background(), requestFinish{
 		base:        eventBase{EventType: "request.completed", RequestID: "fz-finish", OrgID: "org-fz", ModelUsed: "m"},
 		attestModel: "embed-b",
 		info:        resolver.ModelInfo{ModelName: "embed-b", Provider: "openai", Enabled: true},
@@ -224,6 +225,18 @@ func fuzzAffinityAccounted(t *testing.T) {
 	}
 }
 
+// finishEventFacts is the finisher-event projection the termination canon
+// pins; the finisher stamps volatile or integration-bound fields beside
+// them, which stay unpinned here.
+type finishEventFacts struct {
+	eventType   string
+	endpoint    string
+	tokensIn    int64
+	tokensOut   int64
+	usageSource string
+	statusCode  int64
+}
+
 // fuzzFinishCompletionTerminated executes finishCompletion over a canceled
 // request context on the fuzz path (critical-go wave 2): §5.3 Finalize must
 // classify the dead context as a client cancel, the provider-reported usage
@@ -249,7 +262,7 @@ func fuzzFinishCompletionTerminated(t *testing.T) {
 	defer restore()
 	gw.eventNote = func(e *eventpub.Event) { order = append(order, "event_note"); note = e }
 
-	gw.finishCompletion(httptest.NewRecorder(), canceled, admitted{
+	err := gw.finishCompletion(httptest.NewRecorder(), canceled, admitted{
 		Info:           resolver.ModelInfo{ModelName: "m", Provider: "openai", Enabled: true},
 		RequestedModel: "m",
 		OrgID:          "org-fzc",
@@ -259,14 +272,34 @@ func fuzzFinishCompletionTerminated(t *testing.T) {
 		RequestID:      "req-fzc",
 	}, provider.Usage{PromptTokens: 3, CompletionTokens: 5, TotalTokens: 8, Source: provider.UsageSourceProvider},
 		"openai", "http://upstream-fzc.invalid", http.StatusOK, time.Now(), nil)
+	if err != nil {
+		t.Fatalf("finishCompletion: %v", err)
+	}
 
 	if want := []string{"event_note", "publish"}; !slices.Equal(order, want) {
 		t.Fatalf("finishCompletion hook order = %v, want %v", order, want)
 	}
-	if note == nil || note.EventType != "request.completed" || note.Endpoint != "completions" ||
-		note.TokensIn != 3 || note.TokensOut != 5 || note.UsageSource != "provider" ||
-		note.StatusCode != http.StatusOK {
-		t.Fatalf("finishCompletion event = %+v", note)
+	if note == nil {
+		t.Fatal("finishCompletion published no event")
+	}
+	got := finishEventFacts{
+		eventType:   note.EventType,
+		endpoint:    note.Endpoint,
+		tokensIn:    note.TokensIn,
+		tokensOut:   note.TokensOut,
+		usageSource: note.UsageSource,
+		statusCode:  note.StatusCode,
+	}
+	want := finishEventFacts{
+		eventType:   "request.completed",
+		endpoint:    "completions",
+		tokensIn:    3,
+		tokensOut:   5,
+		usageSource: "provider",
+		statusCode:  http.StatusOK,
+	}
+	if got != want {
+		t.Fatalf("finishCompletion event facts = %+v, want %+v", got, want)
 	}
 }
 

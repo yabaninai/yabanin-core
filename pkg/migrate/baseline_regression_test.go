@@ -132,7 +132,7 @@ func TestRun_CleanInstallSeedRegression(t *testing.T) {
 	up, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "fresh-DB baseline apply must succeed")
 	require.Equal(t, 1, up.Applied)
-	require.Equal(t, int64(27), up.Version)
+	require.Equal(t, int64(jointScenario.headVersion), up.Version)
 
 	// Shipped seed scope before any seed run: 21 disabled model templates
 	// (incl. the I18N-14 regional set pinned by
@@ -222,7 +222,7 @@ func TestRun_CleanInstallSeedRegression(t *testing.T) {
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT version, dirty, (SELECT count(*) FROM schema_migrations) FROM schema_migrations`).
 		Scan(&version, &dirty, &recorded))
-	require.Equal(t, int64(27), version)
+	require.Equal(t, int64(jointScenario.headVersion), version)
 	require.False(t, dirty)
 	require.Equal(t, 1, recorded)
 
@@ -278,7 +278,7 @@ func TestRun_PopulatedBaselineNoopPreservesForeignData(t *testing.T) {
 
 	up, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err)
-	require.Equal(t, int64(27), up.Version)
+	require.Equal(t, int64(jointScenario.headVersion), up.Version)
 
 	// Foreign/client data on the stand: org, team, API key, credits balance
 	// and a custom registered model.
@@ -301,7 +301,7 @@ func TestRun_PopulatedBaselineNoopPreservesForeignData(t *testing.T) {
 	// the head.
 	again, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err, "migrate on a populated head-version stand must be a no-op success")
-	require.Equal(t, int64(27), again.Version)
+	require.Equal(t, int64(jointScenario.headVersion), again.Version)
 
 	// Every foreign row survives byte-identical; the baseline did not
 	// re-apply or regenerate seeds.
@@ -351,7 +351,7 @@ func TestRun_PopulatedBaselineNoopPreservesForeignData(t *testing.T) {
 	var version int64
 	require.NoError(t, ownerPool.QueryRow(ctx,
 		`SELECT version FROM schema_migrations`).Scan(&version))
-	require.Equal(t, int64(27), version)
+	require.Equal(t, int64(jointScenario.headVersion), version)
 }
 
 // TestRun_MisBaselineRLSBreaksSeedBootstrap — runtime negative evidence for
@@ -369,7 +369,7 @@ func TestRun_MisBaselineRLSBreaksSeedBootstrap(t *testing.T) {
 
 	up, err := Run(ctx, connStr, "sg")
 	require.NoError(t, err)
-	require.Equal(t, int64(27), up.Version)
+	require.Equal(t, int64(jointScenario.headVersion), up.Version)
 	bootstrapAppRole(t, ctx, connStr)
 
 	app := appRoleConn(t, ctx, connStr, "sg")

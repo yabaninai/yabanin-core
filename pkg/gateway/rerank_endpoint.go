@@ -4,14 +4,15 @@ import (
 	"context"
 	"encoding/json"
 	"io"
+	"log/slog"
 	"net/http"
 	"time"
 
 	"github.com/reireirei/yabanin/pkg/budget"
 	apierrors "github.com/reireirei/yabanin/pkg/errors"
-	"github.com/reireirei/yabanin/pkg/httpmw"
 	"github.com/reireirei/yabanin/pkg/logctx"
 	"github.com/reireirei/yabanin/pkg/provider"
+	"github.com/reireirei/yabanin/pkg/resolver"
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
@@ -24,6 +25,39 @@ const rerankResponseLimit = 64 << 20
 // subset matrix): one rerank call prices and ranks at most 512 documents.
 const rerankMaxDocuments = 512
 
+// rerankRequest is the validated client shape of the rerank route.
+type rerankRequest struct {
+	Model     string          `json:"model"`
+	Query     string          `json:"query"`
+	Documents json.RawMessage `json:"documents"`
+}
+
+// parseRerankRequest reads and validates the client request. Every refusal
+// lands BEFORE admission, so a rejected request leaves no durable trace.
+func parseRerankRequest(w http.ResponseWriter, r *http.Request) (rerankRequest, []byte, bool) {
+	body, ok := readRouteBody(w, r)
+	if !ok {
+		return rerankRequest{}, nil, false
+	}
+	var req rerankRequest
+	if err := json.Unmarshal(body, &req); err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
+		return rerankRequest{}, nil, false
+	}
+	if req.Model == "" {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+		return rerankRequest{}, nil, false
+	}
+	if req.Query == "" {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "query is required")
+		return rerankRequest{}, nil, false
+	}
+	if _, ok := rerankDocuments(w, req.Documents); !ok {
+		return rerankRequest{}, nil, false
+	}
+	return req, body, true
+}
+
 // passthrough of {model, query, documents[], top_n} to the OpenAI-compat
 // /v1/rerank path, byte-honest response relay, provider-token usage
 // accounting (D3 — absent usage is zero + UsageSourceNone, an absent price
@@ -31,39 +65,10 @@ const rerankMaxDocuments = 512
 func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 	started := time.Now()
 	l := logctx.From(r.Context(), gw.log)
-	body, err := io.ReadAll(r.Body)
-	if err != nil {
-		// The 10 MiB gateway cap (httpmw.MaxBody) answers 413 — the
-		// contract's payload-size refusal (audio/images parity,
-		if httpmw.IsMaxBytesError(err) {
-			apierrors.Write(w, http.StatusRequestEntityTooLarge, apierrors.ErrorCodeInvalidRequest, "request body too large")
-			return
-		}
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "request body too large or malformed")
-		return
-	}
-	var req struct {
-		Model     string          `json:"model"`
-		Query     string          `json:"query"`
-		Documents json.RawMessage `json:"documents"`
-	}
-	if err := json.Unmarshal(body, &req); err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "malformed JSON: "+err.Error())
-		return
-	}
-	if req.Model == "" {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
-		return
-	}
-	if req.Query == "" {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "query is required")
-		return
-	}
-	_, ok := rerankDocuments(w, req.Documents)
+	req, body, ok := parseRerankRequest(w, r)
 	if !ok {
 		return
 	}
-
 	admitted, ok := gw.admit(w, r, admitInput{
 		Endpoint: "rerank",
 		Model:    req.Model,
@@ -73,63 +78,58 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"rerank is not supported for this provider", "rerank_not_supported_for_provider")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "rerank", "rerank is not supported for this provider") {
 		return
 	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
-		return
-	}
-
 	// NEXT-18c (ADR-0001 §5.1) + ratified D3: reservation rides the
 	// embeddings-style input pre-estimate (no generated output tokens,
 	// out_cap = 0); the wallet settles on the actual provider usage below.
-	rctx := r.Context()
-	gate, ok := gw.reservationPlan(w, r, "rerank",
-		gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
-			admitted.Info, admitted.Body, nil, true))
+	rctx, gate, ok := gw.reservePaidDispatch(r.Context(), w, r, "rerank", admitted, nil, true)
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
+	client, upstreamBody, apiKey, providerName, upstreamURL, ok := gw.paidUpstreamClient(l, w, gate, admitted, admitted.Info.Provider)
+	if !ok {
 		return
 	}
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
+		return
+	}
+	resp, usage, limited, ok := relayRerankResponse(rctx, w, l, gate, client, admitted.Info, upstreamBody, apiKey)
+	if resp != nil {
+		// The settle stages below keep the body open (headers ride the
+		// finish event); it closes after the reply is written.
+		defer resp.Body.Close()
+	}
+	if !ok {
+		return
+	}
+	gw.finishBufferedJSONRoute(bufferedJSONFinish{
+		rctx: rctx, w: w, admitted: admitted, usage: usage,
+		providerName: providerName, endpoint: "rerank", upstreamURL: upstreamURL,
+		started: started, resp: resp, payload: limited,
+	})
+}
 
-	timeout := admitted.Info.UpstreamTimeout
+// relayRerankResponse performs the paid /v1/rerank dispatch and buffers the
+// upstream reply. On failure the refusal response was already written; the
+// returned response (non-nil after a successful dial) still owns its open
+// body, so the caller defers the close and the settle stages keep today's
+// ordering.
+func relayRerankResponse(rctx context.Context, w http.ResponseWriter, l *slog.Logger, gate *reservationGate, client *upstream.Client, info resolver.ModelInfo, upstreamBody []byte, apiKey string) (*http.Response, provider.Usage, []byte, bool) {
+	timeout := info.UpstreamTimeout
 	if timeout <= 0 {
 		timeout = 60 * time.Second
 	}
 	ctx, cancel := context.WithTimeout(rctx, timeout)
 	defer cancel()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
-		return
-	}
-	upstreamBody := upstream.OverrideModelRaw(admitted.Body, admitted.Info.ModelName)
 	resp, err := client.Do(ctx, "/v1/rerank", upstreamBody, apiKey, false, nil)
 	if err != nil {
 		closeUpstream(l, resp)
 		gate.finalizeNoEvent(mediaTermination(rctx))
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream request failed")
-		return
+		return nil, provider.Usage{}, nil, false
 	}
-	defer resp.Body.Close()
 
 	// Read one byte past the limit so an oversized upstream body is refused
 	// as an upstream error instead of being silently truncated (images
@@ -137,76 +137,21 @@ func (gw *gateway) rerank(w http.ResponseWriter, r *http.Request) {
 	limited, err := io.ReadAll(io.LimitReader(resp.Body, rerankResponseLimit+1))
 	if err != nil {
 		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
-		return
+		writePaidBodyError(w, "failed to read upstream response")
+		return resp, provider.Usage{}, nil, false
 	}
 	if len(limited) > rerankResponseLimit {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response too large")
-		return
+		writePaidBodyError(w, "upstream response too large")
+		return resp, provider.Usage{}, nil, false
 	}
 	if resp.StatusCode != http.StatusOK {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
 		apierrors.Write(w, status, errType, "upstream request failed")
-		return
+		return resp, provider.Usage{}, nil, false
 	}
-
-	usage := rerankUsage(limited)
-	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
-	gw.accountUsage(rctx, w, usageRecord{
-		orgID:      admitted.OrgID,
-		taskID:     admitted.TaskID,
-		sessionID:  admitted.SessionID,
-		usage:      usage,
-		costUSD:    ext.EstimatedCostUSD,
-		priceKnown: ext.PriceKnown,
-	})
-
-	gw.finishRequest(rctx, requestFinish{
-		base: eventBase{
-			EventType:                  "request.completed",
-			RequestID:                  admitted.RequestID,
-			SessionID:                  admitted.SessionID,
-			Payload:                    string(admitted.Body),
-			OrgID:                      admitted.OrgID,
-			TeamID:                     admitted.TeamID,
-			AgentID:                    admitted.AgentID,
-			UserID:                     admitted.UserID,
-			APIKeyID:                   admitted.APIKeyID,
-			SessionKeyID:               admitted.SessionKeyID,
-			TaskID:                     admitted.TaskID,
-			ModelRequested:             admitted.RequestedModel,
-			ModelUsed:                  admitted.Info.ModelName,
-			UpstreamURL:                upstreamURL,
-			StatusCode:                 http.StatusOK,
-			DurationMs:                 time.Since(started).Milliseconds(),
-			TokensIn:                   usage.PromptTokens,
-			TokensOut:                  usage.CompletionTokens,
-			CacheReadTokens:            usage.CacheReadTokens,
-			EstimatedCostUSD:           ext.EstimatedCostUSD,
-			Endpoint:                   "rerank",
-			UsageSource:                usageSourceOrNone(usage.Source),
-			CostStatus:                 costStatus(false, usage.Source, ext.PriceKnown),
-			Method:                     http.MethodPost,
-			InferenceRegion:            admitted.Info.Region,
-			ModelOriginCountry:         admitted.Info.Provider,
-			LogStorageRegion:           gw.cfg.Region,
-			ProviderEntityJurisdiction: admitted.Info.Provider,
-			Labels:                     labelsFrom(rctx),
-		},
-		info: admitted.Info,
-		resp: resp,
-		// NEXT-18c: settle the reservation and stamp tuples + termination
-		// (§5.3 Finalize). No resale on this pipeline; the wallet actual
-		// falls back to the base quote — the consumer's own rule.
-		termination: completionTermination(rctx),
-		eventNote:   true,
-	}, nil)
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write(limited)
+	return resp, rerankUsage(limited), limited, true
 }
 
 // rerankDocuments validates the documents field locally: a non-empty JSON

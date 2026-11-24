@@ -385,6 +385,10 @@ func logdStartElected(ctx context.Context, cfg config.All, rdb *redis.Client, rt
 func logdLeadWork(rt *logdRuntime, logger *slog.Logger) func(context.Context) error {
 	return func(leadCtx context.Context) error {
 		logger.Info("leader: starting stream consumer under elected leadership")
+		recoveryCtx, stopRecovery := context.WithCancel(leadCtx)
+		recoveryDone := make(chan struct{})
+		go func() { defer close(recoveryDone); rt.consumer.RunAdmissionRecovery(recoveryCtx, rt.db) }()
+		defer func() { stopRecovery(); <-recoveryDone }()
 		go func() {
 			if runErr := rt.settlement.Run(leadCtx); runErr != nil {
 				logger.Error("settlement worker failed", "error", runErr)
@@ -409,6 +413,7 @@ func logdLeadWork(rt *logdRuntime, logger *slog.Logger) func(context.Context) er
 // logdStartDirect runs consumer and workers on this replica (the
 // historical single-node behavior).
 func logdStartDirect(ctx context.Context, rt *logdRuntime, logger *slog.Logger) {
+	go rt.consumer.RunAdmissionRecovery(ctx, rt.db)
 	go func() {
 		logger.Info("starting stream consumer", "stream", rt.stream)
 		if err := rt.consumer.Start(ctx); err != nil {

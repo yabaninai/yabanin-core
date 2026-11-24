@@ -109,7 +109,7 @@ func scanEmbeddedNumbering(t *testing.T) numberingScan {
 // 0020_mcp_grant_actions took 0020 against both pending heads; 0019 closed
 // that era and the reservation list drained at 0001..0021.
 //
-// Window through head 0027: slot 0023 alone is claimed outside this
+// Window through head 0029: slot 0023 alone is claimed outside this
 // tree's embedded set —
 //   - 0023: permanently reserved unused (convergence rule: no delivery
 //     may take it).

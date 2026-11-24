@@ -42,6 +42,8 @@ type deliveryPolicy struct {
 	// retainOriginal reports the org's effective original-text retention.
 	// false (the fail-closed default) persists processed text only.
 	retainOriginal bool
+	// recoveredFromFacts is set only by the PostgreSQL recovery worker.
+	recoveredFromFacts bool
 }
 
 // legacyDeliveryPolicy is the permissive seam for callers predating the

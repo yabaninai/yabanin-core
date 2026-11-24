@@ -178,6 +178,9 @@ func TestChatCompletions_DecisionHeaderPresentAndParsable(t *testing.T) {
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}`
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(body)))
 	r.Header.Set("Content-Type", "application/json")
+	// Handler-direct: golden identity stands in for the resolved
+	// principal the production auth middleware injects.
+	goldenIdentity(r)
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 
@@ -204,6 +207,9 @@ func TestChatCompletions_DecisionHeaderDisabled(t *testing.T) {
 	body := `{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hello"}]}`
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader([]byte(body)))
 	r.Header.Set("Content-Type", "application/json")
+	// Handler-direct: golden identity stands in for the resolved
+	// principal the production auth middleware injects.
+	goldenIdentity(r)
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 

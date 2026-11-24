@@ -264,6 +264,17 @@ type requestEvent struct {
 	sessionID      string // raw client session id; resolved against the registry per delivery
 	errorMsg       string // verbatim error field ("" when absent/non-string)
 
+	// Invocation identity: the server-minted UUID that owns dedupe,
+	// settlement and credit identity for the request. invocationIDValue is
+	// nil (legacy domain) when the field is absent; a present value that is
+	// not a canonical UUID string (wrong JSON type, empty, URN/braced/
+	// compact spelling) sets invocationMalformed so the handler parks the
+	// delivery instead of downgrading it to the legacy dedupe domain — a
+	// downgrade would silently reopen duplicate billing.
+	invocationID        string
+	invocationIDValue   any
+	invocationMalformed bool
+
 	// createdAt is the event's business time (W-LOGG): the producer's ts
 	// field (Unix milliseconds) when present and parseable, else the parse
 	// moment. It lands in request_logs.created_at and the team_month period
@@ -353,6 +364,46 @@ func parseRequestEventPolicy(raw map[string]interface{}, policy deliveryPolicy) 
 	return parseRequestEventProfile(raw, policy.profile, policy.retainOriginal)
 }
 
+// terminalFactsFields pins the request_terminal_facts event projection
+// allowlist: exactly the fields accounting recovery needs, same encoding as
+// the wire event. Free-form fields (labels, raw error text) and any content
+// (payload, processed_response, upstream captures) are deliberately absent —
+// recovery binds NULL for them, and the metadata-only recovery policy also
+// fails closed if a corrupt projection ever carried content.
+var terminalFactsFields = []string{
+	"event_type", "used_org_key", "org_id", "request_id", "invocation_id",
+	"model_requested", "model_used", "status_code", "duration_ms",
+	"tokens_in", "tokens_out", "estimated_cost_usd", "resale_cost_usd",
+	"cost_status", "usage_source", "termination", "ts",
+	"session_id", "api_key_id", "session_key_id", "team_id",
+	"agent_id", "user_id", "task_id", "endpoint",
+	"cache_hit_type", "cache_read_tokens", "cache_creation_tokens",
+	"ab_group", "tier_used", "counterfactual_cost_usd", "prompt_hash",
+	"reservations", "first_token_ms", "attempt_count", "retry_count",
+}
+
+// factsDeliveryPolicy is the terminal-facts recovery profile: metadata-only
+// content binding, originals never retained.
+func factsDeliveryPolicy() deliveryPolicy {
+	return deliveryPolicy{profile: config.LogContentProfileMetadataOnly, retainOriginal: false}
+}
+
+// parseTerminalFactsEvent maps a terminal-facts projection through the same
+// mapper as live events. The map is filtered to terminalFactsFields FIRST —
+// the allowlist is enforced structurally, so a corrupt or hostile projection
+// carrying content or free-form fields can never bind, independent of the
+// mapper's own tolerance. The invocation id is rebound by the caller from
+// the facts row's uuid column (authoritative over the map).
+func parseTerminalFactsEvent(raw map[string]interface{}) requestEvent {
+	filtered := make(map[string]interface{}, len(terminalFactsFields))
+	for _, key := range terminalFactsFields {
+		if v, ok := raw[key]; ok {
+			filtered[key] = v
+		}
+	}
+	return parseRequestEventPolicy(filtered, factsDeliveryPolicy())
+}
+
 func parseRequestEventProfile(raw map[string]interface{}, profile config.LogContentProfile, retainOriginal bool) requestEvent {
 	f := fieldsOf(raw)
 	ev := requestEvent{raw: raw}
@@ -371,6 +422,13 @@ func parseRequestEventProfile(raw map[string]interface{}, profile config.LogCont
 	ev.method = f.StringDefault("method", "POST")
 	ev.sessionID = f.String("session_id")
 	ev.errorMsg = f.String("error")
+
+	// Invocation identity: key absent → legacy domain (nil). A present
+	// value must be a canonical UUID string; anything else — wrong JSON
+	// type, empty, or a non-canonical spelling — marks the delivery
+	// malformed so it parks instead of downgrading to the legacy dedupe
+	// domain.
+	ev.invocationID, ev.invocationIDValue, ev.invocationMalformed = invocationField(raw)
 
 	ev.statusCode = f.Int64("status_code")
 	ev.durationMs = f.Int64("duration_ms")
@@ -503,6 +561,10 @@ type logColumn struct {
 // declaration order below.
 type requestLogRow struct {
 	cols []logColumn
+	// conflict, when set, renders after the VALUES list as the ON CONFLICT
+	// clause of the invocation replay guard. Empty keeps the exact legacy
+	// statement bytes.
+	conflict string
 }
 
 func (r *requestLogRow) set(name string, value any) {
@@ -516,6 +578,21 @@ func (r *requestLogRow) setLiteral(name, sqlText string) {
 func (r *requestLogRow) setAttribution(apiKeyID, sessionKeyID any) {
 	r.set("api_key_id", apiKeyID)
 	r.set("session_key_id", sessionKeyID)
+}
+
+// setInvocation binds the invocation_id column and arms the invocation
+// replay guard. It is appended AFTER the builder columns and attribution so
+// every pinned argument position (0..42) is unchanged, and it is a no-op for
+// the legacy domain (nil): legacy rows keep the byte-identical plain INSERT.
+// The partial-unique arbiter makes a redelivery of the same invocation —
+// fresh Redis entry id, consumer restart, DLQ replay, or a recovery race —
+// a no-op against request_logs instead of a second row.
+func (r *requestLogRow) setInvocation(id any) {
+	if id == nil {
+		return
+	}
+	r.set("invocation_id", id)
+	r.conflict = " ON CONFLICT (invocation_id) WHERE invocation_id IS NOT NULL DO NOTHING"
 }
 
 // args returns the bound values in declaration order (literals skipped).
@@ -548,7 +625,7 @@ func (r *requestLogRow) insertSQL() string {
 		placeholder++
 		fmt.Fprintf(&vals, "$%d", placeholder)
 	}
-	return "INSERT INTO request_logs (" + cols.String() + ")\n\t\t VALUES (" + vals.String() + ")"
+	return "INSERT INTO request_logs (" + cols.String() + ")\n\t\t VALUES (" + vals.String() + ")" + r.conflict
 }
 
 // fullRequestLogRow is the canonical 42-column projection shared by
@@ -680,6 +757,38 @@ func budgetRequestLogRow(ev requestEvent, sessionID any, errorMsg string) *reque
 	r.setLiteral("tokens_in", "0")
 	r.setLiteral("tokens_out", "0")
 	r.set("error", "budget_exceeded: "+errorMsg)
+	r.set("request_id", ev.requestIDValue)
+	r.set("team_id", ev.teamIDValue)
+	r.set("prompt_hash", ev.promptHash)
+	r.set("task_id", ev.g2.taskIDStr)
+	r.set("agent_id", ev.g2.agentIDStr)
+	r.set("routing_decision", ev.g2.routingDecision)
+	r.set("labels", ev.labels)
+	r.set("user_id", ev.g2.userIDStr)
+	r.set("created_at", ev.createdAt) // W-LOGG: event business time
+	return r
+}
+
+// refusalRequestLogRow is the typed pre-dispatch refusal projection: a
+// request.invalid event whose producer stamped the exact wire status. The
+// shape mirrors the budget refusal (no dispatch happened: model_used empty,
+// method POST, zero duration/tokens) with two differences — the status is
+// the event's own wire status bound verbatim (never a shape default), and
+// the error is the verbatim client-facing refusal message (nil when empty).
+// No response/upstream column is bound under any profile: the refusal
+// records the demand and the reason, never the refused payload.
+func refusalRequestLogRow(ev requestEvent, sessionID any, statusCode int64) *requestLogRow {
+	r := &requestLogRow{}
+	r.set("session_id", sessionID)
+	r.set("org_id", ev.orgIDValue)
+	r.set("model_requested", ev.modelRequested)
+	r.setLiteral("model_used", "''")
+	r.setLiteral("method", "'POST'")
+	r.set("status_code", statusCode)
+	r.setLiteral("duration_ms", "0")
+	r.setLiteral("tokens_in", "0")
+	r.setLiteral("tokens_out", "0")
+	r.set("error", ev.errorOptional())
 	r.set("request_id", ev.requestIDValue)
 	r.set("team_id", ev.teamIDValue)
 	r.set("prompt_hash", ev.promptHash)

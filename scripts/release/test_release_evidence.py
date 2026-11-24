@@ -25,9 +25,11 @@ twins can never be recorded as byte-equal.
 """
 import base64
 import hashlib
+import io
 import json
 import re
 import sys
+import tarfile
 import tempfile
 import subprocess
 import unittest
@@ -193,8 +195,12 @@ def _generator_tree(root):
     man.write_text(json.dumps({"base_index_digest": ALPINE_DIGEST}) + "\n")
 
 
+_UNSET = object()
+
+
 def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64", omit_subject=False,
-                  image_schema=2, attestation_schema=2, omit_config=False, conflicting_inline=False, bases=(GO_DIGEST, ALPINE_DIGEST)):
+                  image_schema=2, attestation_schema=2, omit_config=False, conflicting_inline=False, bases=(GO_DIGEST, ALPINE_DIGEST),
+                  wrong_subject_digest=False, wrong_att_subject=False, subject_override=_UNSET, rootfs=()):
     # Build the content graph independently from the implementation under test.
     store = td / "artifacts/release-evidence/build-receipts" / role
     store.mkdir(parents=True, exist_ok=True)
@@ -207,9 +213,12 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
         (store / digest).write_bytes(data)
         return {"digest": "sha256:" + digest, "size": len(data), "mediaType": media}
 
-    config = write({"os": "linux", "architecture": selected_platform, "config": {"role": role}},
+    config = write({"os": "linux", "architecture": selected_platform,
+                    "config": {"role": role, "Entrypoint": [role]},
+                    "rootfs": {"diff_ids": [layer["digest"] for layer in rootfs]}},
                    "application/vnd.oci.image.config.v1+json")
-    child = write({"schemaVersion": image_schema, "mediaType": manifest_type, "config": config, "layers": []}, manifest_type)
+    child = write({"schemaVersion": image_schema, "mediaType": manifest_type,
+                   "config": config, "layers": list(rootfs)}, manifest_type)
     child["platform"] = {"os": "linux", "architecture": selected_platform}
     source = {"revision": head, "localdir:context": context, "localdir:dockerfile": str(Path(recipe).parent)}
     request = {"configSource": {"path": Path(recipe).name},
@@ -217,7 +226,10 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
     build = {"externalParameters": request, "internalParameters": {"targetPlatform": "linux/" + selected_platform},
              "buildType": "https://github.com/moby/buildkit/blob/master/docs/attestations/slsa-definitions.md",
              "resolvedDependencies": [{"uri": "pkg:docker/base", "digest": {"sha256": p[7:]}} for p in bases]}
-    subjects = [] if omit_subject else [{"digest": {"sha256": child["digest"][7:]}}]
+    subjects = [] if omit_subject else [
+        {"digest": {"sha256": "f" * 64 if wrong_subject_digest else child["digest"][7:]}}]
+    if subject_override is not _UNSET:
+        subjects = subject_override
     statement = write({"_type": "https://in-toto.io/Statement/v1", "predicateType": slsa,
                        "subject": subjects, "predicate": {"buildDefinition": build, "runDetails": {
                            "metadata": {"buildkit_metadata": {"vcs": source}}}}}, "application/vnd.in-toto+json")
@@ -227,7 +239,8 @@ def fixture_image(td, role, head, context, recipe, *, selected_platform="amd64",
         content = b"!" + content[1:]
     statement["data"] = base64.b64encode(content).decode("ascii")
     attestation = {"schemaVersion": attestation_schema, "mediaType": manifest_type,
-                   "subject": child, "layers": [statement]}
+                   "subject": {**child, "digest": "sha256:" + "f" * 64} if wrong_att_subject else child,
+                   "layers": [statement]}
     if not omit_config:
         attestation["config"] = {"digest": "sha256:" + hashlib.sha256(b"{}").hexdigest(), "size": 2,
                                  "mediaType": "application/vnd.oci.empty.v1+json", "data": "e30="}
@@ -1794,6 +1807,24 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
             ev["reviews"]["assets"]["approved"] = "yes"
         self.verify_fails(nonbool, "reviews: assets.approved must be a boolean")
 
+    def test_generated_pending_text_cannot_support_an_approval(self):
+        reviews = re_ev.pending_reviews()
+        original = reviews["assets"].copy()
+        reviewed = {"approved": True, "owner": "Fixture reviewer",
+                    "reason": "Fixture scope examined", "evidence": "Fixture review record"}
+        with tempfile.TemporaryDirectory() as td:
+            evidence = Path(td) / "review.json"
+            for field in ("owner", "reason", "evidence", None):
+                with self.subTest(field=field):
+                    reviews["assets"] = reviewed.copy()
+                    if field:
+                        reviews["assets"][field] = original[field]
+                    packet = {"source_sha256": "fixture-fingerprint", "reviews": reviews}
+                    evidence.write_text(json.dumps(packet))
+                    gaps = re_ev.license_check.release_gaps([], packet["source_sha256"], evidence)
+                    self.assertEqual(any(g.startswith("assets:") for g in gaps), bool(field))
+                    self.assertEqual(bool(re_ev.review_failures(packet)), bool(field))
+
     def test_review_structured_approval_not_rejected(self):
         def approve(td, ev):
             for rec in ev["reviews"].values():
@@ -1963,7 +1994,12 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
                 ("wrong attestation manifest schema", {"attestation_schema": 1}, "invalid OCI image manifest"),
                 ("conflicting inline provenance bytes", {"conflicting_inline": True}, "inline descriptor digest mismatch"),
                 ("missing attestation config", {"omit_config": True}, "invalid OCI descriptor media type"),
-                ("missing in-toto subject", {"omit_subject": True}, "in-toto subject"),
+                ("wrong in-toto subject digest", {"wrong_subject_digest": True}, "in-toto subject mismatch"),
+                ("attestation manifest subject mismatch", {"wrong_att_subject": True}, "OCI attestation subject mismatch"),
+                ("null in-toto subject", {"subject_override": None}, "invalid in-toto subject list"),
+                ("false in-toto subject", {"subject_override": False}, "invalid in-toto subject list"),
+                ("object in-toto subject", {"subject_override": {}}, "invalid in-toto subject list"),
+                ("empty string in-toto subject", {"subject_override": ""}, "invalid in-toto subject list"),
                 ("different pinned base", {"bases": (GO_DIGEST,)}, "pinned base images"),
             ):
                 with self.subTest(label):
@@ -2873,6 +2909,365 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
         self.verify_fails(
             lambda td, ev: ev.__setitem__("task_base", "0" * 40),
             "task_base mismatch")
+
+
+class MockAlpineAggregateTest(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root, self.ev = build_fixture(self.temp.name)
+        self.head = self.ev["freshness"]["head"]
+        self.role = "mock-provider"
+        self.proof = self.root / "artifacts/release-evidence/mock-provider-proof"
+        self.ev["containers"].append({"repo_ref": "alpine",
+                                      "role": "runtime base (mock image)", "version": "3.21.10"})
+        self.row = next(row for row in self.ev["distribution"]["quickstart_images"]
+                        if row["name"] == self.role)
+
+    def legal_payload(self):
+        payload = {"lib/apk/db/installed": b"P:toy\nV:1-r0\no:toy\nL:MIT\nc:commit\nA:x86_64\n"}
+        package = {"name": "toy", "origin": "toy", "version": "1-r0",
+                   "license": "MIT", "commit": "commit", "arch": "x86_64"}
+        notices = {name: ("Fixture " + name).encode() for name in ("LICENSE", "NOTICE", "LICENSING.md")}
+        notices["toy/LICENSE"] = b"Independent license text"
+        for name in ("LICENSE", "NOTICE", "LICENSING.md"):
+            (self.root / name).write_bytes(notices[name])
+        for name, data in notices.items():
+            payload["usr/share/licenses/yabanin/" + name] = data
+        self.source = self.proof / "source-companion/toy.tar"
+        self.source.parent.mkdir(parents=True)
+        self.source.write_bytes(b"Independent source bytes")
+        source_sha = hashlib.sha256(self.source.read_bytes()).hexdigest()
+        self.source.with_name("SHA256SUMS").write_text(f"{source_sha}  toy.tar\n")
+        manifest = {"schema": 1, "platform": "linux/amd64", "packages": [package],
+                    "notices": {name: {"sha256": hashlib.sha256(data).hexdigest()}
+                                for name, data in notices.items()},
+                    "sources": {"toy": {"version": "1-r0", "commit": "commit",
+                                        "notices": ["toy/LICENSE"], "inputs": ["toy.tar"]}},
+                    "companion_files": {"toy.tar": source_sha}, "recipe_links": {},
+                    "recipe_executables": []}
+        path = self.root / "deploy/mock-provider/legal/MANIFEST.json"
+        path.parent.mkdir()
+        payload["usr/share/licenses/yabanin/MANIFEST.json"] = json.dumps(manifest).encode()
+        path.write_bytes(payload["usr/share/licenses/yabanin/MANIFEST.json"])
+        return payload
+
+    def layer(self, contents):
+        buffer = io.BytesIO()
+        with tarfile.open(fileobj=buffer, mode="w") as output:
+            for name, data in contents.items():
+                entry = tarfile.TarInfo(name)
+                entry.size = len(data)
+                output.addfile(entry, io.BytesIO(data))
+        data = buffer.getvalue()
+        digest = hashlib.sha256(data).hexdigest()
+        loc = self.proof / "layers" / digest
+        loc.parent.mkdir(parents=True, exist_ok=True)
+        loc.write_bytes(data)
+        return {"size": len(data), "digest": "sha256:" + digest,
+                "mediaType": "application/vnd.oci.image.layer.v1.tar"}
+
+    def bind(self, *layers):
+        self.row["image_id"] = fixture_image(
+            self.root, self.role, self.head, "deploy/mock-provider",
+            "deploy/mock-provider/Dockerfile", rootfs=layers,
+        )
+
+    def failures(self):
+        return re_ev._container_gaps(self.root, self.ev)
+
+    def test_missing_then_complete_proof(self):
+        self.assertIn("PENDING gap: mock-provider alpine", "\n".join(self.failures()))
+        self.bind(self.layer(self.legal_payload()))
+        self.assertEqual(self.failures(), [])
+        self.ev["containers"].pop()
+        self.assertIn("missing or ambiguous mock-provider Alpine base record", "\n".join(self.failures()))
+
+    def test_stale_source_or_foreign_subject_cannot_reuse_proof(self):
+        self.bind(self.layer(self.legal_payload()))
+        self.ev["freshness"]["head"] = "f" * 40
+        self.assertIn("different builder-recorded source revision", "\n".join(self.failures()))
+        self.ev["freshness"]["head"] = self.head
+        self.row["image_id"] = "sha256:" + "0" * 64
+        self.assertIn("missing regular receipt blob", "\n".join(self.failures()))
+
+    def test_modified_layer_and_source_bytes_fail(self):
+        layer = self.layer(self.legal_payload())
+        self.bind(layer)
+        path = self.proof / "layers" / layer["digest"][7:]
+        data = path.read_bytes()
+        path.write_bytes(b"x" + data[1:])
+        self.assertIn("mock-provider layer digest mismatch", "\n".join(self.failures()))
+        path.write_bytes(data)
+        self.source.write_bytes(b"Foreign source bytes")
+        self.assertIn("source hash mismatch: toy.tar", "\n".join(self.failures()))
+
+    def test_valid_oci_cannot_substitute_licenses_or_omit_companion(self):
+        payload = self.legal_payload()
+        self.bind(self.layer(payload))
+        self.source.unlink()
+        self.assertIn("missing source: toy.tar", "\n".join(self.failures()))
+        self.source.write_bytes(b"Independent source bytes")
+        payload["usr/share/licenses/yabanin/toy/LICENSE"] = b"Substituted license"
+        self.bind(self.layer(payload))
+        self.assertIn("notice hash mismatch: toy/LICENSE", "\n".join(self.failures()))
+
+    def test_whiteout_cannot_preserve_a_required_lower_notice(self):
+        original = self.layer(self.legal_payload())
+        remove = self.layer({"usr/share/licenses/yabanin/toy/.wh.LICENSE": b""})
+        self.bind(original, remove)
+        self.assertIn("missing notice: toy/LICENSE", "\n".join(self.failures()))
+
+
+class QuickstartBuildCollectionTest(unittest.TestCase):
+    """Generate lane for R4-IMAGE-01: collect_quickstart_build binds the
+    quickstart images only from genuine retained BuildKit receipts -- using
+    the verifier itself as the oracle, never a reimplementation -- and
+    leaves the recorded PENDING gap (no invented rows) otherwise."""
+
+    def _gap(self, td, dist, head):
+        return re_ev._quickstart_images_gap(
+            td, {"distribution": dist, "freshness": {"head": head}})
+
+    def test_round_trip_binds_retained_receipts(self):
+        # what generate collects from the retained store is exactly what the
+        # fixture wired by hand from the same store, and it passes the real
+        # verifier gap unchanged (generate -> verify round trip)
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_images"],
+                             ev["distribution"]["quickstart_images"])
+            build = collected["quickstart_build"]
+            self.assertEqual(build, ev["distribution"]["quickstart_build"])
+            # exact source: the record's head/tree ARE this fixture repo's
+            tree = subprocess.run(["git", "-C", str(td), "rev-parse", "--verify",
+                                   f"{head}^{{tree}}"], check=True,
+                                  capture_output=True, text=True).stdout.strip()
+            self.assertEqual(build["head"], head)
+            self.assertEqual(build["tree_sha256"], tree)
+            # exact platform and subject binding, per row, all three roles
+            store_root = td / "artifacts/release-evidence/build-receipts"
+            for row in collected["quickstart_images"]:
+                role = row["name"]
+                self.assertEqual(row["platform"], "linux/amd64")
+                self.assertEqual(build["platforms"][role], row["platform"])
+                self.assertEqual(build["subjects"][role], row["image_id"])
+                # the image id names the retained engine blob it claims
+                self.assertTrue((store_root / role / row["image_id"][7:]).is_file())
+            # the retained statement itself carries the engine-recorded
+            # source revision and target platform for the core subject
+            index = re_ev.oci_build_receipt.blob(td, "core", build["subjects"]["core"])
+            child = re_ev.oci_build_receipt.platform_image(td, "core", index,
+                                                           "linux/amd64")
+            predicate = re_ev.oci_build_receipt.statement(td, "core", index, child)
+            vcs = predicate["runDetails"]["metadata"]["buildkit_metadata"]["vcs"]
+            self.assertEqual(vcs["revision"], head)
+            self.assertEqual(predicate["buildDefinition"]["internalParameters"]
+                             ["targetPlatform"], "linux/amd64")
+            # generate output passes the real verifier gap unchanged
+            self.assertEqual(self._gap(td, collected, head), [])
+
+    def test_real_engine_statement_binds_without_in_toto_subject(self):
+        # real buildx mode=max output (dockerfile.v0) leaves the in-toto
+        # statement subject empty; the image binding rides on the attestation
+        # manifest's OCI subject, matched by the verifier before the layer walk
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            images = {
+                "core": fixture_image(td, "core", head, ".", "Dockerfile",
+                                      omit_subject=True),
+                "mock-provider": fixture_image(td, "mock-provider", head,
+                                               "deploy/mock-provider",
+                                               "deploy/mock-provider/Dockerfile",
+                                               omit_subject=True),
+                "dashboard": fixture_image(td, "dashboard", head, ".",
+                                           "web/dashboard/Dockerfile",
+                                           omit_subject=True)}
+            collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_build"]["subjects"], images)
+            self.assertEqual(self._gap(td, collected, head), [])
+
+    def test_absent_store_stays_pending(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+            # generate's fallback emission keeps the documented pending gap
+            gap = self._gap(td, {"quickstart_images": [], "quickstart_build": None},
+                            head)
+            self.assertEqual(len(gap), 1)
+            self.assertTrue(gap[0].startswith(
+                "PENDING gap: quickstart built images"))
+
+    def test_foreign_head_receipts_not_bound(self):
+        # receipts minted for another revision never bind this candidate
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts")
+            fixture_image(td, "core", "e" * 40, ".", "Dockerfile")
+            fixture_image(td, "mock-provider", "e" * 40, "deploy/mock-provider",
+                          "deploy/mock-provider/Dockerfile")
+            fixture_image(td, "dashboard", "e" * 40, ".", "web/dashboard/Dockerfile")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_ambiguous_duplicate_receipts_not_bound(self):
+        # a second, equally verifying index for one subject is ambiguity,
+        # not a choice: nothing is bound rather than one id being picked
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            record = json.loads((store / index_digest[7:]).read_text())
+            record["annotations"] = {"fixture": "duplicate candidate"}
+            data = json.dumps(record, sort_keys=True).encode()
+            (store / hashlib.sha256(data).hexdigest()).write_bytes(data)
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_wrong_platform_receipts_not_bound(self):
+        # arm64 receipts cannot pose as the recorded linux/amd64 candidate
+        with tempfile.TemporaryDirectory() as tmp:
+            import shutil
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            shutil.rmtree(td / "artifacts/release-evidence/build-receipts/core")
+            fixture_image(td, "core", head, ".", "Dockerfile",
+                          selected_platform="arm64")
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def _stray_verifying_index(self, store, index_digest):
+        """A second, equally verifying index beside the genuine one."""
+        record = json.loads((store / index_digest[7:]).read_text())
+        record["annotations"] = {"fixture": "duplicate candidate"}
+        data = json.dumps(record, sort_keys=True).encode()
+        (store / hashlib.sha256(data).hexdigest()).write_bytes(data)
+        return "sha256:" + hashlib.sha256(data).hexdigest()
+
+    @staticmethod
+    def _write_layer_sized_blob(store, name="e" * 64, size=9 << 20):
+        (store / name).write_bytes(b"\0" * size)
+        return "sha256:" + name
+
+    def test_large_unrelated_blobs_are_never_loaded(self):
+        # discovery classifies by stat/mediaType only: a rootfs-layer-sized
+        # blob is skipped without ever being read or verified (metadata-only
+        # store, sniff path)
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            big = self._write_layer_sized_blob(store)
+            with patch.object(re_ev.oci_build_receipt, "check_image",
+                              wraps=re_ev.oci_build_receipt.check_image) as spy:
+                collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            checked = [c.args[2] for c in spy.call_args_list if c.args[1] == "core"]
+            self.assertNotIn(big, checked)
+            self.assertEqual(checked,
+                             [ev["distribution"]["quickstart_build"]["subjects"]["core"]])
+
+    def test_layout_index_locates_candidate_indexes(self):
+        # with a retained OCI layout, index.json alone names the candidates:
+        # a stray verifying index and a layer-sized blob are not candidates
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            self._stray_verifying_index(store, index_digest)
+            big = self._write_layer_sized_blob(store)
+            (store / "index.json").write_text(json.dumps(
+                {"schemaVersion": 2,
+                 "manifests": [{"mediaType":
+                                "application/vnd.oci.image.index.v1+json",
+                                "digest": index_digest,
+                                "size": (store / index_digest[7:]).stat().st_size}]}))
+            with patch.object(re_ev.oci_build_receipt, "check_image",
+                              wraps=re_ev.oci_build_receipt.check_image) as spy:
+                collected = re_ev.collect_quickstart_build(td, head)
+            self.assertIsNotNone(collected)
+            self.assertEqual(collected["quickstart_build"]["subjects"]["core"],
+                             index_digest)
+            checked = [c.args[2] for c in spy.call_args_list if c.args[1] == "core"]
+            self.assertEqual(checked, [index_digest])
+            self.assertNotIn(big, checked)
+
+    def test_layout_ambiguity_not_bound(self):
+        # two verifying indexes declared by the layout itself stay ambiguous
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            stray = self._stray_verifying_index(store, index_digest)
+            (store / "index.json").write_text(json.dumps(
+                {"schemaVersion": 2,
+                 "manifests": [{"mediaType":
+                                "application/vnd.oci.image.index.v1+json",
+                                "digest": d,
+                                "size": (store / d[7:]).stat().st_size}
+                               for d in (index_digest, stray)]}))
+            self.assertIsNone(re_ev.collect_quickstart_build(td, head))
+
+    def test_defective_layout_fails_closed(self):
+        # a present but malformed/oversize index.json must never silently
+        # fall back to sniffing the orphan blobs beside it
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_json = store / "index.json"
+            garbage = b"{not json"
+            oversize = b" " * ((1 << 20) + 1)
+            shapeless = json.dumps({"manifests": "not-a-list"})
+            for payload in (garbage, oversize, shapeless):
+                index_json.write_bytes(payload if isinstance(payload, bytes)
+                                       else payload.encode())
+                self.assertIsNone(re_ev.collect_quickstart_build(td, head),
+                                  repr(payload[:12]))
+
+    def test_layout_wrong_size_descriptor_not_loaded(self):
+        # a layer-sized blob described as an index with a wrong/oversize
+        # descriptor is skipped before any candidate bytes are loaded; the
+        # genuine index still binds, and the big blob is never verified
+        with tempfile.TemporaryDirectory() as tmp:
+            td, ev = build_fixture(tmp)
+            head = ev["freshness"]["head"]
+            store = td / "artifacts/release-evidence/build-receipts/core"
+            index_digest = ev["distribution"]["quickstart_build"]["subjects"]["core"]
+            big = self._write_layer_sized_blob(store)
+            bogus = {"mediaType": "application/vnd.oci.image.index.v1+json",
+                     "digest": big, "size": 9 << 20}
+            lying = {"mediaType": "application/vnd.oci.image.index.v1+json",
+                     "digest": big, "size": 128}
+            for extra in (bogus, lying):
+                (store / "index.json").write_text(json.dumps(
+                    {"schemaVersion": 2,
+                     "manifests": [
+                         {"mediaType": "application/vnd.oci.image.index.v1+json",
+                          "digest": index_digest,
+                          "size": (store / index_digest[7:]).stat().st_size},
+                         extra]}))
+                with patch.object(re_ev.oci_build_receipt, "check_image",
+                                  wraps=re_ev.oci_build_receipt.check_image) as spy:
+                    collected = re_ev.collect_quickstart_build(td, head)
+                self.assertIsNotNone(collected, repr(extra))
+                self.assertEqual(collected["quickstart_build"]["subjects"]["core"],
+                                 index_digest)
+                checked = [c.args[2] for c in spy.call_args_list
+                           if c.args[1] == "core"]
+                self.assertEqual(checked, [index_digest])
 
 
 if __name__ == "__main__":

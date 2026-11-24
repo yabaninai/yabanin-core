@@ -96,10 +96,11 @@ A documented gap is not a pass. `verify` reports `PENDING gap: ...` lines
 - the actual notice bytes under `/usr/share/licenses/yabanin/` in the built
   Core image are unbound (requires an image-bound content manifest; paths
   are EXACTLY confined -- a sibling directory is not accepted);
-- the mock-provider alpine 3.21 base has only an apk inventory: closing
-  requires mapping the installed Alpine package versions to delivered
-  licenses and the matching source companion (the blocker binds to the
-  record ROLE, so renaming the inventory artifact does not clear it);
+- the mock-provider Alpine proof requires the final image's installed APK
+  database, delivered notices and matching source companion. The verifier
+  replays the selected OCI image layers and checks these inputs against the
+  committed mock-provider manifest. Missing proof stays pending. See
+  [retaining the mock-provider proof](#retaining-the-mock-provider-proof);
 - dashboard npm package notices do not accompany the built output (the
   nginx stage ships `dist/` only; closing requires a product change mapping
   emitted npm code and assets to full notices, including Lucide's ISC and
@@ -369,3 +370,21 @@ copies the original bytes for one selected digest. Run the ordinary
 release-evidence verification after recording all three subjects. The
 content checks validate the builder records within the captured image.
 Approval of the distribution and final source signing remain separate steps.
+
+## Retaining the mock-provider proof
+
+Use the image and BuildKit receipt for the `mock-provider` quickstart role at
+the candidate commit. From its original OCI layout, copy the root filesystem
+blobs referenced by the linux/amd64 platform image manifest to
+`artifacts/release-evidence/mock-provider-proof/layers/`. Keep the original
+compressed or uncompressed blob bytes and their SHA-256 hex filenames. Place the
+matching Alpine source companion, including its `SHA256SUMS`, under
+`artifacts/release-evidence/mock-provider-proof/source-companion/`.
+
+Run the ordinary `release_evidence.py verify --expected-head COMMIT` command.
+The verifier resolves the mock-provider image through its retained receipt.
+It checks the layer descriptors and uncompressed layer digests, applies
+whiteouts, and passes the effective APK database and notice payload to the
+same verifier used for local mock-provider images. That verifier checks source
+files and notices against the committed manifest. The manual rights review
+remains part of the release process.

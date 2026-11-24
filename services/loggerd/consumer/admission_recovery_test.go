@@ -1,0 +1,208 @@
+package consumer
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/reireirei/yabanin/pkg/credits"
+	"github.com/reireirei/yabanin/pkg/eventpublisher"
+	"github.com/stretchr/testify/require"
+)
+
+type recoveryScan struct {
+	fakeSettlementDB
+	rows   [][]any
+	cursor string
+}
+
+func (s *recoveryScan) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	if query == staleAdmissionIDs {
+		return &fakeRows{vals: [][]any{{"stale-a"}, {"stale-b"}}}, nil
+	}
+	s.cursor = args[0].(string)
+	return &fakeRows{vals: s.rows}, nil
+}
+func TestAdmissionRecoveryBatchPastInvalidFact(t *testing.T) {
+	const org = "org-abc"
+	const rid = "shared-correlation"
+	const badID = "00000001-0000-4000-8000-000000000001"
+	ev := eventpublisher.Event{OrgID: org, InvocationID: testInvocationID, RequestID: rid, EventType: "request.completed", TS: 1777712345678, UsageSource: "provider", TokensIn: 7, TokensOut: 3, EstimatedCostUSD: 0.000032, ResaleCostUSD: 0.000032, CostStatus: "priced", StatusCode: 200, ModelUsed: "m"}
+	fields, err := ev.TerminalAccountingFields()
+	require.NoError(t, err)
+	raw, err := json.Marshal(fields)
+	require.NoError(t, err)
+	scan := &recoveryScan{rows: [][]any{
+		{badID, org, "stream", "stream", rid, rid, []byte(`{"payload":"incomplete"}`)},
+		{ev.InvocationID, org, "chat", "chat", rid, rid, raw},
+	}}
+	scan.failNext = map[string]int{"UPDATE request_admissions": 2}
+	scan.failErr = errors.New("expiry trigger rejected stale row")
+	var logRows, intents, inbox int
+	delivery := &mockDB{
+		QueryRowFn: func(_ context.Context, q string, _ ...any) pgx.Row {
+			switch {
+			case strings.Contains(q, "information_schema"):
+				return &fakeRow{vals: []any{1}}
+			case strings.Contains(q, "FROM request_admissions"):
+				return &fakeRow{vals: []any{org, "admitted"}}
+			case strings.Contains(q, "FROM request_terminal_facts"):
+				return &fakeRow{vals: []any{string(raw)}}
+			}
+			return errRow{err: pgx.ErrNoRows}
+		},
+		ExecFn: func(_ context.Context, q string, _ ...any) (pgconn.CommandTag, error) {
+			switch {
+			case strings.Contains(q, "INSERT INTO request_logs"):
+				logRows++
+			case strings.Contains(q, "INSERT INTO settlement_jobs"):
+				intents++
+			case strings.Contains(q, "INSERT INTO event_inbox"):
+				inbox++
+			}
+			return pgconn.NewCommandTag("INSERT 0 1"), nil
+		},
+	}
+	c := NewWithCreditStore(nil, delivery, "events", silentLogger(), credits.NewStore(nil, silentLogger()))
+	_, retry := c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero(), "failed expiry must be rate-limited")
+	cursor, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.NoError(t, err)
+	require.False(t, more)
+	require.Equal(t, initialRecoveryCursor, scan.cursor)
+	require.Equal(t, initialRecoveryCursor, cursor)
+	require.Equal(t, 1, logRows)
+	require.Equal(t, 1, intents)
+	require.Zero(t, inbox)
+}
+func TestAdmissionRecoveryExpiryFailureIsRetried(t *testing.T) {
+	scan := &recoveryScan{}
+	scan.failNext = map[string]int{"UPDATE request_admissions": 1}
+	scan.failErr = errors.New("database temporarily unavailable")
+	c := New(nil, nil, "events", silentLogger())
+	_, retry := c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero())
+	successful := scan.execsBySubstring("UPDATE request_admissions")
+	require.Len(t, successful, 1)
+	require.Equal(t, "stale-b", successful[0].args[1])
+	_, retry = c.expireAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.False(t, retry.IsZero())
+	successful = scan.execsBySubstring("UPDATE request_admissions")
+	require.Len(t, successful, 3)
+	require.Equal(t, "stale-a", successful[1].args[1])
+}
+
+type brokenFactPage struct {
+	recoveryScan
+	ids         []string
+	checked     []string
+	failListing bool
+}
+type interruptedRows struct{ fakeRows }
+
+func (*interruptedRows) Err() error { return errors.New("page interrupted") }
+func (s *brokenFactPage) Query(_ context.Context, query string, args ...any) (pgx.Rows, error) {
+	if query == pendingFactsSQL {
+		return &interruptedRows{}, nil
+	}
+	if s.failListing {
+		return nil, errors.New("connection reset")
+	}
+	start := args[0].(string)
+	rows := &fakeRows{}
+	for _, id := range s.ids {
+		if id > start {
+			rows.vals = append(rows.vals, []any{id})
+		}
+		if len(rows.vals) == recoveryBatchSize {
+			break
+		}
+	}
+	return rows, nil
+}
+func (s *brokenFactPage) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	id := args[0].(string)
+	s.checked = append(s.checked, id)
+	if id == s.ids[recoveryBatchSize-1] {
+		return errRow{err: errors.New("unreadable individual record")}
+	}
+	return errRow{err: pgx.ErrNoRows} // live delivery already won
+}
+func TestAdmissionRecoveryBrokenPagePreservesCursor(t *testing.T) {
+	scan := new(brokenFactPage)
+	for i := 1; i <= 129; i++ {
+		scan.ids = append(scan.ids, fmt.Sprintf("10000000-0000-4000-8000-%012x", i))
+	}
+	c := New(nil, nil, "events", silentLogger())
+	cursor, more, err := c.recoverAdmissionBatch(t.Context(), scan, initialRecoveryCursor)
+	require.NoError(t, err)
+	require.True(t, more)
+	require.Equal(t, scan.ids[127], cursor)
+	scan.failListing = true
+	resumed, _, err := c.recoverAdmissionBatch(t.Context(), scan, cursor)
+	require.Error(t, err)
+	require.Equal(t, cursor, resumed)
+	scan.failListing = false
+	end, more, err := c.recoverAdmissionBatch(t.Context(), scan, resumed)
+	require.NoError(t, err)
+	require.False(t, more)
+	require.Equal(t, initialRecoveryCursor, end)
+	require.Equal(t, scan.ids, scan.checked)
+}
+
+func TestAdmissionRecoveryLockedRowCannotConsumeWorkerContext(t *testing.T) {
+	ev := chargedProducerEvent()
+	fields, err := ev.TerminalAccountingFields()
+	require.NoError(t, err)
+	data, err := json.Marshal(fields)
+	require.NoError(t, err)
+	fact := recoveryFact{id: ev.InvocationID, orgID: ev.OrgID, admittedKind: "chat", terminalKind: "chat", correlation: ev.RequestID, terminalCorrelation: ev.RequestID, data: data}
+	workerCtx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	workerDeadline, _ := workerCtx.Deadline()
+	holdingLock := true
+	route := admissionRow(1, &fakeRow{vals: []any{ev.OrgID, "admitted"}}, chargedTerminalFacts())
+	db := &mockDB{QueryRowFn: func(ctx context.Context, q string, args ...any) pgx.Row {
+		if holdingLock && strings.Contains(q, "FROM request_admissions") {
+			deadline, ok := ctx.Deadline()
+			require.True(t, ok && deadline.Before(workerDeadline), "row lock uses the worker lifetime")
+			<-ctx.Done()
+			return errRow{err: ctx.Err()}
+		}
+		return route(ctx, q, args...)
+	}}
+	c := NewWithCreditStore(nil, db, "events", silentLogger(), credits.NewStore(nil, silentLogger()))
+	require.ErrorIs(t, c.recoverAdmission(workerCtx, fact), context.DeadlineExceeded)
+	require.NoError(t, workerCtx.Err())
+	holdingLock = false
+	require.NoError(t, c.recoverAdmission(workerCtx, fact))
+}
+
+type recoveryLookupContext struct {
+	fakeSettlementDB
+	lookup context.Context
+}
+
+func (db *recoveryLookupContext) QueryRow(ctx context.Context, _ string, _ ...any) pgx.Row {
+	db.lookup = ctx
+	return errRow{err: pgx.ErrNoRows}
+}
+
+func TestAdmissionRecoveryFallbackReadHasOwnDeadline(t *testing.T) {
+	db := new(recoveryLookupContext)
+	workerCtx, cancel := context.WithTimeout(t.Context(), time.Minute)
+	defer cancel()
+	_, err := readRecoveryFactByID(workerCtx, db, testInvocationID)
+	require.ErrorIs(t, err, pgx.ErrNoRows)
+	workerDeadline, _ := workerCtx.Deadline()
+	lookupDeadline, ok := db.lookup.Deadline()
+	require.True(t, ok && lookupDeadline.Before(workerDeadline))
+	require.ErrorIs(t, db.lookup.Err(), context.Canceled)
+	require.NoError(t, workerCtx.Err())
+}

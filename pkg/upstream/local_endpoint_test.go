@@ -238,7 +238,7 @@ func TestLocalEndpoint_AllowlistedPrivateEndpointDials(t *testing.T) {
 			AllowedUpstreams: []string{"http://10.20.30.40:8081"},
 		})
 		require.NoError(t, cerr)
-		require.NoError(t, client.checkSSRF(),
+		require.NoError(t, client.checkSSRF(t.Context()),
 			"the exact allow-list pin admits the RFC1918 host at request time (D-4)")
 	})
 }

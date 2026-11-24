@@ -50,7 +50,14 @@ func (t *ppCaptureTx) Exec(_ context.Context, query string, args ...any) (pgconn
 	return pgconn.NewCommandTag("INSERT 0 1"), nil
 }
 
-func (t *ppCaptureTx) QueryRow(context.Context, string, ...any) pgx.Row {
+func (t *ppCaptureTx) QueryRow(_ context.Context, query string, _ ...any) pgx.Row {
+	// The only legitimate row read on this surface is the settlement
+	// schema probe (legacy intents resolve their arbiter through the
+	// delivery transaction). Answer it as a pre-0028 schema; anything
+	// else remains a hard failure.
+	if strings.Contains(query, "information_schema.columns") {
+		return &fakeRow{vals: []any{0}}
+	}
 	return &fakeTxRow{err: context.Canceled}
 }
 func (t *ppCaptureTx) Commit(context.Context) error   { return nil }
@@ -205,7 +212,7 @@ func TestPendingPriceInterruptionCorpus(t *testing.T) {
 		require.Equal(t, int64(7), plan[0].link.AllowanceID, "the reserve linkage rides the charge")
 
 		tx := &ppCaptureTx{}
-		require.NoError(t, ppBillingConsumer().insertScopeIntent(ctx, tx, "org-n06", ev.requestID,
+		require.NoError(t, ppBillingConsumer().insertScopeIntent(ctx, tx, "org-n06", ev.requestID, nil,
 			plan[0], 10, 20, 0.012, 0.012, "stub-model"))
 		execs := tx.recorded()
 		require.Len(t, execs, 1)

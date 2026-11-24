@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 
 	"github.com/reireirei/yabanin/pkg/auth"
@@ -40,9 +41,20 @@ type Store struct {
 	log    *slog.Logger
 }
 
-// New creates a new rule store. If pool is nil, only Redis cache is used (cache-only mode for testing).
+// New creates a new rule store. If pool is nil, only Redis cache is used;
+// if rdb is nil, reads go straight to the DB. Both are optional: the gateway
+// wires its *pgxpool.Pool / *redis.Client into the interfaces, so an absent
+// dependency arrives as a typed nil that a plain == nil check cannot see —
+// normalize both here so GetByOrg and Invalidate degrade instead of
+// panicking on first use.
 // Pass signer as nil to skip HMAC verification on cache values.
 func New(pool dbConn, rdb cacheOps, ttl time.Duration, signer *auth.CacheSigner, l *slog.Logger) *Store {
+	if p, ok := pool.(*pgxpool.Pool); ok && p == nil {
+		pool = nil
+	}
+	if c, ok := rdb.(*redis.Client); ok && c == nil {
+		rdb = nil
+	}
 	if ttl == 0 {
 		ttl = defaultTTL
 	}

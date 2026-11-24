@@ -6,31 +6,38 @@ package adminstore
 //
 //   T07a — root self-grant boundaries: exact expiry edges (consume must fail
 //          at and after expires_at), revoked-then-consume, cross-request
-//          reuse, scope exclusivity (payload.read never implies
-//          payload.read_originals), the issuing-root binding (a grant is a
-//          self-grant: grantee == grantor, no other root can redeem or
-//          revoke it), and the per-root active-grant cap (10 OK, 11th
-//          rejected, revoking one frees the slot).
+//          reuse, row binding (0031: a grant redeems exactly the one
+//          physical request_logs row it was issued against; any other row
+//          denies without burning), scope exclusivity (payload.read never
+//          implies payload.read_originals), the issuing-root binding (a
+//          grant is a self-grant: grantee == grantor, no other root can
+//          redeem or revoke it), and the per-root active-grant cap (10 OK,
+//          11th rejected, revoking one frees the slot).
 //   T07b — no-account-limits edges: provisioning under concurrent invites
 //          and developer creations (no seat/license gate anywhere), with
 //          the duplicate-active-invite uniqueness enforced per email.
 //   T08  — interruption/restart/retry/resume: issuance interrupted while
-//          blocked in the mandatory audit write (token must not escape
-//          before the audit commits; completion converges), the audit-
-//          failure resume state (a compensated grant is unredeemable and
-//          does not consume the cap), and root settings writes that are
+//          blocked in the mandatory audit write (grant and audit share one
+//          transaction: while blocked nothing is durable — no live grant, no
+//          issue event — and completion commits both atomically), the
+//          journal-outage atomicity (a failed issue or use audit rolls the
+//          state change back entirely; zero rows, zero events survive, and
+//          the retry converges), and root settings writes that are
 //          interrupted or aborted — never a partial settings pair.
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -63,6 +70,74 @@ func auditRowCount(t *testing.T, store *Store, ctx context.Context, id string) i
 	return n
 }
 
+// grantAuditEventCount counts durable audit rows for one lifecycle action of
+// one issuing root (scoped by admin_id so the assertion observes only this
+// test's grants).
+func grantAuditEventCount(t *testing.T, pool *pgxpool.Pool, ctx context.Context, rootID, action string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM admin_audit_logs WHERE admin_id=$1 AND action=$2`, rootID, action).Scan(&n))
+	return n
+}
+
+// activeGrantCount counts live (neither revoked nor consumed) grants of one
+// org.
+func activeGrantCount(t *testing.T, pool *pgxpool.Pool, ctx context.Context, orgID string) int64 {
+	t.Helper()
+	var n int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM request_payload_grants WHERE org_id=$1::uuid AND revoked_at IS NULL AND consumed_at IS NULL`, orgID).Scan(&n))
+	return n
+}
+
+// consumedGrantCount counts consumed grant rows for one bearer token.
+func consumedGrantCount(t *testing.T, pool *pgxpool.Pool, ctx context.Context, token string) int64 {
+	t.Helper()
+	hash := sha256.Sum256([]byte(token))
+	var n int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM request_payload_grants WHERE token_hash=$1 AND consumed_at IS NOT NULL`, hash[:]).Scan(&n))
+	return n
+}
+
+// failGrantAuditTrigger installs a BEFORE INSERT trigger on admin_audit_logs
+// that raises for exactly one grant lifecycle action — a deterministic
+// journal outage for that action only (any other audit action appends
+// freely) — and returns its drop func for the recovery phase of a test;
+// t.Cleanup drops it regardless.
+func failGrantAuditTrigger(t *testing.T, pool *pgxpool.Pool, action string) func() {
+	t.Helper()
+	fn := "test_fail_audit_" + strings.ReplaceAll(action, ".", "_")
+	ctx := context.Background()
+	_, err := pool.Exec(ctx, `DROP TRIGGER IF EXISTS `+fn+`_trg ON admin_audit_logs`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE OR REPLACE FUNCTION `+fn+`() RETURNS trigger LANGUAGE plpgsql AS $fn$ BEGIN RAISE EXCEPTION 'test: audit journal unavailable for `+action+`'; END $fn$`)
+	require.NoError(t, err)
+	_, err = pool.Exec(ctx, `CREATE TRIGGER `+fn+`_trg BEFORE INSERT ON admin_audit_logs FOR EACH ROW WHEN (NEW.action = '`+action+`') EXECUTE FUNCTION `+fn+`()`)
+	require.NoError(t, err)
+	drop := func() {
+		_, _ = pool.Exec(ctx, `DROP TRIGGER IF EXISTS `+fn+`_trg ON admin_audit_logs`)
+		_, _ = pool.Exec(ctx, `DROP FUNCTION IF EXISTS `+fn+`()`)
+	}
+	t.Cleanup(drop)
+	return drop
+}
+
+// corpusRequestRow seeds one physical request_logs carrier row and returns
+// its numeric row key: 0031 binds every one-request grant to exactly one
+// physical row, so issuance needs a carrier before any grant can exist.
+func corpusRequestRow(t *testing.T, store *Store, ctx context.Context, orgID, requestID string) int64 {
+	t.Helper()
+	var rowKey int64
+	require.NoError(t, store.db.QueryRow(ctx,
+		`INSERT INTO request_logs (org_id, model_requested, model_used, status_code, duration_ms, tokens_in, tokens_out, method, home_region, request_id, created_at)
+		 VALUES ($1::uuid, 'corpus-model', 'corpus-model', 200, 10, 10, 10, 'POST', 'sg', $2, $3)
+		 RETURNING id`,
+		orgID, requestID, time.Now().UTC()).Scan(&rowKey))
+	return rowKey
+}
+
 func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
@@ -70,6 +145,11 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	orgID, rootA, rootB := corpusOrg(t, store, ctx, "boundary")
 
 	const requestID = "boundary-request"
+
+	// 0031: issuance binds a grant to exactly one physical request_logs
+	// row — seed that carrier before any grant can be issued.
+	rowKey := corpusRequestRow(t, store, ctx, orgID, requestID)
+	carriers := []string{requestID}
 
 	// --- expiry edges -----------------------------------------------------
 	now := time.Now().UTC()
@@ -112,18 +192,46 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 	// The failed reuse left the grant live — retire it for the cap section.
 	require.NoError(t, store.RevokeRequestPayloadGrant(active.Token, rootA))
 
+	// --- 0031 row binding: exactly one physical row ----------------------
+	// Issuance resolved and stored the seeded carrier's row key; a redeem
+	// against any other physical row denies fail-closed and burns nothing.
+	pinned, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
+	require.NoError(t, err)
+	assert.Equal(t, rowKey, pinned.RowKey, "issuance binds the grant to the seeded carrier row")
+	_, err = store.ConsumeRequestPayloadGrantScope(pinned.Token, orgID, requestID, rowKey+1, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant,
+		"a grant pinned to one physical row cannot be redeemed against another")
+	redeemed, err := store.ConsumeRequestPayloadGrantScope(pinned.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	require.NoError(t, err,
+		"the denied wrong-row attempt burned nothing — the token still redeems its bound row")
+	assert.Equal(t, rowKey, redeemed.RowKey)
+
+	// Scoped expiry edges through the keyed consume: exactly at expires_at
+	// denies (strict predicate) and burns nothing; one millisecond earlier
+	// redeems.
+	edgeScope, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
+	require.NoError(t, err)
+	_, err = store.ConsumeRequestPayloadGrantScope(edgeScope.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, edgeScope.ExpiresAt)
+	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant,
+		"scoped consume exactly at expires_at must fail (durable predicate is strict)")
+	_, err = store.ConsumeRequestPayloadGrantScope(edgeScope.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, edgeScope.ExpiresAt.Add(-time.Millisecond))
+	require.NoError(t, err,
+		"the failed expiry probe burned nothing — the live grant still redeems")
+
 	// --- scope exclusivity -------------------------------------------------
 	readOnly, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeRead, time.Minute, now)
 	require.NoError(t, err)
-	assert.Error(t, store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Now().UTC()),
-		"payload.read must never imply payload.read_originals")
-	assert.NoError(t, store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rootA, RequestPayloadScopeRead, time.Now().UTC()))
+	_, err = store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeOriginals, time.Now().UTC())
+	assert.Error(t, err, "payload.read must never imply payload.read_originals")
+	_, err = store.ConsumeRequestPayloadGrantScope(readOnly.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.NoError(t, err)
 
 	originals, err := store.CreateRequestPayloadGrantScope(orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Minute, now)
 	require.NoError(t, err)
-	assert.Error(t, store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rootA, RequestPayloadScopeRead, time.Now().UTC()),
-		"payload.read_originals must never imply payload.read")
-	assert.NoError(t, store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rootA, RequestPayloadScopeOriginals, time.Now().UTC()))
+	_, err = store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.Error(t, err, "payload.read_originals must never imply payload.read")
+	_, err = store.ConsumeRequestPayloadGrantScope(originals.Token, orgID, requestID, rowKey, rootA, RequestPayloadScopeOriginals, time.Now().UTC())
+	assert.NoError(t, err)
 
 	// The used-audit entry shares the issuance prefix (canonical grant id).
 	assert.Equal(t, int64(1), auditRowCount(t, store, ctx, readOnly.ID+"-request_payload.grant_used"),
@@ -147,7 +255,16 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 
 	// --- per-root active cap (10 OK, 11th rejected, revoke frees a slot) --
 	// Every earlier grant is by now consumed, revoked or expired, so the
-	// quota starts empty for rootA.
+	// quota starts empty for rootA. Each cap request carries its own seeded
+	// row: 0031 issuance resolves one physical carrier per request id.
+	for i := 0; i <= MaxActiveRequestGrants; i++ {
+		capID := fmt.Sprintf("cap-request-%d", i)
+		if i == MaxActiveRequestGrants {
+			capID = "cap-request-over"
+		}
+		corpusRequestRow(t, store, ctx, orgID, capID)
+		carriers = append(carriers, capID)
+	}
 	var capTokens []string
 	for i := 0; i < MaxActiveRequestGrants; i++ {
 		g, err := store.CreateRequestPayloadGrant(orgID, fmt.Sprintf("cap-request-%d", i), rootA, time.Minute, time.Now().UTC())
@@ -162,26 +279,36 @@ func TestIntegration_RootSelfGrantBoundaryCorpus(t *testing.T) {
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, carriers)
 	})
 }
 
 // TestIntegration_GrantIssuanceInterruptedMidAudit pins the T08 mid-flow
-// interruption on the real durable plane: the grant row commits first, then
-// the mandatory audit write serializes on the append advisory lock. While
-// that write is blocked, the bearer token has NOT escaped the issuer; once
-// the interruption clears, issuance completes and the grant is audited
-// exactly once and redeemable (a retry in front of a still-blocked audit
-// would block identically — no second usable grant can exist).
+// interruption on the real durable plane: the grant row and its mandatory
+// audit share ONE transaction, and the audit write serializes on the append
+// advisory lock. While that write is blocked, nothing of the issuance is
+// durable — an independent connection observes zero live grant rows and zero
+// issue events, so the bearer token has NOT escaped the issuer; once the
+// interruption clears, the single commit lands grant and audit together and
+// the grant is audited exactly once and redeemable (a retry in front of a
+// still-blocked audit would block identically — no second usable grant can
+// exist).
 func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
 	ctx := context.Background()
 	orgID, rootA, _ := corpusOrg(t, store, ctx, "interrupt")
+	corpusRequestRow(t, store, ctx, orgID, "interrupted-request")
 
 	// Hold the audit append lock from a foreign transaction: the issuance's
-	// audit write will block after the grant row has already committed.
+	// audit write will block before anything of the issuance can commit.
 	lockTx, err := pool.Begin(ctx)
 	require.NoError(t, err)
+	// Deferred NOW, not at the convergence point: any assertion failure
+	// below must still release the advisory lock, or the pool cleanup
+	// deadlocks with the issuer goroutine (the leak the first corrected
+	// run exhibited).
+	defer func() { _ = lockTx.Rollback(context.Background()) }()
 	_, err = lockTx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext(current_database() || ':admin_audit_logs:append'))`)
 	require.NoError(t, err)
 
@@ -198,9 +325,53 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 	select {
 	case res := <-done:
 		t.Fatalf("issuance returned while its mandatory audit write was still blocked: grant=%+v err=%v", res.grant, res.err)
-	case <-time.After(600 * time.Millisecond):
-		// Still blocked inside the audit write — the token has not escaped.
+	default:
 	}
+	// Reach-proof, not a timed guess: identify the holder session (the
+	// lockTx backend) and, from an independent connection, wait until an
+	// issuer connection is actually QUEUED on the very same advisory lock
+	// — a waiting row whose full database/classid/objid/objsubid tag
+	// matches a granted row of the holder. Matching the holder row instead
+	// of recomputing the key is the portable proof: pg_advisory_xact_lock
+	// widens the int4 hashtext() to bigint, and a negative hash
+	// sign-extends into classid=4294967295 rather than 0, so a classid=0
+	// probe would silently depend on the disposable database name.
+	var holderPID int32
+	require.NoError(t, lockTx.QueryRow(ctx, `SELECT pg_backend_pid()`).Scan(&holderPID),
+		"identifying the advisory-lock holder backend")
+	var heldByHolder int64
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT count(*) FROM pg_locks WHERE locktype='advisory' AND granted AND pid=$1`, holderPID).Scan(&heldByHolder))
+	require.NotZero(t, heldByHolder,
+		"the holder transaction must already own the append advisory lock before the issuance starts")
+	const waitingOnHolderLockSQL = `SELECT count(*) FROM pg_locks w
+WHERE w.locktype='advisory' AND NOT w.granted
+  AND EXISTS (SELECT 1 FROM pg_locks h
+              WHERE h.locktype='advisory' AND h.granted AND h.pid=$1
+                AND h.database IS NOT DISTINCT FROM w.database
+                AND h.classid  IS NOT DISTINCT FROM w.classid
+                AND h.objid    IS NOT DISTINCT FROM w.objid
+                AND h.objsubid IS NOT DISTINCT FROM w.objsubid)`
+	reached := false
+	for deadline := time.Now().Add(5 * time.Second); !reached && time.Now().Before(deadline); {
+		var waiting int64
+		require.NoError(t, pool.QueryRow(ctx, waitingOnHolderLockSQL, holderPID).Scan(&waiting))
+		if waiting > 0 {
+			reached = true
+			break
+		}
+		select {
+		case res := <-done:
+			t.Fatalf("issuance returned before ever queuing on the append advisory lock: grant=%+v err=%v", res.grant, res.err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	require.True(t, reached,
+		"the issuance never queued on the holder's admin_audit_logs append advisory lock within 5s")
+	assert.Zero(t, activeGrantCount(t, pool, ctx, orgID),
+		"while the issuance transaction is blocked in its audit write, zero active grants may exist")
+	assert.Zero(t, grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_issued"),
+		"while the issuance transaction is blocked in its audit write, zero issue events may exist")
 
 	// The interruption clears; issuance converges.
 	require.NoError(t, lockTx.Rollback(context.Background()), "releasing the append lock")
@@ -218,43 +389,115 @@ func TestIntegration_GrantIssuanceInterruptedMidAudit(t *testing.T) {
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, []string{"interrupted-request"})
 	})
 }
 
-// TestIntegration_AuditFailureResumeState pins the T08 post-interruption
-// resume state on the real durable plane: a grant whose audit failed and
-// that was compensated (revoked_at set) can never be redeemed and never
-// counts toward the per-root active cap — a retry starts clean.
-func TestIntegration_AuditFailureResumeState(t *testing.T) {
+// TestIntegration_GrantIssuanceAuditFailureRollsBackFully pins single-commit
+// issuance atomicity on the real durable plane (physical counterpart of
+// TestRequestPayloadGrant_IssuanceJournalFailureLeavesNoGrantOrEvent): with
+// the journal write deterministically failing for exactly
+// request_payload.grant_issued rows, the failed issuance must leave zero
+// grant rows and zero issue events — nothing active, nothing revoked, no
+// quota consumed — and the retry after recovery converges to exactly one
+// audited, redeemable grant. (Negative control, recorded in the task
+// evidence: with the audit appended after the commit — the pre-fix shape —
+// the mid-failure observation goes red: the grant row is live while its
+// issue event is missing.)
+func TestIntegration_GrantIssuanceAuditFailureRollsBackFully(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.Default(), nil)
 	ctx := context.Background()
-	orgID, rootA, _ := corpusOrg(t, store, ctx, "resume")
+	orgID, rootA, _ := corpusOrg(t, store, ctx, "atomic")
+	corpusRequestRow(t, store, ctx, orgID, "atomic-request")
 
-	now := time.Now().UTC()
-	compensated, err := store.CreateRequestPayloadGrantScope(orgID, "resume-request", rootA, RequestPayloadScopeRead, time.Minute, now)
+	drop := failGrantAuditTrigger(t, pool, "request_payload.grant_issued")
+
+	_, err := store.CreateRequestPayloadGrant(orgID, "atomic-request", rootA, time.Minute, time.Now().UTC())
+	require.ErrorContains(t, err, "audit payload grant issue",
+		"the journal outage must surface as a failed issuance")
+
+	// Independent observation on a separate connection: nothing survived.
+	assert.Zero(t, activeGrantCount(t, pool, ctx, orgID),
+		"a failed issuance must leave zero grant rows — nothing active, nothing revoked")
+	assert.Zero(t, grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_issued"),
+		"a failed issuance must leave zero issue events")
+
+	// Recovery: the journal is reachable again; the retry converges to
+	// exactly one grant and one issue event, audited together in one commit.
+	drop()
+	retried, err := store.CreateRequestPayloadGrant(orgID, "atomic-request", rootA, time.Minute, time.Now().UTC())
 	require.NoError(t, err)
-	// Emulate the completed compensating revoke (the exact statement the
-	// issuance path runs when its audit write fails after the commit).
-	tag, err := pool.Exec(ctx,
-		`UPDATE request_payload_grants SET revoked_at=$2 WHERE id=$1::uuid AND revoked_at IS NULL`,
-		compensated.ID, now)
-	require.NoError(t, err)
-	require.Equal(t, int64(1), tag.RowsAffected())
-
-	assert.False(t, store.ConsumeRequestPayloadGrant(compensated.Token, orgID, "resume-request", rootA, time.Now().UTC()),
-		"the compensated grant is unredeemable after a restart")
-
-	// The compensated row does not count toward the active cap.
-	for i := 0; i < MaxActiveRequestGrants; i++ {
-		_, err := store.CreateRequestPayloadGrant(orgID, fmt.Sprintf("resume-cap-%d", i), rootA, time.Minute, time.Now().UTC())
-		require.NoError(t, err, "active grant %d must issue despite the compensated row", i+1)
-	}
-	_, err = store.CreateRequestPayloadGrant(orgID, "resume-cap-over", rootA, time.Minute, time.Now().UTC())
-	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant, "the cap counts only live grants, not compensated rows")
+	assert.Equal(t, int64(1), activeGrantCount(t, pool, ctx, orgID),
+		"recovery converges to exactly one live grant row")
+	assert.Equal(t, int64(1), grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_issued"),
+		"exactly one issue event after recovery")
+	assert.True(t, store.ConsumeRequestPayloadGrant(retried.Token, orgID, "atomic-request", rootA, time.Now().UTC()),
+		"the recovered grant is redeemable exactly once")
+	assert.False(t, store.ConsumeRequestPayloadGrant(retried.Token, orgID, "atomic-request", rootA, time.Now().UTC()),
+		"the token does not redeem twice")
 
 	t.Cleanup(func() {
 		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, []string{"atomic-request"})
+	})
+}
+
+// TestIntegration_GrantConsumeAuditFailureRollsBackAndRetrySucceeds pins the
+// use-audit coupling on the real durable plane with an independent
+// connection as oracle: with the journal write deterministically failing for
+// exactly request_payload.grant_used rows, the consume must roll back
+// entirely — the token stays unconsumed (its row keeps consumed_at NULL) and
+// zero use events exist — so the same token retries successfully once the
+// journal recovers, redeems exactly once, and exactly one durable use event
+// survives. A shared-map fake cannot prove this: its whole-map rollback can
+// mask a consume that ran OUTSIDE the transaction, which is exactly the
+// defect class this test excludes. (Negative control, recorded in the task
+// evidence: consuming via the pool instead of the consume transaction — the
+// out-of-transaction variant — goes red at the post-failure observation:
+// consumed_at is set and a use event exists despite the failed audit.)
+func TestIntegration_GrantConsumeAuditFailureRollsBackAndRetrySucceeds(t *testing.T) {
+	pool := openAdminTestPool(t)
+	store := New(pool, slog.Default(), nil)
+	ctx := context.Background()
+	orgID, rootA, _ := corpusOrg(t, store, ctx, "consume-atomic")
+	corpusRequestRow(t, store, ctx, orgID, "consume-atomic-request")
+
+	grant, err := store.CreateRequestPayloadGrant(orgID, "consume-atomic-request", rootA, time.Minute, time.Now().UTC())
+	require.NoError(t, err)
+
+	drop := failGrantAuditTrigger(t, pool, "request_payload.grant_used")
+
+	_, err = store.ConsumeRequestPayloadGrantScope(grant.Token, orgID, "consume-atomic-request", grant.RowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	require.ErrorContains(t, err, "audit payload grant use",
+		"the journal outage must surface as a failed consume")
+
+	// Independent observation on a separate connection: the consume did not
+	// survive its failed audit.
+	assert.Zero(t, consumedGrantCount(t, pool, ctx, grant.Token),
+		"a failed consume must leave consumed_at NULL — the token is not destroyed")
+	assert.Zero(t, grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_used"),
+		"a failed consume must leave zero use events")
+
+	// Recovery: the same token redeems exactly once; exactly one durable use
+	// event survives; an independent store (empty replay cache) denies the
+	// replay from durable state alone.
+	drop()
+	consumed, err := store.ConsumeRequestPayloadGrantScope(grant.Token, orgID, "consume-atomic-request", grant.RowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	require.NoError(t, err)
+	assert.Equal(t, grant.RowKey, consumed.RowKey)
+	assert.Equal(t, int64(1), consumedGrantCount(t, pool, ctx, grant.Token),
+		"the retry consumes the row exactly once")
+	assert.Equal(t, int64(1), grantAuditEventCount(t, pool, ctx, rootA, "request_payload.grant_used"),
+		"exactly one durable use event after recovery")
+	replay := New(pool, slog.Default(), nil)
+	_, err = replay.ConsumeRequestPayloadGrantScope(grant.Token, orgID, "consume-atomic-request", grant.RowKey, rootA, RequestPayloadScopeRead, time.Now().UTC())
+	assert.ErrorIs(t, err, ErrInvalidRequestPayloadGrant,
+		"the replay denial must hold from durable state alone, not from the first store's cache")
+
+	t.Cleanup(func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_payload_grants WHERE org_id = $1::uuid`, orgID)
+		_, _ = pool.Exec(context.Background(), `DELETE FROM request_logs WHERE org_id = $1::uuid AND request_id = ANY($2)`, orgID, []string{"consume-atomic-request"})
 	})
 }
 

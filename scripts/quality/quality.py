@@ -36,7 +36,7 @@ PROFILES = {
     # `full`: the acceptance evidence (full) does not depend on the browser
     # runtime, while web-profile runs and changed-file runs that touch
     # e2e/** / e2e-journey/** get the gates.
-    "web": ["dashboard", "site", "design", "browser", "journey"],
+    "web": ["dashboard", "site", "design", "browser", "journey", "orgpresentation"],
     "sdk": ["node-sdk", "python-sdk", "bridge", "go-sdk"],
     "docs": ["docs"],
     # Private planning data does not change the product. Keep its validator
@@ -65,9 +65,9 @@ RELEASE_PLAN_DATA = {RELEASE_PLAN_DIR + "PLAN-DATA.md"}
 # suites, image builds, disposable PG drills). Docker Desktop runs the daemon
 # in a CPU-limited VM; overlapping them starves time-sensitive tests into
 # flakes (observed 2026-10-06: slowlog/timing failures under jobs=4). They
-HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity", "journey"}
+HEAVY_GATES = {"self", "go-policy", "critical-go", "static", "security", "tests", "routing", "guards", "int-modules", "nested-go", "deps", "history-secrets", "commit-secrets", "go-complexity", "journey", "orgpresentation"}
 LIGHT_GATES = LEAVES - HEAVY_GATES
-DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan", "journey"}
+DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package", "dr", "image-scan", "journey", "orgpresentation"}
 # NEXT-14b: ordering constraints for the parallel scheduler. The browser gate
 # serves the production builds produced by dashboard/site; those builds wipe
 # their output directories mid-run (Makefile re-stamps the fingerprint after
@@ -75,7 +75,7 @@ DOCKER_GATES = {"critical-go", "tests", "int-modules", "integration", "package",
 # failures (observed 2026-10-13 under jobs=3). In serial reference mode the
 # gate order already guarantees this; the map only constrains jobs>1.
 # The journey gate serves the same dashboard artifact: same constraint.
-GATE_ORDER = {"browser": ("dashboard", "site"), "journey": ("dashboard",)}
+GATE_ORDER = {"browser": ("dashboard", "site"), "journey": ("dashboard",), "orgpresentation": ("dashboard",)}
 
 
 def git(root, *args):
@@ -200,6 +200,27 @@ def classify_product_paths(paths):
                     "pkg/adminstore/request_detail.go",
                 )):
             add(["journey"], path)
+        # CV-03 org-presentation acceptance scope: the browser acceptance
+        # certifies org presentation end to end, so it runs for its harness
+        # (suite, Playwright config, Go stand) AND the bounded product
+        # sources it exercises: the presentation hook and its formatters,
+        # the org picker/scope bar, the two pages under test and the /api/me
+        # presentation fields. Bounded and non-consuming as for journey.
+        if (path.startswith(("web/dashboard/e2e-orgpresentation/",
+                             "services/admin/handlers/cv03"))
+                or path in (
+                    "web/dashboard/playwright.orgpresentation.config.ts",
+                    "web/dashboard/src/i18n/useOrgPresentation.ts",
+                    "web/dashboard/src/i18n/money.ts",
+                    "web/dashboard/src/i18n/date.ts",
+                    "web/dashboard/src/i18n/format.ts",
+                    "web/dashboard/src/components/OrgSelect.tsx",
+                    "web/dashboard/src/components/GlobalScopeBar.tsx",
+                    "web/dashboard/src/pages/CreditsPage.tsx",
+                    "web/dashboard/src/pages/AnalyticsExplorerPage.tsx",
+                    "services/admin/handlers/me.go",
+                )):
+            add(["orgpresentation"], path)
         # Package names cannot reliably identify trust boundaries. Go changes
         # conservatively receive all cumulative mandatory Go gates.
         if path.endswith("_test.go") and ("integration" in Path(path).parent.name or path.endswith(("integration_test.go", "updown_test.go", "rls_verify_test.go", "drill_test.go", "e2e_test.go"))):
@@ -489,6 +510,42 @@ def skip_reason(log):
     if MAKE_SKIP_RE.search(lines[-1]) and len(lines) > 1:
         return lines[-2]
     return lines[-1]
+
+
+SEED_OVERRIDE_STATUS_LINE = "Critical Go checks: passed-seed-block-override"
+
+
+def seed_override_status(log):
+    """Honest propagation of the Preview2 critical-go seed-block stopgap.
+
+    The gate process exits 0, so the make-level status alone would read as
+    a plain pass. The manifest must keep the override visible instead of
+    silently normalizing it: the gate record carries the explicit
+    passed-seed-block-override status and an override flag built from what
+    the run actually printed — never a constant. Parsed when present: the
+    task base from the activation banner, the report path from the status
+    line and the report SHA256 from the following line; unparsed parts
+    stay None. Returns None when the run printed no override status.
+    """
+    base = report = report_sha = None
+    matched = False
+    base_re = re.compile(r"seed-block override \(Preview2, base ([0-9a-f]+)\)")
+    status_re = re.compile(re.escape(SEED_OVERRIDE_STATUS_LINE) + r"; (.+)$")
+    sha_re = re.compile(r"^Report SHA256: ([0-9a-f]{64})$")
+    for line in Path(log).read_text(errors="replace").splitlines():
+        banner = base_re.search(line)
+        if banner:
+            base = banner.group(1)
+        hit = status_re.match(line)
+        if hit:
+            matched = True
+            report = hit.group(1).strip()
+        sha = sha_re.match(line)
+        if sha:
+            report_sha = sha.group(1)
+    if not matched:
+        return None
+    return {"base": base, "report": report, "report_sha256": report_sha}
 
 
 def gate_status(code, log=None):
@@ -804,7 +861,8 @@ def verify_evidence(root, manifest, required):
     # exist (a gate killed before writing output) and prove nothing.
     for index, (_path, _report, by_name) in enumerate(links):
         for name, gate in by_name.items():
-            if gate.get("status") not in ("passed", "skipped"):
+            if gate.get("status") not in ("passed", "passed-seed-block-override",
+                                          "skipped"):
                 continue
             if name not in LEAVES or gate.get("log") != name + ".log":
                 return False
@@ -833,7 +891,15 @@ def verify_evidence(root, manifest, required):
         # the skip to be explicit and self-describing so it can never
         # masquerade as a pass.
         if status == "passed":
-            if code != 0:
+            # A recorded override flag under a plain passed status is the
+            # normalization this status contract exists to prevent.
+            if code != 0 or gate.get("seed_block_override"):
+                return False
+        elif status == "passed-seed-block-override":
+            # Same exit contract as a pass, but the explicit override flag
+            # must be present: the stopgap may never masquerade as a clean
+            # pass and its warning must survive into the manifest.
+            if code != 0 or not gate.get("seed_block_override"):
                 return False
         elif status == "skipped":
             # 77 = the gate process itself skipped; 2 = the make wrapper
@@ -878,6 +944,20 @@ def execute_gate(gate, command, root, log_path, timeout, report, directory,
         gate["log_sha256"] = hashlib.sha256(log_path.read_bytes()).hexdigest()
         if gate["name"] == "tests":
             gate["tests"] = test_summary(log_path)
+        # Strictly critical-go, and only on a confirmed pass: a failed gate
+        # with the line in its log must stay failed, and no other gate may
+        # ever activate this propagation.
+        if gate["name"] == "critical-go" and gate.get("exit_code") == 0:
+            matched = seed_override_status(log_path)
+            if matched:
+                gate["status"] = "passed-seed-block-override"
+                gate["seed_block_override"] = dict(
+                    {"mode": "preview2-temporary",
+                     "note": "Preview2 temporary seed-block acceptance; Preview3 "
+                             "must land the acceptance redesign and remove this "
+                             "override"}, **matched)
+                print("WARNING critical-go seed-block override active (Preview2 "
+                      "temporary; Preview3 must remove it)", flush=True)
     print(f"{gate['status'].upper()} {gate['name']} (exit {gate['exit_code']})", flush=True)
 
 
@@ -901,6 +981,10 @@ def gate_entry(gate, directory):
         # Isolate this run's fixture/stand receipts (stand-summary.json,
         # playwright.out, screenshots) in the evidence dir.
         entry["command"] = ["env", "CV02_JOURNEY_OUT=" + str(directory / "journey")] + entry["command"]
+    elif gate == "orgpresentation":
+        # Same receipt isolation for the CV-03 stand (stand-summary.json,
+        # playwright.out, barrier state) in the evidence dir.
+        entry["command"] = ["env", "CV03_ORG_PRESENTATION_OUT=" + str(directory / "orgpresentation")] + entry["command"]
     return entry
 
 
@@ -982,7 +1066,8 @@ def rerun(root, prior_arg, timeout, jobs=1):
                          "required — a rerun must not bind fresh results to "
                          "a changed source")
     rerun_names = {gate["name"] for gate in prior_gates
-                   if gate["status"] not in ("passed", "skipped")}
+                   if gate["status"] not in ("passed", "passed-seed-block-override",
+                                             "skipped")}
     if any(gate["name"] == "self" for gate in prior_gates):
         # The runner's self-test is cheap and guards the rerun machinery
         # itself: it always re-executes when the prior profile carried it.
@@ -1041,7 +1126,8 @@ def finalize(root, report, before, interrupted):
     policy_findings.extend(cov_findings)
     if policy_findings:
         report["policy_findings"] = policy_findings
-    all_ok = all(g["status"] in ("passed", "skipped") for g in report["gates"])
+    all_ok = all(g["status"] in ("passed", "passed-seed-block-override", "skipped")
+                  for g in report["gates"])
     if policy_findings:
         report["status"] = "failed"
     else:

@@ -11,6 +11,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/go-chi/chi/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/redis/go-redis/v9"
 	migrate "github.com/reireirei/yabanin/pkg/migrate"
@@ -69,7 +70,7 @@ func TestSessionKey_IntegrationMintResolveRevoke(t *testing.T) {
 		`INSERT INTO api_keys (key_hash, org_id, team_id, name, active, can_mint_sessions, labels)
 		 VALUES ('parent-hash', $1::uuid, $2::uuid, 'parent', true, true, '{"team":"payments"}'::jsonb) RETURNING id::text`, orgID, teamID).Scan(&keyID))
 
-	gw := &gateway{dbPool: pool, rdb: rdb, log: slog.Default(), sessionDB: pool, sessionKV: rdb}
+	gw := &gateway{gatewayCore: gatewayCore{dbPool: pool, rdb: rdb, log: slog.Default()}}
 	req := httptest.NewRequest(http.MethodPost, "/v1/yabanin/session-keys", strings.NewReader(`{"ttl_seconds":60,"labels":{"job":"lint"}}`))
 	req = req.WithContext(withPrincipal(req.Context(), principal{APIKeyID: keyID, CanMintSessions: true}))
 	req.Header.Set("X-Org-Id", orgID)
@@ -77,4 +78,30 @@ func TestSessionKey_IntegrationMintResolveRevoke(t *testing.T) {
 	gw.mintSessionKey(rec, req)
 	require.Equal(t, http.StatusCreated, rec.Code, rec.Body.String())
 	require.Contains(t, rec.Body.String(), "ybs_")
+}
+
+func TestSessionUsageDatabaseVisibilityAndOutage(t *testing.T) {
+	ctx := t.Context()
+	pool, err := pgxpool.New(ctx, startPolicyAvailabilityPostgres(t, ctx))
+	require.NoError(t, err)
+	t.Cleanup(pool.Close)
+	gw := &gateway{gatewayCore: gatewayCore{dbPool: pool, log: slog.Default()}}
+	r := chi.NewRouter()
+	r.Get("/session-keys/{id}/usage", gw.sessionKeyUsage)
+	read := func(id string) *httptest.ResponseRecorder {
+		req := httptest.NewRequestWithContext(withPrincipal(ctx, principal{APIKeyID: "test-parent"}), http.MethodGet, "/session-keys/"+id+"/usage", nil)
+		rec := httptest.NewRecorder()
+		r.ServeHTTP(rec, req)
+		return rec
+	}
+	const absent = "d0602833-fef7-4671-87bc-db975fd3493a"
+	missing := read(absent)
+	require.Equal(t, http.StatusNotFound, missing.Code)
+	malformed := read("not-a-uuid")
+	require.Equal(t, missing.Code, malformed.Code)
+	require.JSONEq(t, missing.Body.String(), malformed.Body.String())
+	pool.Close()
+	unavailable := read(absent)
+	require.Equal(t, http.StatusServiceUnavailable, unavailable.Code)
+	require.Contains(t, unavailable.Body.String(), "usage_unavailable")
 }

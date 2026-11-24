@@ -43,6 +43,10 @@ func newAudioGateway(t *testing.T, info resolver.ModelInfo) *gateway {
 		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
 		res:  stubModelResolver{"m": info, "tts": info},
 		pool: upstream.NewPool(upstream.Options{}),
+		// Preview2 durable accounting: isolated tests wire an explicit
+		// fake store so the fail-closed confirmed start admits; tests
+		// scripting admission/facts faults replace this after construction.
+		invocations: &fakeInvocationStore{},
 	}
 }
 
@@ -51,13 +55,16 @@ func postAudioSpeech(t *testing.T, gw *gateway, body, accept string) *httptest.R
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/speech", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	if accept != "" {
 		req.Header.Set("Accept", accept)
 	}
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	// Handler-direct (the post-4a1aaaa convention): the auth middleware
+	// strips client-supplied identity headers, and durable terminal facts
+	// require a tenant — the golden identity stands in for the resolved
+	// principal the production resolver injects.
+	gw.audioSpeech(rec, req)
 	return rec
 }
 
@@ -247,6 +254,7 @@ func TestAudioSpeech_BodyTooLarge(t *testing.T) {
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/audio/speech", strings.NewReader(big))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	rec := httptest.NewRecorder()
 	r.ServeHTTP(rec, req)
 

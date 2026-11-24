@@ -5,8 +5,6 @@ import (
 	"errors"
 	"testing"
 	"time"
-
-	"github.com/jackc/pgx/v5/pgxpool"
 )
 
 // AF-01 regressions (audit fixtures TestReview_* from code-review-2026-10-02).
@@ -60,7 +58,16 @@ func TestConfig_NegativeGracePeriodPreserved(t *testing.T) {
 // balance == floor every positive deduction breaches the floor, so the floor
 // itself must be rejected (inclusive); floor+1 cent is the last admissible
 // balance; floor−1 cent is rejected outright.
+//
+// Contract change (authoritative admission, 2026-11): CheckBalance reads a
+// fresh wallet snapshot per decision and never serves the display cache, so
+// the original audit fixture's seeded-cache/empty-pool form no longer
+// exercises the real path — the boundary matrix runs on the migrated
+// fixture stand instead. The AF-01 regression intent is unchanged.
 func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
+	ctx := t.Context()
+	pool := setupTestDB(t)
+
 	const floor = int64(-100)
 	cases := []struct {
 		name      string
@@ -71,16 +78,11 @@ func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 		{"floor", floor, false},
 		{"floor_plus_1", floor + 1, true},
 	}
+	s := NewStoreWithConfig(pool, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			// Non-nil pool so the balance cache path is reachable; the seeded
-			// cache entry means the DB is never touched (audit-fixture style).
-			s := NewStoreWithConfig(&pgxpool.Pool{}, nil, Config{GracePeriodCents: floor, CacheTTL: time.Minute})
-			s.mu.Lock()
-			s.cache["org-a"] = &cachedBalance{walletCents: tc.balance, updated: time.Now()}
-			s.mu.Unlock()
-
-			bal, err := s.CheckBalance(context.Background(), "org-a")
+			org := seedAdmissionWallet(t, ctx, pool, tc.balance, nil)
+			bal, err := s.CheckBalance(ctx, org)
 			if tc.wantAdmit {
 				if err != nil {
 					t.Fatalf("balance %d must be admissible, got err=%v", tc.balance, err)
@@ -99,16 +101,16 @@ func TestCheckBalance_ExhaustedGraceFloorRejectsAdmission(t *testing.T) {
 
 // TestCheckBalance_DBErrorIsNotAdmittedBalance: a real database failure must
 // surface as an error (503 upstream), never as an admissible zero balance and
-// never as insufficient credits.
+// never as insufficient credits. The missing-relation drop runs inside the
+// isolated fixture schema, so the genuine 42P01 negative is preserved while
+// the public migrated schema stays intact for the suites that measure it.
 func TestCheckBalance_DBErrorIsNotAdmittedBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
-
-	// Force a genuine DB error: the wallet table does not exist past this drop.
-	if _, err := pool.Exec(ctx, `DROP TABLE IF EXISTS org_credits`); err != nil {
-		t.Fatalf("drop org_credits: %v", err)
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	if _, err := pool.Exec(ctx, `DROP TABLE org_credits`); err != nil {
+		t.Fatalf("drop org_credits in isolated fixture schema: %v", err)
 	}
-	defer teardownTestTables(ctx, t, pool)
 
 	s := NewStore(pool, nil)
 	bal, err := s.CheckBalance(ctx, "org-db-error")
@@ -127,7 +129,7 @@ func TestCheckBalance_DBErrorIsNotAdmittedBalance(t *testing.T) {
 // must fail closed — no balance, no admission.
 func TestCheckBalance_CancelledContextIsNotAdmittedBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 

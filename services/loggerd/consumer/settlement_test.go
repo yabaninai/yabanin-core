@@ -43,8 +43,8 @@ func (r *fakeRows) Scan(dest ...any) error {
 			*v = row[j].(string)
 		case *int64:
 			*v = row[j].(int64)
-		case *int:
-			*v = row[j].(int)
+		case *int32:
+			*v = row[j].(int32)
 		case *[]byte:
 			*v = row[j].([]byte)
 		}
@@ -528,8 +528,8 @@ func TestTick_BatchFailureFallsBackToPerJobWithReserveRelease(t *testing.T) {
 		fakeSettlementDB: &fakeSettlementDB{},
 		tx:               tx,
 		claimRows: &fakeRows{vals: [][]any{
-			{int64(31), "org", "req-a", ChargeKindAgentSpend, int64(12000), int64(120), payload, 1},
-			{int64(32), "org", "req-b", ChargeKindAgentSpend, int64(12000), int64(120), payload, 1},
+			{int64(31), "org", "req-a", ChargeKindAgentSpend, int64(12000), int64(120), payload, int32(1)},
+			{int64(32), "org", "req-b", ChargeKindAgentSpend, int64(12000), int64(120), payload, int32(1)},
 		}},
 		failFirstBegin: true,
 	}

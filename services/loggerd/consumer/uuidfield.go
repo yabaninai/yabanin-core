@@ -56,6 +56,70 @@ func uuidField(s string) any {
 	return uuid.NewSHA1(nsRequestLogsUUID, []byte(s)).String()
 }
 
+// invocationField reads the invocation_id terminal-event field under the
+// invocation identity contract:
+//
+//   - key absent: legacy domain — nil id, malformed false;
+//   - canonical UUID string (case-insensitive hex, normalized to
+//     lowercase): the invocation identity;
+//   - anything else present — non-string JSON value, empty string, or a
+//     non-canonical spelling (URN, braced, compact hex) — malformed.
+//
+// A malformed id must never fall back to the legacy dedupe domain: that
+// would silently reopen duplicate billing, so callers park the delivery.
+// rawText carries a loggable rendering of what was actually present (the
+// value for strings, the JSON type otherwise).
+func invocationField(raw map[string]interface{}) (rawText string, id any, malformed bool) {
+	v, present := raw["invocation_id"]
+	if !present {
+		return "", nil, false
+	}
+	s, isString := v.(string)
+	if !isString {
+		return jsonTypeName(v), nil, true
+	}
+	if u, ok := parseCanonicalUUID(s); ok {
+		return s, u, false
+	}
+	return s, nil, true
+}
+
+// parseCanonicalUUID accepts exactly the canonical 8-4-4-4-12 hex spelling
+// (case-insensitive), returning the normalized lowercase form. The URN,
+// braced and compact spellings uuid.Parse also tolerates are out of
+// contract for the wire field.
+func parseCanonicalUUID(s string) (string, bool) {
+	if len(s) != 36 || s[8] != '-' || s[13] != '-' || s[18] != '-' || s[23] != '-' {
+		return "", false
+	}
+	u, err := uuid.Parse(s)
+	if err != nil {
+		return "", false
+	}
+	return u.String(), true
+}
+
+// jsonTypeName names a decoded JSON value's type for diagnostics without
+// echoing the value itself.
+func jsonTypeName(v any) string {
+	switch v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		return "bool"
+	case float64:
+		return "number"
+	case string:
+		return "string"
+	case []interface{}:
+		return "array"
+	case map[string]interface{}:
+		return "object"
+	default:
+		return "unknown"
+	}
+}
+
 // eventString reads a stream field as a string; non-string values (or missing
 // keys) become "", mirroring the typed field reads in the handlers. Wrong
 // types therefore take the same NULL path as absent values.

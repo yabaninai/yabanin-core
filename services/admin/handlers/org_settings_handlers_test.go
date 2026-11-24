@@ -11,10 +11,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/stretchr/testify/assert"
@@ -23,6 +25,7 @@ import (
 	"github.com/reireirei/yabanin/pkg/adminauth"
 	"github.com/reireirei/yabanin/pkg/adminstore"
 	"github.com/reireirei/yabanin/pkg/credits"
+	"github.com/reireirei/yabanin/pkg/testdb"
 )
 
 // orgSettingsTestRouter mounts the NEXT-18f routes exactly as the hot-patched
@@ -480,4 +483,71 @@ func TestOrgBudgetSettings_NullFloorSurfacesPlatformDefault(t *testing.T) {
 	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
 	assert.Nil(t, out.GraceFloorCents)
 	assert.Equal(t, int64(-100), out.EffectiveGraceFloorCents)
+}
+
+// TestPutOrgGraceFloor_InvalidatesAdmissionCache: the §8 floor mutation must
+// refresh this process's display view — the handler invalidates the credits
+// store right after the adminstore commit, so balance views reflect current
+// state immediately instead of after the cache TTL. Admission itself is
+// authoritative (fresh snapshot per decision): the very next CheckBalance
+// must reject under the tightened floor with no invalidation at all. Runs
+// against the disposable stand: the credits store is real, the settings
+// store stays the mock (the commit is simulated; the invalidation and the
+// authoritative decision are what is under test).
+func TestPutOrgGraceFloor_InvalidatesAdmissionCache(t *testing.T) {
+	pool := testdb.Postgres(t)
+	resetOrgSettingsState()
+	org := fmt.Sprintf("gf-wire-%x", time.Now().UnixNano())
+	cleanup := func() {
+		_, _ = pool.Exec(context.Background(), `DELETE FROM org_credits WHERE org_id = $1`, org)
+	}
+	cleanup()
+	t.Cleanup(cleanup)
+	_, err := pool.Exec(context.Background(),
+		`INSERT INTO org_credits (org_id, balance_cents, grace_floor_cents) VALUES ($1, -50, NULL)`, org)
+	require.NoError(t, err, "seed the wallet on the stand")
+
+	creditStore := credits.NewStoreWithConfig(pool, slog.Default(), credits.Config{GracePeriodCents: -100, CacheTTL: time.Minute})
+	store := newMockStore()
+	store.orgs[org] = &adminstore.Organization{ID: org, Name: "GF Wire", Slug: org}
+	h := newTestAdminH(store)
+	h.SetCreditStore(creditStore, pool)
+	r := orgSettingsTestRouter(t, h.AdminHandlers)
+
+	// The admission path admits the wallet under the platform floor and the
+	// display view warms on the same instance.
+	_, err = creditStore.CheckBalance(context.Background(), org)
+	require.NoError(t, err, "wallet -50 admits under the platform floor")
+	bal, err := creditStore.GetBalance(context.Background(), org)
+	require.NoError(t, err)
+	require.Equal(t, int64(-50), bal.BalanceCents, "display view warms at the seeded wallet")
+
+	// Foreign-process activity lands behind the warm display snapshot: the
+	// wallet moves. Nothing in this process knows yet.
+	_, err = pool.Exec(context.Background(),
+		`UPDATE org_credits SET balance_cents = -500 WHERE org_id = $1`, org)
+	require.NoError(t, err, "wallet moves behind the warm snapshot")
+
+	rec := orgSettingsRequest(r, "root-1", true, http.MethodPut, "/api/orgs/"+org+"/credits/grace",
+		`{"grace_floor_cents": 0, "reason": "no overdraft for this org"}`, org)
+	require.Equal(t, http.StatusOK, rec.Code, "the floor mutation must succeed: %s", rec.Body.String())
+	var out orgBudgetSettingsResponse
+	require.NoError(t, json.Unmarshal(rec.Body.Bytes(), &out))
+	require.NotNil(t, out.GraceFloorCents)
+	assert.Equal(t, int64(0), *out.GraceFloorCents)
+	assert.Equal(t, int64(0), out.EffectiveGraceFloorCents)
+
+	// The handler's invalidation must refresh the display view: without the
+	// post-commit InvalidateOrg the warm snapshot would still show -50.
+	bal, err = creditStore.GetBalance(context.Background(), org)
+	require.NoError(t, err, "display view readable after the PUT")
+	require.Equal(t, int64(-500), bal.BalanceCents,
+		"the PUT must invalidate the display snapshot — a warm view must not mask the moved wallet")
+
+	// Admission is authoritative: the next decision reads fresh state and
+	// rejects under the explicit zero floor (wallet -500 ≤ 0, AF-01) — no
+	// invalidation required for correctness.
+	_, err = creditStore.CheckBalance(context.Background(), org)
+	require.ErrorIs(t, err, credits.ErrInsufficientCredits,
+		"the tightened floor must decide the next admission on the authoritative path")
 }

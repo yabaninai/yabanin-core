@@ -47,15 +47,28 @@ import (
 	"github.com/reireirei/yabanin/pkg/upstream"
 )
 
-func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Minute)
-	defer cancel()
-	dsn := startPolicyAvailabilityPostgres(t, ctx)
-	directPool, err := pgxpool.New(ctx, dsn)
-	if err != nil {
-		t.Fatalf("open isolated Postgres pool: %v", err)
-	}
-	t.Cleanup(directPool.Close)
+// r018OrgJudgeStand is the shared per-test stand: the disposable migrated
+// Postgres, the real policy runtime over the store and the gateway routing
+// to the recorded upstream. Scenario helpers run the HTTP requests; the
+// cleanup lifecycle stays wired here exactly as before.
+type r018OrgJudgeStand struct {
+	store    *adminstore.Store
+	recorder *r018UpstreamRecorder
+	clock    *policyAvailabilityClock
+	client   *http.Client
+	baseURL  string
+}
+
+// newR018OrgJudgeStand wires the REAL consumer entry point — the production
+// chat route (gw.routes over chi + httptest) — against a disposable, fully
+// migrated Postgres stand (testcontainers). The runtime is wired exactly as
+// buildPolicyRuntime wires it (real adminstore prompt-studio sources via the
+// structural assertion + the real UpstreamJudgeClient riding the gateway's
+// own upstream pool and resolver/credential chain), so every claim crosses
+// the boundaries production crosses: auth → policyPreUpstream → per-org
+// compile over the store → judge transport → upstream.
+func newR018OrgJudgeStand(t *testing.T, directPool *pgxpool.Pool) *r018OrgJudgeStand {
+	t.Helper()
 	store := adminstore.New(directPool, slog.New(slog.DiscardHandler), nil)
 
 	recorder := &r018UpstreamRecorder{}
@@ -69,7 +82,9 @@ func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
 	cfg.UnknownModelPolicy = "reject"
 
 	gw := &gateway{
-		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}, cfg: cfg, log: slog.New(slog.DiscardHandler)},
 		gatewayEgress: gatewayEgress{
 			pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL}),
 		},
@@ -77,10 +92,7 @@ func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
 			"r018-model": {ModelName: "r018-model", Provider: "openai", Enabled: true},
 		}},
 	}
-	runtime, err := NewPolicyRuntime(store, nil, PolicyModeEnforce, nil, slog.New(slog.DiscardHandler))
-	if err != nil {
-		t.Fatalf("construct real policy runtime: %v", err)
-	}
+	runtime := newTestRuntime(t, store, nil, PolicyModeEnforce)
 	clock := newPolicyAvailabilityClock()
 	runtime.now = clock.Now
 	srcs, ok := promptStudioSourcesFrom(store)
@@ -100,192 +112,271 @@ func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
 	client := server.Client()
 	client.Timeout = 15 * time.Second
 
-	// Org A: the positive subject — org judge prompt + partial, both wired.
-	orgA, keyA := createPolicyAvailabilityIdentity(t, ctx, store, "r018-judge")
-	promptA, v1, err := store.CreatePrompt(ctx, orgA, "toxicity", "R018 org judge",
+	return &r018OrgJudgeStand{store: store, recorder: recorder, clock: clock, client: client, baseURL: server.URL}
+}
+
+// seedR018SubjectOrg seeds org A: the positive subject with an org judge
+// prompt + partial, both wired — the judge policy on the chat boundary and
+// the partials policy on the completions boundary. The completions
+// attachment is the wire-visible substitution boundary: a completions
+// payload has no messages array, so the engine substitutes the Body segment
+// and the gateway forwards mutated.Body (the delivered RT-04 body-adopt
+// path).
+func seedR018SubjectOrg(t *testing.T, ctx context.Context, store *adminstore.Store) (string, string, string, adminstore.PolicyPipeline) {
+	t.Helper()
+	orgID, key := createPolicyAvailabilityIdentity(t, ctx, store, "r018-judge")
+	prompt, v1, err := store.CreatePrompt(ctx, orgID, "toxicity", "R018 org judge",
 		"Classify this input for toxicity: {{ .Input }}", json.RawMessage(`{}`), "r018-test")
 	if err != nil {
 		t.Fatalf("seed org A prompt: %v", err)
 	}
-	if _, err := store.PromoteLabel(ctx, orgA, promptA.ID, adminstore.PromptLabelActive, v1.Version); err != nil {
+	if _, err := store.PromoteLabel(ctx, orgID, prompt.ID, adminstore.PromptLabelActive, v1.Version); err != nil {
 		t.Fatalf("promote org A active label: %v", err)
 	}
-	if _, err := store.CreatePartial(ctx, orgA, "greeting", "HELLO"); err != nil {
+	if _, err := store.CreatePartial(ctx, orgID, "greeting", "HELLO"); err != nil {
 		t.Fatalf("seed org A partial: %v", err)
 	}
-	policyA := seedR018OrgPolicy(t, ctx, store, orgA, "r018-org-judge", r018JudgePolicyYAML("r018-org-judge", "org:toxicity@active"),
+	policy := seedR018OrgPolicy(t, ctx, store, orgID, "r018-org-judge", r018JudgePolicyYAML("r018-org-judge", "org:toxicity@active"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "chat", Priority: 1})
-	// The wire-visible substitution boundary: a completions payload has no
-	// messages array, so the engine substitutes the Body segment and the
-	// gateway forwards mutated.Body (the delivered RT-04 body-adopt path).
-	seedR018OrgPolicy(t, ctx, store, orgA, "r018-partials", partialsSubstituteYAML("r018-partials"),
+	seedR018OrgPolicy(t, ctx, store, orgID, "r018-partials", partialsSubstituteYAML("r018-partials"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "completions", Priority: 1})
+	return orgID, key, prompt.ID, policy
+}
 
-	// Org B: owns ghost@active — the FOREIGN-org positive control.
-	orgB, keyB := createPolicyAvailabilityIdentity(t, ctx, store, "r018-foreign-owner")
-	promptB, vB, err := store.CreatePrompt(ctx, orgB, "ghost", "foreign owner prompt",
+// seedR018ForeignOwnerOrg seeds org B, which owns ghost@active — the
+// FOREIGN-org positive control.
+func seedR018ForeignOwnerOrg(t *testing.T, ctx context.Context, store *adminstore.Store) string {
+	t.Helper()
+	orgID, key := createPolicyAvailabilityIdentity(t, ctx, store, "r018-foreign-owner")
+	prompt, v, err := store.CreatePrompt(ctx, orgID, "ghost", "foreign owner prompt",
 		"FOREIGN-ORG template: {{ .Input }}", json.RawMessage(`{}`), "r018-test")
 	if err != nil {
 		t.Fatalf("seed org B prompt: %v", err)
 	}
-	if _, err := store.PromoteLabel(ctx, orgB, promptB.ID, adminstore.PromptLabelActive, vB.Version); err != nil {
+	if _, err := store.PromoteLabel(ctx, orgID, prompt.ID, adminstore.PromptLabelActive, v.Version); err != nil {
 		t.Fatalf("promote org B active label: %v", err)
 	}
-	seedR018OrgPolicy(t, ctx, store, orgB, "r018-foreign-judge", r018JudgePolicyYAML("r018-foreign-judge", "org:ghost@active"),
+	seedR018OrgPolicy(t, ctx, store, orgID, "r018-foreign-judge", r018JudgePolicyYAML("r018-foreign-judge", "org:ghost@active"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "chat", Priority: 1})
+	return key
+}
 
-	// Org C: a judge-less candidate (deny-word policy only) — header absence.
-	orgC, keyC := createPolicyAvailabilityIdentity(t, ctx, store, "r018-judge-less")
-	seedPolicyAvailabilityPolicy(t, ctx, store, orgC)
+// seedR018JudgelessOrg seeds org C: a judge-less candidate (deny-word
+// policy only) — its judge header must be absent.
+func seedR018JudgelessOrg(t *testing.T, ctx context.Context, store *adminstore.Store) string {
+	t.Helper()
+	orgID, key := createPolicyAvailabilityIdentity(t, ctx, store, "r018-judge-less")
+	seedPolicyAvailabilityPolicy(t, ctx, store, orgID)
+	return key
+}
 
-	// Org D: references ghost@active, which exists ONLY in org B.
-	orgD, keyD := createPolicyAvailabilityIdentity(t, ctx, store, "r018-unknown-ref")
-	seedR018OrgPolicy(t, ctx, store, orgD, "r018-unknown-judge", r018JudgePolicyYAML("r018-unknown-judge", "org:ghost@active"),
+// seedR018UnknownRefOrg seeds org D, which references ghost@active — a
+// prompt that exists ONLY in org B.
+func seedR018UnknownRefOrg(t *testing.T, ctx context.Context, store *adminstore.Store) string {
+	t.Helper()
+	orgID, key := createPolicyAvailabilityIdentity(t, ctx, store, "r018-unknown-ref")
+	seedR018OrgPolicy(t, ctx, store, orgID, "r018-unknown-judge", r018JudgePolicyYAML("r018-unknown-judge", "org:ghost@active"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "chat", Priority: 1})
+	return key
+}
 
-	// Org E: the cyclic partial, chat-attached ahead of a deny policy so the
-	// substituted message text is observable through the composed verdict,
-	// plus a completions attachment for the wire-visible insertion.
-	orgE, keyE := createPolicyAvailabilityIdentity(t, ctx, store, "r018-cycle")
-	if _, err := store.CreatePartial(ctx, orgE, "a", "a={{partials.a}}-CYCLED"); err != nil {
+// seedR018CyclicOrg seeds org E: the cyclic partial, chat-attached ahead of
+// a deny policy so the substituted message text is observable through the
+// composed verdict, plus a completions attachment for the wire-visible
+// insertion.
+func seedR018CyclicOrg(t *testing.T, ctx context.Context, store *adminstore.Store) string {
+	t.Helper()
+	orgID, key := createPolicyAvailabilityIdentity(t, ctx, store, "r018-cycle")
+	if _, err := store.CreatePartial(ctx, orgID, "a", "a={{partials.a}}-CYCLED"); err != nil {
 		t.Fatalf("seed org E partial: %v", err)
 	}
-	seedR018OrgPolicy(t, ctx, store, orgE, "r018-cycle", partialsSubstituteYAML("r018-cycle"),
+	seedR018OrgPolicy(t, ctx, store, orgID, "r018-cycle", partialsSubstituteYAML("r018-cycle"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "chat", Priority: 1},
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "completions", Priority: 1})
-	seedR018OrgPolicy(t, ctx, store, orgE, "r018-cycle-deny", denyWordYAML("r018-cycle-deny", "CYCLED"),
+	seedR018OrgPolicy(t, ctx, store, orgID, "r018-cycle-deny", denyWordYAML("r018-cycle-deny", "CYCLED"),
 		adminstore.PolicyAttachment{ModelPattern: "*", Endpoint: "chat", Priority: 2})
+	return key
+}
 
-	// --- positive: org prompt rendered over the real request content at the wire
-	before := recorder.total()
-	resp := policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyA)
+// assertR018JudgeWirePrompt decodes one judge record and pins the exact
+// wire shape: [system user] roles with the rendered org prompt over the
+// request content.
+func assertR018JudgeWirePrompt(t *testing.T, rec r018UpstreamRecord, wantSystem, wantUser string) {
+	t.Helper()
+	roles, contents := r018JudgeMessages(t, rec)
+	if len(roles) != 2 || roles[0] != "system" || roles[1] != "user" {
+		t.Fatalf("judge wire roles %v, want [system user]", roles)
+	}
+	if contents[0] != wantSystem {
+		t.Fatalf("judge system prompt on the wire = %q, want %q", contents[0], wantSystem)
+	}
+	if contents[1] != wantUser {
+		t.Fatalf("judge user content on the wire = %q, want the actual request content", contents[1])
+	}
+}
+
+// assertR018JudgeSystemPrompt pins only the judge system bytes, matching
+// the narrower per-scenario checks.
+func assertR018JudgeSystemPrompt(t *testing.T, rec r018UpstreamRecord, want string) {
+	t.Helper()
+	_, contents := r018JudgeMessages(t, rec)
+	if contents[0] != want {
+		t.Fatalf("judge bytes = %q, want %q", contents[0], want)
+	}
+}
+
+// runR018PositiveOrgJudge pins the positive scenario: the org judge prompt
+// renders over the real request content at the wire, the version header and
+// the judge bytes come from the same compiled candidate, and the client
+// traffic still reaches the upstream.
+func runR018PositiveOrgJudge(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("wired org judge status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
 	if got := resp.Header.Get(judgeVersionHeaderKey); got != "1" {
 		t.Fatalf("%s = %q, want %q (the stored active prompt version)", judgeVersionHeaderKey, got, "1")
 	}
-	judge := recorder.judgeSince(before)
+	judge := stand.recorder.judgeSince(before)
 	if len(judge) != 1 {
 		t.Fatalf("judge calls after first request = %d, want 1", len(judge))
 	}
-	roles, contents := r018JudgeMessages(t, judge[0])
-	if len(roles) != 2 || roles[0] != "system" || roles[1] != "user" {
-		t.Fatalf("judge wire roles %v, want [system user]", roles)
-	}
-	if contents[0] != "Classify this input for toxicity: hello" {
-		t.Fatalf("judge system prompt on the wire = %q, want the org template rendered over the request content", contents[0])
-	}
-	if contents[1] != "hello" {
-		t.Fatalf("judge user content on the wire = %q, want the actual request content", contents[1])
-	}
-	traffic := recorder.trafficSince(before)
+	assertR018JudgeWirePrompt(t, judge[0], "Classify this input for toxicity: hello", "hello")
+	traffic := stand.recorder.trafficSince(before)
 	if len(traffic) != 1 || !strings.Contains(traffic[0].body, `"hello"`) {
 		t.Fatalf("forwarded client traffic %d records, want 1 carrying the request content", len(traffic))
 	}
+}
 
-	// --- partials through the real boundaries. Completions payloads carry no
-	// messages array, so the engine substitutes the Body segment and the
-	// gateway forwards the mutated body: the insertion is visible on the wire.
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/completions",
-		`{"model":"r018-model","prompt":"Hi {{partials.greeting}}"}`, keyA)
+// runR018PartialsCompletionsForward pins partials substitution on the
+// completions boundary: the engine substitutes the Body segment and the
+// gateway forwards the mutated body, so the insertion is visible on the
+// wire.
+func runR018PartialsCompletionsForward(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/completions",
+		`{"model":"r018-model","prompt":"Hi {{partials.greeting}}"}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("partials completions status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
-	traffic = recorder.trafficSince(before)
+	traffic := stand.recorder.trafficSince(before)
 	if len(traffic) != 1 {
 		t.Fatalf("partials forward records = %d, want 1", len(traffic))
 	}
 	if !strings.Contains(traffic[0].body, "Hi HELLO") || strings.Contains(traffic[0].body, "{{partials.greeting}}") {
 		t.Fatalf("forwarded body was not partials-substituted: %s", traffic[0].body)
 	}
+}
 
-	// --- cyclic partial through the boundaries: single verbatim insertion,
-	// explicit cycle detection fails closed for both chat and completions.
+// runR018CyclicPartialFailClosed pins the cyclic partial through both
+// boundaries: a single verbatim insertion cannot loop — explicit cycle
+// detection fails closed with the deny envelope for chat (the deny policy
+// observes the substituted text) and a bare 400 for completions, and no
+// request reaches upstream.
+func runR018CyclicPartialFailClosed(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
 	var envelope struct {
 		Error struct {
 			Code string `json:"code"`
 		} `json:"error"`
 	}
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"X {{partials.a}} Y"}]}`, keyE)
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"X {{partials.a}} Y"}]}`, key)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("cyclic chat status = %d, want 400 (the deny policy must observe the substituted text); body=%s", resp.StatusCode, resp.Body)
 	}
 	if err := json.Unmarshal([]byte(resp.Body), &envelope); err != nil || envelope.Error.Code != policyDenyErrorCode {
 		t.Fatalf("cyclic chat code = %q (err %v), want %s; body=%s", envelope.Error.Code, err, policyDenyErrorCode, resp.Body)
 	}
-	if got := recorder.total(); got != before {
+	if got := stand.recorder.total(); got != before {
 		t.Fatalf("cyclic chat reached upstream: %d records, want unchanged %d", got, before)
 	}
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/completions",
-		`{"model":"r018-model","prompt":"X {{partials.a}} Y"}`, keyE)
+	before = stand.recorder.total()
+	resp = policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/completions",
+		`{"model":"r018-model","prompt":"X {{partials.a}} Y"}`, key)
 	if resp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("cyclic completions status = %d, want fail-closed 400; body=%s", resp.StatusCode, resp.Body)
 	}
-	if got := recorder.total(); got != before {
+	if got := stand.recorder.total(); got != before {
 		t.Fatalf("cyclic completions reached upstream: %d records, want unchanged %d", got, before)
 	}
+}
 
-	// --- prompt label movement alone is pinned; explicit policy re-activation
-	// resolves the new label target into a new activation snapshot.
-	if _, err := store.UpdatePrompt(ctx, orgA, promptA.ID, "Classify v2: {{ .Input }}", json.RawMessage(`{}`), "r018-test", 1); err != nil {
+// runR018PromptLabelStaysPinned pins that a prompt label re-promotion alone
+// keeps the pinned pair: the header stays on the stored v1 activation and
+// the judge bytes stay the v1 template.
+func runR018PromptLabelStaysPinned(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, orgID, promptID, key string) {
+	t.Helper()
+	if _, err := stand.store.UpdatePrompt(ctx, orgID, promptID, "Classify v2: {{ .Input }}", json.RawMessage(`{}`), "r018-test", 1); err != nil {
 		t.Fatalf("append org A prompt v2: %v", err)
 	}
-	if _, err := store.PromoteLabel(ctx, orgA, promptA.ID, adminstore.PromptLabelActive, 2); err != nil {
+	if _, err := stand.store.PromoteLabel(ctx, orgID, promptID, adminstore.PromptLabelActive, 2); err != nil {
 		t.Fatalf("re-point org A active label to v2: %v", err)
 	}
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyA)
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("pinned request status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
 	if got := resp.Header.Get(judgeVersionHeaderKey); got != "1" {
 		t.Fatalf("re-promotion header = %q, want still pinned %q", got, "1")
 	}
-	judge = recorder.judgeSince(before)
+	judge := stand.recorder.judgeSince(before)
 	if len(judge) != 1 {
 		t.Fatalf("pinned judge calls = %d, want 1", len(judge))
 	}
-	if _, contents = r018JudgeMessages(t, judge[0]); contents[0] != "Classify this input for toxicity: hello" {
-		t.Fatalf("re-promotion judge bytes = %q, want still the pinned v1 template", contents[0])
-	}
+	assertR018JudgeSystemPrompt(t, judge[0], "Classify this input for toxicity: hello")
+}
 
-	if _, err := store.CreatePolicyVersion(ctx, orgA, policyA.ID, r018JudgePolicyYAML("r018-org-judge", "org:toxicity@active"), "", "r018-test"); err != nil {
+// runR018PolicyReactivationReload pins that explicit policy re-activation
+// resolves the new label target into a new activation snapshot after the
+// cache window: the header and the judge bytes swap to v2 together.
+func runR018PolicyReactivationReload(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, orgID string, policy adminstore.PolicyPipeline, key string) {
+	t.Helper()
+	if _, err := stand.store.CreatePolicyVersion(ctx, orgID, policy.ID, r018JudgePolicyYAML("r018-org-judge", "org:toxicity@active"), "", "r018-test"); err != nil {
 		t.Fatalf("append reactivation policy version: %v", err)
 	}
-	if _, err := store.SetActivePolicyVersion(ctx, orgA, policyA.ID, 2); err != nil {
+	if _, err := stand.store.SetActivePolicyVersion(ctx, orgID, policy.ID, 2); err != nil {
 		t.Fatalf("reactivate policy: %v", err)
 	}
-	clock.Advance(2 * policyCacheTTL)
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyA)
+	stand.clock.Advance(2 * policyCacheTTL)
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("post-reload request status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
 	if got := resp.Header.Get(judgeVersionHeaderKey); got != "2" {
 		t.Fatalf("post-reload header = %q, want %q", got, "2")
 	}
-	judge = recorder.judgeSince(before)
+	judge := stand.recorder.judgeSince(before)
 	if len(judge) != 1 {
 		t.Fatalf("post-reload judge calls = %d, want 1", len(judge))
 	}
-	if _, contents = r018JudgeMessages(t, judge[0]); contents[0] != "Classify v2: hello" {
-		t.Fatalf("post-reload judge bytes = %q, want the reloaded v2 template over the request content", contents[0])
-	}
+	assertR018JudgeSystemPrompt(t, judge[0], "Classify v2: hello")
+}
 
-	// --- negative: unknown ref through the endpoint (nothing upstream).
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyD)
+// runR018UnknownRefNegative pins the negative scenario: an unresolvable
+// prompt ref answers 503 policy_configuration_unavailable before any
+// upstream byte.
+func runR018UnknownRefNegative(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusServiceUnavailable {
 		t.Fatalf("unknown ref status = %d, want 503; body=%s", resp.StatusCode, resp.Body)
+	}
+	var envelope struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
 	}
 	if err := json.Unmarshal([]byte(resp.Body), &envelope); err != nil {
 		t.Fatalf("decode unknown-ref envelope: %v; body=%s", err, resp.Body)
@@ -293,42 +384,77 @@ func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
 	if envelope.Error.Code != "policy_configuration_unavailable" {
 		t.Fatalf("unknown ref code = %q, want policy_configuration_unavailable; body=%s", envelope.Error.Code, resp.Body)
 	}
-	if got := recorder.total(); got != before {
+	if got := stand.recorder.total(); got != before {
 		t.Fatalf("unknown ref reached upstream: %d records, want unchanged %d", got, before)
 	}
+}
 
-	// --- foreign-org positive isolation: org B resolves ITS OWN ghost@active
-	// through the same endpoint while org D cannot.
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyB)
+// runR018ForeignOrgPositiveIsolation pins the foreign-org POSITIVE control
+// (the contract's explicit gap): org B resolves ITS OWN ghost@active
+// through the same endpoint.
+func runR018ForeignOrgPositiveIsolation(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("foreign-owner org status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
 	if got := resp.Header.Get(judgeVersionHeaderKey); got != "1" {
 		t.Fatalf("foreign-owner header = %q, want %q", got, "1")
 	}
-	judge = recorder.judgeSince(before)
+	judge := stand.recorder.judgeSince(before)
 	if len(judge) != 1 {
 		t.Fatalf("foreign-owner judge calls = %d, want 1", len(judge))
 	}
-	if _, contents = r018JudgeMessages(t, judge[0]); contents[0] != "FOREIGN-ORG template: hello" {
-		t.Fatalf("foreign-owner judge bytes = %q, want org B's own template", contents[0])
-	}
+	assertR018JudgeSystemPrompt(t, judge[0], "FOREIGN-ORG template: hello")
+}
 
-	// --- judge-less org: the header is absent (never set empty).
-	before = recorder.total()
-	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions",
-		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, keyC)
+// runR018JudgelessHeaderAbsent pins that a judge-less org never gets the
+// judge header — absent, never set empty — while its client traffic still
+// reaches the upstream exactly once.
+func runR018JudgelessHeaderAbsent(t *testing.T, ctx context.Context, stand *r018OrgJudgeStand, key string) {
+	t.Helper()
+	before := stand.recorder.total()
+	resp := policyAvailabilityRequest(t, ctx, stand.client, stand.baseURL, "/v1/chat/completions",
+		`{"model":"r018-model","messages":[{"role":"user","content":"hello"}]}`, key)
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("judge-less org status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
 	}
 	if got := resp.Header.Get(judgeVersionHeaderKey); got != "" {
 		t.Fatalf("judge-less org header = %q, want absent", got)
 	}
-	if got := recorder.total(); got != before+1 {
+	if got := stand.recorder.total(); got != before+1 {
 		t.Fatalf("judge-less org traffic = %d, want %d", got, before+1)
 	}
+}
+
+// TestR018OrgJudgePartialsThroughChatHTTP is the scenario orchestrator: the
+// stand and the five orgs are seeded once, then every pinned scenario runs
+// in the original order over the real HTTP boundary.
+func TestR018OrgJudgePartialsThroughChatHTTP(t *testing.T) {
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Minute)
+	defer cancel()
+	pool, err := pgxpool.New(ctx, startPolicyAvailabilityPostgres(t, ctx))
+	if err != nil {
+		t.Fatalf("open isolated Postgres pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	stand := newR018OrgJudgeStand(t, pool)
+	orgA, keyA, promptA, policyA := seedR018SubjectOrg(t, ctx, stand.store)
+	keyB := seedR018ForeignOwnerOrg(t, ctx, stand.store)
+	keyC := seedR018JudgelessOrg(t, ctx, stand.store)
+	keyD := seedR018UnknownRefOrg(t, ctx, stand.store)
+	keyE := seedR018CyclicOrg(t, ctx, stand.store)
+
+	runR018PositiveOrgJudge(t, ctx, stand, keyA)
+	runR018PartialsCompletionsForward(t, ctx, stand, keyA)
+	runR018CyclicPartialFailClosed(t, ctx, stand, keyE)
+	runR018PromptLabelStaysPinned(t, ctx, stand, orgA, promptA, keyA)
+	runR018PolicyReactivationReload(t, ctx, stand, orgA, policyA, keyA)
+	runR018UnknownRefNegative(t, ctx, stand, keyD)
+	runR018ForeignOrgPositiveIsolation(t, ctx, stand, keyB)
+	runR018JudgelessHeaderAbsent(t, ctx, stand, keyC)
 }
 
 // r018JudgePolicyYAML is the integration org-judge policy: a literal judge

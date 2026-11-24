@@ -94,8 +94,8 @@ func TestMigrateRunProvisionsAppReadableViews_Raw_Integration(t *testing.T) {
 		}
 		require.NoError(t, rerr, "migrate generation %d", gen)
 		require.NotNil(t, res)
-		assert.EqualValues(t, 27, res.Version,
-			"generation %d: views are not migrations; schema head must stay 27", gen)
+		assert.EqualValues(t, 34, res.Version,
+			"generation %d: views are not migrations (the head moved for the 0032–0034 contract migrations, not for views)", gen)
 	}
 
 	// Raw catalog truth: exactly the seven views exist after Run.

@@ -17,8 +17,6 @@ import (
 	"sync/atomic"
 	"testing"
 
-	"github.com/go-chi/chi/v5"
-
 	"github.com/reireirei/yabanin/pkg/config"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/policy"
@@ -30,13 +28,14 @@ func postImagesWithHeaders(t *testing.T, gw *gateway, body string, headers map[s
 	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/images/generations", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	goldenIdentity(req)
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
 	rec := httptest.NewRecorder()
-	r := chi.NewRouter()
-	gw.routes(r)
-	r.ServeHTTP(rec, req)
+	// Handler-direct: the auth middleware strips client identity headers
+	// while durable terminal facts require a tenant.
+	gw.imagesGenerations(rec, req)
 	return rec
 }
 

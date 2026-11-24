@@ -3,9 +3,12 @@ package evalgate
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 )
 
@@ -95,6 +98,11 @@ func TestTP03_JudgeVerdictValidation(t *testing.T) {
 			wantErr: "judge returned invalid JSON",
 		},
 		{
+			name:    "null decision cannot become false",
+			content: `{"cheap_quality":0.5,"premium_quality":0.5,"should_upgrade":null,"reason":"r"}`,
+			wantErr: "should_upgrade",
+		},
+		{
 			name:    "missing reason field is an error",
 			content: `{"cheap_quality":0.5,"premium_quality":0.5,"should_upgrade":false}`,
 			wantErr: `missing field "reason"`,
@@ -141,29 +149,131 @@ func TestTP03_JudgeVerdictValidation(t *testing.T) {
 	}
 
 	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			server := judgeServerWithContent(t, tc.content)
-			judge := NewJudge(server.URL, nil)
+		t.Run(tc.name, func(t *testing.T) { assertJudgeVerdictValidationCase(t, tc.content, tc.wantErr, tc.wantVerdict) })
+	}
+}
 
-			v, err := judge.Evaluate(context.Background(), "prompt", "cheap", "premium")
-			if tc.wantErr != "" {
-				if err == nil {
-					t.Fatalf("expected error containing %q, got verdict %+v", tc.wantErr, v)
-				}
-				if !strings.Contains(err.Error(), tc.wantErr) {
-					t.Fatalf("error %q does not contain %q", err.Error(), tc.wantErr)
-				}
-				if v != nil {
-					t.Fatalf("no verdict must be returned alongside an error, got %+v", v)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("expected valid verdict, got error: %v", err)
-			}
-			if *v != *tc.wantVerdict {
-				t.Fatalf("verdict mismatch: got %+v, want %+v", *v, *tc.wantVerdict)
-			}
+func assertJudgeVerdictValidationCase(t *testing.T, content, wantErr string, want *Verdict) {
+	t.Helper()
+	server := judgeServerWithContent(t, content)
+	verdict, err := NewJudge(server.URL, nil).Evaluate(context.Background(), "prompt", "cheap", "premium")
+	if wantErr != "" {
+		if err == nil || !strings.Contains(err.Error(), wantErr) {
+			t.Fatalf("error = %v, want text %q", err, wantErr)
+		}
+		if verdict != nil {
+			t.Fatalf("no verdict must be returned alongside an error, got %+v", verdict)
+		}
+		return
+	}
+	if err != nil {
+		t.Fatalf("expected valid verdict, got error: %v", err)
+	}
+	if *verdict != *want {
+		t.Fatalf("verdict mismatch: got %+v, want %+v", *verdict, *want)
+	}
+}
+
+// judgeWantCallFacts pins the measured call contract: the configured judge
+// model, the HTTP status and the provider-reported token usage.
+func judgeWantCallFacts(t *testing.T, name string, call JudgeCall, model string, status int, prompt, completion int64) {
+	t.Helper()
+	if call.Model != model || call.Status != status || call.Usage.PromptTokens != prompt || call.Usage.CompletionTokens != completion {
+		t.Fatalf("%s: call=%+v, want model=%q status=%d prompt=%d completion=%d", name, call, model, status, prompt, completion)
+	}
+}
+
+func TestMeasuredJudgePreservesUsageForInvalidVerdict(t *testing.T) {
+	const model = "configured-evaluator"
+	var arrived atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		arrived.Add(1)
+		_, _ = io.WriteString(w, `{"choices":[{"message":{"content":"invalid verdict"}}],"usage":{"prompt_tokens":11,"completion_tokens":3}}`)
+	}))
+	defer server.Close()
+	j := NewJudge(server.URL, nil)
+	j.SetModel(model)
+	refused := errors.New("start unavailable")
+	admit := func(ctx context.Context, m string) error {
+		if m != model {
+			t.Fatalf("admission model = %q", m)
+		}
+		return refused
+	}
+	// Failed admission must not contact the evaluator at all.
+	_, _, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", admit)
+	if !errors.Is(err, refused) || arrived.Load() != 0 {
+		t.Fatalf("failed admission contacted evaluator: arrivals=%d err=%v", arrived.Load(), err)
+	}
+	// An invalid verdict still reports the provider facts of its call.
+	v, call, err := j.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+	if v != nil {
+		t.Fatalf("invalid verdict must not produce a verdict: %+v", v)
+	}
+	if err == nil {
+		t.Fatalf("invalid verdict must surface its decode error")
+	}
+	if arrived.Load() != 1 {
+		t.Fatalf("evaluator arrivals = %d, want exactly 1", arrived.Load())
+	}
+	judgeWantCallFacts(t, "invalid verdict preserves provider facts", call, model, 200, 11, 3)
+}
+
+func TestMeasuredJudgeStopsAtFirstProvider(t *testing.T) {
+	var secondCalls atomic.Int32
+	second := httptest.NewServer(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { secondCalls.Add(1) }))
+	defer second.Close()
+	first := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Location", second.URL)
+		w.WriteHeader(http.StatusTemporaryRedirect)
+		_, _ = io.WriteString(w, `{"usage":{"prompt_tokens":5,"completion_tokens":2}}`)
+	}))
+	defer first.Close()
+	j := NewJudge(first.URL, nil)
+	verdict, call, err := j.EvaluateMeasured(t.Context(), "prompt", "A", "B", nil)
+	if secondCalls.Load() != 0 || verdict != nil || err == nil || call.Status != http.StatusTemporaryRedirect {
+		t.Fatalf("additional contacts=%d verdict=%v call=%+v err=%v", secondCalls.Load(), verdict, call, err)
+	}
+	if call.Usage.PromptTokens != 5 || call.Usage.CompletionTokens != 2 {
+		t.Fatalf("lost reported usage on unsuccessful response: %+v", call)
+	}
+}
+
+func TestMeasuredJudgeUnusableProviderReply(t *testing.T) {
+	cases := []struct {
+		name, key, authorization, body, wantError string
+		promptTokens, completionTokens            int64
+	}{
+		{"invalid JSON", "", "", `{"choices":`, "parse judge response", 0, 0},
+		{"empty choices with measured usage", "fixture-key", "Bearer fixture-key",
+			`{"choices":[],"usage":{"prompt_tokens":17,"completion_tokens":4}}`, "judge returned empty choices", 17, 4},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			assertUnusableJudgeReply(t, tc.key, tc.authorization, tc.body, tc.wantError, tc.promptTokens, tc.completionTokens)
 		})
+	}
+}
+
+func assertUnusableJudgeReply(t *testing.T, key, authorization, body, wantError string, promptTokens, completionTokens int64) {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != authorization {
+			http.Error(w, "unexpected evaluator credentials", http.StatusUnauthorized)
+			return
+		}
+		if _, err := io.WriteString(w, body); err != nil {
+			t.Errorf("write evaluator reply: %v", err)
+		}
+	}))
+	t.Cleanup(srv.Close)
+	judge := NewJudge(srv.URL, nil)
+	judge.SetAPIKey(key)
+	verdict, call, err := judge.EvaluateMeasured(t.Context(), "prompt", "cheap", "premium", nil)
+	if verdict != nil || err == nil || !strings.Contains(err.Error(), wantError) {
+		t.Fatalf("verdict = %v, error = %v, want failure containing %q", verdict, err, wantError)
+	}
+	if call.Status != http.StatusOK || call.Usage.PromptTokens != promptTokens || call.Usage.CompletionTokens != completionTokens {
+		t.Fatalf("unexpected provider facts: %+v", call)
 	}
 }

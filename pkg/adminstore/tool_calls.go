@@ -43,20 +43,69 @@ func (s *Store) GetToolCallsReport(ctx context.Context, orgID string, days int) 
 	to := time.Now()
 	from := to.AddDate(0, 0, -days)
 
-	var total, distinct, requests int
-	err := s.db.QueryRow(ctx, `
-		SELECT COUNT(*),
-		       COUNT(DISTINCT tool_name),
-		       COUNT(DISTINCT request_id)
-		FROM tool_calls
-		WHERE org_id = $1 AND created_at BETWEEN $2 AND $3`,
+	total, distinct, requests, err := s.toolReportTotals(ctx, orgID, from, to)
+	if err != nil {
+		return nil, err
+	}
+	rep := &ToolCallsReport{TotalCalls: total, DistinctTools: distinct, RequestsUsing: requests}
+	if err := s.appendToolReportTop(ctx, rep, orgID, from, to, total); err != nil {
+		return nil, err
+	}
+	if err := s.appendToolReportByModel(ctx, rep, orgID, from, to); err != nil {
+		return nil, err
+	}
+	return rep, nil
+}
+
+// toolReportTotals returns the fact-domain totals (calls, distinct tool
+// names) and the request-identity count. RequestsUsing counts physical
+// request identities (0028/0030), not client correlations, using the single
+// association rule of this package (toolFactMatchesRow): invocation-bearing
+// facts count their exact rl row, and NULL-invocation facts (legacy, or
+// pre-0030 writer mode) count the org's unique carrier — ambiguous
+// multi-carrier correlations count no row. Facts retained past their
+// request_logs rows (retention keeps facts longer than rows) still count:
+// once per minted invocation when invocation identity survives, else once
+// under the correlation key, so pruning parents never silently drops usage.
+func (s *Store) toolReportTotals(ctx context.Context, orgID string, from, to time.Time) (total, distinct, requests int, err error) {
+	err = s.db.QueryRow(ctx, `
+		SELECT (SELECT COUNT(*) FROM tool_calls
+		        WHERE org_id = $1 AND created_at BETWEEN $2 AND $3),
+		       (SELECT COUNT(DISTINCT tool_name) FROM tool_calls
+		        WHERE org_id = $1 AND created_at BETWEEN $2 AND $3),
+		       (SELECT COUNT(DISTINCT k) FROM (
+		          SELECT rl.id::text AS k
+		          FROM tool_calls tc
+		          JOIN request_logs rl
+		            ON rl.org_id = tc.org_id AND rl.request_id = tc.request_id
+		           AND `+toolFactMatchesRow+`
+		          WHERE tc.org_id = $1 AND tc.created_at BETWEEN $2 AND $3
+		          UNION
+		          SELECT 'i:' || tc.invocation_id
+		          FROM tool_calls tc
+		          WHERE tc.org_id = $1 AND tc.created_at BETWEEN $2 AND $3
+		            AND tc.invocation_id IS NOT NULL
+		            AND NOT EXISTS (SELECT 1 FROM request_logs rl
+		            WHERE rl.org_id = tc.org_id AND rl.request_id = tc.request_id
+		              AND rl.invocation_id = tc.invocation_id)
+		          UNION
+		          SELECT 'r:' || tc.request_id
+		          FROM tool_calls tc
+		          WHERE tc.org_id = $1 AND tc.created_at BETWEEN $2 AND $3
+		            AND tc.invocation_id IS NULL
+		            AND NOT EXISTS (SELECT 1 FROM request_logs rl
+		            WHERE rl.org_id = tc.org_id AND rl.request_id = tc.request_id)
+		       ) keys)`,
 		orgID, from, to).Scan(&total, &distinct, &requests)
 	if err != nil {
-		return nil, fmt.Errorf("tool_calls totals: %w", err)
+		return 0, 0, 0, fmt.Errorf("tool_calls totals: %w", err)
 	}
+	return total, distinct, requests, nil
+}
 
-	rep := &ToolCallsReport{TotalCalls: total, DistinctTools: distinct, RequestsUsing: requests}
-
+// appendToolReportTop fills the per-tool leaderboard (top 25 by calls) with
+// each tool's share of the org's total calls in the window.
+func (s *Store) appendToolReportTop(ctx context.Context, rep *ToolCallsReport, orgID string, from, to time.Time, total int) error {
 	rows, err := s.db.Query(ctx, `
 		SELECT tool_name, COUNT(*), MAX(created_at)
 		FROM tool_calls
@@ -65,13 +114,13 @@ func (s *Store) GetToolCallsReport(ctx context.Context, orgID string, days int) 
 		ORDER BY COUNT(*) DESC, tool_name ASC
 		LIMIT 25`, orgID, from, to)
 	if err != nil {
-		return nil, fmt.Errorf("tool_calls top: %w", err)
+		return fmt.Errorf("tool_calls top: %w", err)
 	}
 	defer rows.Close()
 	for rows.Next() {
 		var r ToolCallsRow
 		if err := rows.Scan(&r.Tool, &r.Calls, &r.LastUsedAt); err != nil {
-			return nil, fmt.Errorf("tool_calls top scan: %w", err)
+			return fmt.Errorf("tool_calls top scan: %w", err)
 		}
 		if total > 0 {
 			r.Share = float64(r.Calls) / float64(total) * 100
@@ -79,9 +128,13 @@ func (s *Store) GetToolCallsReport(ctx context.Context, orgID string, days int) 
 		rep.Top = append(rep.Top, r)
 	}
 	if err := rows.Err(); err != nil {
-		return nil, fmt.Errorf("tool_calls top rows: %w", err)
+		return fmt.Errorf("tool_calls top rows: %w", err)
 	}
+	return nil
+}
 
+// appendToolReportByModel fills the per-model call counts for the window.
+func (s *Store) appendToolReportByModel(ctx context.Context, rep *ToolCallsReport, orgID string, from, to time.Time) error {
 	mrows, err := s.db.Query(ctx, `
 		SELECT COALESCE(model_used, ''), COUNT(*)
 		FROM tool_calls
@@ -89,19 +142,18 @@ func (s *Store) GetToolCallsReport(ctx context.Context, orgID string, days int) 
 		GROUP BY COALESCE(model_used, '')
 		ORDER BY COUNT(*) DESC`, orgID, from, to)
 	if err != nil {
-		return nil, fmt.Errorf("tool_calls by model: %w", err)
+		return fmt.Errorf("tool_calls by model: %w", err)
 	}
 	defer mrows.Close()
 	for mrows.Next() {
 		var r ToolModelRow
 		if err := mrows.Scan(&r.Model, &r.Calls); err != nil {
-			return nil, fmt.Errorf("tool_calls by model scan: %w", err)
+			return fmt.Errorf("tool_calls by model scan: %w", err)
 		}
 		rep.ByModel = append(rep.ByModel, r)
 	}
 	if err := mrows.Err(); err != nil {
-		return nil, fmt.Errorf("tool_calls by model rows: %w", err)
+		return fmt.Errorf("tool_calls by model rows: %w", err)
 	}
-
-	return rep, nil
+	return nil
 }

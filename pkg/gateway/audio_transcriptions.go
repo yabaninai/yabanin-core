@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"io"
+	"log/slog"
 	"mime"
 	"mime/multipart"
 	"net/http"
@@ -53,38 +54,53 @@ var (
 // D4 — guards scan the text fields, not the binary part), and the multipart
 // stream is rebuilt with the model field rewritten to the resolved registry
 // name before the upstream call.
-func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
-	started := time.Now()
-	l := logctx.From(r.Context(), gw.log)
-
+// readTranscriptionRequest stream-parses and validates the
+// /v1/audio/transcriptions multipart form. ok=false means the caller
+// already answered the client (or the client walked away — N3).
+func readTranscriptionRequest(w http.ResponseWriter, r *http.Request) (parts []audioFormPart, ok bool) {
 	mr, err := r.MultipartReader()
 	if err != nil {
 		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 			"expected a multipart/form-data request")
-		return
+		return nil, false
 	}
-	parts, err := audioReadForm(mr)
+	parts, err = audioReadForm(mr)
 	if err != nil {
 		if r.Context().Err() != nil {
 			// N3: the client walked away mid-upload — the response target is
 			// gone and writing the envelope would race the server's conn
 			// teardown (found by the wire test under -race)
-			return
+			return nil, false
 		}
 		writeAudioBodyError(w, err)
+		return nil, false
+	}
+	if audioFieldValue(parts, "model") == "" {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
+		return nil, false
+	}
+	if audioFilePart(parts) == nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "file is required")
+		return nil, false
+	}
+	return parts, true
+}
+
+// multipart/form-data in, upstream JSON out byte-identical. The form is
+// stream-parsed (never ParseMultipartForm full-buffering), admission runs on
+// a metadata-only text projection (D3 — audio bytes are never persisted,
+// D4 — guards scan the text fields, not the binary part), and the multipart
+// stream is rebuilt with the model field rewritten to the resolved registry
+// name before the upstream call.
+func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
+	started := time.Now()
+	l := logctx.From(r.Context(), gw.log)
+	parts, ok := readTranscriptionRequest(w, r)
+	if !ok {
 		return
 	}
 	model := audioFieldValue(parts, "model")
-	if model == "" {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "model is required")
-		return
-	}
 	filePart := audioFilePart(parts)
-	if filePart == nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "file is required")
-		return
-	}
-
 	admitted, ok := gw.admit(w, r, admitInput{
 		Endpoint: "audio.transcriptions",
 		Model:    model,
@@ -94,64 +110,39 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !openAICompatProvider(admitted.Info.Provider) {
-		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"transcriptions are not supported for this provider", "transcriptions_not_supported_for_provider")
-		return
-	}
-	if gw.pool == nil {
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream is not configured")
+	if !gw.openAICompatRouteReady(w, admitted.Info.Provider, "transcriptions", "transcriptions are not supported for this provider") {
 		return
 	}
 
 	rctx := r.Context()
+	rctx = withInvocationIdentity(rctx, admitted.Invocation)
 	// T02: the bound is per AUDIO SECOND derived conservatively from the
 	// payload size (8 kbit/s floor, rounded up); models the unit catalog
 	// does not price per second keep the token-free estimate path and are
 	// refused in enforce mode as unpriced (fail-closed, I3).
 	breq := gw.reservationRequest(rctx, admitted.OrgID, admitted.TeamID, admitted.AgentID, admitted.SessionKeyID,
 		admitted.Info, admitted.Body, nil, true)
-	if file := audioFilePart(parts); file != nil {
-		breq = withUnitDemand(breq, pricing.UnitPerAudioSecond, transcriptionReservationSeconds(len(file.data)))
-	}
-	gate, ok := gw.reservationPlan(w, r, "audio.transcriptions", breq)
+	breq = withUnitDemand(breq, pricing.UnitPerAudioSecond, transcriptionReservationSeconds(len(filePart.data)))
+	rctx, gate, ok := gw.reservePlannedRequest(rctx, w, r, "audio.transcriptions", breq)
 	if !ok {
 		return
 	}
-	rctx = withReservationGate(rctx, gate)
-	if !gate.reserve(rctx) {
+
+	ctx, cancel, client, apiKey, upstreamURL, ok := gw.mediaDispatch(w, rctx, l, gate, admitted)
+	if !ok {
 		return
 	}
-
-	timeout := admitted.Info.UpstreamTimeout
-	if timeout <= 0 {
-		timeout = 60 * time.Second
-	}
-	ctx, cancel := context.WithTimeout(rctx, timeout)
 	defer cancel()
-
-	providerName := admitted.Info.Provider
-	if providerName == "" {
-		providerName = "openai"
-	}
-	apiKey := admitted.Info.UpstreamAPIKey
-	if apiKey == "" {
-		apiKey = gw.getUpstreamAPIKey()
-	}
-	upstreamURL := gw.upstreamURL(admitted.Info)
-	client, err := gw.pool.Get(upstreamURL, providerName)
-	if err != nil {
-		l.Warn("upstream client unavailable", "provider", providerName, "error", err.Error())
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to initialise upstream client")
-		return
-	}
-	rebuilt, extra, err := audioRebuildForm(parts, admitted.Info.ModelName)
+	rebuilt, extra, err := audioRebuild(parts, admitted.Info.ModelName)
 	if err != nil {
 		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
 		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to encode upstream request")
 		return
 	}
+	if !gw.confirmPaidStart(w, l, gate, rctx, invocationKindChat) {
+		return
+	}
+
 	resp, err := client.Do(ctx, "/v1/audio/transcriptions", rebuilt, apiKey, false, extra)
 	if err != nil {
 		closeUpstream(l, resp)
@@ -161,29 +152,18 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	}
 	defer resp.Body.Close()
 
-	limited, over, err := readAudioResponse(resp.Body)
-	if err != nil {
-		gate.finalizeNoEvent(mediaTermination(rctx))
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "failed to read upstream response")
+	limited, ok := readMediaResponse(w, rctx, gate, resp, audioResponseLimit, "upstream response exceeds the audio size limit")
+	if !ok {
 		return
 	}
-	if over {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		apierrors.Write(w, http.StatusBadGateway, apierrors.ErrorCodeAPI, "upstream response exceeds the audio size limit")
-		return
-	}
-	if resp.StatusCode != http.StatusOK {
-		gate.finalizeNoEvent(budget.TerminationUpstreamErr)
-		status, errType := apierrors.MapUpstreamStatus(resp.StatusCode)
-		apierrors.Write(w, status, errType, "upstream request failed")
-		return
-	}
-	if rctx.Err() != nil {
-		// N3: client gone mid-response — no request.completed success event.
-		gate.finalizeNoEvent(budget.TerminationClientCancel)
-		return
-	}
+	gw.finishAudioTranscription(rctx, w, l, admitted, providerName(admitted), upstreamURL, resp, started, limited)
+}
 
+// finishAudioTranscription settles the served transcription durably —
+// provider usage or the T02 per-second fallback, the usage record,
+// terminal facts — then writes the upstream JSON byte-identical with the
+// upstream Content-Type.
+func (gw *gateway) finishAudioTranscription(rctx context.Context, w http.ResponseWriter, l *slog.Logger, admitted admitted, prov, upstreamURL string, resp *http.Response, started time.Time, limited []byte) {
 	// Usage is "provider" only when the upstream JSON carries a usage block
 	tokensIn, tokensOut, source := audioUsage(limited)
 	usage := provider.Usage{
@@ -192,7 +172,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		TotalTokens:      tokensIn + tokensOut,
 		Source:           source,
 	}
-	ext := provider.ComputeCost(usage, providerName, admitted.Info.ModelName)
+	ext := provider.ComputeCost(usage, prov, admitted.Info.ModelName)
 	// T02: when the upstream reported no token usage and the pinned unit
 	// catalog prices the model per audio second, the cost is rate × the
 	// verbose_json duration. Responses without a duration (plain
@@ -200,7 +180,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 	// size-derived reservation quantity is never reused for billing.
 	unitPriced := false
 	if source == "" && !ext.PriceKnown {
-		if entry, ok := gw.unitPrice(providerName, admitted.Info.ModelName, pricing.UnitPerAudioSecond); ok {
+		if entry, ok := gw.unitPrice(prov, admitted.Info.ModelName, pricing.UnitPerAudioSecond); ok {
 			if secs, ok := transcriptionResponseDuration(limited); ok {
 				ext.EstimatedCostUSD = entry.Rate * secs
 				ext.PriceKnown = true
@@ -217,7 +197,7 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 		priceKnown: ext.PriceKnown,
 	})
 
-	gw.finishRequest(rctx, requestFinish{
+	_, ferr := gw.finishRequest(rctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.completed",
 			RequestID:                  admitted.RequestID,
@@ -248,11 +228,31 @@ func (gw *gateway) audioTranscriptions(w http.ResponseWriter, r *http.Request) {
 			ProviderEntityJurisdiction: admitted.Info.Provider,
 			Labels:                     labelsFrom(rctx),
 		},
-		info:        admitted.Info,
-		resp:        resp,
+		info: admitted.Info,
+		resp: resp,
+		// N3 + owner review 0574aa1: the provider fully served and was paid
+		// for its 200 (an interrupted read returned above with no fabricated
+		// usage). Whether the client transport is still alive only picks the
+		// termination outcome (completionTermination → client_cancel) and
+		// whether success bytes are written below — the KNOWN usage settles
+		// durably either way (terminal facts ride the WithoutCancel funnel).
 		termination: completionTermination(rctx),
 		eventNote:   true,
 	}, nil)
+	if ferr != nil {
+		// Central binding: usage was dispatched but its durable record did
+		// not commit — the client must not see the upstream body as a
+		// payable success (never a re-dispatch; support reconciles).
+		l.Error("terminal facts commit failed; withholding reply", "error", ferr)
+		writeTerminalAccountingFailure(w)
+		return
+	}
+	if rctx.Err() != nil {
+		// N3: the client walked away after the provider was paid — no
+		// success bytes to the dead transport; the settlement above already
+		// carries the known usage with the cancellation recorded.
+		return
+	}
 
 	contentType := resp.Header.Get("Content-Type")
 	if contentType == "" {
@@ -353,6 +353,12 @@ func audioFormMetadata(parts []audioFormPart, file *audioFormPart) []byte {
 	}
 	return out
 }
+
+// audioRebuild is the handler's rebuild seam: a package variable so tests
+// can force the defensive encode failure the bytes.Buffer-backed multipart
+// writer cannot produce by itself (audioRebuildForm's write targets cannot
+// return errors under the pinned toolchain).
+var audioRebuild = audioRebuildForm
 
 // audioRebuildForm re-encodes the collected parts into the upstream multipart
 // stream: the model field value is replaced with the resolved registry model

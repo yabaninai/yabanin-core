@@ -494,6 +494,14 @@ func TestRT03_Evalgate_PremiumAllowed_VerdictStillProduced(t *testing.T) {
 	assert.Equal(t, 1, store.count(), "the allowed premium comparison keeps producing verdicts")
 	assert.Equal(t, 1, premium.totalCalls(), "the premium upstream is called once")
 	assert.Equal(t, "premium-target", premium.callAt(0).Model)
+	accounting := gw.invocations.(*fakeInvocationStore)
+	accounting.mu.Lock()
+	defer accounting.mu.Unlock()
+	ids := make(map[string]bool)
+	for _, row := range accounting.admitted {
+		ids[row.InvocationID] = true
+	}
+	require.Len(t, ids, 3, "each paid call requires its own durable start (primary=%d premium=%d judge=%d)", primaryOK.totalCalls(), premium.totalCalls(), judgeHits)
 }
 
 // --- Shadow target is gated -----------------------------------------------------
@@ -562,4 +570,86 @@ func TestRT03_Shadow_AllowedCandidate_StillMirrored(t *testing.T) {
 	assert.Equal(t, "gpt-4o", shadowed.callAt(0).Model)
 	assert.Equal(t, "Bearer shadow-key", shadowed.callAt(0).Auth,
 		"the shadow call keeps its own documented credential contract")
+}
+
+func TestRT03_EvalgateDispatchesSelectedRegionalModel(t *testing.T) {
+	var judgeHits int32
+	judge, _, _ := judgeHitServer(t, &judgeHits)
+	verdicts := newFakeVerdictStore()
+	original := newRT03Upstream(t, nil)
+	regional := newRT03Upstream(t, nil)
+	gw := evalgateTestGateway(t, original.srv.URL, judge.URL, verdicts)
+	gw.res = stubModelResolver{
+		"premium":  {ModelName: "premium", Provider: "openai", UpstreamURL: original.srv.URL, Enabled: true},
+		"regional": {ModelName: "regional", Provider: "openai", UpstreamURL: regional.srv.URL, Enabled: true},
+	}
+	gw.residencyEnforcer = fakeResidency{dec: policy.Decision{Allowed: true, Region: "SG", RemappedModel: "regional"}}
+	cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "regional-comparison", body: nonStreamBody("cheap", mediumPrompt)}
+	cc.req.Model = "cheap"
+	gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+	require.Equal(t, 0, original.totalCalls())
+	require.Equal(t, 1, regional.totalCalls())
+	require.Equal(t, "regional", regional.callAt(0).Model)
+	require.Equal(t, int32(1), judgeHits)
+	require.Equal(t, 1, verdicts.count())
+}
+
+type evalgateRefusingStore struct {
+	fakeInvocationStore
+	attempts int
+	refuseAt int
+}
+
+func (s *evalgateRefusingStore) AdmitInvocation(ctx context.Context, rec admissionRecord) error {
+	s.attempts++
+	if s.attempts == s.refuseAt {
+		return ErrInvocationStoreUnavailable
+	}
+	return s.fakeInvocationStore.AdmitInvocation(ctx, rec)
+}
+
+func TestRT03_EvalgateStartFailurePreventsPaidCall(t *testing.T) {
+	for _, tc := range []struct {
+		name                   string
+		refuseAt, premiumCalls int
+	}{
+		{"premium admission", 1, 0},
+		{"evaluator admission", 2, 1},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var judgeHits int32
+			judge, _, _ := judgeHitServer(t, &judgeHits)
+			verdicts := newFakeVerdictStore()
+			premium := newRT03Upstream(t, nil)
+			gw := evalgateTestGateway(t, premium.srv.URL, judge.URL, verdicts)
+			gw.res = stubModelResolver{"premium": {ModelName: "premium", Provider: "openai", UpstreamURL: premium.srv.URL, Enabled: true}}
+			accounting := &evalgateRefusingStore{refuseAt: tc.refuseAt}
+			gw.invocations = accounting
+			cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "fault-comparison", body: nonStreamBody("cheap", mediumPrompt)}
+			cc.req.Model = "cheap"
+			gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+			assert.Equal(t, tc.refuseAt, accounting.attempts)
+			assert.Equal(t, tc.premiumCalls, premium.totalCalls())
+			assert.Equal(t, int32(0), judgeHits)
+			assert.Zero(t, verdicts.count())
+		})
+	}
+}
+
+func TestRT03_EvalgatePremiumToolOnlySkipsEvaluator(t *testing.T) {
+	var judgeHits int32
+	judge, _, _ := judgeHitServer(t, &judgeHits)
+	verdicts := newFakeVerdictStore()
+	premium := newRT03Upstream(t, func(rt03Call) rt03Response {
+		return rt03Response{Body: `{"choices":[{"message":{"content":null,"tool_calls":[{"type":"function","function":{"name":"lookup","arguments":"{}"}}]}}],"usage":{"prompt_tokens":2,"completion_tokens":1}}`}
+	})
+	gw := evalgateTestGateway(t, premium.srv.URL, judge.URL, verdicts)
+	gw.res = stubModelResolver{"premium": {ModelName: "premium", Provider: "openai", UpstreamURL: premium.srv.URL, Enabled: true}}
+	cc := &chatContext{l: gw.log, orgID: "org-1", reqID: "tool-only", body: nonStreamBody("cheap", mediumPrompt)}
+	cc.req.Model = "cheap"
+	gw.evalgateJudge(t.Context(), cc, candidateIdentity{OrgID: cc.orgID}, mediumPrompt, "cheap answer", "cheap", "premium", 0.5)
+	require.Equal(t, 1, premium.totalCalls())
+	require.Zero(t, judgeHits)
+	require.Zero(t, verdicts.count())
+	require.Len(t, gw.invocations.(*fakeInvocationStore).admitted, 1)
 }

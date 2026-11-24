@@ -25,6 +25,8 @@ import (
 	"github.com/reireirei/yabanin/pkg/metrics"
 	"github.com/reireirei/yabanin/pkg/migrate"
 	"github.com/reireirei/yabanin/pkg/upstream"
+	"github.com/stretchr/testify/require"
+	"github.com/testcontainers/testcontainers-go"
 	testpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 )
 
@@ -39,17 +41,7 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	t.Cleanup(directPool.Close)
 	seedStore := adminstore.New(directPool, slog.New(slog.DiscardHandler), nil)
 	var upstreamCalls atomic.Int64
-	upstreamServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		upstreamCalls.Add(1)
-		w.Header().Set("Content-Type", "application/json")
-		if strings.Contains(r.Header.Get("Accept"), "text/event-stream") {
-			w.Header().Set("Content-Type", "text/event-stream")
-			_, _ = io.WriteString(w, "data: [DONE]\n\n")
-			return
-		}
-		_, _ = io.WriteString(w, `{"id":"r00905","object":"chat.completion","model":"r00905-model","choices":[{"index":0,"message":{"role":"assistant","content":"ok"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}`)
-	}))
-	t.Cleanup(upstreamServer.Close)
+	upstreamServer := newPolicyAvailabilityUpstream(t, &upstreamCalls)
 
 	pgConfig, err := pgxpool.ParseConfig(dsn)
 	if err != nil {
@@ -68,21 +60,7 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	cfg.Provider = upstreamServer.URL
 	cfg.FallbackModel = "r00905-model"
 	cfg.UnknownModelPolicy = "reject"
-	gw := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
-		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL})},
-		gatewayRouting: gatewayRouting{res: stubModelResolver{
-			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},
-		}},
-		gatewayCompliance: gatewayCompliance{policyRuntime: runtime},
-	}
-	gw.auth = NewAuthMiddleware(cfg, auth.NewResolver(directPool, nil, 300, nil))
-	router := chi.NewRouter()
-	gw.routes(router)
-	server := httptest.NewServer(router)
-	t.Cleanup(server.Close)
-	client := server.Client()
-	client.Timeout = 15 * time.Second
+	server, client := startPolicyAvailabilityHTTPGateway(t, cfg, upstreamServer.URL, directPool, runtime)
 
 	cases := []struct {
 		name, path, body string
@@ -95,86 +73,28 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	}
 	for i, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			suffix := fmt.Sprintf("%d-%d", i, time.Now().UnixNano())
-			org, err := seedStore.CreateOrganization(ctx, "R00905 synthetic", "r00905-"+suffix)
-			if err != nil {
-				t.Fatalf("create synthetic organization: %v", err)
-			}
-			team, err := seedStore.CreateTeam(ctx, org.ID, "R00905 team", "r00905-team-"+suffix, nil)
-			if err != nil {
-				t.Fatalf("create synthetic team: %v", err)
-			}
-			plainKey, err := auth.GeneratePersonalKey()
-			if err != nil {
-				t.Fatalf("generate synthetic API key: %v", err)
-			}
-			if _, err := seedStore.CreateAPIKey(ctx, auth.HashKey(plainKey), "R00905 synthetic", &org.ID, &team.ID); err != nil {
-				t.Fatalf("create synthetic API key: %v", err)
-			}
-			seedPolicyAvailabilityPolicy(t, ctx, seedStore, org.ID)
+			orgID, plainKey := createPolicyAvailabilityIdentity(t, ctx, seedStore, fmt.Sprintf("route-%d", i))
+			seedPolicyAvailabilityPolicy(t, ctx, seedStore, orgID)
 			before := upstreamCalls.Load()
 			proxy.SetUnavailable(true)
 			resp := policyAvailabilityRequest(t, ctx, client, server.URL, tc.path, tc.body, plainKey)
-			if resp.StatusCode != http.StatusServiceUnavailable {
-				t.Fatalf("cold policy-store failure status = %d, want 503; body=%s", resp.StatusCode, resp.Body)
-			}
-			var envelope struct {
-				Error struct {
-					Type    string `json:"type"`
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}
-			if err := json.Unmarshal([]byte(resp.Body), &envelope); err != nil {
-				t.Fatalf("decode cold failure envelope: %v; body=%s", err, resp.Body)
-			}
-			if tc.path == "/v1/messages" {
-				if envelope.Error.Type != "overloaded_error" || !strings.HasPrefix(envelope.Error.Message, "[policy_temporarily_unavailable]") {
-					t.Fatalf("Anthropic cold failure envelope = type %q message %q; want overloaded_error with stable policy code prefix", envelope.Error.Type, envelope.Error.Message)
-				}
-			} else if envelope.Error.Code != "policy_temporarily_unavailable" {
-				t.Fatalf("cold failure envelope code = %q, want policy_temporarily_unavailable; body=%s", envelope.Error.Code, resp.Body)
-			}
-			if strings.Contains(resp.Body, "connection refused") || strings.Contains(resp.Body, "r00905") {
-				t.Fatalf("policy-store detail leaked in response: %s", resp.Body)
-			}
-			if strings.Contains(strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream") || strings.Contains(resp.Body, "data:") {
-				t.Fatalf("cold streaming failure emitted SSE: content-type=%q body=%q", resp.Header.Get("Content-Type"), resp.Body)
-			}
-			if got := upstreamCalls.Load(); got != before {
-				t.Fatalf("upstream calls after cold rejection = %d, want unchanged %d", got, before)
-			}
+			require.Equal(t, http.StatusServiceUnavailable, resp.StatusCode, resp.Body)
+			assertPolicyRouteError(t, tc.path, resp, "overloaded_error", "policy_temporarily_unavailable")
+			require.NotContains(t, resp.Body, "connection refused")
+			require.NotContains(t, resp.Body, "r00905")
+			require.NotContains(t, strings.ToLower(resp.Header.Get("Content-Type")), "text/event-stream")
+			require.NotContains(t, resp.Body, "data:")
+			require.Equal(t, before, upstreamCalls.Load(), "cold rejection contacted upstream")
 
 			proxy.SetUnavailable(false)
 			blockedBody := strings.Replace(tc.body, "hello", "r00905-blocked", 1)
 			resp = policyAvailabilityRequest(t, ctx, client, server.URL, tc.path, blockedBody, plainKey)
-			denialEnvelope := struct {
-				Error struct {
-					Type    string `json:"type"`
-					Code    string `json:"code"`
-					Message string `json:"message"`
-				} `json:"error"`
-			}{}
-			decodeDenialErr := json.Unmarshal([]byte(resp.Body), &denialEnvelope)
-			denialMatches := false
-			if decodeDenialErr == nil && tc.path == "/v1/messages" {
-				denialMatches = denialEnvelope.Error.Type == "invalid_request_error" && strings.HasPrefix(denialEnvelope.Error.Message, "["+policyDenyErrorCode+"]")
-			} else if decodeDenialErr == nil {
-				denialMatches = denialEnvelope.Error.Code == policyDenyErrorCode
-			}
-			if resp.StatusCode != http.StatusBadRequest || !denialMatches {
-				t.Fatalf("recovered attached policy status=%d body=%s; want its deny before upstream", resp.StatusCode, resp.Body)
-			}
-			if got := upstreamCalls.Load(); got != before {
-				t.Fatalf("upstream calls after recovered policy denial = %d, want unchanged %d", got, before)
-			}
+			require.Equal(t, http.StatusBadRequest, resp.StatusCode, resp.Body)
+			assertPolicyRouteError(t, tc.path, resp, "invalid_request_error", policyDenyErrorCode)
+			require.Equal(t, before, upstreamCalls.Load(), "recovered policy denial contacted upstream")
 			resp = policyAvailabilityRequest(t, ctx, client, server.URL, tc.path, tc.body, plainKey)
-			if resp.StatusCode != http.StatusOK {
-				t.Fatalf("ordinary request after policy recovery status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
-			}
-			if got := upstreamCalls.Load(); got != before+1 {
-				t.Fatalf("upstream calls after recovery = %d, want %d", got, before+1)
-			}
+			require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+			require.Equal(t, before+1, upstreamCalls.Load(), "upstream calls after recovery")
 		})
 	}
 
@@ -187,30 +107,12 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 		t.Fatalf("construct fail-open real policy runtime: %v", err)
 	}
 	failOpenRuntime.coldFailureMode = PolicyColdFailureFailOpen
-	failOpenGW := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
-		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamServer.URL})},
-		gatewayRouting: gatewayRouting{res: stubModelResolver{
-			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},
-		}},
-		gatewayCompliance: gatewayCompliance{policyRuntime: failOpenRuntime},
-	}
-	failOpenGW.auth = NewAuthMiddleware(cfg, auth.NewResolver(directPool, nil, 300, nil))
-	failOpenRouter := chi.NewRouter()
-	failOpenGW.routes(failOpenRouter)
-	failOpenServer := httptest.NewServer(failOpenRouter)
-	t.Cleanup(failOpenServer.Close)
-	failOpenClient := failOpenServer.Client()
-	failOpenClient.Timeout = 15 * time.Second
+	failOpenServer, failOpenClient := startPolicyAvailabilityHTTPGateway(t, cfg, upstreamServer.URL, directPool, failOpenRuntime)
 	proxy.SetUnavailable(true)
 	before := upstreamCalls.Load()
 	resp := policyAvailabilityRequest(t, ctx, failOpenClient, failOpenServer.URL, "/v1/chat/completions", `{"model":"r00905-model","messages":[{"role":"user","content":"hello"}]}`, failOpenKey)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("cold fail-open request status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
-	}
-	if got := upstreamCalls.Load(); got != before+1 {
-		t.Fatalf("cold fail-open upstream calls = %d, want %d", got, before+1)
-	}
+	require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+	require.Equal(t, before+1, upstreamCalls.Load(), "cold fail-open upstream calls")
 	proxy.SetUnavailable(false)
 
 	// A reachable, empty policy snapshot remains a healthy success and does
@@ -218,12 +120,26 @@ func TestPolicyAvailabilityColdFailureThroughHTTPRoutes(t *testing.T) {
 	_, emptyKey := createPolicyAvailabilityIdentity(t, ctx, seedStore, "healthy-empty")
 	emptyBefore := upstreamCalls.Load()
 	resp = policyAvailabilityRequest(t, ctx, client, server.URL, "/v1/chat/completions", `{"model":"r00905-model","messages":[{"role":"user","content":"hello"}]}`, emptyKey)
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("reachable empty policy snapshot status = %d, want 200; body=%s", resp.StatusCode, resp.Body)
+	require.Equal(t, http.StatusOK, resp.StatusCode, resp.Body)
+	require.Equal(t, emptyBefore+1, upstreamCalls.Load(), "reachable empty snapshot upstream calls")
+}
+
+func assertPolicyRouteError(t *testing.T, path string, resp policyAvailabilityResponse, anthropicType, code string) {
+	t.Helper()
+	var envelope struct {
+		Error struct {
+			Type    string
+			Code    string
+			Message string
+		}
 	}
-	if got := upstreamCalls.Load(); got != emptyBefore+1 {
-		t.Fatalf("reachable empty snapshot upstream calls = %d, want %d", got, emptyBefore+1)
+	require.NoError(t, json.Unmarshal([]byte(resp.Body), &envelope), resp.Body)
+	if path == "/v1/messages" {
+		require.Equal(t, anthropicType, envelope.Error.Type)
+		require.True(t, strings.HasPrefix(envelope.Error.Message, "["+code+"]"), envelope.Error.Message)
+		return
 	}
+	require.Equal(t, code, envelope.Error.Code)
 }
 
 func createPolicyAvailabilityIdentity(t *testing.T, ctx context.Context, store *adminstore.Store, suffix string) (string, string) {
@@ -271,42 +187,34 @@ func seedPolicyAvailabilityPolicy(t *testing.T, ctx context.Context, store *admi
 	}
 }
 
-func startPolicyAvailabilityPostgres(t *testing.T, ctx context.Context) string {
-	t.Helper()
+func startPolicyAvailabilityPostgres(tb testing.TB, ctx context.Context) string {
+	tb.Helper()
 	pg, err := testpostgres.Run(ctx, "pgvector/pgvector:pg16",
 		testpostgres.WithDatabase("yabanin"),
 		testpostgres.WithUsername("postgres"),
 		testpostgres.WithPassword("postgres"),
+		testpostgres.BasicWaitStrategies(),
 	)
 	if err != nil {
-		t.Fatalf("start R00905-owned Postgres: %v", err)
+		_ = testcontainers.TerminateContainer(pg)
+		tb.Fatalf("start R00905-owned Postgres: %v", err)
 	}
-	t.Cleanup(func() {
+	tb.Cleanup(func() {
 		cleanupCtx, cleanupCancel := context.WithTimeout(context.WithoutCancel(ctx), 15*time.Second)
 		defer cleanupCancel()
 		_ = pg.Terminate(cleanupCtx)
 	})
 	host, err := pg.Host(ctx)
 	if err != nil {
-		t.Fatalf("get Postgres host: %v", err)
+		tb.Fatalf("get Postgres host: %v", err)
 	}
 	port, err := pg.MappedPort(ctx, "5432")
 	if err != nil {
-		t.Fatalf("get Postgres port: %v", err)
+		tb.Fatalf("get Postgres port: %v", err)
 	}
 	dsn := "postgres://postgres:postgres@" + net.JoinHostPort(host, strings.Split(port.Port(), "/")[0]) + "/yabanin?sslmode=disable"
-	deadline := time.Now().Add(20 * time.Second)
-	for {
-		if _, err = migrate.Run(ctx, dsn, "sg"); err == nil {
-			break
-		}
-		if !time.Now().Before(deadline) {
-			break
-		}
-		time.Sleep(200 * time.Millisecond)
-	}
-	if err != nil {
-		t.Fatalf("apply production migrations to isolated Postgres: %v", err)
+	if _, err := migrate.Run(ctx, dsn, "sg"); err != nil {
+		tb.Fatalf("apply production migrations to isolated Postgres: %v", err)
 	}
 	return dsn
 }
@@ -520,7 +428,9 @@ func newPolicyAvailabilityUpstream(t *testing.T, upstreamCalls *atomic.Int64) *h
 func startPolicyAvailabilityHTTPGateway(t *testing.T, cfg config.Gateway, upstreamURL string, directPool *pgxpool.Pool, rt *PolicyRuntime) (*httptest.Server, *http.Client) {
 	t.Helper()
 	gw := &gateway{
-		gatewayCore:   gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler)},
+		gatewayCore: gatewayCore{cfg: cfg, log: slog.New(slog.DiscardHandler),
+			// Explicit in-memory invocation store (see streamTestGateway).
+			invocations: &fakeInvocationStore{}},
 		gatewayEgress: gatewayEgress{pool: upstream.NewPool(upstream.Options{BaseURL: upstreamURL})},
 		gatewayRouting: gatewayRouting{res: stubModelResolver{
 			"r00905-model": {ModelName: "r00905-model", Provider: "openai", Enabled: true},

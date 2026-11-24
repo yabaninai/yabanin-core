@@ -105,9 +105,14 @@ func sseGenFrames(p []byte) (frames []string, sawDenied bool) {
 			frames = append(frames, frame)
 			continue
 		}
-		frame, denied := sseGenCallFrame(c, sseGenName(c[0]))
+		frame, denied, resolvable := sseGenCallFrame(c, sseGenName(c[0]))
 		frames = append(frames, frame)
-		sawDenied = sawDenied || denied
+		// sawDenied means "the gate must have counted a dropped denial".
+		// Ambiguous identities (fractional index, in-frame duplicate) are
+		// skipped by absorb before any name decision, so the gate suppresses
+		// their bytes without a counted denial; only resolvable denied calls
+		// carry the count expectation (TestSSEGenDeniedCountContract).
+		sawDenied = sawDenied || (denied && resolvable)
 	}
 	if sseGenHasTerminalFrame(p) {
 		frames = append(frames, `data: {"choices":[{"delta":{},"finish_reason":"tool_calls"}]}`+"\n\n")
@@ -141,19 +146,30 @@ func sseGenSpecialFrame(c []byte) (frame string, ok bool) {
 
 // sseGenCallFrame renders one tool-call data frame from a 4-byte group:
 // name/arguments payload plus the duplicate-choice (c[0]&0x20) and
-// null-choice-member (c[3]&0x20) arms. The bool reports a declared denied
+// null-choice-member (c[3]&0x20) arms. denied reports a declared denied
 // name — only a named call frame can carry (and leak) one; nameless frames
-// omit the name key, so no denial is declared either.
-func sseGenCallFrame(c []byte, name string) (string, bool) {
+// omit the name key, so no denial is declared either. resolvable reports
+// whether the choice identity survives resolution: a fractional index
+// (0x10) and an in-frame duplicate (0x20) are ambiguous by construction
+// (toolgate resolveChoiceIdentity marks both occurrences ambiguous), so
+// absorb skips them before decideName and their suppressed bytes never
+// produce a counted denial.
+func sseGenCallFrame(c []byte, name string) (frame string, denied bool, resolvable bool) {
 	nameless := c[0]&0x04 != 0
-	denied := name == "secret_tool" && !nameless
+	denied = name == "secret_tool" && !nameless
+	resolvable = c[0]&0x10 == 0 && c[0]&0x20 == 0
 	argsBytes, _ := json.Marshal(string(c[1:])) // infallible for strings; valid JSON fragment
 	if c[0]&0x08 != 0 {                         // non-string argument form: refused fail-closed
 		argsBytes = []byte(`{"fuzz":true}`)
 	}
 	fn := fmt.Sprintf(`"arguments":%s`, string(argsBytes))
 	if !nameless {
-		fn = fmt.Sprintf(`"name":%q,`+fn, name)
+		// The arguments fragment is DATA, never part of the format string:
+		// percent bytes in fuzzed arguments previously flowed through
+		// Sprintf as verbs (corpus 1b76d105e1136cb4), malformed the frame,
+		// and the gate hit its unparseable-passthrough arm, releasing the
+		// denied name. Concatenate the rendered parts instead.
+		fn = fmt.Sprintf(`"name":%q,`, name) + fn
 	}
 	choice := fmt.Sprintf(`{"index":%s,"delta":{"tool_calls":[{"index":%d,"function":{%s}}]}}`,
 		choiceIndex(c), c[2]%3, fn)
@@ -164,7 +180,7 @@ func sseGenCallFrame(c []byte, name string) (string, bool) {
 	if c[3]&0x20 != 0 { // null choice member inside an indexed frame
 		choices = "null," + choices
 	}
-	return fmt.Sprintf(`data: {"choices":[%s]}`+"\n\n", choices), denied
+	return fmt.Sprintf(`data: {"choices":[%s]}`+"\n\n", choices), denied, resolvable
 }
 
 // sseGenHasTerminalFrame reports the historical finish derivation: a
@@ -185,10 +201,12 @@ func choiceIndex(c []byte) string {
 
 // sseGenStreamOracle holds the independent invariants for generated streams:
 // the active gate must never release denied-tool bytes under ANY framing or
-// chunk split (and must have counted the drop when one was declared), every
-// released data line stays valid JSON except the generator's two genuinely
-// non-JSON passthrough payloads, and the inactive writer is a strict
-// byte-identical passthrough.
+// chunk split, and it must have counted the drop for every denied call the
+// oracle declares countable (identity-resolvable named calls; ambiguous
+// fractional/duplicate choices legitimately accumulate nowhere while their
+// bytes stay suppressed). Every released data line stays valid JSON except
+// the generator's two genuinely non-JSON passthrough payloads, and the
+// inactive writer is a strict byte-identical passthrough.
 func sseGenStreamOracle(t *testing.T, out string, active, sawDenied bool, deniedCount int) {
 	t.Helper()
 	if active {
@@ -866,5 +884,182 @@ func fuzzSSE24(t *testing.T) {
 	}
 	if got := pw.payloadJSON(); got != "" {
 		t.Fatalf("SSE-24: writer payload must render the empty state, got %q", got)
+	}
+}
+
+// TestSSEGenDeniedCountContract pins the deny-accounting contract the
+// generated-stream oracle relies on, deterministically and in both
+// directions: an identity-ambiguous denied call (fractional index plus
+// in-frame duplicate — the exact 71b1b831e6189cae corpus shape, driven
+// byte-wise with mid-stream flushes) must keep its bytes suppressed WITHOUT
+// a counted denial, while an unambiguous denied call must both stay
+// suppressed and be counted.
+// sseGenDrive renders the generated stream for p and drives the active
+// gate with the fuzz chunking; the deterministic contract controls use it.
+func sseGenDrive(t *testing.T, p []byte) (stream, out string, count int, sawDenied bool) {
+	t.Helper()
+	frames, sawDenied := sseGenFrames(p)
+	w := httptest.NewRecorder()
+	g := newSSEToolGateWriter(context.Background(), w, fuzzToolEngine(), "org-deny", "*", true)
+	stream = strings.Join(frames, "")
+	sseGenWriteChunks(t, g, stream, p)
+	return stream, w.Body.String(), g.DeniedCount(), sawDenied
+}
+
+func TestSSEGenDeniedCountContract(t *testing.T) {
+	// Ambiguous denied call (fractional + duplicated choice): bytes
+	// suppressed, count zero. The guard rejects a vacuous control: the
+	// generated stream must actually declare the denied name while sawDenied
+	// stays unset.
+	stream, out, count, sawDenied := sseGenDrive(t, []byte("000 000"))
+	if !strings.Contains(stream, "secret_tool") {
+		t.Fatal("contract control: ambiguous stream did not declare the denied name")
+	}
+	if sawDenied {
+		t.Fatal("contract control: ambiguous denied call was declared countable")
+	}
+	if strings.Contains(out, "secret_tool") {
+		t.Fatalf("ambiguous denied bytes leaked: %q", out)
+	}
+	if count != 0 {
+		t.Fatalf("ambiguous denied call was counted: %d", count)
+	}
+
+	// Unambiguous denied call: bytes suppressed AND counted.
+	_, out, count, sawDenied = sseGenDrive(t, []byte{0x00, 0x00, 0x00, 0x00})
+	if !sawDenied {
+		t.Fatal("contract control: unambiguous denied call was not declared countable")
+	}
+	if strings.Contains(out, "secret_tool") {
+		t.Fatalf("denied bytes leaked: %q", out)
+	}
+	if count != 1 {
+		t.Fatalf("denied call not counted exactly once: %d", count)
+	}
+}
+
+// TestSSEGenJSONValidAndDeniedFilter pins the generator contract restored by
+// the Sprintf format-string fix (corpus 1b76d105e1136cb4): percent payloads
+// in fuzzed arguments stay DATA — every generated frame remains valid JSON
+// with the denied name and exact argument payload intact — and the gate
+// must still filter that denied call (bytes suppressed, exactly one counted
+// denial) instead of falling through its unparseable-passthrough arm.
+// sseGenJSONDoc mirrors the tool-call frame shape the generator emits.
+type sseGenJSONDoc struct {
+	Choices []struct {
+		Delta struct {
+			ToolCalls []map[string]any `json:"tool_calls"`
+		} `json:"delta"`
+	} `json:"choices"`
+}
+
+// sseGenFrameCase is one percent-payload table entry: args is the raw
+// denied payload tail, wantArgs the exact arguments string the generator
+// must carry through JSON, and nullChoice marks the entry that also
+// activates the null-choice-member arm via 0x20 at c[3].
+type sseGenFrameCase struct {
+	args       string
+	wantArgs   string
+	nullChoice bool
+}
+
+// sseGenPercentPayload builds the denied, named, resolvable control input
+// for one table case: the 0x80 lead byte, then args, zero-padded to
+// exactly one 4-byte group so the round-trip maps frame-to-payload.
+// Trailing zero bytes avoid the c[3] frame-shape arms; a nullChoice entry
+// must end at c[3]=0x20 to activate the null-choice-member arm.
+func sseGenPercentPayload(t *testing.T, tc sseGenFrameCase) []byte {
+	t.Helper()
+	payload := append([]byte{0x80}, []byte(tc.args)...) // denied, named, resolvable
+	for len(payload) < 4 {                              // sseGenFrames emits whole 4-byte groups only
+		payload = append(payload, 0x00)
+	}
+	if len(payload) != 4 {
+		t.Fatalf("args %q: control payload exceeds one frame group", tc.args)
+	}
+	if tc.nullChoice && payload[3] != 0x20 {
+		t.Fatalf("args %q: null-choice case must set 0x20 at c[3]", tc.args)
+	}
+	return payload
+}
+
+// assertSSEGenFramePayload decodes one generated SSE frame: it must be
+// valid JSON whose tool call carries the denied name with exactly the
+// table's wanted arguments (JSON round-trip control).
+func assertSSEGenFramePayload(t *testing.T, fr, wantArgs string) {
+	t.Helper()
+	line := strings.TrimSuffix(strings.TrimPrefix(fr, "data: "), "\n\n")
+	if !json.Valid([]byte(line)) {
+		t.Fatalf("generated frame is not valid JSON: %q", fr)
+	}
+	var doc sseGenJSONDoc
+	if err := json.Unmarshal([]byte(line), &doc); err != nil {
+		t.Fatalf("frame does not decode: %v", err)
+	}
+	var call map[string]any
+	for _, ch := range doc.Choices {
+		if len(ch.Delta.ToolCalls) > 0 {
+			call = ch.Delta.ToolCalls[0]
+		}
+	}
+	if call == nil {
+		t.Fatalf("frame carries no tool call: %q", fr)
+	}
+	fn, _ := call["function"].(map[string]any)
+	if fn == nil || fn["name"] != "secret_tool" {
+		t.Fatalf("denied name lost or mangled: %v", fn)
+	}
+	if fn["arguments"] != wantArgs {
+		t.Fatalf("arguments mangled: %q != %q", fn["arguments"], wantArgs)
+	}
+}
+
+// assertSSEGenDeniedFrames runs the JSON round-trip control across every
+// generated frame of one table case.
+func assertSSEGenDeniedFrames(t *testing.T, tc sseGenFrameCase, frames []string) {
+	t.Helper()
+	if len(frames) == 0 {
+		t.Fatalf("args %q: no generated frames to validate", tc.args)
+	}
+	for _, fr := range frames {
+		assertSSEGenFramePayload(t, fr, tc.wantArgs)
+	}
+}
+
+// assertSSEGenDeniedCall drives the real gate over the built payload: the
+// denied bytes must never leak and the denied call must count exactly once.
+func assertSSEGenDeniedCall(t *testing.T, payload []byte) {
+	t.Helper()
+	_, out, count, _ := sseGenDrive(t, payload)
+	if strings.Contains(out, "secret_tool") {
+		t.Fatalf("denied bytes leaked: %q", out)
+	}
+	if count != 1 {
+		t.Fatalf("denied call not counted exactly once: %d", count)
+	}
+}
+
+// TestSSEGenJSONValidAndDeniedFilter drives one 4-byte percent payload per
+// table case through the generator: every frame must round-trip as valid
+// JSON with the denied name and arguments intact, denied bytes must never
+// leak, and the denied call must count exactly once.
+func TestSSEGenJSONValidAndDeniedFilter(t *testing.T) {
+	for _, tc := range []sseGenFrameCase{
+		{args: "% ", wantArgs: "% \x00"},
+		{args: "%s", wantArgs: "%s\x00"},
+		{args: "%!", wantArgs: "%!\x00"},
+		{args: "%w", wantArgs: "%w\x00"},
+		{args: "0%\x03", wantArgs: "0%\x03"},
+		{args: "% \x20", wantArgs: "% \x20", nullChoice: true},
+	} {
+		t.Run(tc.args, func(t *testing.T) {
+			payload := sseGenPercentPayload(t, tc)
+			frames, sawDenied := sseGenFrames(payload)
+			if !sawDenied {
+				t.Fatalf("args %q: denied call was not declared countable", tc.args)
+			}
+			assertSSEGenDeniedFrames(t, tc, frames)
+			assertSSEGenDeniedCall(t, payload)
+		})
 	}
 }

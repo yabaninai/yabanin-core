@@ -28,11 +28,12 @@ import (
 func r105TestGateway(t *testing.T, info resolver.ModelInfo) *gateway {
 	t.Helper()
 	return &gateway{
-		cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: info.UpstreamURL},
-		log:  slog.New(slog.DiscardHandler),
-		auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
-		res:  stubModelResolver{"m": info, info.ModelName: info},
-		pool: upstream.NewPool(upstream.Options{}),
+		cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: info.UpstreamURL},
+		log:         slog.New(slog.DiscardHandler),
+		auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver("org-test", nil)),
+		res:         stubModelResolver{"m": info, info.ModelName: info},
+		pool:        upstream.NewPool(upstream.Options{}),
+		invocations: &fakeInvocationStore{},
 	}
 }
 
@@ -44,6 +45,10 @@ func postR105(t *testing.T, gw *gateway, path, body string, headers map[string]s
 	for k, v := range headers {
 		req.Header.Set(k, v)
 	}
+	// Preview2 tenant attribution rides the auth resolver, not a
+	// client header (the middleware deletes X-Org-Id): the test
+	// gateway's resolver resolves the static key to org-test, and
+	// per-test org overrides swap the resolver (residency fixtures).
 	rec := httptest.NewRecorder()
 	r := chi.NewRouter()
 	gw.routes(r)

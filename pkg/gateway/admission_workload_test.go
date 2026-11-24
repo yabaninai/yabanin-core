@@ -148,7 +148,11 @@ func TestAdmissionCore_WorkloadLabelCopyOnWrite(t *testing.T) {
 func TestAdmissionCore_WorkloadCapDenied(t *testing.T) {
 	gw, hits, _ := newAdmissionMatrixGateway(t)
 	ledger := presetWorkloadLedger(t, 100) // 0.0001 USD window cap
-	ledger.Charge("", "ci-fleet", money.MicroUSD(100))
+	// The window is org-namespaced and the matrix fixture resolves the
+	// bearer to matrix-org, so the saturation must seed THAT tenant's
+	// "ci-fleet" window — an empty-org seed no longer matches the
+	// org the routed request admits under.
+	ledger.Charge("matrix-org", "ci-fleet", money.MicroUSD(100))
 
 	body := `{"model":"m","messages":[{"role":"user","content":"hi"}]}`
 	rec := postMatrixRequest(t, gw, "/v1/chat/completions", "application/json", body,

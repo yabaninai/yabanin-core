@@ -496,13 +496,13 @@ func TestN06P7T09UnknownChargeKindRefusedAtIntentSeam(t *testing.T) {
 	tx, err := db.BeginTx(ctx)
 	require.NoError(t, err)
 
-	err = c.insertScopeIntent(ctx, tx, "org-n06p7t09", "req-n06p7t09-seam",
+	err = c.insertScopeIntent(ctx, tx, "org-n06p7t09", "req-n06p7t09-seam", nil,
 		scopeCharge{kind: "quantum_flux", scope: "quantum", key: "k", amount: 500000},
 		1, 2, 0.5, 0.5, "gpt-4")
 	require.NoError(t, err, "the refusal is a skip, never a delivery error")
 	assert.Empty(t, execs, "an unknown charge kind produces no durable work item")
 
-	err = c.insertScopeIntent(ctx, tx, "org-n06p7t09", "req-n06p7t09-seam",
+	err = c.insertScopeIntent(ctx, tx, "org-n06p7t09", "req-n06p7t09-seam", nil,
 		scopeCharge{kind: ChargeKindAgentSpend, scope: "agent_day", key: "agent-n06p7t09", amount: 100},
 		1, 2, 0.01, 0.01, "gpt-4")
 	require.NoError(t, err)

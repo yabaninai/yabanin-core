@@ -39,7 +39,11 @@ func TestContract_ErrorEnvelopeShape(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(tc.body))
+			r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 			r.Header.Set("Content-Type", "application/json")
+			// Handler-direct: golden identity stands in for the resolved
+			// principal the production auth middleware injects.
+			goldenIdentity(r)
 			rec := httptest.NewRecorder()
 			gw.chatCompletions(rec, r)
 			require.Equal(t, tc.wantStatus, rec.Code, rec.Body.String())
@@ -67,7 +71,11 @@ func TestContract_SuccessBodyShape(t *testing.T) {
 
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
+	// Handler-direct: golden identity stands in for the resolved principal
+	// the production auth middleware injects.
+	goldenIdentity(r)
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
@@ -106,9 +114,10 @@ func TestContract_SSEStreamShapes(t *testing.T) {
 	gw := decisionTestGateway(sse.URL)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		strings.NewReader(`{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`))
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
-	gw.serveStream(rec, r.Context(), rt06TestResolve(gw, "gpt-4o-mini"),
+	gw.serveStream(rec, r.Context(), rt06TestResolve(r.Context(), gw, "gpt-4o-mini"),
 		[]byte(`{"model":"gpt-4o-mini","stream":true,"messages":[{"role":"user","content":"hi"}]}`),
 		false, "s1", "org", "", "", "req", gw.log, routingDecision{}, "", 0, "", "", "", false)
 

@@ -57,6 +57,8 @@ func TestChat_UnknownModel_FallbackHeader(t *testing.T) {
 
 	body := []byte(`{"model":"claude-sonnet-4-6","messages":[{"role":"user","content":"hi"}]}`)
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", bytes.NewReader(body))
+	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	rec := httptest.NewRecorder()
 	gw.chatCompletions(rec, r)
 

@@ -37,6 +37,7 @@ func n07rlPostChatBG(t *testing.T, gw *gateway, body string, headers map[string]
 	req := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	for k, vs := range headers {
 		for _, v := range vs {
 			req.Header.Add(k, v)
@@ -78,6 +79,7 @@ func n07rlPostReal(t *testing.T, srv *httptest.Server, body string, headers map[
 	if err != nil {
 		return 0, "", "", err
 	}
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	for k, vs := range headers {
@@ -398,6 +400,7 @@ func TestFairAdmission_DeadContextNoWrite(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel() // dead on arrival
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(n03p6t06OpenAIPlainBody))
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()

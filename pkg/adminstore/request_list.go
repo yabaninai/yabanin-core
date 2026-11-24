@@ -6,7 +6,24 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
+
+// toolFactMatchesRow is the single association rule binding retained tool
+// facts (tc) to a physical request_logs row (rl), applied identically by
+// the list projection, the YQL tool filters and the request-count aggregate
+// (0028/0030): an invocation-bearing fact binds exactly to the row carrying
+// the same invocation identity; a NULL-invocation fact (legacy, or emitted
+// by a pre-0030 writer mode for a minted request) associates only when rl
+// is the org's unique carrier of the correlation — a correlation carried by
+// multiple rows associates its NULL facts to none of them. The carrier
+// count stays org-scoped, so the same correlation string in another org
+// never steals facts. (The detail path applies the parameterized equivalent
+// with uniqueCorrelationCarrier.)
+const toolFactMatchesRow = "((tc.invocation_id IS NOT NULL AND tc.invocation_id = rl.invocation_id) OR " +
+	"(tc.invocation_id IS NULL AND " +
+	"(SELECT COUNT(*) FROM request_logs c WHERE c.org_id = tc.org_id AND c.request_id = tc.request_id) = 1))"
 
 // RequestListFilters narrows the request-log list query. All fields optional
 // except OrgID; a zero filter returns the newest rows for the org.
@@ -42,6 +59,13 @@ type RequestListFilters struct {
 	// RequestID is an exact primary-key-style lookup (Bifrost `request_id`
 	// filter): when set it collapses the list to that one request.
 	RequestID string
+	// RowKey pins the shared list/count/stats/export predicate to one
+	// immutable request_logs row (payload-grant redemption, 0031). It
+	// composes with every other filter, so a grant disclosure both matches
+	// and counts exactly the bound physical row: correlation siblings that
+	// legitimately share request_id (0028) can neither widen the match nor
+	// trip the export row cap. Zero means unbounded.
+	RowKey int64
 	// RuleID narrows to rows whose stored routing_decision names this
 	// routing rule (CORE-TRACE-04 rule→requests lookup). The stored column
 	// is legacy TEXT: the probe is guarded so a malformed historical value
@@ -72,8 +96,17 @@ type RequestListFilters struct {
 
 // RequestListRow is one request_logs row as returned to the request explorer.
 type RequestListRow struct {
-	RequestID      string  `json:"request_id"`
-	OrgID          string  `json:"org_id"`
+	RequestID string `json:"request_id"`
+	OrgID     string `json:"org_id"`
+	// RowKey is the immutable request_logs.id of this physical row, exposed
+	// as `row_key` — an exact decimal STRING, never a JSON number: the
+	// bigint routinely exceeds 2^53, where JS number rounding would point a
+	// client at the wrong physical row. The client-supplied RequestID is a
+	// correlation field only (0028): two legitimate invocations sharing it
+	// bill and log as independent rows, so exact-row consumers (the export
+	// walk, the inspector deep link) address rows by RowKey. Omitted only
+	// for synthetic rows with no physical key (omitempty's zero check).
+	RowKey         int64   `json:"row_key,string,omitempty"`
 	ModelRequested string  `json:"model_requested,omitempty"`
 	ModelUsed      string  `json:"model_used"`
 	StatusCode     int     `json:"status_code"`
@@ -116,143 +149,140 @@ type RequestListStats struct {
 	TotalCostUSD   float64 `json:"total_cost_usd"`
 }
 
-// requestListWhere builds the shared WHERE clause + args for the list, count,
-// and stats queries so all three always agree on the filter semantics.
+type requestListPredicate struct {
+	terms []string
+	args  []interface{}
+}
+
+func (p *requestListPredicate) add(condition string, value interface{}) {
+	p.args = append(p.args, value)
+	p.terms = append(p.terms, fmt.Sprintf(condition, len(p.args)))
+}
+
+// requestListWhere builds the shared predicate for list, count, stats and export.
 func requestListWhere(f RequestListFilters) (string, []interface{}) {
-	where := []string{"org_id = $1", "COALESCE(ab_group, '') <> 'shadow'"}
-	args := []interface{}{f.OrgID}
-	add := func(cond string, val interface{}) {
-		args = append(args, val)
-		where = append(where, fmt.Sprintf(cond, len(args)))
-	}
+	p := requestListPredicate{terms: []string{"org_id = $1", "COALESCE(ab_group, '') <> 'shadow'"}, args: []interface{}{f.OrgID}}
+	p.scope(f)
+	p.identityAndStatus(f)
+	p.metrics(f)
+	p.search(f)
+	return strings.Join(p.terms, " AND "), p.args
+}
+
+func (p *requestListPredicate) scope(f RequestListFilters) {
 	if f.DelegateAgentID != "" {
 		// Delegated subject (N04-P05 T03): the trusted attribution scope.
 		// Applied before the deny branch so a deny still yields nothing.
-		add("agent_id::text = $%d", f.DelegateAgentID)
+		p.add("agent_id::text = $%d", f.DelegateAgentID)
 	}
 	if f.PayloadDenied && f.PayloadUserID != "" {
 		// Deny-own-history removes a person's rows before list/count/stats,
 		// avoiding both direct reads and aggregate side channels.
-		add("(user_id::text <> $%d OR agent_id IS NOT NULL OR api_key_id IS NOT NULL OR user_id IS NULL)", f.PayloadUserID)
+		p.add("(user_id::text <> $%d OR agent_id IS NOT NULL OR api_key_id IS NOT NULL OR user_id IS NULL)", f.PayloadUserID)
 	} else if f.PayloadDenied {
-		where = append(where, "FALSE")
+		p.terms = append(p.terms, "FALSE")
 	}
 	if !f.OrgWideMetadata && f.OwnerUserID != "" {
-		add("(user_id::text = $%d AND agent_id IS NULL AND api_key_id IS NULL)", f.OwnerUserID)
+		p.add("(user_id::text = $%d AND agent_id IS NULL AND api_key_id IS NULL)", f.OwnerUserID)
 	}
 	if f.RequestID != "" {
-		add("request_id = $%d", f.RequestID)
+		p.add("request_id = $%d", f.RequestID)
 	}
+	if f.RowKey > 0 {
+		// Exact physical-row pin: unlike request_id (a correlation field),
+		// the immutable row key addresses one row (see RequestListFilters).
+		p.add("id = $%d", f.RowKey)
+	}
+}
+
+func (p *requestListPredicate) identityAndStatus(f RequestListFilters) {
 	if f.RuleID != "" {
 		// pg_input_is_valid + CASE guard the legacy TEXT column (PG16 core,
 		// non-raising): rows holding NULL, empty or malformed decision
 		// payloads evaluate to false instead of failing the cast — the list
 		// can never 500 on historical data.
-		add("CASE WHEN routing_decision IS NOT NULL AND pg_input_is_valid(routing_decision, 'jsonb') "+
+		p.add("CASE WHEN routing_decision IS NOT NULL AND pg_input_is_valid(routing_decision, 'jsonb') "+
 			"THEN routing_decision::jsonb->'rule'->>'id' = $%d ELSE false END", f.RuleID)
 	}
 	if f.Model != "" {
-		add("model_used = $%d", f.Model)
+		p.add("model_used = $%d", f.Model)
 	}
 	if !f.From.IsZero() {
-		add("created_at >= $%d::timestamptz", f.From)
+		p.add("created_at >= $%d::timestamptz", f.From)
 	}
 	if !f.To.IsZero() {
-		add("created_at <= $%d::timestamptz", f.To)
+		p.add("created_at <= $%d::timestamptz", f.To)
 	}
 	if f.ErrorOnly {
-		where = append(where, "status_code >= 400")
+		p.terms = append(p.terms, "status_code >= 400")
 	} else if f.MinStatus > 0 {
-		add("status_code >= $%d", f.MinStatus)
+		p.add("status_code >= $%d", f.MinStatus)
 	}
 	if f.TaskID != "" {
-		add("task_id = $%d", f.TaskID)
+		p.add("task_id = $%d", f.TaskID)
 	}
 	if f.AgentID != "" {
 		// Compare ::text like the YQL `agent` field: an invalid uuid value can
 		// never surface as a 500 from a failed cast, it just matches nothing.
-		add("agent_id::text = $%d", f.AgentID)
+		p.add("agent_id::text = $%d", f.AgentID)
 	}
+}
+
+func (p *requestListPredicate) metrics(f RequestListFilters) {
 	if f.MinLatencyMs > 0 {
-		add("COALESCE(duration_ms, 0) >= $%d", f.MinLatencyMs)
+		p.add("COALESCE(duration_ms, 0) >= $%d", f.MinLatencyMs)
 	}
 	if f.MaxLatencyMs > 0 {
-		add("COALESCE(duration_ms, 0) <= $%d", f.MaxLatencyMs)
+		p.add("COALESCE(duration_ms, 0) <= $%d", f.MaxLatencyMs)
 	}
 	if f.MinTokens > 0 {
-		add("(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) >= $%d", f.MinTokens)
+		p.add("(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) >= $%d", f.MinTokens)
 	}
 	if f.MaxTokens > 0 {
-		add("(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) <= $%d", f.MaxTokens)
+		p.add("(COALESCE(tokens_in, 0) + COALESCE(tokens_out, 0)) <= $%d", f.MaxTokens)
 	}
 	if f.MinCostUSD > 0 {
-		add("COALESCE(cost_in_usd, 0) >= $%d", f.MinCostUSD)
+		p.add("COALESCE(cost_in_usd, 0) >= $%d", f.MinCostUSD)
 	}
 	if f.MaxCostUSD > 0 {
-		add("COALESCE(cost_in_usd, 0) <= $%d", f.MaxCostUSD)
+		p.add("COALESCE(cost_in_usd, 0) <= $%d", f.MaxCostUSD)
 	}
 	switch f.CacheHit {
 	case "exact", "semantic":
-		add("cache_hit_type = $%d", f.CacheHit)
+		p.add("cache_hit_type = $%d", f.CacheHit)
 	case "miss":
-		where = append(where, "COALESCE(cache_hit_type, '') = ''")
+		p.terms = append(p.terms, "COALESCE(cache_hit_type, '') = ''")
 	}
-	if f.ContentSearch != "" {
-		if f.PayloadAuthorizationSet && (!f.PayloadSearchAllowed || f.PayloadDenied) {
-			where = append(where, "FALSE")
-		} else if scope := payloadContentScope(f, len(args)+1); scope != "" {
-			if f.DelegateAgentID != "" {
-				args = append(args, f.DelegateAgentID)
-			} else {
-				args = append(args, f.PayloadUserID)
-			}
-			where = append(where, scope)
-		}
-		pat := "%" + f.ContentSearch + "%"
-		args = append(args, pat)
-		n := len(args)
-		where = append(where, fmt.Sprintf(
-			"(COALESCE(error, '') ILIKE $%d OR COALESCE(upstream_request::text, '') ILIKE $%d OR COALESCE(response::text, '') ILIKE $%d)",
-			n, n, n))
-	}
-	if f.Query != nil {
-		if f.Query.hasBodySearch() {
-			if f.PayloadAuthorizationSet && (!f.PayloadSearchAllowed || f.PayloadDenied) {
-				where = append(where, "FALSE")
-			} else if scope := payloadContentScope(f, len(args)+1); scope != "" {
-				if f.DelegateAgentID != "" {
-					args = append(args, f.DelegateAgentID)
-				} else {
-					args = append(args, f.PayloadUserID)
-				}
-				// Scope the entire boolean expression; local scoping can be
-				// escaped by NOT/OR in a YQL query.
-				where = append(where, scope)
-			}
-		}
-		// ParseYQL validated and dry-ran the tree, so compilation here is
-		// total; placeholders continue the numbering of the flat filters.
-		// An order-only query contributes no fragment.
-		frag, fragArgs := f.Query.whereSQL(args)
-		if frag != "" {
-			where = append(where, frag)
-		}
-		args = fragArgs
-	}
-	return strings.Join(where, " AND "), args
 }
 
-// payloadContentScope returns the common authorization predicate for q and
-// YQL `text` content search. A grant is never used for list-wide searches.
-// A delegated subject searches only its own attributed rows.
-func payloadContentScope(f RequestListFilters, placeholder int) string {
-	if f.DelegateAgentID != "" {
-		return fmt.Sprintf("rl.agent_id::text = $%d", placeholder)
+// Apply authorization outside the full search expression, including YQL NOT/OR.
+func (p *requestListPredicate) scopePayloadSearch(f RequestListFilters) {
+	switch {
+	case f.PayloadAuthorizationSet && (!f.PayloadSearchAllowed || f.PayloadDenied):
+		p.terms = append(p.terms, "FALSE")
+	case f.DelegateAgentID != "":
+		p.add("rl.agent_id::text = $%d", f.DelegateAgentID)
+	case f.PayloadUserID != "":
+		p.add("(rl.user_id::text = $%d AND rl.agent_id IS NULL AND rl.api_key_id IS NULL)", f.PayloadUserID)
 	}
-	if f.PayloadUserID == "" {
-		return ""
+}
+
+func (p *requestListPredicate) search(f RequestListFilters) {
+	if f.ContentSearch != "" {
+		p.scopePayloadSearch(f)
+		p.add("(COALESCE(error, '') ILIKE $%[1]d OR COALESCE(upstream_request::text, '') ILIKE $%[1]d OR COALESCE(response::text, '') ILIKE $%[1]d)", "%"+f.ContentSearch+"%")
 	}
-	return fmt.Sprintf("(rl.user_id::text = $%d AND rl.agent_id IS NULL AND rl.api_key_id IS NULL)", placeholder)
+	if f.Query == nil {
+		return
+	}
+	if f.Query.hasBodySearch() {
+		p.scopePayloadSearch(f)
+	}
+	fragment, args := f.Query.whereSQL(p.args)
+	if fragment != "" {
+		p.terms = append(p.terms, fragment)
+	}
+	p.args = args
 }
 
 // RequestQueryRunner is the exported read surface for list/count helpers that
@@ -313,22 +343,26 @@ func listRequestsOn(ctx context.Context, ex exportQueryRunner, f RequestListFilt
 
 	// Deterministic ordering: YQL's ORDER BY when present (parse-validated
 	// against the field whitelist), newest-first otherwise, always with the
-	// request_id tiebreak so equal keys page stably.
-	orderSQL := "rl.created_at DESC, rl.request_id"
+	// request_id tiebreak and the immutable row key as the FINAL tiebreak
+	// so equal keys page stably — two physical rows may legitimately share
+	// both created_at and request_id (0028 correlation semantics).
+	orderSQL := "rl.created_at DESC, rl.request_id, rl.id"
 	if f.Query != nil && f.Query.Order != nil {
-		orderSQL = f.Query.Order.sql()
+		orderSQL = f.Query.Order.sql() + ", rl.id"
 	}
 
 	// The tool_calls column is an org-scoped correlated subquery, not a
-	// join: rows of a foreign org that merely shadow the same request_id
-	// can never leak names into this org's list (mirror of the detail
-	// view's org scoping, and its regression test).
-	q := "SELECT COALESCE(rl.request_id, ''), COALESCE(rl.org_id::text, ''), COALESCE(rl.model_requested, ''), " +
+	// join: rows of a foreign org that merely shadow the request_id can
+	// never leak names into this org's list (mirror of the detail view's
+	// org scoping, and its regression test). Names bind by invocation
+	// identity (0030): an invocation-bearing row lists only its own
+	// invocation's tools; a legacy row lists only legacy facts.
+	q := "SELECT rl.id, COALESCE(rl.request_id, ''), COALESCE(rl.org_id::text, ''), COALESCE(rl.model_requested, ''), " +
 		"COALESCE(rl.model_used, ''), rl.status_code, COALESCE(rl.cost_in_usd, 0), COALESCE(rl.tokens_in, 0), COALESCE(rl.tokens_out, 0), " +
 		"COALESCE(rl.task_id, ''), COALESCE(rl.session_id::text, ''), COALESCE(rl.duration_ms, 0), COALESCE(rl.cache_hit_type, ''), " +
 		"rl.first_token_ms, rl.attempt_count, rl.retry_count, COALESCE(rl.error, ''), rl.created_at, " +
 		"COALESCE((SELECT array_agg(DISTINCT tc.tool_name ORDER BY tc.tool_name) FROM tool_calls tc " +
-		"WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id), '{}'), COALESCE(rl.labels, '{}'::jsonb), COALESCE(rl.user_id::text, '') " +
+		"WHERE tc.request_id = rl.request_id AND tc.org_id = rl.org_id AND " + toolFactMatchesRow + "), '{}'), COALESCE(rl.labels, '{}'::jsonb), COALESCE(rl.user_id::text, '') " +
 		", (rl.agent_id IS NULL AND rl.api_key_id IS NULL), COALESCE(rl.agent_id::text, '') " +
 		"FROM request_logs rl WHERE " + w + " ORDER BY " + orderSQL + " LIMIT $" + fmt.Sprint(len(args)+1) +
 		" OFFSET $" + fmt.Sprint(len(args)+2)
@@ -341,26 +375,36 @@ func listRequestsOn(ctx context.Context, ex exportQueryRunner, f RequestListFilt
 	defer rows.Close()
 	var out []RequestListRow
 	for rows.Next() {
-		var r RequestListRow
-		var labelsRaw []byte
-		var ownerID string
-		var humanRequest bool
-		var agentID string
-		if err := rows.Scan(&r.RequestID, &r.OrgID, &r.ModelRequested, &r.ModelUsed, &r.StatusCode, &r.CostUSD,
-			&r.TokensIn, &r.TokensOut, &r.TaskID, &r.SessionID, &r.DurationMs, &r.CacheHitType,
-			&r.FirstTokenMs, &r.AttemptCount, &r.RetryCount, &r.ErrorMsg, &r.CreatedAt, &r.ToolCalls, &labelsRaw, &ownerID, &humanRequest, &agentID); err != nil {
-			return nil, 0, fmt.Errorf("request list scan: %w", err)
+		r, err := scanRequestListRow(rows, f)
+		if err != nil {
+			return nil, 0, err
 		}
-		r.Labels = decodeLabels(labelsRaw)
-		// Payload visibility per row: a human's own rows, or — under a live
-		// delegation carrying the payload scope — the delegated subject's own
-		// attributed rows. A deny never marks rows as owned.
-		r.PayloadOwned = !f.PayloadDenied &&
-			((humanRequest && f.PayloadUserID != "" && ownerID == f.PayloadUserID) ||
-				(f.DelegateAgentID != "" && f.DelegatePayload && agentID == f.DelegateAgentID))
 		out = append(out, r)
 	}
 	return out, total, rows.Err()
+}
+
+// scanRequestListRow decodes one physical list row — the immutable row key
+// first — including the per-row payload ownership flag derived from the
+// boundary decision: a human's own rows, or — under a live delegation
+// carrying the payload scope — the delegated subject's own attributed rows.
+// A deny never marks rows as owned.
+func scanRequestListRow(rows pgx.Rows, f RequestListFilters) (RequestListRow, error) {
+	var r RequestListRow
+	var labelsRaw []byte
+	var ownerID string
+	var humanRequest bool
+	var agentID string
+	if err := rows.Scan(&r.RowKey, &r.RequestID, &r.OrgID, &r.ModelRequested, &r.ModelUsed, &r.StatusCode, &r.CostUSD,
+		&r.TokensIn, &r.TokensOut, &r.TaskID, &r.SessionID, &r.DurationMs, &r.CacheHitType,
+		&r.FirstTokenMs, &r.AttemptCount, &r.RetryCount, &r.ErrorMsg, &r.CreatedAt, &r.ToolCalls, &labelsRaw, &ownerID, &humanRequest, &agentID); err != nil {
+		return RequestListRow{}, fmt.Errorf("request list scan: %w", err)
+	}
+	r.Labels = decodeLabels(labelsRaw)
+	r.PayloadOwned = !f.PayloadDenied &&
+		((humanRequest && f.PayloadUserID != "" && ownerID == f.PayloadUserID) ||
+			(f.DelegateAgentID != "" && f.DelegatePayload && agentID == f.DelegateAgentID))
+	return r, nil
 }
 
 func decodeLabels(raw []byte) map[string]string {

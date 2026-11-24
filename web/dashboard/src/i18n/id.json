@@ -1125,6 +1125,7 @@
     "setupRequestIdPlaceholder": "Tempel X-Request-ID yang dikirim klien Anda",
     "setupRequestIdVerify": "Verifikasi",
     "setupRequestNotFound": "Tidak ada permintaan dengan ID itu di organisasi ini.",
+    "setupRequestUnavailable": "Tidak dapat memeriksa ID itu saat ini — riwayat permintaan sementara tidak tersedia. Tekan Verifikasi untuk mencoba lagi.",
     "skippedNote": "Alur ini dilewati untuk organisasi ini. Langkah-langkah di bawah tetap mencerminkan kondisi terkini.",
     "flagUnavailable": "Kemajuan tidak dapat disimpan pada deployment ini; alur tetap berfungsi dan diperiksa lagi pada kunjungan berikutnya.",
     "stateChecking": "Memeriksa…",

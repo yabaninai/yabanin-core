@@ -12,9 +12,11 @@
 import i18n from './index'
 import { formatDateIn, formatDateTimeIn } from './date'
 import { formatUsdMoney } from './money'
+import { DEFAULT_CURRENCY, DEFAULT_TIMEZONE } from './defaults.ts'
 
-export const DEFAULT_CURRENCY = 'USD'
-export const DEFAULT_TIMEZONE = 'UTC'
+// Re-exported for compatibility (the canonical home is the test-loadable
+// leaf above); existing importers keep working unchanged.
+export { DEFAULT_CURRENCY, DEFAULT_TIMEZONE }
 
 /** The active UI locale tag (e.g. "ja", "pt-BR"); falls back to "en". */
 export function uiLocale(): string {

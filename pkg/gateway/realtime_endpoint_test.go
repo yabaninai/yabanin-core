@@ -9,6 +9,8 @@ package cli
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -23,6 +25,7 @@ import (
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
 	"github.com/reireirei/yabanin/pkg/policy"
 	"github.com/reireirei/yabanin/pkg/resolver"
+	"github.com/stretchr/testify/require"
 )
 
 // Cancel-settle fixtures: an enforce-mode plan with a zero Reservation keeps
@@ -397,4 +400,116 @@ func TestRealtime_ClientCancelSettlesConsumedPrefix(t *testing.T) {
 	if !strings.Contains(rec.Body.String(), "input_tokens") {
 		t.Fatalf("consumed prefix not relayed: %q", rec.Body.String())
 	}
+}
+
+// realtimeBoundaryWire mirrors the durable-accounting integration
+// boundary shapes (tests/integration/accounting, commit 182e218): a
+// single completed response whose terminal frame exceeds the hold's
+// 1 MiB RAM window (temp-file spill path), a completed response
+// followed by trailing metadata, and two completed responses in one
+// session. The final completed response carries usage 7/3.
+func realtimeBoundaryWire(t *testing.T, shape string) string {
+	t.Helper()
+	response := func(id, text string, inputTokens, outputTokens int) string {
+		created := fmt.Sprintf(`{"type":"response.created","response":{"id":%q,"status":"in_progress"}}`, id)
+		delta := `{"type":"response.output_text.delta","delta":"assistant text"}`
+		done := fmt.Sprintf(`{"type":"response.done","response":{"id":%q,"status":"completed","output":[{"type":"message","content":[{"type":"output_text","text":%q}]}],"usage":{"input_tokens":%d,"output_tokens":%d}}}`, id, text, inputTokens, outputTokens)
+		return "event: response.created\ndata: " + created + "\n\n" +
+			"event: response.output_text.delta\ndata: " + delta + "\n\n" +
+			"event: response.done\ndata: " + done + "\n\n"
+	}
+	switch shape {
+	case "cr":
+		return strings.ReplaceAll(response("first", "one", 7, 3), "\n", "\r")
+	case "crlf":
+		return strings.ReplaceAll(response("first", "one", 7, 3), "\n", "\r\n")
+	case "large":
+		return response("first", strings.Repeat("a", (1<<20)+1), 7, 3)
+	case "trailing":
+		return response("first", "one", 7, 3) +
+			"event: rate_limits.updated\ndata: {\"type\":\"rate_limits.updated\",\"rate_limits\":[]}\n\n"
+	case "multiple":
+		return response("first", "one", 2, 1) + response("second", "two", 7, 3)
+	default:
+		t.Fatalf("unknown realtime boundary shape %q", shape)
+		return ""
+	}
+}
+
+// TestRealtime_TerminalBoundaryHoldShapes pins the terminal hold at the
+// gateway level for every boundary shape: a healthy facts commit
+// replays the deferred suffix byte-for-byte after it lands (7/3
+// terminal facts, stream admission), while a facts-commit failure
+// withholds every completed terminal and closes the stream with
+// accounting_commit_failed followed by [DONE] — the client never sees
+// a success terminator for an unaccounted session.
+func TestRealtime_TerminalBoundaryHoldShapes(t *testing.T) {
+	for _, shape := range []string{"large", "trailing", "multiple", "cr", "crlf"} {
+		for _, commitFails := range []bool{false, true} {
+			name := realtimeBoundaryOutcomeName(commitFails)
+			t.Run(shape+"/"+name, func(t *testing.T) { assertRealtimeTerminalBoundaryCase(t, shape, commitFails) })
+		}
+	}
+}
+
+func realtimeBoundaryOutcomeName(commitFails bool) string {
+	if commitFails {
+		return "facts-failure"
+	}
+	return "healthy"
+}
+
+func assertRealtimeTerminalBoundaryCase(t *testing.T, shape string, commitFails bool) {
+	t.Helper()
+	wire := realtimeBoundaryWire(t, shape)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		_, _ = w.Write([]byte(wire))
+	}))
+	defer server.Close()
+	store := &fakeInvocationStore{}
+	if commitFails {
+		store.factsErr = errors.New("terminal facts insert failed")
+	}
+	gw := r105TestGateway(t, realtimeTestModel(server.URL))
+	gw.invocations = store
+	rec := postR105(t, gw, "/v1/realtime", `{"model":"m","input":"boundary"}`, nil)
+	assertRealtimeTerminalBoundaryResponse(t, rec, store)
+	if commitFails {
+		assertRealtimeBoundaryCommitFailure(t, rec.Body.String(), store)
+		return
+	}
+	assertRealtimeBoundaryCommitted(t, shape, wire, rec.Body.String(), store)
+}
+
+func assertRealtimeTerminalBoundaryResponse(t *testing.T, rec *httptest.ResponseRecorder, store *fakeInvocationStore) {
+	t.Helper()
+	require.Equal(t, http.StatusOK, rec.Code)
+	require.Equal(t, "text/event-stream", rec.Header().Get("Content-Type"))
+	require.Len(t, store.admitted, 1)
+	require.Equal(t, invocationKindStream, store.admitted[0].Kind)
+	require.Positive(t, store.factsCalls)
+}
+
+func assertRealtimeBoundaryCommitFailure(t *testing.T, body string, store *fakeInvocationStore) {
+	t.Helper()
+	require.Empty(t, store.facts)
+	require.NotContains(t, body, `"type":"response.done"`)
+	require.Contains(t, body, accountingCommitFailedCode)
+	require.Equal(t, 1, strings.Count(body, "data: [DONE]"))
+	require.True(t, strings.HasSuffix(body, "data: [DONE]\n\n"))
+}
+
+func assertRealtimeBoundaryCommitted(t *testing.T, shape, wire, body string, store *fakeInvocationStore) {
+	t.Helper()
+	if body != wire {
+		t.Fatalf("healthy %s stream altered: got %d bytes, want %d", shape, len(body), len(wire))
+	}
+	require.Len(t, store.facts, 1)
+	facts := store.facts[0]
+	require.Equal(t, store.admitted[0].InvocationID, facts.InvocationID)
+	require.Equal(t, invocationKindStream, facts.Kind)
+	require.Equal(t, "org-test", facts.OrgID)
+	require.Equal(t, "7", facts.Fields["tokens_in"])
+	require.Equal(t, "3", facts.Fields["tokens_out"])
 }

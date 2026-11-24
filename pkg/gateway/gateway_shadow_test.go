@@ -55,6 +55,9 @@ func shadowTestGateway(t *testing.T, primaryURL, shadowURL string) *gateway {
 		t.Fatalf("shadow config: %v", err)
 	}
 	gw := &gateway{
+		// Explicit invocation store, the scripted shadow double (embeds
+		// fakeInvocationStore; see streamTestGateway for the plain one).
+		invocations: &shadowAccountingFixture{},
 		cfg:         cfg,
 		pool:        upstream.NewPool(upstream.Options{BaseURL: primaryURL}),
 		fallback:    fallbackrouter.NewFallbackExecutor(nil, 3, nil),

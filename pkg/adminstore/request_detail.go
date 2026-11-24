@@ -193,13 +193,126 @@ func (s *Store) GetRequestDetail(ctx context.Context, orgID, requestID string) (
 	return getRequestDetailOn(ctx, s.db, orgID, requestID)
 }
 
+// GetRequestDetailRow returns the full request_logs row addressed by the
+// immutable row key (org-scoped): the exact-row identity the request list
+// and the payload-grant binding use, so a redemption discloses the very row
+// the grant was bound to even when several rows share the client
+// correlation. Unknown, purged, or cross-org keys return ErrNotFound.
+func (s *Store) GetRequestDetailRow(ctx context.Context, orgID string, rowKey int64) (*RequestDetail, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	return getRequestDetailOnKey(ctx, s.db, orgID, rowKey)
+}
+
+// GetRequestDetailRowInCorrelation returns the full request_logs row
+// addressed by the immutable row key, scoped to the org AND the correlation
+// the caller named (0028): the exact-row identity for API callers that
+// selected a physical row out of a correlation-keyed list or link. A key
+// that belongs to a different org, a different correlation of the same org,
+// or that is unknown, purged or NULL-correlated returns ErrNotFound — the
+// same no-existence-oracle 404 as every other detail miss.
+func (s *Store) GetRequestDetailRowInCorrelation(ctx context.Context, orgID, requestID string, rowKey int64) (*RequestDetail, error) {
+	if s.db == nil {
+		return nil, fmt.Errorf("database not available")
+	}
+	if requestID == "" {
+		return nil, ErrNotFound
+	}
+	d, err := getRequestDetailOnKey(ctx, s.db, orgID, rowKey)
+	if err != nil {
+		return nil, err
+	}
+	// id is the primary key, so the load already resolved at most one row;
+	// a correlation mismatch (stale link, hand-edited key) is simply not
+	// this path's row. Equivalent to a compound predicate, without forking
+	// the shared projection's parameter layout.
+	if d.RequestID != requestID {
+		return nil, ErrNotFound
+	}
+	return d, nil
+}
+
+// requestDetailRowSelect is the shared authorized detail projection. The
+// WHERE clause is caller-supplied: $1 = org_id, $2 = the row identity (the
+// client correlation for the legacy path, the immutable request_logs.id for
+// the exact-row path), $3 = payload user id, $4 = payload grant, $5 =
+// deny-own-history, $6 = owner-scope eligibility, $7 = originals. A delegated
+// subject pin is appended as $8 by loadRequestDetail.
+const requestDetailRowSelect = `
+	SELECT COALESCE(request_id, ''),
+	       COALESCE(org_id::text, ''),
+	       COALESCE(model_requested, ''),
+	       COALESCE(model_used, ''),
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN COALESCE(upstream_url, '') ELSE '' END,
+	       COALESCE(method, 'POST'),
+	       status_code,
+	       COALESCE(duration_ms, 0),
+	       COALESCE(tokens_in, 0),
+	       COALESCE(tokens_out, 0),
+	       CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN COALESCE(error, '') ELSE '' END,
+	       to_jsonb(created_at),
+	       COALESCE(prompt_hash, ''),
+	       COALESCE(CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN response ELSE NULL END, 'null'::jsonb),
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_request ELSE NULL END,
+	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_response ELSE NULL END,
+	       COALESCE(cache_hit_type, ''),
+	       COALESCE(counterfactual_cost_usd, 0),
+	       COALESCE(cost_in_usd, 0),
+	       COALESCE(classifier_class, ''),
+	       COALESCE(classifier_confidence, 0),
+	       COALESCE(classifier_source, ''),
+	       COALESCE(tier_used, ''),
+	       COALESCE(ab_group, ''),
+	       COALESCE(task_id, ''),
+	       COALESCE(agent_id::text, ''),
+	       COALESCE(session_id::text, ''),
+	       COALESCE(routing_decision, ''),
+	       COALESCE(home_region, ''),
+	       first_token_ms,
+	       attempt_count,
+	       retry_count,
+	       COALESCE(labels, '{}'::jsonb), user_id::text, invocation_id::text
+	FROM request_logs
+	WHERE `
+
 // getRequestDetailOn loads one authorized request detail on the given
-// executor — the pool or an export snapshot transaction — so the export walk
-// reads each detail from the same snapshot its pages came from.
+// executor — the pool or an export snapshot transaction — addressed by the
+// legacy correlation key (org_id + request_id). When several physical rows
+// share the correlation (legitimate per 0028) the database picks one
+// arbitrarily; that ambiguity is inherent to the correlation address itself.
 func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, requestID string) (*RequestDetail, error) {
 	if orgID == "" || requestID == "" {
 		return nil, ErrNotFound
 	}
+	return loadRequestDetail(ctx, ex, "org_id = $1::uuid AND request_id = $2", orgID, requestID, false)
+}
+
+// getRequestDetailOnKey loads one authorized request detail addressed by the
+// immutable request_logs.id row key (org_id + id): the exact-row identity the
+// export walk uses, so every emitted detail is the very row the list page
+// selected even when several rows share the client correlation. Tool facts
+// bind by invocation identity where the row carries one (0030); a legacy
+// NULL-invocation row keeps the correlation-uniqueness guard (see
+// loadRequestDetail).
+func getRequestDetailOnKey(ctx context.Context, ex exportQueryRunner, orgID string, rowKey int64) (*RequestDetail, error) {
+	if orgID == "" || rowKey <= 0 {
+		return nil, ErrNotFound
+	}
+	return loadRequestDetail(ctx, ex, "org_id = $1::uuid AND id = $2::bigint", orgID, rowKey, true)
+}
+
+// loadRequestDetail runs the shared authorized projection under the caller's
+// key predicate and applies the payload boundary decision. guardCorrelation
+// (the exact-row path) additionally guards the LEGACY tool-child association:
+// legacy child rows are keyed by (org_id, request_id) only — a correlation two
+// legitimate invocations may share (0028) — so for a legacy row (no
+// invocation identity) whose org holds more than one row carrying that
+// correlation, child facts are not attributable to this physical row and NONE
+// of them attach rather than silently attaching a sibling invocation's
+// children to both rows. Invocation-bearing rows bind children exactly by
+// invocation identity and need no guard.
+func loadRequestDetail(ctx context.Context, ex exportQueryRunner, keyWhere, orgID string, key interface{}, guardCorrelation bool) (*RequestDetail, error) {
 	access, _ := ctx.Value(requestPayloadAccessKey{}).(RequestPayloadAccess)
 	payloadUserID := access.UserID
 	human := access.SubjectType == "" || access.SubjectType == RequestPayloadHuman
@@ -209,43 +322,8 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	// attribution, and the payload columns additionally require the delegated
 	// payload scope. An explicit deny still overrides the delegation.
 	delegated, payloadGrantSQL := resolveDelegatedRowAccess(access)
-	q := `
-		SELECT COALESCE(request_id, ''),
-		       COALESCE(org_id::text, ''),
-		       COALESCE(model_requested, ''),
-		       COALESCE(model_used, ''),
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN COALESCE(upstream_url, '') ELSE '' END,
-		       COALESCE(method, 'POST'),
-		       status_code,
-		       COALESCE(duration_ms, 0),
-		       COALESCE(tokens_in, 0),
-		       COALESCE(tokens_out, 0),
-		       CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN COALESCE(error, '') ELSE '' END,
-		       to_jsonb(created_at),
-		       COALESCE(prompt_hash, ''),
-		       COALESCE(CASE WHEN NOT $5::boolean AND ($4::boolean OR ($6::boolean AND $3::text <> '' AND user_id::text = $3::text AND agent_id IS NULL AND api_key_id IS NULL)) THEN response ELSE NULL END, 'null'::jsonb),
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_request ELSE NULL END,
-	       CASE WHEN NOT $5::boolean AND $7::boolean THEN upstream_response ELSE NULL END,
-		       COALESCE(cache_hit_type, ''),
-		       COALESCE(counterfactual_cost_usd, 0),
-		       COALESCE(cost_in_usd, 0),
-		       COALESCE(classifier_class, ''),
-		       COALESCE(classifier_confidence, 0),
-		       COALESCE(classifier_source, ''),
-		       COALESCE(tier_used, ''),
-		       COALESCE(ab_group, ''),
-		       COALESCE(task_id, ''),
-		       COALESCE(agent_id::text, ''),
-		       COALESCE(session_id::text, ''),
-		       COALESCE(routing_decision, ''),
-		       COALESCE(home_region, ''),
-		       first_token_ms,
-		       attempt_count,
-		       retry_count,
-		       COALESCE(labels, '{}'::jsonb), user_id::text
-	FROM request_logs
-	WHERE org_id = $1::uuid AND request_id = $2`
-	args := []interface{}{orgID, requestID, payloadUserID, payloadGrantSQL, payloadDeny, payloadOwner, access.Originals}
+	q := requestDetailRowSelect + keyWhere
+	args := []interface{}{orgID, key, payloadUserID, payloadGrantSQL, payloadDeny, payloadOwner, access.Originals}
 	if delegated {
 		// Scope-pin the lookup to the delegated subject's own attribution: a
 		// delegated agent/CI subject can never address another subject's row.
@@ -255,13 +333,14 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	var d RequestDetail
 	var labelsRaw []byte
 	var ownerID *string
+	var invocationID *string
 	err := ex.QueryRow(ctx, q, args...).Scan(
 		&d.RequestID, &d.OrgID, &d.ModelRequested, &d.ModelUsed, &d.UpstreamURL,
 		&d.Method, &d.StatusCode, &d.DurationMs, &d.TokensIn, &d.TokensOut,
 		&d.Error, &d.CreatedAt, &d.PromptHash, &d.Response, &d.UpstreamRequest, &d.UpstreamResponse, &d.CacheHitType,
 		&d.Counterfactual, &d.CostUSD, &d.ClassifierClass, &d.ClassifierConfidence,
 		&d.ClassifierSource, &d.TierUsed, &d.ABGroup, &d.TaskID, &d.AgentID, &d.SessionID,
-		&d.RoutingDecision, &d.HomeRegion, &d.FirstTokenMs, &d.AttemptCount, &d.RetryCount, &labelsRaw, &ownerID,
+		&d.RoutingDecision, &d.HomeRegion, &d.FirstTokenMs, &d.AttemptCount, &d.RetryCount, &labelsRaw, &ownerID, &invocationID,
 	)
 	if err != nil {
 		if IsNotFound(err) {
@@ -274,32 +353,76 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	// it is a v1 model-response envelope; legacy rows and denied/absent
 	// values stay nil (the raw Response field is unchanged either way).
 	d.ResponseView = ParseResponseEnvelope(d.Response)
-	if payloadDeny && payloadOwner && ownerID != nil && *ownerID == payloadUserID {
-		// Deny-own-history removes the resource itself from the caller's view;
-		// returning metadata would still disclose that their history exists.
-		return nil, ErrNotFound
-	}
 	owned := ownerID != nil && payloadOwner && *ownerID == payloadUserID
-	if !owned && !delegated && !access.Grant && !access.OrgWideMetadata {
+	if requestDetailHidden(access, payloadDeny, payloadOwner, owned, delegated, payloadUserID, ownerID) {
 		return nil, ErrNotFound
 	}
+	uniqueCarrier, err := uniqueCorrelationCarrier(ctx, ex, orgID, d.RequestID)
+	if err != nil {
+		return nil, err
+	}
+	return finalizeRequestDetail(ctx, ex, &d, orgID, payloadDeny, owned, payloadGrantSQL, invocationID, uniqueCarrier)
+}
+
+// uniqueCorrelationCarrier reports whether the org holds exactly one
+// request_logs row carrying this correlation: the precondition for
+// associating NULL-invocation tool facts (legacy rows, or facts a pre-0030
+// writer mode emitted for a minted request) with that row. An empty/NULL
+// correlation can never be unique-carrier (tool facts carry NOT NULL
+// request_ids and cannot reference it at all).
+func uniqueCorrelationCarrier(ctx context.Context, ex exportQueryRunner, orgID, requestID string) (bool, error) {
+	if requestID == "" {
+		return false, nil
+	}
+	var correlated int
+	if err := ex.QueryRow(ctx,
+		"SELECT COUNT(*) FROM request_logs WHERE org_id = $1::uuid AND request_id = $2",
+		orgID, requestID).Scan(&correlated); err != nil {
+		return false, fmt.Errorf("request detail correlation count: %w", err)
+	}
+	return correlated == 1, nil
+}
+
+// finalizeRequestDetail returns the finished detail: without payload
+// authorization it returns metadata only — empty child lists, never related
+// payload rows.
+func finalizeRequestDetail(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, payloadDeny, owned, payloadGrantSQL bool, invocationID *string, uniqueCarrier bool) (*RequestDetail, error) {
 	if payloadDeny || (!owned && !payloadGrantSQL) {
-		// Return metadata without selecting related payload rows. The main-row
-		// projection above also returns only redacted payload columns.
 		d.ToolCalls = []RequestToolCall{}
 		d.ToolCallInvocations = []RequestToolCallInvocation{}
-		return &d, nil
+		return d, nil
 	}
-	// Tool calls recorded for this request, org-scoped exactly like the row
-	// above. Sourced from the tool_calls table (populated pre-truncation by
-	// loggerd), so names survive when the stored upstream_response sample is
-	// cut before the tool-call fragments. An empty result is a valid "none
-	// recorded" state; a transport/scan failure is surfaced, not swallowed.
+	return attachRequestChildren(ctx, ex, d, orgID, invocationID, uniqueCarrier)
+}
+
+// requestDetailHidden enforces the post-load visibility boundary: an explicit
+// deny-own-history removes the caller's own resource entirely (metadata would
+// still disclose that their history exists), and a caller holding neither
+// ownership, delegation, grant nor org-wide metadata sees nothing at all —
+// ErrNotFound both ways, so existence never leaks.
+func requestDetailHidden(access RequestPayloadAccess, payloadDeny, payloadOwner, owned, delegated bool, payloadUserID string, ownerID *string) bool {
+	if payloadDeny && payloadOwner && ownerID != nil && *ownerID == payloadUserID {
+		return true
+	}
+	return !owned && !delegated && !access.Grant && !access.OrgWideMetadata
+}
+
+// attachRequestChildren loads the tool facts for d — the distinct tool names
+// and the per-occurrence invocations — org-scoped exactly like the main row,
+// sourced pre-truncation by loggerd. The bind predicate is the single
+// association rule of this package (toolFactMatchesRow, 0030): invocation-
+// bearing facts bind exactly to their own invocation ($3, NULL = never), and
+// NULL-invocation facts (legacy, or pre-0030 writer mode) bind only when
+// this row is the org's unique carrier of the correlation ($4). An empty
+// result is a valid "none recorded" state; a transport/scan failure is
+// surfaced, not swallowed.
+func attachRequestChildren(ctx context.Context, ex exportQueryRunner, d *RequestDetail, orgID string, invocationID *string, uniqueCarrier bool) (*RequestDetail, error) {
 	d.ToolCalls = []RequestToolCall{}
 	tcRows, err := ex.Query(ctx, `
 		SELECT tool_name FROM tool_calls
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY id`, orgID, requestID)
+		  AND (invocation_id = $3::uuid OR (invocation_id IS NULL AND $4::boolean))
+		ORDER BY id`, orgID, d.RequestID, invocationID, uniqueCarrier)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool calls: %w", err)
 	}
@@ -314,13 +437,15 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	if err := tcRows.Err(); err != nil {
 		return nil, fmt.Errorf("request detail tool calls rows: %w", err)
 	}
-	// Per-occurrence invocations with arguments (0014), same org scoping.
-	// Rows only exist for post-0014 requests; empty = legacy/sample-only.
+	// Per-occurrence invocations with arguments (0014), same org scoping and
+	// association rule as the distinct-name query above. Rows only exist for
+	// post-0014 requests; empty = legacy/sample-only.
 	d.ToolCallInvocations = []RequestToolCallInvocation{}
 	invRows, err := ex.Query(ctx, `
 		SELECT seq, call_id, tool_name, arguments FROM tool_call_invocations
 		WHERE org_id = $1::uuid AND request_id = $2
-		ORDER BY seq, id`, orgID, requestID)
+		  AND (invocation_id = $3::uuid OR (invocation_id IS NULL AND $4::boolean))
+		ORDER BY seq, id`, orgID, d.RequestID, invocationID, uniqueCarrier)
 	if err != nil {
 		return nil, fmt.Errorf("request detail tool call invocations: %w", err)
 	}
@@ -335,5 +460,5 @@ func getRequestDetailOn(ctx context.Context, ex exportQueryRunner, orgID, reques
 	if err := invRows.Err(); err != nil {
 		return nil, fmt.Errorf("request detail tool call invocations rows: %w", err)
 	}
-	return &d, nil
+	return d, nil
 }

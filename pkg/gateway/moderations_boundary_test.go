@@ -90,6 +90,9 @@ func TestModerations_OversizedResponse(t *testing.T) {
 	if errorType(t, rec) != "api_error" || !strings.Contains(rec.Body.String(), "upstream response too large") {
 		t.Fatalf("body %s", rec.Body.String())
 	}
+	if hint := rec.Result().Header.Get("X-Should-Retry"); hint != "false" {
+		t.Fatalf("retry hint %q after oversized provider response", hint)
+	}
 }
 
 // TestModerations_BodyTooLargeThroughMaxBody: a body past the 10 MiB global

@@ -2,13 +2,14 @@ package cli
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/binary"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"log/slog"
 	"math"
-	"math/rand"
 	"net/http"
 	"strconv"
 	"strings"
@@ -68,6 +69,10 @@ type chatContext struct {
 	orgID, teamID, apiKeyID            string
 	sessionID, taskID, agentID, userID string
 
+	// invocation is the Preview2 durable-accounting holder minted at the
+	// shared admission core; stashed on the request context below.
+	invocation *invocationIdentity
+
 	// Candidate state: what the client asked for and what will be called.
 	requestedModel  string
 	unknownFallback bool
@@ -111,6 +116,7 @@ type chatContext struct {
 //	executeChatJSON       breaker + per-model retry + fallback chain
 //	finalizeChatJSON      usage/accounting, events, cache write, response
 func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
+	// Keep the entry context; admission updates *r with request-scoped labels.
 	ctx := r.Context()
 	cc, ok := gw.normalizeChatRequest(w, r)
 	if !ok {
@@ -122,41 +128,52 @@ func (gw *gateway) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// release before the batch executor's next in-process line, which made
 	// every N>Capacity line shed on the batch path.
 	defer cc.fairTicket.Release()
-	if !gw.routeChatCandidate(ctx, cc) {
-		return
-	}
-	if !gw.enforceChatPolicy(ctx, cc) {
-		return
-	}
-	// OP-8: unified policy-pipeline run point (pre-upstream, before any
-	// forward or cache branch). One call site for the whole chat JSON path;
-	// the SSE branch carries the OP-4 streaming stubs instead.
-	if !gw.policyPreChat(ctx, cc) {
-		return
-	}
-	ctx = withRequestPolicyEntryOutcome(ctx, cc.r, gw.policyRuntime, cc.orgID)
-	// request context so every downstream routing site sees it.
-	ctx = withRequestRouteHint(ctx, cc.r)
-	// org's compiled policies (X-Policy-Judge-Version), before any response
-	// bytes (the cache branch below may answer directly). No extra store
-	// read: the request-scoped policy outcome was just stamped above.
-	gw.setJudgeVersionHeader(ctx, w, cc.orgID)
-	// NEXT-18c (ADR-0001 §5.1): reservation pre-check after route+policy and
-	// BEFORE the cache lookup — a cache hit at exhaustion must be denied too
-	// (D7). The gate rides the context for the finalize stages below.
-	gate, ok := gw.reservationPlan(w, r, "chat.completions",
-		gw.reservationRequest(ctx, cc.orgID, cc.teamID, cc.agentID, headerSessionKeyID(r), cc.info, cc.body, reservationMaxTokens(cc.req.MaxTokens), false))
+	ctx, gate, ok := gw.prepareChatDispatch(ctx, w, r, cc)
 	if !ok {
 		return
 	}
-	ctx = withReservationGate(ctx, gate)
 	if gw.serveChatCache(ctx, cc) {
 		return
 	}
-	// Cache miss: reserve locally (granting from Postgres on shortage).
-	if !gate.reserve(ctx) {
+	if !gw.confirmChatDispatch(ctx, cc, gate) {
 		return
 	}
+	gw.dispatchChatCompletion(ctx, cc)
+}
+
+func (gw *gateway) prepareChatDispatch(ctx context.Context, w http.ResponseWriter, r *http.Request, cc *chatContext) (context.Context, *reservationGate, bool) {
+	if !gw.routeChatCandidate(ctx, cc) || !gw.enforceChatPolicy(ctx, cc) || !gw.policyPreChat(ctx, cc) {
+		return nil, nil, false
+	}
+	ctx = withInvocationIdentity(ctx, cc.invocation)
+	ctx = withRequestPolicyEntryOutcome(ctx, cc.r, gw.policyRuntime, cc.orgID)
+	ctx = withRequestRouteHint(ctx, cc.r)
+	gw.setJudgeVersionHeader(ctx, w, cc.orgID)
+	// Plan before cache lookup so cache hits cannot bypass exhausted budgets.
+	gate, ok := gw.reservationPlan(w, r, "chat.completions",
+		gw.reservationRequest(ctx, cc.orgID, cc.teamID, cc.agentID, headerSessionKeyID(r), cc.info, cc.body, reservationMaxTokens(cc.req.MaxTokens), false))
+	if !ok {
+		return nil, nil, false
+	}
+	return withReservationGate(ctx, gate), gate, true
+}
+
+func (gw *gateway) confirmChatDispatch(ctx context.Context, cc *chatContext, gate *reservationGate) bool {
+	if !gate.reserve(ctx) {
+		return false
+	}
+	// Confirm the start after reservation and before the first paid provider call.
+	if err := gw.confirmPaidInvocation(ctx, invocationKindForChat(cc.req.Stream)); err != nil {
+		// A failed or unknown start must release the local reservation before refusal.
+		gate.finalizeNoEvent(budget.TerminationPolicyDenied)
+		cc.l.Warn("refusing paid dispatch: durable start unwritten", "error", err)
+		writeInvocationStartRefusal(cc.w, err)
+		return false
+	}
+	return true
+}
+
+func (gw *gateway) dispatchChatCompletion(ctx context.Context, cc *chatContext) {
 	if cc.req.Stream {
 		// Cache hits (including for streaming clients) were served in the
 		// RT-05 cache branch above; here the request always goes upstream.
@@ -191,44 +208,16 @@ func (gw *gateway) policyPreChat(_ context.Context, cc *chatContext) bool {
 	return true
 }
 
-// normalizeChatRequest (stage 1) reads the body, funnels the shared
-// pre-routing admission core (guards → typed-projection rebuild → model
-// resolution → unknown-model policy → task tag → whitelist → budgets — the
-// the chat-specific post-admission steps: request validation and the vertical
-// transform. A false result means the request was answered terminally inside
-// the stage.
+// normalizeChatRequest admits the guarded body, validates its typed projection,
+// and applies the chat-specific vertical transform before routing.
 func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) (*chatContext, bool) {
 	l := logctx.From(r.Context(), gw.log)
 	reqID := logctx.RequestID(r.Context())
-
-	raw, err := io.ReadAll(r.Body)
-	if err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"request body too large or malformed")
+	raw, req, ok := readChatRequest(w, r)
+	if !ok {
 		return nil, false
 	}
-
-	var req openai.ChatCompletionRequest
-	if err := json.Unmarshal(raw, &req); err != nil {
-		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-			"malformed JSON: "+err.Error())
-		return nil, false
-	}
-
-	// RT-04: rebuild the typed projection from the GUARDED body. Every
-	// downstream consumer (validation, verticals, classifier, cache key,
-	// events, forwarding) must agree with the payload that will actually be
-	// forwarded; a pre-guard projection would leak removed secrets back into
-	// the upstream payload and hide the guard's rewrites.
-	core, ok := gw.admissionCore(w, r, l, admissionCoreInput{
-		Model: req.Model,
-		Body:  raw,
-		Rebuild: func(body []byte) error {
-			return json.Unmarshal(body, &req)
-		},
-		// The chat budget event historically carries the key owner.
-		BudgetEventUser: true,
-	})
+	core, ok := gw.admitChatProjection(w, r, l, raw, &req)
 	if !ok {
 		return nil, false
 	}
@@ -257,77 +246,114 @@ func (gw *gateway) normalizeChatRequest(w http.ResponseWriter, r *http.Request) 
 		agentID:        core.AgentID,
 		userID:         core.UserID,
 		fairTicket:     core.FairTicket,
+		invocation:     core.Invocation,
 	}
 
 	l.Debug("chat request", "model", cc.model, "session", cc.sessionID, "org", cc.orgID, "msgs", len(req.Messages))
 
-	if apiErr, statusCode := validator.ValidateRequest(req); apiErr != nil {
-		validator.WriteError(w, apiErr, statusCode)
-		publishEvent(gw.publisher, l, eventBase{ //nolint:contextcheck // publishEvent creates its own timeout context internally — standard pattern in gateway
-			EventType:      "request.invalid",
-			RequestID:      reqID,
-			SessionID:      cc.sessionID,
-			Payload:        string(cc.body),
-			OrgID:          cc.orgID,
-			TeamID:         cc.teamID,
-			ModelRequested: cc.requestedModel,
-			Error:          apiErr.Error.Message,
-			Labels:         labelsFrom(r.Context()),
-		}.build())
+	if !gw.validateChatProjection(r.Context(), l, reqID, cc) {
 		return nil, false
 	}
-
-	// PC2: Run vertical pack PreTransform (compliance checks + data masking).
-	if gw.verticalReg != nil && cc.orgID != "" {
-		vReq := verticals.Request{
-			OrgID:          cc.orgID,
-			ModelRequested: cc.requestedModel,
-			Prompt:         extractUserPrompt(req.Messages),
-			SystemPrompt:   extractSystemMessage(req.Messages),
-			Metadata:       make(map[string]string),
-		}
-		newCtx, newIn, err := gw.verticalReg.PreTransform(r.Context(), cc.orgID, vReq)
-		if err != nil {
-			l.Warn("vertical transform denied request", "error", err, "org_id", cc.orgID)
-			apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
-				fmt.Sprintf("compliance check failed: %s", err))
-			return nil, false
-		}
-
-		// Propagate context from vertical transform (may carry metadata for downstream).
-		r = r.WithContext(newCtx)
-		cc.r = r
-
-		originalPrompt := extractUserPrompt(req.Messages)
-		// RT-04: if the prompt was redacted/modified by a vertical, patch the
-		// GUARDED raw JSON in place. Re-serializing the typed projection here
-		// would restore pre-guard content (removed secrets) and drop unknown
-		// provider fields; the raw patch touches only the last message's
-		// content and keeps everything else byte-for-byte.
-		if newIn.Prompt != originalPrompt {
-			patched, perr := patchLastMessageContent(cc.body, newIn.Prompt)
-			if perr != nil {
-				l.Warn("vertical prompt patch failed", "error", perr, "org_id", cc.orgID)
-				apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-					"failed to apply vertical transform to request body")
-				return nil, false
-			}
-			// Keep the typed projection consistent with the patched payload
-			// for classifier, events and forwarding below.
-			if uerr := json.Unmarshal(patched, &cc.req); uerr != nil {
-				l.Warn("vertically patched body is not a valid chat completion request", "error", uerr, "org_id", cc.orgID)
-				apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-					"malformed JSON: "+uerr.Error())
-				return nil, false
-			}
-			cc.body = patched
-			for k, v := range newIn.Metadata {
-				r.Header.Set("X-Vertical-"+k, v)
-			}
-		}
+	if !gw.transformChatProjection(r.Context(), w, cc) {
+		return nil, false
 	}
-
 	return cc, true
+}
+
+func readChatRequest(w http.ResponseWriter, r *http.Request) ([]byte, openai.ChatCompletionRequest, bool) {
+	raw, err := io.ReadAll(r.Body)
+	if err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"request body too large or malformed")
+		return nil, openai.ChatCompletionRequest{}, false
+	}
+	var req openai.ChatCompletionRequest
+	if err := json.Unmarshal(raw, &req); err != nil {
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"malformed JSON: "+err.Error())
+		return nil, openai.ChatCompletionRequest{}, false
+	}
+	return raw, req, true
+}
+
+func (gw *gateway) admitChatProjection(w http.ResponseWriter, r *http.Request, l *slog.Logger, raw []byte, req *openai.ChatCompletionRequest) (admissionCore, bool) {
+	// Rebuild the typed view from guarded bytes before downstream consumers run.
+	return gw.admissionCore(w, r, l, admissionCoreInput{
+		Model: req.Model,
+		Body:  raw,
+		Rebuild: func(body []byte) error {
+			return json.Unmarshal(body, req)
+		},
+		BudgetEventUser: true,
+	})
+}
+
+func (gw *gateway) validateChatProjection(ctx context.Context, l *slog.Logger, reqID string, cc *chatContext) bool {
+	apiErr, statusCode := validator.ValidateRequest(cc.req)
+	if apiErr == nil {
+		return true
+	}
+	validator.WriteError(cc.w, apiErr, statusCode)
+	publishEventWithContext(ctx, gw.publisher, l, eventBase{
+		EventType:      "request.invalid",
+		RequestID:      reqID,
+		SessionID:      cc.sessionID,
+		Payload:        string(cc.body),
+		OrgID:          cc.orgID,
+		TeamID:         cc.teamID,
+		ModelRequested: cc.requestedModel,
+		Error:          apiErr.Error.Message,
+		Labels:         labelsFrom(ctx),
+	}.build())
+	return false
+}
+
+func (gw *gateway) transformChatProjection(ctx context.Context, w http.ResponseWriter, cc *chatContext) bool {
+	if gw.verticalReg == nil || cc.orgID == "" {
+		return true
+	}
+	request := verticals.Request{
+		OrgID:          cc.orgID,
+		ModelRequested: cc.requestedModel,
+		Prompt:         extractUserPrompt(cc.req.Messages),
+		SystemPrompt:   extractSystemMessage(cc.req.Messages),
+		Metadata:       make(map[string]string),
+	}
+	newCtx, transformed, err := gw.verticalReg.PreTransform(ctx, cc.orgID, request)
+	if err != nil {
+		cc.l.Warn("vertical transform denied request", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusForbidden, apierrors.ErrorCodePermissionDenied,
+			fmt.Sprintf("compliance check failed: %s", err))
+		return false
+	}
+	cc.r = cc.r.WithContext(newCtx)
+	return applyChatVerticalResult(w, cc, transformed)
+}
+
+func applyChatVerticalResult(w http.ResponseWriter, cc *chatContext, transformed verticals.Request) bool {
+	originalPrompt := extractUserPrompt(cc.req.Messages)
+	if transformed.Prompt == originalPrompt {
+		return true
+	}
+	// Patch only message content so guarded fields and unknown provider keys survive.
+	patched, err := patchLastMessageContent(cc.body, transformed.Prompt)
+	if err != nil {
+		cc.l.Warn("vertical prompt patch failed", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"failed to apply vertical transform to request body")
+		return false
+	}
+	if err := json.Unmarshal(patched, &cc.req); err != nil {
+		cc.l.Warn("vertically patched body is not a valid chat completion request", "error", err, "org_id", cc.orgID)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			"malformed JSON: "+err.Error())
+		return false
+	}
+	cc.body = patched
+	for key, value := range transformed.Metadata {
+		cc.r.Header.Set("X-Vertical-"+key, value)
+	}
+	return true
 }
 
 // routeChatCandidate (stage 2) resolves the candidate that will be called:
@@ -784,192 +810,15 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 	if err := gw.checkBreaker(); err != nil {
 		l.Error("circuit breaker open, rejecting request", "error", err)
 		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		gw.voidUndispatchedInvocation(ctx, l)
 		apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
 		return nil, false
 	}
 
-	// RT-03: trusted identity captured once — every provider attempt below
-	// (primary and every fallback hop) is gated under the same identity.
-	gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
-
-	// Per-model retry + fallback: retry.Do handles transient errors against a
-	// single upstream; fallbackExecutor walks the failover_models chain when
-	// retry is exhausted (or the error is non-retryable per classifier).
-	type respHolder struct {
-		body    []byte
-		info    resolver.ModelInfo
-		headers http.Header
-		sent    []byte           // what actually went upstream (post model override)
-		orgUse  orgCredentialUse // winning hop's org credential (BYOK); zero = none
-	}
-	var holder respHolder
-
-	// totalRetries accumulates intra-model retries across all fallback hops
-	// (observability parity: Bifrost-style retry accounting per request).
-	var totalRetries int
-
-	// number of chain attempts, EVERY candidate's circuit is open and the
-	// request terminates with the same 503 envelope the global-scope entry
-	// gate produces (per-endpoint parity, see below).
+	ex := new(chatExecution)
 	var openRejections atomic.Int32
-
 	perModel := func(ctx context.Context, mi resolver.ModelInfo) (int, error) {
-		// Cancellation is terminal before anything else: gating with a dead
-		// context would misreport the cancel as a policy-store outage.
-		if err := ctx.Err(); err != nil {
-			return 0, err
-		}
-		// RT-03: every actual provider attempt re-passes the shared gate. A
-		// policy denial/unavailable is chain-terminal (router.PolicyError) —
-		// the transport fallback must not route around a policy decision.
-		mi, pol := gw.gateAttemptCandidate(ctx, gateID, cc.req.Model, mi)
-		if pol != nil {
-			return pol.Status, pol
-		}
-		url := gw.upstreamURL(mi)
-		// breaker. An open primary circuit fails this hop immediately
-		// (retryable) so the chain advances to a candidate on another
-		// endpoint, whose breaker is independent; only when every candidate's
-		// breaker is open does the request terminate with 503. In global
-		// scope this is a no-op (the entry checkBreaker gate rules).
-		if berr := gw.allowEndpoint(url); berr != nil {
-			openRejections.Add(1)
-			return http.StatusServiceUnavailable, berr
-		}
-		// W-BYOK-CORE: request path resolves the credential in priority
-		// order — org credential (BYOK) → this candidate's per-model
-		// upstream_api_key → global default (see resolveUpstreamKey). An
-		// infrastructure failure while the org plausibly holds a credential
-		// for this endpoint is fail-closed (never route the GLOBAL key to an
-		// org-registered endpoint).
-		key, use, kerr := gw.resolveUpstreamKey(ctx, cc.orgID, mi)
-		if kerr != nil {
-			return 0, kerr
-		}
-
-		// Reasoning-effort injection (v15 E1, opt-in): per-model body, after
-		// the cache lookup, so the cache key is unchanged. The retry body
-		// stays fwdBody for this attempt.
-		fwdBody := gw.maybeInjectEffort(cc.body, mi, classifier.Class(cc.classifierClass))
-		if eff := gw.effortForModel(mi.ModelName); eff != "" {
-			cc.dec.Effort = eff
-		}
-
-		start := time.Now()
-		client, perr := gw.pool.Get(url, mi.Provider)
-		if perr != nil {
-			// Pool initialisation failure (unknown provider / SSRF-allowlist
-			// violation) is a configuration error, not transient: no retries —
-			return http.StatusBadGateway, fmt.Errorf("upstream client for %s: %w", mi.Provider, perr)
-		}
-		var attemptNum int // tracks how many times the retry loop has run
-		res := retry.Do(ctx, chatRetryPolicy(gw.retryPolicy), func(ctx context.Context) retry.Result {
-			attemptNum++
-			hdrs, b, sentBody, ferr := client.ForwardJSONCapturing(ctx, fwdBody, mi.ModelName, key, mi.UpstreamTimeout)
-			if ferr != nil {
-				if capErr, ok := provider.Refusal(ferr); ok {
-					// Adapter capability refusal: the feature check failed
-					// before any byte left the gateway. Client-shaped 400 on
-					// a terminal policy carrier — no retry, no failover to
-					// another model (no silent downgrade), no breaker or
-					// credential penalty, no upstream accounting.
-					return retry.Result{
-						StatusCode: http.StatusBadRequest,
-						Err:        capabilityPolicy(capErr),
-						Safety:     retry.OutcomeNotExecuted,
-					}
-				}
-				// Real upstream/transport failure. Carry the failed attempt's
-				// headers (nil for refusals / not-sent) so Retry-After hints
-				// feed the retry scheduler; Status/Err/Safety semantics below
-				// are unchanged.
-				result := retry.Result{StatusCode: extractUpstreamStatus(ferr), Err: ferr, Headers: upstreamFailureHeaders(ferr)}
-				switch {
-				case result.StatusCode > 0 || retry.DefinitelyNotSent(ferr):
-					result.Safety = retry.OutcomeNotExecuted
-				case provider.IsUnsupportedFeature(ferr):
-					// N07-P05-T02: a deterministic pre-flight capability
-					// rejection (image part / unmapped content-part type).
-					// Proof of non-execution, but never same-candidate
-					// retryable (the answer cannot change) — keep the typed
-					// error unwrapped so the terminal handler answers an
-					// explicit 400 unsupported_feature instead of the opaque
-					// upstream_outcome_unknown 502.
-				case retry.IsRequestNotSent(ferr):
-					// Translate-layer refusal (N07-P01-T05): typed proof the
-					// request never left this process. Safety intentionally
-					// stays Unknown — MayRepeat forbids repeating Unknown
-					// attempts (a deterministic refusal must not be retried),
-					// while the router classifier still sees NotExecuted via
-					// retry.Classify and advances the fallback chain. The
-					// error stays unwrapped so the terminal render can
-					// errors.As the typed proof and surface the exact reason.
-				default:
-					result.Err = unknownOutcomeError(ferr)
-				}
-				return result
-			}
-			holder.sent = sentBody
-			return retry.Result{StatusCode: http.StatusOK, Headers: hdrs, Body: b}
-		})
-
-		// Capability refusals ride the terminal policy carrier: nothing was
-		// sent, the chain stops here, and no upstream accounting applies —
-		// skip the metrics/quarantine/breaker path below entirely.
-		var capPolicyErr *router.PolicyError
-		if res.Err != nil && errors.As(res.Err, &capPolicyErr) {
-			return res.StatusCode, res.Err
-		}
-
-		// Emit metrics for the attempt. Usage is parsed from body on success.
-		var u provider.Usage
-		if res.Err == nil && len(res.Body) > 0 {
-			u = client.Adapter().ParseUsage(res.Body)
-		}
-		ext := provider.ComputeCost(u, mi.Provider, mi.ModelName)
-		gw.emitUpstreamMetrics(mi.Provider, mi.ModelName, res.StatusCode, time.Since(start), u, ext.EstimatedCostUSD)
-
-		// Emit retry_total for retries that occurred (attemptNum > 1 means
-		// at least one retry was performed). The attempt label is the number
-		// of the retry (1 = first retry, 2 = second retry, ...).
-		if attemptNum > 1 {
-			statusLabel := strconv.Itoa(res.StatusCode)
-			if res.Err != nil && res.StatusCode == 0 {
-				statusLabel = "0"
-			}
-			for r := 1; r < attemptNum; r++ {
-				metrics.RetryTotal.WithLabelValues(strconv.Itoa(r), statusLabel).Inc()
-			}
-		}
-		totalRetries += attemptNum - 1
-
-		// — a 401/429 quarantines the CREDENTIAL that authenticated this
-		// hop (never the endpoint breaker). Bookkeeping only: it can never
-		// fail the request, and the hop's already-resolved plaintext is
-		// unaffected.
-		gw.recordOrgCredOutcome(ctx, cc.orgID, mi.Provider, use, res.StatusCode)
-
-		if res.Err == nil && res.StatusCode < 500 {
-			// (per-endpoint scope; no-op in global scope).
-			gw.recordEndpointSuccess(url)
-			holder.body = res.Body
-			holder.info = mi
-			holder.headers = res.Headers
-			holder.orgUse = use
-			return res.StatusCode, nil
-		}
-		// endpoint the chain touches (per-endpoint scope; no-op in global).
-		// A translate-layer refusal (N07-P01-T05) never contacted the
-		// endpoint — counting it as an endpoint failure would trip the
-		// breaker on a client-side request problem.
-		if !retry.IsRequestNotSent(res.Err) {
-			gw.recordEndpointFailure(url)
-		}
-		errOut := res.Err
-		if errOut == nil {
-			errOut = fmt.Errorf("upstream error %d", res.StatusCode)
-		}
-		return res.StatusCode, errOut
+		return gw.tryChatModel(ctx, cc, mi, ex, &openRejections)
 	}
 
 	start := time.Now()
@@ -991,68 +840,7 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 	finalURL := gw.upstreamURL(finalInfo)
 
 	if lastErr != nil {
-		// N07-P05-T02 (order restored by N07-RECON): a media-capability
-		// rejection (image part on an adapter without image input, unmapped
-		// content-part type) is a CLIENT format error the adapter raised
-		// before any byte left the gateway. The typed branch is matched
-		// BEFORE the plain request-not-sent branch: the translate seam wraps
-		// the refusal in retry.RequestNotSentError, and the refusal must
-		// render 400 unsupported_feature with the adapter's exact reason —
-		// never an opaque 5xx, no breaker penalty, and no analytics event
-		// (the escrow settles locally; parity with the policy-denial path).
-		var unsupportedFeatureErr *provider.UnsupportedFeatureError
-		if errors.As(lastErr, &unsupportedFeatureErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			l.Warn("provider adapter rejected unsupported request feature",
-				"error", lastErr, "attempts", len(attempts))
-			apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
-				unsupportedFeatureErr.Error(), apierrors.CodeUnsupportedFeature)
-			return nil, false
-		}
-		// N07-P01-T05: a translate-layer refusal is a client-side request
-		// problem — the request never reached any endpoint, so the exact
-		// reason (which modeled field was lost, and why) renders as 400
-		// invalid_request_error, never disguised as a generic upstream
-		// failure (I51: no silent drop, and no misleading status). Typed
-		// unsupported-feature refusals are matched by the dedicated branch
-		// above.
-		var notSentErr *retry.RequestNotSentError
-		if errors.As(lastErr, &notSentErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
-			apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, notSentErr.Error())
-			return nil, false
-		}
-		// RT-03: a terminal policy outcome from a fallback hop ends the
-		// request with the gate envelope. The denied candidate was never
-		// called, so this is not an upstream failure: no provider error
-		// mapping and no circuit-breaker penalty.
-		var policyErr *router.PolicyError
-		var unknownErr *unknownOutcomeErrorType
-		if errors.As(lastErr, &unknownErr) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
-			status := lastCode
-			if status < 400 {
-				status = http.StatusBadGateway
-			}
-			apierrors.Write(w, status, apierrors.ErrorCodeAPI, "upstream outcome unknown; request was not retried")
-			return nil, false
-		}
-		if errors.As(lastErr, &policyErr) {
-			// NEXT-18c: no analytics event is published on this path — settle
-			// the local escrow (zero spend, in-flight bound released).
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			writeGateDenial(w, gateResultFromPolicy(policyErr))
-			return nil, false
-		}
-
-		// parity of the global-scope entry rejection: same 503 envelope, no
-		// analytics event, the escrow settles locally. No endpoint was
-		// dialed, so this is not an upstream failure to record.
-		if lastCode == http.StatusServiceUnavailable && int(openRejections.Load()) == len(attempts) {
-			reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
-			l.Error("circuit breaker open, rejecting request (all candidate endpoints open)",
-				"attempts", len(attempts))
-			apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
+		if gw.rejectChatAttempt(ctx, cc, lastErr, lastCode, len(attempts), int(openRejections.Load())) {
 			return nil, false
 		}
 
@@ -1081,18 +869,18 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 			ClassifierConfidence: cc.classifierConfidence,
 			ClassifierSource:     cc.classifierSource,
 			AttemptCount:         len(attempts),
-			RetryCount:           totalRetries,
+			RetryCount:           ex.totalRetries,
 			Labels:               labelsFrom(ctx),
 		}
 		// NEXT-18c: the reserve tuples ride the failure event (§5.3
 		// Finalize); no usage accrued — the worker bills nothing and the
 		// idle return sweeps the escrow.
-		gw.finishRequest(ctx, requestFinish{
+		gw.finishRequestLogged(ctx, cc.l, requestFinish{
 			base:        errBase,
 			attestModel: finalInfo.ModelName,
 			info:        finalInfo,
 			termination: budget.TerminationUpstreamErr,
-		}, nil)
+		})
 
 		httpStatus, errType, errCode, errMsg := gw.mapProviderUpstream(finalInfo.Provider, lastCode, lastErr)
 		// RATELIMIT-FALLBACK P2: on a decision-bearing upstream rate limit,
@@ -1109,19 +897,244 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 		return nil, false
 	}
 
-	return &chatExecution{
-		body:         holder.body,
-		sent:         holder.sent,
-		headers:      holder.headers,
-		finalInfo:    finalInfo,
-		finalURL:     finalURL,
-		durationMs:   durationMs,
-		attempts:     len(attempts),
-		totalRetries: totalRetries,
-		lastCode:     lastCode,
-		usedOrgKey:   holder.orgUse.used,
-		orgCredRef:   holder.orgUse.ref(),
-	}, true
+	ex.finalInfo, ex.finalURL = finalInfo, finalURL
+	ex.durationMs, ex.attempts, ex.lastCode = durationMs, len(attempts), lastCode
+	return ex, true
+}
+
+func (gw *gateway) tryChatModel(ctx context.Context, cc *chatContext, mi resolver.ModelInfo, ex *chatExecution, openRejections *atomic.Int32) (int, error) {
+	// Cancellation is terminal before anything else: gating with a dead
+	// context would misreport the cancel as a policy-store outage.
+	if err := ctx.Err(); err != nil {
+		return 0, err
+	}
+	// RT-03: every actual provider attempt re-passes the shared gate. A
+	// policy denial/unavailable is chain-terminal (router.PolicyError) —
+	// the transport fallback must not route around a policy decision.
+	mi, pol := gw.gateAttemptCandidate(ctx, candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}, cc.req.Model, mi)
+	if pol != nil {
+		return pol.Status, pol
+	}
+	url := gw.upstreamURL(mi)
+	// breaker. An open primary circuit fails this hop immediately
+	// (retryable) so the chain advances to a candidate on another
+	// endpoint, whose breaker is independent; only when every candidate's
+	// breaker is open does the request terminate with 503. In global
+	// scope this is a no-op (the entry checkBreaker gate rules).
+	if berr := gw.allowEndpoint(url); berr != nil {
+		openRejections.Add(1)
+		return http.StatusServiceUnavailable, berr
+	}
+	// W-BYOK-CORE: request path resolves the credential in priority
+	// order — org credential (BYOK) → this candidate's per-model
+	// upstream_api_key → global default (see resolveUpstreamKey). An
+	// infrastructure failure while the org plausibly holds a credential
+	// for this endpoint is fail-closed (never route the GLOBAL key to an
+	// org-registered endpoint).
+	key, use, kerr := gw.resolveUpstreamKey(ctx, cc.orgID, mi)
+	if kerr != nil {
+		return 0, kerr
+	}
+
+	// Reasoning-effort injection (v15 E1, opt-in): per-model body, after
+	// the cache lookup, so the cache key is unchanged. The retry body
+	// stays fwdBody for this attempt.
+	fwdBody := gw.maybeInjectEffort(cc.body, mi, classifier.Class(cc.classifierClass))
+	if eff := gw.effortForModel(mi.ModelName); eff != "" {
+		cc.dec.Effort = eff
+	}
+
+	start := time.Now()
+	client, perr := gw.pool.Get(url, mi.Provider)
+	if perr != nil {
+		// Pool initialisation failure (unknown provider / SSRF-allowlist
+		// violation) is a configuration error, not transient: no retries —
+		return http.StatusBadGateway, fmt.Errorf("upstream client for %s: %w", mi.Provider, perr)
+	}
+	var attemptNum int // tracks how many times the retry loop has run
+	res := retry.Do(ctx, chatRetryPolicy(gw.retryPolicy), func(ctx context.Context) retry.Result {
+		attemptNum++
+		return forwardChatAttempt(ctx, client, fwdBody, mi, key, ex)
+	})
+
+	// Capability refusals ride the terminal policy carrier: nothing was
+	// sent, the chain stops here, and no upstream accounting applies —
+	// skip the metrics/quarantine/breaker path below entirely.
+	var capPolicyErr *router.PolicyError
+	if res.Err != nil && errors.As(res.Err, &capPolicyErr) {
+		return res.StatusCode, res.Err
+	}
+
+	gw.recordChatAttemptMetrics(client, mi, res, attemptNum, start)
+	ex.totalRetries += attemptNum - 1
+
+	gw.recordOrgCredOutcome(ctx, cc.orgID, mi.Provider, use, res.StatusCode)
+
+	return gw.finishChatHop(url, res, use, ex)
+}
+
+func forwardChatAttempt(ctx context.Context, client *upstream.Client, fwdBody []byte, mi resolver.ModelInfo, key string, ex *chatExecution) retry.Result {
+	hdrs, b, sentBody, ferr := client.ForwardJSONCapturing(ctx, fwdBody, mi.ModelName, key, mi.UpstreamTimeout)
+	if ferr != nil {
+		return chatRetryError(ferr)
+	}
+	ex.sent = sentBody
+	return retry.Result{StatusCode: http.StatusOK, Headers: hdrs, Body: b}
+}
+
+func chatRetryError(ferr error) retry.Result {
+	if capErr, ok := provider.Refusal(ferr); ok {
+		// Adapter capability refusal: the feature check failed
+		// before any byte left the gateway. Client-shaped 400 on
+		// a terminal policy carrier — no retry, no failover to
+		// another model (no silent downgrade), no breaker or
+		// credential penalty, no upstream accounting.
+		return retry.Result{
+			StatusCode: http.StatusBadRequest,
+			Err:        capabilityPolicy(capErr),
+			Safety:     retry.OutcomeNotExecuted,
+		}
+	}
+	// Real upstream/transport failure. Carry the failed attempt's
+	// headers (nil for refusals / not-sent) so Retry-After hints
+	// feed the retry scheduler; Status/Err/Safety semantics below
+	// are unchanged.
+	result := retry.Result{StatusCode: extractUpstreamStatus(ferr), Err: ferr, Headers: upstreamFailureHeaders(ferr)}
+	switch {
+	case result.StatusCode > 0 || retry.DefinitelyNotSent(ferr):
+		result.Safety = retry.OutcomeNotExecuted
+	case provider.IsUnsupportedFeature(ferr):
+		// N07-P05-T02: a deterministic pre-flight capability
+		// rejection (image part / unmapped content-part type).
+		// Proof of non-execution, but never same-candidate
+		// retryable (the answer cannot change) — keep the typed
+		// error unwrapped so the terminal handler answers an
+		// explicit 400 unsupported_feature instead of the opaque
+		// upstream_outcome_unknown 502.
+	case retry.IsRequestNotSent(ferr):
+		// Translate-layer refusal (N07-P01-T05): typed proof the
+		// request never left this process. Safety intentionally
+		// stays Unknown — MayRepeat forbids repeating Unknown
+		// attempts (a deterministic refusal must not be retried),
+		// while the router classifier still sees NotExecuted via
+		// retry.Classify and advances the fallback chain. The
+		// error stays unwrapped so the terminal render can
+		// errors.As the typed proof and surface the exact reason.
+	default:
+		result.Err = unknownOutcomeError(ferr)
+	}
+	return result
+}
+
+func (gw *gateway) recordChatAttemptMetrics(client *upstream.Client, mi resolver.ModelInfo, res retry.Result, attemptNum int, start time.Time) {
+	// Emit metrics for the attempt. Usage is parsed from body on success.
+	var u provider.Usage
+	if res.Err == nil && len(res.Body) > 0 {
+		u = client.Adapter().ParseUsage(res.Body)
+	}
+	ext := provider.ComputeCost(u, mi.Provider, mi.ModelName)
+	gw.emitUpstreamMetrics(mi.Provider, mi.ModelName, res.StatusCode, time.Since(start), u, ext.EstimatedCostUSD)
+
+	// Emit retry_total for retries that occurred (attemptNum > 1 means
+	// at least one retry was performed). The attempt label is the number
+	// of the retry (1 = first retry, 2 = second retry, ...).
+	for n := 1; n < attemptNum; n++ {
+		metrics.RetryTotal.WithLabelValues(strconv.Itoa(n), strconv.Itoa(res.StatusCode)).Inc()
+	}
+}
+
+func (gw *gateway) finishChatHop(url string, res retry.Result, use orgCredentialUse, ex *chatExecution) (int, error) {
+	if res.Err == nil && res.StatusCode < 500 {
+		// (per-endpoint scope; no-op in global scope).
+		gw.recordEndpointSuccess(url)
+		ex.body = res.Body
+		ex.headers = res.Headers
+		ex.usedOrgKey, ex.orgCredRef = use.used, use.ref()
+		return res.StatusCode, nil
+	}
+	// endpoint the chain touches (per-endpoint scope; no-op in global).
+	// A translate-layer refusal (N07-P01-T05) never contacted the
+	// endpoint — counting it as an endpoint failure would trip the
+	// breaker on a client-side request problem.
+	if !retry.IsRequestNotSent(res.Err) {
+		gw.recordEndpointFailure(url)
+	}
+	errOut := res.Err
+	if errOut == nil {
+		errOut = fmt.Errorf("upstream error %d", res.StatusCode)
+	}
+	return res.StatusCode, errOut
+}
+
+func (gw *gateway) rejectChatAttempt(ctx context.Context, cc *chatContext, lastErr error, lastCode, attemptCount, openRejections int) bool {
+	w, l := cc.w, cc.l
+	// N07-P05-T02 (order restored by N07-RECON): a media-capability
+	// rejection (image part on an adapter without image input, unmapped
+	// content-part type) is a CLIENT format error the adapter raised
+	// before any byte left the gateway. The typed branch is matched
+	// BEFORE the plain request-not-sent branch: the translate seam wraps
+	// the refusal in retry.RequestNotSentError, and the refusal must
+	// render 400 unsupported_feature with the adapter's exact reason —
+	// never an opaque 5xx, no breaker penalty, and no analytics event
+	// (the escrow settles locally; parity with the policy-denial path).
+	var unsupportedFeatureErr *provider.UnsupportedFeatureError
+	if errors.As(lastErr, &unsupportedFeatureErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		l.Warn("provider adapter rejected unsupported request feature",
+			"error", lastErr, "attempts", attemptCount)
+		apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
+			unsupportedFeatureErr.Error(), apierrors.CodeUnsupportedFeature)
+		return true
+	}
+	// N07-P01-T05: a translate-layer refusal is a client-side request
+	// problem — the request never reached any endpoint, so the exact
+	// reason (which modeled field was lost, and why) renders as 400
+	// invalid_request_error, never disguised as a generic upstream
+	// failure (I51: no silent drop, and no misleading status). Typed
+	// unsupported-feature refusals are matched by the dedicated branch
+	// above.
+	var notSentErr *retry.RequestNotSentError
+	if errors.As(lastErr, &notSentErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
+		apierrors.Write(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, notSentErr.Error())
+		return true
+	}
+	// RT-03: a terminal policy outcome from a fallback hop ends the
+	// request with the gate envelope. The denied candidate was never
+	// called, so this is not an upstream failure: no provider error
+	// mapping and no circuit-breaker penalty.
+	var policyErr *router.PolicyError
+	var unknownErr *unknownOutcomeErrorType
+	if errors.As(lastErr, &unknownErr) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationUpstreamErr)
+		status := lastCode
+		if status < 400 {
+			status = http.StatusBadGateway
+		}
+		apierrors.Write(w, status, apierrors.ErrorCodeAPI, "upstream outcome unknown; request was not retried")
+		return true
+	}
+	if errors.As(lastErr, &policyErr) {
+		// NEXT-18c: no analytics event is published on this path — settle
+		// the local escrow (zero spend, in-flight bound released).
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		writeGateDenial(w, gateResultFromPolicy(policyErr))
+		return true
+	}
+
+	// parity of the global-scope entry rejection: same 503 envelope, no
+	// analytics event, the escrow settles locally. No endpoint was
+	// dialed, so this is not an upstream failure to record.
+	if allCircuitsOpen(lastCode, openRejections, attemptCount) {
+		reservationGateFrom(ctx).finalizeNoEvent(budget.TerminationPolicyDenied)
+		gw.voidUndispatchedInvocation(ctx, l)
+		l.Error("circuit breaker open, rejecting request (all candidate endpoints open)",
+			"attempts", attemptCount)
+		apierrors.Write(w, http.StatusServiceUnavailable, apierrors.ErrorCodeServiceUnavailable, "upstream provider unavailable")
+		return true
+	}
+
+	return false
 }
 
 // serveChatCache (stage 4b) tries the RT-05 cache branch after the full
@@ -1138,18 +1151,12 @@ func (gw *gateway) executeChatJSON(ctx context.Context, cc *chatContext) (*chatE
 // true = the request was answered from the cache (including a terminal
 // policy denial of the cached document).
 func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
-	w, l := cc.w, cc.l
+	if !gw.chatCacheEligible(cc) {
+		return false
+	}
+	l := cc.l
 	orgID := cc.orgID
 
-	if gw.cache == nil || orgID == "" || cc.cacheDisabled {
-		return false
-	}
-	// Stream-cache kill-switch (W-STCACHE): when cache_stream_enabled is off,
-	// streaming requests never get answers from (possibly stale, pre-fix)
-	// stream-cache entries; non-stream lookups are unaffected.
-	if cc.req.Stream && !gw.cfg.CacheStreamEnabled {
-		return false
-	}
 	ri := cache.RouteIdentity{
 		OrgID:     orgID,
 		Model:     cc.model,
@@ -1159,161 +1166,200 @@ func (gw *gateway) serveChatCache(ctx context.Context, cc *chatContext) bool {
 	hit, err := gw.cache.LookupWithResult(ctx, ri, cc.body)
 	var sseBody []byte
 	if err == nil && hit != nil {
-		// time and must never bypass the CURRENT post-upstream control.
-		// The cached document (exact, semantic, and the SSE replay of
-		// either) is evaluated exactly like a fresh upstream body: a mask
-		// replaces what the client sees, a deny answers the terminal
-		// content_policy_violation envelope and no cached byte is written.
-		// This closes the "entry created before a policy change" gap —
-		// the tenant boundary itself is already enforced below this point
-		// (the cache service verified the sealed provenance against this
-		// request's org, so a foreign org's entry degrades to a miss).
-		served, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
-		if postEvent != "" {
-			cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
-		}
-		if denied {
-			gw.serveChatCachePolicyDenied(ctx, cc, hit, postEvent)
+		if gw.governChatCacheHit(ctx, cc, hit) {
 			return true
 		}
-		hit.Data = served
-		if cc.req.Stream {
-			// Stream-attached policies (stream_prefix/stream_final) never
-			// run at post_upstream — re-govern the replay with them before
-			// any frame is converted, or a deny tightened after the entry
-			// was cached would serve forbidden content (N03-P02-T02).
-			// A replay has issued no bytes, so a stream_final deny stays
-			// terminal here (live streams can only flag after issuance).
-			streamServed, streamEvents, streamDenied := gw.policyReplayStreamCheck(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
-			if streamEvents != "" {
-				cc.policyEvent = appendPolicyEvents(cc.policyEvent, streamEvents)
-			}
-			if streamDenied {
-				gw.serveChatCachePolicyDenied(ctx, cc, hit, cc.policyEvent)
-				return true
-			}
-			hit.Data = streamServed
-		}
-		// N03-P02-T08: the entry survived governance and is about to be
-		// served — it must decode as a completion document. A torn cache
-		// value (sealed envelope and provenance intact, completion document
-		// truncated or corrupted inside) degrades to a miss here, never
-		// broken bytes; the refetch below re-serves fresh and the writer
-		// overwrites the broken value at the same key (self-healing). The
-		// guard sits AFTER enforcement on purpose: a corrupt entry whose
-		// governed verdict is a terminal deny never reaches this point, so
-		// corruption cannot bypass enforcement and a denial does not
-		// trigger an upstream refetch.
-		// FIX-10 (N03-P02-T10): the probe uses the shared usable-completion
-		// contract, so a document that decodes but carries no choices
-		// (`{}`, `{"choices":[]}`) degrades to a miss on the nonstream path
-		// exactly like the streaming replay always did — never served with
-		// X-Cache attribution.
-		if _, probeErr := cachedCompletionUsable(hit.Data); probeErr != nil {
-			l.Warn("cache hit is not a usable completion document — serving from upstream",
-				"error", probeErr, "org_id", orgID)
-			hit = nil
-		}
-	}
-	if err == nil && hit != nil && cc.req.Stream {
-		// Streaming clients must receive SSE frames, never a raw JSON
-		// completion document — OpenAI-compatible SDKs block waiting for
-		// `data:` lines and the caller appears hung. Convert before any
-		// header is written; on conversion failure treat the entry as a
-		// miss so the request is served fresh instead of broken.
-		sseBody, err = sseReplayFrames(hit.Data)
-		if err != nil {
-			l.Warn("cache hit is not a replayable completion document — serving from upstream",
-				"error", err, "org_id", orgID)
+		var usable bool
+		sseBody, usable = validateChatCacheReplay(l, orgID, hit, cc.req.Stream)
+		if !usable {
 			hit = nil
 		}
 	}
 	if err == nil && hit != nil {
-		// Honest attribution: provenance of the entry — the model that
-		// actually generated the cached response (verified against this
-		// route by the cache service).
-		modelUsed := hit.ModelUsed
-		if modelUsed == "" {
-			modelUsed = cc.model
-		}
-		if eff := gw.effortForCandidate(cc.info, classifier.Class(cc.classifierClass)); eff != "" {
-			cc.dec.Effort = eff
-		}
-		l.Debug("cache hit", "org_id", orgID, "model", cc.model, "model_used", modelUsed, "source", hit.SourceType, "stream", cc.req.Stream)
-		// Counterfactual for a cache hit: what the request would have
-		// cost had it gone upstream. The cached completion document
-		// carries the original usage, so price it with the winning
-		// model's adapter. Without usable usage the counterfactual stays
-		// 0 — the savings percentage degrades to 0 instead of lying.
-		cacheCounterfactual := cachedUsageCounterfactual(hit.Data, cc.info.Provider, modelUsed)
-		// Cache hits are counted by pkg/cache itself
-		// (cache_hits_total{type}, misses included) — do not
-		// double-count here.
-		if cc.req.Stream {
-			w.Header().Set("Content-Type", "text/event-stream")
-			w.Header().Set("Cache-Control", "no-cache")
-			w.Header().Set("X-Accel-Buffering", "no")
-		} else {
-			w.Header().Set("Content-Type", "application/json")
-		}
-		w.Header().Set("X-Cache", strings.ToUpper(hit.SourceType))
-		if hit.Similarity > 0 {
-			w.Header().Set("X-Cache-Similarity", fmt.Sprintf("%.4f", hit.Similarity))
-		}
-		w.WriteHeader(http.StatusOK)
-		payload := hit.Data
-		if cc.req.Stream {
-			payload = sseBody
-		}
-		if _, err := w.Write(payload); err != nil {
-			l.Error("cache hit write failed", "error", err, "org_id", orgID)
-		}
-		if cc.req.Stream {
-			if f, ok := w.(http.Flusher); ok {
-				f.Flush()
-			}
-		}
-
-		// P4.13: Publish cache-aware analytics event for savings tracking.
-		gw.finishRequest(ctx, requestFinish{
-			base: eventBase{
-				EventType: "request.completed",
-				RequestID: cc.reqID,
-				SessionID: cc.sessionID,
-				Payload:   string(cc.body),
-				// FIX-20: the served document IS the processed response on a
-				// cache hit (stream replay and JSON alike) — envelope from it.
-				ProcessedResponse:     envelopeFromCompletionDoc(hit.Data, modelUsed).marshal(),
-				OrgID:                 orgID,
-				TeamID:                cc.teamID,
-				ModelRequested:        cc.requestedModel,
-				ModelUsed:             modelUsed,
-				UpstreamURL:           cc.info.UpstreamURL,
-				StatusCode:            http.StatusOK,
-				Method:                "POST",
-				Endpoint:              endpointFrom(ctx, "chat.completions"),
-				UsageSource:           "none",
-				CostStatus:            costStatus(true, "none", false),
-				CacheHitType:          hit.SourceType,
-				CacheSimilarity:       hit.Similarity,
-				CounterfactualCostUSD: cacheCounterfactual,
-				TierUsed:              cc.tierUsed,
-				ClassifierClass:       cc.classifierClass,
-				ClassifierConfidence:  cc.classifierConfidence,
-				ClassifierSource:      cc.classifierSource,
-				RoutingDecision:       gw.decisionJSON(decisionSourceCacheHit(hit.SourceType), cc.dec),
-				Policy:                cc.policyEvent,
-				Labels:                labelsFrom(ctx),
-			},
-			// Cache hits never reserve: publish without a settle.
-			noSettle: true,
-			info:     cc.info,
-		}, nil)
-
+		gw.finishChatCacheHit(ctx, cc, hit, sseBody)
 		return true
 	}
 	l.Debug("cache miss — forwarding to upstream", "org_id", orgID)
 	return false
+}
+
+// validateChatCacheReplay enforces that a governed hit is servable before
+// any header is written, degrading to a miss (ok=false) instead of broken
+// bytes; the upstream refetch re-serves fresh and the writer overwrites the
+// broken value at the same key (self-healing). Both guards sit AFTER
+// enforcement on purpose: a corrupt entry whose governed verdict is a
+// terminal deny never reaches this point, so corruption cannot bypass
+// enforcement and a denial does not trigger an upstream refetch.
+func validateChatCacheReplay(l *slog.Logger, orgID string, hit *cache.CacheHit, stream bool) (sseBody []byte, ok bool) {
+	// N03-P02-T08: the entry survived governance and is about to be served —
+	// it must decode as a completion document. A torn cache value (sealed
+	// envelope and provenance intact, completion document truncated or
+	// corrupted inside) never serves broken bytes.
+	// FIX-10 (N03-P02-T10): the probe uses the shared usable-completion
+	// contract, so a document that decodes but carries no choices
+	// (`{}`, `{"choices":[]}`) degrades to a miss on the nonstream path
+	// exactly like the streaming replay always did — never served with
+	// X-Cache attribution.
+	if _, probeErr := cachedCompletionUsable(hit.Data); probeErr != nil {
+		l.Warn("cache hit is not a usable completion document — serving from upstream",
+			"error", probeErr, "org_id", orgID)
+		return nil, false
+	}
+	if !stream {
+		return nil, true
+	}
+	// Streaming clients must receive SSE frames, never a raw JSON completion
+	// document — OpenAI-compatible SDKs block waiting for `data:` lines and
+	// the caller appears hung. Convert before any header is written; on
+	// conversion failure treat the entry as a miss so the request is served
+	// fresh instead of broken.
+	sseBody, err := sseReplayFrames(hit.Data)
+	if err != nil {
+		l.Warn("cache hit is not a replayable completion document — serving from upstream",
+			"error", err, "org_id", orgID)
+		return nil, false
+	}
+	return sseBody, true
+}
+
+// chatCacheEligible is the cache lookup gate: no cache service, no org
+// tenant, an org that disabled caching, or — W-STCACHE — a streaming request
+// while cache_stream_enabled is off (streaming must never be answered from
+// possibly stale, pre-fix stream-cache entries; non-stream lookups are
+// unaffected).
+func (gw *gateway) chatCacheEligible(cc *chatContext) bool {
+	return gw.cache != nil && cc.orgID != "" && !cc.cacheDisabled &&
+		(!cc.req.Stream || gw.cfg.CacheStreamEnabled)
+}
+
+// governChatCacheHit re-governs a cached document with the CURRENT
+// post-upstream policy: a cache entry was written under an earlier policy
+// regime and must never bypass it. The cached document (exact, semantic,
+// and the SSE replay of either) is evaluated exactly like a fresh upstream
+// body: a mask replaces what the client sees, a deny answers the terminal
+// content_policy_violation envelope and no cached byte is written. This
+// closes the "entry created before a policy change" gap — the tenant
+// boundary itself is already enforced below this point (the cache service
+// verified the sealed provenance against this request's org, so a foreign
+// org's entry degrades to a miss). Returns true when the request was
+// answered terminally (policy denial); the hit's Data carries the governed
+// body otherwise.
+func (gw *gateway) governChatCacheHit(ctx context.Context, cc *chatContext, hit *cache.CacheHit) bool {
+	served, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
+	if postEvent != "" {
+		cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
+	}
+	if denied {
+		gw.serveChatCachePolicyDenied(ctx, cc, hit, postEvent)
+		return true
+	}
+	hit.Data = served
+	if cc.req.Stream {
+		// Stream-attached policies (stream_prefix/stream_final) never run at
+		// post_upstream — re-govern the replay with them before any frame is
+		// converted, or a deny tightened after the entry was cached would
+		// serve forbidden content (N03-P02-T02). A replay has issued no
+		// bytes, so a stream_final deny stays terminal here (live streams
+		// can only flag after issuance).
+		streamServed, streamEvents, streamDenied := gw.policyReplayStreamCheck(cc.r, "chat", cc.model, cc.info.Provider, hit.Data)
+		if streamEvents != "" {
+			cc.policyEvent = appendPolicyEvents(cc.policyEvent, streamEvents)
+		}
+		if streamDenied {
+			gw.serveChatCachePolicyDenied(ctx, cc, hit, cc.policyEvent)
+			return true
+		}
+		hit.Data = streamServed
+	}
+	return false
+}
+
+// finishChatCacheHit serves a governed cache hit: honest attribution headers
+// (the model that actually generated the response, the entry's source type),
+// the payload (SSE frames for streaming clients), and the cache-aware
+// request.completed event. Cache hits never reserve: publish without a
+// settle. Cache hits are counted by pkg/cache itself — do not double-count.
+func (gw *gateway) finishChatCacheHit(ctx context.Context, cc *chatContext, hit *cache.CacheHit, sseBody []byte) {
+	w, l := cc.w, cc.l
+	orgID := cc.orgID
+
+	// Honest attribution: provenance of the entry — the model that
+	// actually generated the cached response (verified against this
+	// route by the cache service).
+	modelUsed := hit.ModelUsed
+	if modelUsed == "" {
+		modelUsed = cc.model
+	}
+	if eff := gw.effortForCandidate(cc.info, classifier.Class(cc.classifierClass)); eff != "" {
+		cc.dec.Effort = eff
+	}
+	l.Debug("cache hit", "org_id", orgID, "model", cc.model, "model_used", modelUsed, "source", hit.SourceType, "stream", cc.req.Stream)
+	// Counterfactual for a cache hit: what the request would have cost had
+	// it gone upstream. The cached completion document carries the original
+	// usage, so price it with the winning model's adapter. Without usable
+	// usage the counterfactual stays 0 — the savings percentage degrades
+	// to 0 instead of lying.
+	cacheCounterfactual := cachedUsageCounterfactual(hit.Data, cc.info.Provider, modelUsed)
+	if cc.req.Stream {
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("X-Accel-Buffering", "no")
+	} else {
+		w.Header().Set("Content-Type", "application/json")
+	}
+	w.Header().Set("X-Cache", strings.ToUpper(hit.SourceType))
+	if hit.Similarity > 0 {
+		w.Header().Set("X-Cache-Similarity", fmt.Sprintf("%.4f", hit.Similarity))
+	}
+	w.WriteHeader(http.StatusOK)
+	payload := hit.Data
+	if cc.req.Stream {
+		payload = sseBody
+	}
+	if _, err := w.Write(payload); err != nil {
+		l.Error("cache hit write failed", "error", err, "org_id", orgID)
+	}
+	if cc.req.Stream {
+		if f, ok := w.(http.Flusher); ok {
+			f.Flush()
+		}
+	}
+
+	// P4.13: Publish cache-aware analytics event for savings tracking.
+	gw.finishRequestLogged(ctx, cc.l, requestFinish{
+		base: eventBase{
+			EventType: "request.completed",
+			RequestID: cc.reqID,
+			SessionID: cc.sessionID,
+			Payload:   string(cc.body),
+			// FIX-20: the served document IS the processed response on a
+			// cache hit (stream replay and JSON alike) — envelope from it.
+			ProcessedResponse:     envelopeFromCompletionDoc(hit.Data, modelUsed).marshal(),
+			OrgID:                 orgID,
+			TeamID:                cc.teamID,
+			ModelRequested:        cc.requestedModel,
+			ModelUsed:             modelUsed,
+			UpstreamURL:           cc.info.UpstreamURL,
+			StatusCode:            http.StatusOK,
+			Method:                "POST",
+			Endpoint:              endpointFrom(ctx, "chat.completions"),
+			UsageSource:           "none",
+			CostStatus:            costStatus(true, "none", false),
+			CacheHitType:          hit.SourceType,
+			CacheSimilarity:       hit.Similarity,
+			CounterfactualCostUSD: cacheCounterfactual,
+			TierUsed:              cc.tierUsed,
+			ClassifierClass:       cc.classifierClass,
+			ClassifierConfidence:  cc.classifierConfidence,
+			ClassifierSource:      cc.classifierSource,
+			RoutingDecision:       gw.decisionJSON(decisionSourceCacheHit(hit.SourceType), cc.dec),
+			Policy:                cc.policyEvent,
+			Labels:                labelsFrom(ctx),
+		},
+		// Cache hits never reserve: publish without a settle.
+		noSettle: true,
+		info:     cc.info,
+	})
 }
 
 // serveChatCachePolicyDenied ends a cache-hit request whose document the
@@ -1330,7 +1376,7 @@ func (gw *gateway) serveChatCachePolicyDenied(ctx context.Context, cc *chatConte
 	}
 	l.Warn("policy denied cache hit", "org_id", cc.orgID, "request_id", cc.reqID,
 		"model", cc.model, "source", hit.SourceType, "mode", string(gw.policyRuntime.mode))
-	gw.finishRequest(ctx, requestFinish{
+	gw.finishRequestLogged(ctx, l, requestFinish{
 		base: eventBase{
 			EventType:            "request.failed",
 			RequestID:            cc.reqID,
@@ -1359,7 +1405,7 @@ func (gw *gateway) serveChatCachePolicyDenied(ctx context.Context, cc *chatConte
 		// Cache hits never reserve: publish without a settle.
 		noSettle: true,
 		info:     cc.info,
-	}, nil)
+	})
 	apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 		"response blocked by organization policy", policyDenyErrorCode)
 }
@@ -1383,29 +1429,14 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// (usage.input_tokens) shapes since the adapter knows its provider's
 	// response schema. ComputeCost turns tokens into an estimated USD amount
 	// using pkg/pricing.
-	adapter, adapterErr := provider.New(finalInfo.Provider)
-	if adapterErr != nil {
-		l.Warn("usage accounting skipped: unknown provider", "provider", finalInfo.Provider, "error", adapterErr)
-		adapter = provider.OpenAI{}
-	}
-	usage := adapter.ParseUsage(resp)
+	usage := chatUsageAdapter(finalInfo, l).ParseUsage(resp)
 	ext := provider.ComputeCost(usage, finalInfo.Provider, finalModelName)
 
-	// OP-8: post-upstream policy hook. Usage was parsed from the ORIGINAL
-	// upstream body (the tokens were consumed regardless of the verdict); a
-	// mask replaces the body every downstream consumer sees (client, cache,
-	// tool gate); a deny answers 400 instead of the upstream body while the
-	// accounting still records the spend that left the org.
-	if gw.policyRuntime != nil {
-		masked, postEvent, denied := gw.policyPostUpstream(r, "chat", finalModelName, finalInfo.Provider, resp)
-		if postEvent != "" {
-			cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
-		}
-		if denied {
-			gw.finishPolicyDeniedJSON(ctx, cc, finalInfo, usage, ext, ex, masked)
-			return
-		}
-		resp = masked
+	// OP-8: post-upstream policy hook — a deny answers 400 and finishes the
+	// request with the spend accounted (see applyChatPostUpstreamPolicy).
+	resp, handled := gw.applyChatPostUpstreamPolicy(ctx, cc, ex, usage, ext, resp)
+	if handled {
+		return
 	}
 
 	// G3: record final token usage against task/session budgets, correct the
@@ -1424,121 +1455,19 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// Compute resale cost with markup for reseller billing.
 	resaleCostUSD := gw.resaleCostUSD(ctx, orgID, finalInfo.Provider, finalModelName, usage)
 
-	// P5.9: Evalgate sampling — for Medium/low-confidence requests, sample a
-	// fraction to run LLM-as-judge comparing cheap vs premium responses.
-	// Results feed into evalgate_results table and calibration refresher.
-	// Runs through the finishRequest pre-attestation hook: EvalgateSampled is
-	// stamped synchronously before lineage/publish (no race with publishEvent).
-	var evalgateHook func(*eventpub.Event)
-	if gw.judge != nil && gw.evalStore != nil && orgID != "" {
-		evalgateHook = func(ev *eventpub.Event) {
-			classLabel := cc.classifierClass
-			conf := cc.classifierConfidence
-
-			// Check if this request matches sampling criteria: Medium class, low confidence
-			isMediumLowConf := classLabel == "medium" && conf < 0.7
-			if isMediumLowConf && gw.cfg.EvalgateSampleRate > 0 && rand.Float64() < gw.cfg.EvalgateSampleRate { //nolint:gosec // evalgate sampling, not cryptography
-				// TP-04: a judge pair needs the cheap answer as full comparable
-				// text. Tool-only, empty or unparseable bodies must not produce a
-				// fabricated verdict — skip judging and record why.
-				if _, ok := comparableCheapResponse(resp); !ok {
-					l.Debug("evalgate: cheap response unavailable (tool-only, empty or unparseable), judge skipped",
-						"org_id", orgID, "request_id", cc.reqID)
-				} else {
-					l.Debug("evalgate sampling triggered", "org_id", orgID, "class", classLabel, "confidence", conf)
-
-					// Store original prompt for judge
-					userPrompt := extractUserPrompt(cc.req.Messages)
-					cheapModelName := finalModelName
-
-					// Determine premium model from tier router
-					var premiumModelName string
-					if gw.tierRouter != nil {
-						premiumSel, perr := gw.tierRouter.SelectModel(ctx, classifier.ClassHard, orgID)
-						if perr == nil && premiumSel.Name != "" {
-							premiumModelName = premiumSel.Name
-						} else {
-							premiumModelName = "gpt-4o" // fallback
-						}
-					} else {
-						premiumModelName = "gpt-4o"
-					}
-
-					// Mark as sampled synchronously to avoid data race with publishEvent.
-					ev.EvalgateSampled = true
-
-					// RT-03: the optional premium comparison runs under the same
-					// trusted identity as the main chain (captured once above).
-					gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
-
-					// Run judge evaluation asynchronously (non-blocking).
-					go func(prompt, cheapResp string) { //nolint:contextcheck // detached by design: judge evaluation must survive request cancellation; internal 15s timeout governs it
-						judgeCtx, jcancel := context.WithTimeout(context.Background(), 15*time.Second)
-						defer jcancel()
-
-						// RT-03: the optional premium comparison is a real
-						// provider attempt — gate it like every other candidate.
-						// A denied/unavailable premium target makes no call and
-						// no verdict (nothing is fabricated from a missing
-						// response — the TP-03/04 contract is preserved).
-						premiumInfo, perr2 := gw.resolveModelInfo(judgeCtx, premiumModelName)
-						if perr2 != nil {
-							l.Debug("evalgate: premium model resolution failed", "error", perr2)
-							return
-						}
-						if _, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo); pol != nil {
-							return
-						}
-
-						// Call premium model for comparison
-						premiumResp, perr := gw.callUpstreamSingle(judgeCtx, premiumModelName, cc.body)
-						if perr != nil {
-							l.Debug("evalgate: premium response failed", "error", perr)
-							return
-						}
-
-						v, err := gw.judge.Evaluate(judgeCtx, prompt, cheapResp, string(premiumResp))
-						if err != nil {
-							l.Debug("evalgate judge failed", "error", err)
-							return
-						}
-
-						// Store verdict (including ShouldUpgrade flag for calibration).
-						// N02-P06 T06: the judge prompt is the PRE-MASK original —
-						// its persistence is retention-gated like every other
-						// original capture (fail-closed OFF stores the verdict
-						// metadata without the prompt text). The gate routes
-						// through the retention-policy seam (gw's one in-process
-						// boundary decision: strict profile first, then the
-						// installed policy / boolean default — FIX-07/OBS-02).
-						storedPrompt := prompt
-						if !gw.originalRetentionEnabled(judgeCtx, orgID) {
-							storedPrompt = ""
-						}
-						err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumModelName, v, conf)
-						if err != nil {
-							l.Debug("evalgate store failed", "error", err)
-						}
-					}(userPrompt, string(resp))
-				}
-			}
-		}
-	}
-
 	// TOOL-02: strip tool_calls the org policy denies BEFORE the client (or
 	// the cache) sees them. No deny policies → one cached bool, zero parsing.
-	// FIX-20: the gate moved above the event build so the processed-response
+	// FIX-20: the gate runs above the event build so the processed-response
 	// envelope captures the POST-gate body — the envelope must describe what
-	// the client receives, and denied tool calls never reach it. The evalgate
-	// judge above is deliberately unaffected: it snapshots `resp` inside its
-	// block (pre-gate), unchanged behavior.
-	if gw.toolPolicies != nil {
-		var deniedTools []string
-		resp, deniedTools = gw.gateToolCallsJSON(ctx, orgID, agentSubject(r), resp)
-		if len(deniedTools) > 0 {
-			l.Warn("tool policy denied model tool_calls", "org", orgID, "tools", toolNamesFromDenied(deniedTools))
-		}
-	}
+	// the client receives, and denied tool calls never reach it.
+	resp = gw.gateChatToolCalls(ctx, r, l, orgID, resp)
+
+	// P5.9: Evalgate sampling hook (see buildEvalgateHook). Built after the
+	// tool gate on purpose: the hook's judge arguments were previously
+	// evaluated when the hook ran inside finishRequest — i.e. on the
+	// post-gate body — and resp is never reassigned after the gate, so
+	// building here with the post-gate resp is behaviorally identical.
+	evalgateHook := gw.buildEvalgateHook(ctx, cc, finalModelName, resp)
 
 	// Build the completed-request event (the single builder) and finish:
 	// evalgate hook → lineage attestation → reservation settle → publish.
@@ -1600,42 +1529,28 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 		ProviderEntityJurisdiction: finalInfo.Provider,
 		Labels:                     labelsFrom(ctx),
 	}
-	gw.finishRequest(ctx, requestFinish{
+	_, ferr := gw.finishRequest(ctx, requestFinish{
 		base:        base,
 		info:        finalInfo,
 		resp:        upResp,
 		termination: budget.TerminationCompleted,
 	}, evalgateHook)
-
-	// P4/RT-05: write to cache asynchronously (non-blocking) under the route
-	// identity of the model that ACTUALLY generated the response (the winning
-	// fallback candidate, not the routed primary) — an entry may only ever be
-	// served under the identity it was generated with.
-	// Skip caching for error responses, no-store headers, or disabled orgs.
-	// RT-07: no-store must also skip the WRITE — the lookup guard above is
-	// not enough, or a response the client forbade storing still lands in the
-	// shared cache and is served to the next request without the header.
-	// a warm hit is re-governed by the CURRENT post-upstream policy at the
-	// out of the cache raw in the first place.
-	if gw.cache != nil && orgID != "" && !cc.cacheDisabled && shouldCache(resp) {
-		ri := cache.RouteIdentity{
-			OrgID:     orgID,
-			Model:     finalModelName,
-			GenParams: gw.effortForCandidate(finalInfo, classifier.Class(cc.classifierClass)),
-			Upstream:  gw.cacheUpstreamFP(finalInfo), // H1: bind the entry to the endpoint that generated it
-		}
-		gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)) //nolint:errcheck,gosec // async cache write: a miss is non-fatal, the next request repopulates
+	// Central binding: client success is ordered after persistence. A
+	// failed terminal write (even after transient-PG retries) must not
+	// surface the upstream body as a payable success — and the event is
+	// already withheld inside the funnel. No cache write, no shadow
+	// mirror: the response being failed must not outlive this call.
+	if ferr != nil {
+		writeTerminalAccountingFailure(w)
+		return
 	}
 
-	// prompt-cache outcome (hit|miss) from the same usage fields that bill
-	// (CacheReadTokens). Absent when no provider usage was parsed.
-	if outcome := promptCacheOutcome(usage); outcome != "" {
-		w.Header().Set(PromptCacheHeader, outcome)
-	}
-	w.Header().Set("Content-Type", "application/json")
-	if _, err := w.Write(resp); err != nil {
-		l.Error("write response failed", "error", err, "final_model", finalModelName)
-	}
+	// P4/RT-05: write to cache asynchronously under the route identity of
+	// the model that ACTUALLY generated the response (see
+	// writeChatCacheAsync).
+	gw.writeChatCacheAsync(ctx, cc, finalInfo, finalModelName, resp, usage)
+
+	writeChatJSONClient(w, l, usage, resp, finalModelName)
 
 	gw.recordBreakerSuccess()
 
@@ -1644,6 +1559,245 @@ func (gw *gateway) finalizeChatJSON(ctx context.Context, cc *chatContext, ex *ch
 	// passthrough). It only mirrors the request to a candidate model for
 	// real-cost/latency accounting.
 	gw.maybeShadow(r, cc.body, finalModelName, orgID, cc.teamID, sessionID, cc.reqID)
+}
+
+// chatUsageAdapter resolves the usage parser for the final-attempt provider
+// (P3.11: the adapter knows its provider's response schema), falling back to
+// the OpenAI shape when the provider is unknown so usage accounting degrades
+// instead of disappearing.
+func chatUsageAdapter(finalInfo resolver.ModelInfo, l *slog.Logger) provider.Provider {
+	adapter, err := provider.New(finalInfo.Provider)
+	if err != nil {
+		l.Warn("usage accounting skipped: unknown provider", "provider", finalInfo.Provider, "error", err)
+		return provider.OpenAI{}
+	}
+	return adapter
+}
+
+// applyChatPostUpstreamPolicy runs the OP-8 post-upstream hook. Usage was
+// parsed from the ORIGINAL upstream body (the tokens were consumed
+// regardless of the verdict); a mask replaces the body every downstream
+// consumer sees (client, cache, tool gate); a deny answers 400 instead of the
+// upstream body while the accounting still records the spend that left the
+// org (finishPolicyDeniedJSON carries that terminal path). Returns the
+// governed body and whether the request was answered terminally.
+func (gw *gateway) applyChatPostUpstreamPolicy(ctx context.Context, cc *chatContext, ex *chatExecution, usage provider.Usage, ext provider.ExtendedUsage, resp []byte) ([]byte, bool) {
+	if gw.policyRuntime == nil {
+		return resp, false
+	}
+	masked, postEvent, denied := gw.policyPostUpstream(cc.r, "chat", ex.finalInfo.ModelName, ex.finalInfo.Provider, resp)
+	if postEvent != "" {
+		cc.policyEvent = appendPolicyEvents(cc.policyEvent, postEvent)
+	}
+	if denied {
+		gw.finishPolicyDeniedJSON(ctx, cc, ex.finalInfo, usage, ext, ex, masked)
+		return masked, true
+	}
+	return masked, false
+}
+
+// gateChatToolCalls applies TOOL-02: strip tool_calls the org policy denies
+// before the client (or the cache) sees them. No deny policies → one cached
+// bool, zero parsing inside the gate.
+func (gw *gateway) gateChatToolCalls(ctx context.Context, r *http.Request, l *slog.Logger, orgID string, resp []byte) []byte {
+	if gw.toolPolicies == nil {
+		return resp
+	}
+	var deniedTools []string
+	resp, deniedTools = gw.gateToolCallsJSON(ctx, orgID, agentSubject(r), resp)
+	if len(deniedTools) > 0 {
+		l.Warn("tool policy denied model tool_calls", "org", orgID, "tools", toolNamesFromDenied(deniedTools))
+	}
+	return resp
+}
+
+// buildEvalgateHook returns the P5.9 Evalgate sampling hook — for
+// Medium/low-confidence requests, sample a fraction to run LLM-as-judge
+// comparing cheap vs premium responses. Results feed into evalgate_results
+// table and calibration refresher. Runs through the finishRequest
+// pre-attestation hook: EvalgateSampled is stamped synchronously before
+// lineage/publish (no race with publishEvent). Returns nil when evalgate is
+// not configured for this request; finishRequest treats a nil hook as absent.
+func (gw *gateway) buildEvalgateHook(ctx context.Context, cc *chatContext, finalModelName string, resp []byte) func(*eventpub.Event) {
+	if gw.judge == nil || gw.evalStore == nil || cc.orgID == "" {
+		return nil
+	}
+	return func(ev *eventpub.Event) {
+		gw.maybeEvalgateSample(ctx, cc, finalModelName, resp, ev)
+	}
+}
+
+// evalgateSample uses 53 random bits so every draw is exactly representable
+// as a float64 in [0, 1).
+func evalgateSample(rate float64) bool {
+	if !(rate > 0) {
+		return false
+	}
+	if rate >= 1 {
+		return true
+	}
+	var bits [8]byte
+	_, _ = rand.Read(bits[:])
+	const fractionBits = 53
+	draw := binary.BigEndian.Uint64(bits[:]) >> (64 - fractionBits)
+	return float64(draw)/(1<<fractionBits) < rate
+}
+
+// maybeEvalgateSample applies the P5.9 sampling criteria — Medium class,
+// low confidence, configured rate — and spawns the detached judge
+// evaluation. EvalgateSampled is stamped synchronously here, before
+// lineage/publish, to avoid a data race with publishEvent.
+func (gw *gateway) maybeEvalgateSample(ctx context.Context, cc *chatContext, finalModelName string, resp []byte, ev *eventpub.Event) {
+	orgID, l := cc.orgID, cc.l
+	classLabel := cc.classifierClass
+	conf := cc.classifierConfidence
+
+	// Check if this request matches sampling criteria: Medium class, low confidence
+	isMediumLowConf := classLabel == "medium" && conf < 0.7
+	if isMediumLowConf && evalgateSample(gw.cfg.EvalgateSampleRate) {
+		// TP-04: a judge pair needs the cheap answer as full comparable
+		// text. Tool-only, empty or unparseable bodies must not produce a
+		// fabricated verdict — skip judging and record why.
+		cheapAnswer, ok := comparableResponseText(resp)
+		if !ok {
+			l.Debug("evalgate: cheap response unavailable (tool-only, empty or unparseable), judge skipped",
+				"org_id", orgID, "request_id", cc.reqID)
+			return
+		}
+		l.Debug("evalgate sampling triggered", "org_id", orgID, "class", classLabel, "confidence", conf)
+
+		// Store original prompt for judge
+		userPrompt := extractUserPrompt(cc.req.Messages)
+		cheapModelName := finalModelName
+
+		// Determine premium model from tier router
+		var premiumModelName string
+		if gw.tierRouter != nil {
+			premiumSel, perr := gw.tierRouter.SelectModel(ctx, classifier.ClassHard, orgID)
+			if perr == nil && premiumSel.Name != "" {
+				premiumModelName = premiumSel.Name
+			} else {
+				premiumModelName = "gpt-4o" // fallback
+			}
+		} else {
+			premiumModelName = "gpt-4o"
+		}
+
+		// Mark as sampled synchronously to avoid data race with publishEvent.
+		ev.EvalgateSampled = true
+
+		// RT-03: the optional premium comparison runs under the same
+		// trusted identity as the main chain (captured once here).
+		gateID := candidateIdentity{OrgID: cc.orgID, TeamID: cc.teamID, APIKeyID: cc.apiKeyID}
+
+		// Run judge evaluation asynchronously (non-blocking).
+		go gw.evalgateJudge(context.WithoutCancel(ctx), cc, gateID, userPrompt, cheapAnswer, cheapModelName, premiumModelName, conf)
+	}
+}
+
+// evalgateJudge is the detached evalgate comparison: a real premium provider
+// attempt under the request's trusted identity, judged against the served
+// cheap response, with the verdict persisted for calibration.
+func (gw *gateway) evalgateJudge(ctx context.Context, cc *chatContext, gateID candidateIdentity, prompt, cheapResp, cheapModelName, premiumModelName string, conf float64) {
+	orgID, l := cc.orgID, cc.l
+	judgeCtx, jcancel := context.WithTimeout(ctx, 15*time.Second)
+	defer jcancel()
+
+	// RT-03: the optional premium comparison is a real provider attempt —
+	// gate it like every other candidate. A denied/unavailable premium
+	// target makes no call and no verdict (nothing is fabricated from a
+	// missing response — the TP-03/04 contract is preserved).
+	premiumInfo, perr2 := gw.resolveModelInfo(judgeCtx, premiumModelName)
+	if perr2 != nil {
+		l.Debug("evalgate: premium model resolution failed", "error", perr2)
+		return
+	}
+	premiumInfo, pol := gw.gateAttemptCandidate(judgeCtx, gateID, cc.req.Model, premiumInfo)
+	if pol != nil {
+		return
+	}
+
+	// Call premium model for comparison
+	premiumID := newInvocationIdentity(orgID, cc.reqID, cc.sessionID, cc.apiKeyID, eventSessionID(ctx), premiumInfo.ModelName)
+	premiumCtx := withInvocationIdentity(judgeCtx, premiumID)
+	premiumResp, perr := gw.callUpstreamSingle(premiumCtx, premiumInfo, cc.body)
+	if perr != nil {
+		l.Debug("evalgate: premium response failed", "error", perr)
+		return
+	}
+
+	premiumAnswer, ok := comparableResponseText(premiumResp)
+	if !ok {
+		l.Debug("evalgate: premium response has no comparable text", "request_id", cc.reqID)
+		return
+	}
+	v, _, err := gw.judge.EvaluateMeasured(judgeCtx, prompt, cheapResp, premiumAnswer, func(ctx context.Context, model string) error {
+		judgeID := newInvocationIdentity(orgID, cc.reqID, cc.sessionID, cc.apiKeyID, eventSessionID(ctx), model)
+		return judgeID.beginPaidDispatch(ctx, gw.invocations, invocationKindJudge)
+	})
+	if err != nil {
+		l.Debug("evalgate judge failed", "error", err)
+		return
+	}
+
+	// Store verdict (including ShouldUpgrade flag for calibration).
+	// N02-P06 T06: the judge prompt is the PRE-MASK original — its
+	// persistence is retention-gated like every other original capture
+	// (fail-closed OFF stores the verdict metadata without the prompt
+	// text). The gate routes through the retention-policy seam (gw's one
+	// in-process boundary decision: strict profile first, then the
+	// installed policy / boolean default — FIX-07/OBS-02).
+	storedPrompt := prompt
+	if !gw.originalRetentionEnabled(judgeCtx, orgID) {
+		storedPrompt = ""
+	}
+	err = gw.evalStore.InsertVerdict(judgeCtx, orgID, cc.reqID, storedPrompt, cheapModelName, premiumInfo.ModelName, v, conf)
+	if err != nil {
+		l.Debug("evalgate store failed", "error", err)
+	}
+}
+
+// writeChatCacheAsync implements P4/RT-05: write to cache asynchronously
+// (non-blocking) under the route identity of the model that ACTUALLY
+// generated the response (the winning fallback candidate, not the routed
+// primary) — an entry may only ever be served under the identity it was
+// generated with. Skip caching for error responses, no-store headers, or
+// disabled orgs. RT-07: no-store must also skip the WRITE — the lookup guard
+// at serve time is not enough, or a response the client forbade storing
+// still lands in the shared cache and is served to the next request without
+// the header. A warm hit is re-governed by the CURRENT post-upstream policy
+// at lookup, so a stale entry never bypasses enforcement.
+func (gw *gateway) writeChatCacheAsync(ctx context.Context, cc *chatContext, finalInfo resolver.ModelInfo, finalModelName string, resp []byte, usage provider.Usage) {
+	if gw.cache == nil || cc.orgID == "" || cc.cacheDisabled || !shouldCache(resp) {
+		return
+	}
+	ri := cache.RouteIdentity{
+		OrgID:     cc.orgID,
+		Model:     finalModelName,
+		GenParams: gw.effortForCandidate(finalInfo, classifier.Class(cc.classifierClass)),
+		Upstream:  gw.cacheUpstreamFP(finalInfo), // H1: bind the entry to the endpoint that generated it
+	}
+	if usage.PromptTokens < 0 || usage.PromptTokens > math.MaxInt || usage.CompletionTokens < 0 || usage.CompletionTokens > math.MaxInt {
+		cc.l.Debug("cache write skipped for invalid provider token counts", "request_id", cc.reqID)
+		return
+	}
+	if err := gw.cache.Write(ctx, ri, cc.body, resp, int(usage.PromptTokens), int(usage.CompletionTokens)); err != nil {
+		cc.l.Debug("chat cache write failed", "request_id", cc.reqID, "error", err)
+	}
+}
+
+// writeChatJSONClient answers the JSON client after the terminal event has
+// been persisted: the prompt-cache outcome header (hit|miss from the same
+// usage fields that bill, CacheReadTokens; absent when no provider usage was
+// parsed) and the governed body.
+func writeChatJSONClient(w http.ResponseWriter, l *slog.Logger, usage provider.Usage, resp []byte, finalModelName string) {
+	if outcome := promptCacheOutcome(usage); outcome != "" {
+		w.Header().Set(PromptCacheHeader, outcome)
+	}
+	w.Header().Set("Content-Type", "application/json")
+	if _, err := w.Write(resp); err != nil {
+		l.Error("write response failed", "error", err, "final_model", finalModelName)
+	}
 }
 
 // finishPolicyDeniedJSON ends a chat JSON request whose post-upstream policy
@@ -1674,7 +1828,7 @@ func (gw *gateway) finishPolicyDeniedJSON(ctx context.Context, cc *chatContext, 
 	// the analytics ledger irreproducible from its own fields (the invariant
 	// documented at completions_endpoint.go:295–299). Parity with the
 	// completed path in finalizeChatJSON.
-	gw.finishRequest(ctx, requestFinish{
+	if _, ferr := gw.finishRequest(ctx, requestFinish{
 		base: eventBase{
 			EventType:                  "request.failed",
 			RequestID:                  cc.reqID,
@@ -1723,7 +1877,13 @@ func (gw *gateway) finishPolicyDeniedJSON(ctx context.Context, cc *chatContext, 
 		attestModel: finalModelName,
 		info:        finalInfo,
 		termination: budget.TerminationPolicyDenied,
-	}, nil)
+	}, nil); ferr != nil {
+		// Facts gate the client outcome for dispatched-then-denied
+		// responses too: without the durable record the withheld
+		// response cannot be reconciled — fail instead of answering 400.
+		writeTerminalAccountingFailure(w)
+		return
+	}
 
 	apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest,
 		"response blocked by organization policy", policyDenyErrorCode)
@@ -1929,12 +2089,12 @@ func whitelistModel(info resolver.ModelInfo, requested string) string {
 	return requested
 }
 
-// comparableCheapResponse reports whether a non-stream completion body
+// comparableResponseText reports whether a non-stream completion body
 // carries a full comparable text answer for the evalgate judge. Tool-only
 // responses (content null/empty with tool_calls), empty or unparseable
 // bodies must not be judged: they would fabricate a calibration pair
 // (TP-04).
-func comparableCheapResponse(body []byte) (string, bool) {
+func comparableResponseText(body []byte) (string, bool) {
 	var doc struct {
 		Choices []struct {
 			Message struct {

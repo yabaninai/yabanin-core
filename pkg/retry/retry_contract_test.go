@@ -67,6 +67,9 @@ func TestDo_ProvenDialFailureCanRetry(t *testing.T) {
 func TestDefinitelyNotSent(t *testing.T) {
 	assert.True(t, retry.DefinitelyNotSent(&net.OpError{Op: "dial", Err: errors.New("refused")}))
 	assert.False(t, retry.DefinitelyNotSent(&net.OpError{Op: "read", Err: errors.New("reset")}))
+	assert.False(t, retry.DefinitelyNotSent(&retry.RequestMayHaveBeenSentError{
+		Err: &net.OpError{Op: "dial", Err: errors.New("refused after redirect")},
+	}))
 }
 
 // TestDo_RetryAfterClampedToMaxDelay pins the P3.8 contract: a 429 with a

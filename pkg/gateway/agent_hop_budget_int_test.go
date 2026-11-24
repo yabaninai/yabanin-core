@@ -55,6 +55,7 @@ func newLiveJudgeClient(t *testing.T, gw *gateway, up *httptest.Server) *budgete
 		admission:     gw.admission,
 		agentEnforcer: gw.agentEnforcer,
 		publisher:     gw.publisher,
+		invocations:   gw.invocations,
 		log:           gw.log,
 		now:           gw.now,
 	}

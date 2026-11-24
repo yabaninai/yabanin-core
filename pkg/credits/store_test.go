@@ -2,10 +2,14 @@ package credits
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/reireirei/yabanin/pkg/testdb"
 )
@@ -18,6 +22,20 @@ func setupTestDB(t *testing.T) *pgxpool.Pool {
 	return testdb.Postgres(t)
 }
 
+// setupFixtureDB returns a fixture-owned, isolated-schema pool on the shared
+// stand — the ownership boundary for every raw-DDL fixture in this package
+// (testdb.PostgresOwnedSchema, the A05 primitive). setupTestTables builds
+// the illustrative interim posture (0028 shape including the global usage
+// index that 0029 contracts away) and teardownTestTables DROPs the tables;
+// inside the fixture schema that DDL can never reshape the public migrated
+// schema that overshoot, sqlcontract, the crash/starter corpora and the
+// migrated_posture invariant measure directly. Unqualified fixture DDL
+// keeps resolving through current_schema(); teardown is guaranteed restore.
+func setupFixtureDB(t *testing.T) *pgxpool.Pool {
+	t.Helper()
+	return testdb.PostgresOwnedSchema(t, t.Name())
+}
+
 func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	t.Helper()
 	// Mirrors the migrated shape (0001 + 0018 fractional money); on the
@@ -28,6 +46,7 @@ func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 			org_id TEXT PRIMARY KEY,
 			balance_cents BIGINT NOT NULL DEFAULT 0,
 			remainder_micro_usd BIGINT NOT NULL DEFAULT 0 CHECK (remainder_micro_usd >= 0 AND remainder_micro_usd < 10000),
+			grace_floor_cents BIGINT CHECK (grace_floor_cents >= -100000 AND grace_floor_cents <= 0),
 			updated_at TIMESTAMPTZ NOT NULL DEFAULT now()
 		);
 	`)
@@ -51,6 +70,37 @@ func setupTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 	if err != nil {
 		t.Fatalf("create credit_transactions: %v", err)
 	}
+	// 0001 usage-identity backstop, restored alongside the 0028 expansion:
+	// sibling tests drop and recreate credit_transactions in older shapes
+	// and -shuffle decides who runs first, so every setup guarantees the
+	// full interim posture (original global index live next to the
+	// domain-split arbiters) instead of inheriting whatever shape the
+	// previous test left behind.
+	_, err = pool.Exec(ctx, `
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_request_id
+		ON credit_transactions (request_id)
+		WHERE request_id IS NOT NULL AND type = 'usage'::text;
+	`)
+	if err != nil {
+		t.Fatalf("restore the production usage-identity unique index: %v", err)
+	}
+	// 0028 invocation identity (expand), byte-mirrored: the invocation
+	// column plus the domain-split usage arbiters. The original global
+	// index above intentionally stays live alongside them — the interim
+	// posture pinned by the migration: same-correlation usage rows still
+	// collide loudly until 0029 contracts it away.
+	_, err = pool.Exec(ctx, `
+		ALTER TABLE credit_transactions ADD COLUMN IF NOT EXISTS invocation_id uuid;
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_usage_legacy
+			ON credit_transactions (request_id)
+			WHERE ((request_id IS NOT NULL) AND (invocation_id IS NULL) AND (type = 'usage'::text));
+		CREATE UNIQUE INDEX IF NOT EXISTS uniq_credit_transactions_invocation
+			ON credit_transactions (invocation_id)
+			WHERE ((invocation_id IS NOT NULL) AND (type = 'usage'::text));
+	`)
+	if err != nil {
+		t.Fatalf("apply 0028 invocation scaffolding: %v", err)
+	}
 }
 
 func teardownTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
@@ -63,7 +113,7 @@ func teardownTestTables(ctx context.Context, t *testing.T, pool *pgxpool.Pool) {
 
 func TestGetBalance_ZeroWhenNoWallet(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -80,7 +130,7 @@ func TestGetBalance_ZeroWhenNoWallet(t *testing.T) {
 
 func TestTopUp_IncreasesBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -115,9 +165,30 @@ func TestTopUp_IncreasesBalance(t *testing.T) {
 	}
 }
 
+func TestGetBalance_CachedWalletTimestamp(t *testing.T) {
+	ctx := t.Context()
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	const org = "org-cached-stamp"
+	stamp := time.Date(2024, time.March, 3, 11, 27, 43, 0, time.UTC)
+	if _, err := pool.Exec(ctx, "INSERT INTO org_credits (org_id, balance_cents, updated_at) VALUES ($1, 432, $2)", org, stamp); err != nil {
+		t.Fatal(err)
+	}
+	store := NewStore(pool, nil)
+	for _, source := range []string{"database", "cache"} {
+		bal, err := store.GetBalance(ctx, org)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bal.UpdatedAt.Equal(stamp) || bal.BalanceCents != 432 {
+			t.Fatalf("%s read returned %d cents at %s, want 432 cents at %s", source, bal.BalanceCents, bal.UpdatedAt, stamp)
+		}
+	}
+}
+
 func TestDeduct_ReducesBalance(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -147,7 +218,7 @@ func TestDeduct_ReducesBalance(t *testing.T) {
 
 func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -166,7 +237,7 @@ func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	if err == nil {
 		t.Fatal("expected Deduct to fail when balance would go below grace period")
 	}
-	if err != ErrInsufficientCredits {
+	if !errors.Is(err, ErrInsufficientCredits) {
 		t.Fatalf("expected ErrInsufficientCredits, got %v", err)
 	}
 
@@ -176,14 +247,10 @@ func TestDeduct_FailsWhenBelowGracePeriod(t *testing.T) {
 	}
 }
 
-func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
-	ctx := context.Background()
-	pool := setupTestDB(t)
-	setupTestTables(ctx, t, pool)
-	defer teardownTestTables(ctx, t, pool)
-
-	store := NewStore(pool, nil)
-
+// graceCheckWithinLimit exercises the inside-the-grace window: a wallet
+// driven to −50 (grace −100) still passes CheckBalance.
+func graceCheckWithinLimit(ctx context.Context, t *testing.T, store *Store) {
+	t.Helper()
 	// Top up $0.50 (50 cents).
 	err := store.TopUp(ctx, "org-check", 50, "inv-030")
 	if err != nil {
@@ -204,30 +271,52 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 	if bal.BalanceCents != -50 {
 		t.Errorf("expected balance_cents=-50, got %d", bal.BalanceCents)
 	}
+}
 
+// graceCheckRejectsBeyondLimit drives the wallet past the grace floor and
+// verifies the rejection is a clean rollback observed on the fixture DB —
+// not a cached wallet read (the store could serve balance 100 from memory
+// while the wallet row or the ledger drifted) and not a swallowed write.
+func graceCheckRejectsBeyondLimit(ctx context.Context, t *testing.T, store *Store, pool *pgxpool.Pool) {
+	t.Helper()
 	// Top up to 100 cents so we can deduct enough to go below grace.
-	err = store.TopUp(ctx, "org-check", 150, "inv-grace-topup")
+	err := store.TopUp(ctx, "org-check", 150, "inv-grace-topup")
 	if err != nil {
 		t.Fatalf("TopUp for grace test: %v", err)
 	}
 
 	// Now balance is 100. Deduct 250 to go to -150 (below grace of -100).
 	err = store.Deduct(ctx, "org-check", 250, "req-grace-exceed", nil)
-	if err == nil {
-		t.Fatal("expected Deduct to fail when balance exceeds grace period")
+	if !errors.Is(err, ErrInsufficientCredits) {
+		t.Fatalf("expected ErrInsufficientCredits when balance exceeds grace period, got %v", err)
 	}
 
-	// Balance should still be at 100 (deduction rolled back).
-	bal, err = store.GetBalance(ctx, "org-check")
-	if err != nil {
-		t.Fatalf("GetBalance after blocked deduct: %v", err)
+	var walletCents int64
+	if err := pool.QueryRow(ctx,
+		`SELECT balance_cents FROM org_credits WHERE org_id = 'org-check'`).Scan(&walletCents); err != nil {
+		t.Fatalf("wallet row after blocked deduct: %v", err)
 	}
-	if bal.BalanceCents != 100 {
-		t.Errorf("expected balance_cents=100 (unchanged), got %d", bal.BalanceCents)
+	if walletCents != 100 {
+		t.Errorf("expected wallet_cents=100 (unchanged), got %d", walletCents)
 	}
+	var strayRows int64
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM credit_transactions
+		 WHERE org_id = 'org-check' AND request_id = 'req-grace-exceed' AND type = 'usage'`).Scan(&strayRows); err != nil {
+		t.Fatalf("ledger rows for rejected request: %v", err)
+	}
+	if strayRows != 0 {
+		t.Errorf("rejected request must leave zero usage rows, got %d", strayRows)
+	}
+}
 
+// graceCheckRejectsBelowFloor pins the rejection on a manually lowered
+// wallet: the balance is set below grace directly in the fixture DB, the
+// in-memory cache is invalidated, and CheckBalance must still refuse.
+func graceCheckRejectsBelowFloor(ctx context.Context, t *testing.T, store *Store) {
+	t.Helper()
 	// Manually set balance below grace period to test CheckBalance rejection.
-	_, err = store.db.Exec(ctx, `UPDATE org_credits SET balance_cents = -200 WHERE org_id = 'org-check'`)
+	_, err := store.db.Exec(ctx, `UPDATE org_credits SET balance_cents = -200 WHERE org_id = 'org-check'`)
 	if err != nil {
 		t.Fatalf("manual balance update: %v", err)
 	}
@@ -239,14 +328,27 @@ func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
 
 	// Now CheckBalance should fail.
 	_, err = store.CheckBalance(ctx, "org-check")
-	if err != ErrInsufficientCredits {
+	if !errors.Is(err, ErrInsufficientCredits) {
 		t.Fatalf("expected CheckBalance to return ErrInsufficientCredits, got %v", err)
 	}
 }
 
+func TestCheckBalance_AllowsGracePeriod(t *testing.T) {
+	ctx := context.Background()
+	pool := setupFixtureDB(t)
+	setupTestTables(ctx, t, pool)
+	defer teardownTestTables(ctx, t, pool)
+
+	store := NewStore(pool, nil)
+
+	graceCheckWithinLimit(ctx, t, store)
+	graceCheckRejectsBeyondLimit(ctx, t, store, pool)
+	graceCheckRejectsBelowFloor(ctx, t, store)
+}
+
 func TestTransactions_Recorded(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -304,9 +406,23 @@ func TestInvalidTopUp_AmountMustBePositive(t *testing.T) {
 	}
 }
 
+// isContentionErr reports whether the error is a PostgreSQL serialization
+// failure (SQLSTATE 40001) or deadlock (40P01) — exactly the failure classes
+// the store's own retry loop treats as retryable contention (mirrors the
+// unexported isSerializationFailure). Deadlocks can surface here because the
+// deduction serializes per-org via a transaction-scoped advisory lock, not
+// via serializable isolation.
+func isContentionErr(err error) bool {
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) {
+		return false
+	}
+	return pgErr.Code == "40001" || pgErr.Code == "40P01"
+}
+
 func TestConcurrentDeductions(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -318,79 +434,201 @@ func TestConcurrentDeductions(t *testing.T) {
 		t.Fatalf("TopUp: %v", err)
 	}
 
-	// Run 25 concurrent deductions of $0.50 (50 cents each).
-	// Total = $12.50, which exceeds the wallet by $2.50.
-	// Some should succeed, some should fail (balance goes below grace period).
-	done := make(chan error, 25)
-	for i := 0; i < 25; i++ {
+	// 25 concurrent deductions of $0.50 (50 cents each); total $12.50
+	// exceeds the wallet by $2.50. Deterministic ledger truth under the
+	// production floor rule (post > floor, or post == floor with a zero new
+	// remainder — whole-cent charges satisfy the second branch): exactly 22
+	// charges land, ending the wallet at 1000 − 22×50 = −100, exactly ON the
+	// grace floor (default −100), and the remaining 3 are rejected with
+	// ErrInsufficientCredits. Contention (serialization failure/deadlock) is
+	// retried post-phase, so these totals must hold regardless of scheduling;
+	// any other error is a bug and fails the test.
+	const (
+		workers     = 25
+		amountCents = int64(50)
+		wantDebits  = 22
+		wantFloor   = 3
+	)
+
+	// Request IDs are the idempotency key — preserve each worker's identity
+	// end-to-end so results can be compared against the ledger per ID.
+	ids := make([]string, workers)
+	for i := range ids {
+		ids[i] = fmt.Sprintf("req-concurrent-%d", i)
+	}
+
+	// Coordinated, bounded phase: every worker starts on the same gate and
+	// every result must arrive before the deadline.
+	phaseCtx, cancel := context.WithTimeout(ctx, 60*time.Second)
+	defer cancel()
+
+	results := runDeductionPhase(phaseCtx, t, store, "org-concurrent", amountCents, ids)
+	unresolved := unresolvedContentions(t, results, ids)
+	settleContentions(phaseCtx, t, store, "org-concurrent", amountCents, ids, results, unresolved)
+	assertDeterministicOutcome(t, results, ids, wantDebits, wantFloor)
+	verifyWalletFloor(ctx, t, pool, store, "org-concurrent", 1000, amountCents, wantDebits)
+	verifyPerIDLedger(ctx, t, pool, "org-concurrent", results, ids, wantDebits)
+}
+
+// runDeductionPhase fires one Deduct per request ID behind a common gate and
+// waits for all results under the phase deadline, so a hung worker fails the
+// test instead of hanging the run.
+func runDeductionPhase(ctx context.Context, t *testing.T, store *Store, org string, amountCents int64, ids []string) []error {
+	t.Helper()
+	results := make([]error, len(ids))
+	gate := make(chan struct{})
+	var wg sync.WaitGroup
+	for i := range ids {
+		wg.Add(1)
 		go func(i int) {
-			err := store.Deduct(ctx, "org-concurrent", 50, fmt.Sprintf("req-concurrent-%d", i), nil)
-			done <- err
+			defer wg.Done()
+			<-gate
+			results[i] = store.Deduct(ctx, org, amountCents, ids[i], nil)
 		}(i)
 	}
+	close(gate)
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatalf("deduction phase exceeded deadline: %v", ctx.Err())
+	}
+	return results
+}
 
-	successes := 0
-	failures := 0
-	for i := 0; i < 25; i++ {
-		err = <-done
-		if err == nil {
-			successes++
-		} else if IsInsufficientCredits(err) {
-			failures++
-		} else {
-			// Under high contention, serializable conflicts may exhaust all retries.
-			// This is expected — the retry loop mitigates but doesn't eliminate
-			// serialization failures under extreme concurrent load.
-			failures++
-			t.Logf("deduction %d failed with non-balance error (expected under contention): %v", i, err)
+// unresolvedContentions classifies the phase results. Only recognized
+// contention may remain unresolved here: a floor rejection is already final
+// (the wallet only moves down during the test), and ErrNoWallet for a
+// just-funded wallet or any connection/schema error is a bug, not a balance
+// decision.
+func unresolvedContentions(t *testing.T, results []error, ids []string) []int {
+	t.Helper()
+	var unresolved []int
+	for i, err := range results {
+		switch {
+		case err == nil:
+		case errors.Is(err, ErrInsufficientCredits):
+		case isContentionErr(err):
+			unresolved = append(unresolved, i)
+		default:
+			t.Fatalf("deduction %d (%s): unexpected error: %v", i, ids[i], err)
 		}
 	}
+	return unresolved
+}
 
-	// NEXT-04 (flake fix): under serializable isolation, 25-way contention
-	// can exhaust the retry budget — the previous "≥18 successes" threshold
-	// contradicted the test's own contention comment and failed on loaded
-	// machines. The CORRECTNESS invariants are exact accounting and the
-	// grace-period floor, not retry throughput:
-	//   1. at least one deduction succeeds (the path is exercised);
-	//   2. balance == 1000 − 50×successes EXACTLY (no double-spend, no loss);
-	//   3. balance never violates the grace period (fail-closed held).
-	if successes < 1 {
-		t.Fatalf("no deduction succeeded — contention path not exercised (failures=%d)", failures)
+// settleContentions retries unresolved contention sequentially: no concurrent
+// writers remain post-phase, so a bounded number of attempts must end in
+// success or a floor rejection.
+func settleContentions(ctx context.Context, t *testing.T, store *Store, org string, amountCents int64, ids []string, results []error, unresolved []int) {
+	t.Helper()
+	for _, i := range unresolved {
+		for attempt := 1; attempt <= 5; attempt++ {
+			err := store.Deduct(ctx, org, amountCents, ids[i], nil)
+			if err == nil || errors.Is(err, ErrInsufficientCredits) {
+				results[i] = err
+				break
+			}
+			if attempt == 5 || !isContentionErr(err) {
+				t.Fatalf("retry %d (%s): unexpected error after %d attempts: %v", i, ids[i], attempt, err)
+			}
+		}
 	}
+}
 
-	bal, err := store.GetBalance(ctx, "org-concurrent")
+// assertDeterministicOutcome pins the scheduling-independent ledger truth:
+// exactly wantDebits charges land and wantFloor floor rejections occur —
+// the floor is a hard ledger bound.
+func assertDeterministicOutcome(t *testing.T, results []error, ids []string, wantDebits, wantFloor int) {
+	t.Helper()
+	successes, floor := 0, 0
+	for i, err := range results {
+		switch {
+		case err == nil:
+			successes++
+		case errors.Is(err, ErrInsufficientCredits):
+			floor++
+		default:
+			t.Fatalf("unclassified result for %s: %v", ids[i], err)
+		}
+	}
+	if successes != wantDebits || floor != wantFloor {
+		t.Fatalf("deterministic outcome violated: %d debits + %d floor rejections, want %d + %d",
+			successes, floor, wantDebits, wantFloor)
+	}
+}
+
+// verifyWalletFloor asserts exact accounting and the grace floor on the
+// fixture DB — independent of the store's in-memory cache.
+func verifyWalletFloor(ctx context.Context, t *testing.T, pool *pgxpool.Pool, store *Store, org string, startCents, amountCents int64, debits int) {
+	t.Helper()
+	var walletCents int64
+	if err := pool.QueryRow(ctx,
+		`SELECT balance_cents FROM org_credits WHERE org_id = $1`, org).Scan(&walletCents); err != nil {
+		t.Fatalf("wallet row: %v", err)
+	}
+	if want := startCents - amountCents*int64(debits); walletCents != want {
+		t.Errorf("exact accounting violated: wallet %d, want %d", walletCents, want)
+	}
+	if walletCents < store.cfg.GracePeriodCents {
+		t.Errorf("grace period violated: %d < %d", walletCents, store.cfg.GracePeriodCents)
+	}
+}
+
+// verifyPerIDLedger checks usage rows per request ID — exactly one row per
+// successful deduction and zero for rejected ones, not just counts.
+func verifyPerIDLedger(ctx context.Context, t *testing.T, pool *pgxpool.Pool, org string, results []error, ids []string, wantDebits int) {
+	t.Helper()
+	rows, err := pool.Query(ctx,
+		`SELECT request_id FROM credit_transactions WHERE org_id = $1 AND type = 'usage'`, org)
 	if err != nil {
-		t.Fatalf("GetBalance: %v", err)
+		t.Fatalf("ledger query: %v", err)
 	}
-	if want := int64(1000 - 50*successes); bal.BalanceCents != want {
-		t.Errorf("exact accounting violated: balance %d, want 1000-50*%d=%d", bal.BalanceCents, successes, want)
+	defer rows.Close()
+	ledger := make(map[string]int, wantDebits)
+	for rows.Next() {
+		var id *string
+		if err := rows.Scan(&id); err != nil {
+			t.Fatalf("scan ledger row: %v", err)
+		}
+		if id == nil {
+			t.Fatal("usage row without request_id")
+		}
+		ledger[*id]++
 	}
-	if bal.BalanceCents < store.cfg.GracePeriodCents {
-		t.Errorf("grace period violated: %d < %d", bal.BalanceCents, store.cfg.GracePeriodCents)
+	if err := rows.Err(); err != nil {
+		t.Fatalf("ledger rows: %v", err)
 	}
+	if len(ledger) != wantDebits {
+		t.Fatalf("expected %d distinct usage rows, got %d", wantDebits, len(ledger))
+	}
+	for i := range ids {
+		want := 0
+		if results[i] == nil {
+			want = 1
+		}
+		if ledger[ids[i]] != want {
+			t.Errorf("request %s: %d ledger rows, want %d", ids[i], ledger[ids[i]], want)
+		}
+	}
+}
 
-	// Verify transaction count matches successes.
-	txns, err := store.GetTransactions(ctx, "org-concurrent", 100)
-	if err != nil {
-		t.Fatalf("GetTransactions: %v", err)
-	}
+// usageTxnCount counts the ledger rows a given request ID produced — the
+// idempotency oracle: a replayed request must leave exactly one usage row.
+func usageTxnCount(txns []Transaction, requestID string) int {
 	usageTxns := 0
 	for _, tx := range txns {
-		if tx.Type == "usage" {
+		if tx.Type == "usage" && tx.RequestID != nil && *tx.RequestID == requestID {
 			usageTxns++
 		}
 	}
-	if usageTxns != successes {
-		t.Errorf("expected %d usage transactions, got %d", successes, usageTxns)
-	}
-
-	// Small delay for cache TTL.
-	time.Sleep(100 * time.Millisecond)
+	return usageTxns
 }
 
 func TestDeduct_IdempotentDuplicate(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 	defer teardownTestTables(ctx, t, pool)
 
@@ -431,12 +669,7 @@ func TestDeduct_IdempotentDuplicate(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetTransactions: %v", err)
 	}
-	usageTxns := 0
-	for _, tx := range txns {
-		if tx.Type == "usage" && tx.RequestID != nil && *tx.RequestID == requestID {
-			usageTxns++
-		}
-	}
+	usageTxns := usageTxnCount(txns, requestID)
 	if usageTxns != 1 {
 		t.Errorf("expected 1 usage transaction for this request_id, got %d", usageTxns)
 	}
@@ -462,5 +695,13 @@ func TestNewStoreWithConfig_NilLogger(t *testing.T) {
 	}
 	if balance.BalanceCents != 0 {
 		t.Errorf("expected zero balance, got %d", balance.BalanceCents)
+	}
+}
+
+func TestUsageMetadataJSONFailsClosedOnUnsupportedValue(t *testing.T) {
+	_, err := usageMetadataJSON(map[string]interface{}{"unsupported": make(chan int)})
+	var typeErr *json.UnsupportedTypeError
+	if !errors.As(err, &typeErr) {
+		t.Fatalf("unsupported metadata must return its marshal error, got %v", err)
 	}
 }

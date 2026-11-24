@@ -43,6 +43,10 @@ func streamTestGateway(upstreamURL string) *gateway {
 	pool := upstream.NewPool(upstream.Options{
 		BaseURL: upstreamURL,
 	})
+	// Explicit in-memory invocation store: fail-closed admission refuses
+	// every paid dispatch without one, so this trusted fixture wires one
+	// deliberately. Deliberate-refusal tests (the review battery) reset the
+	// field to a true nil interface to keep proving the fail-closed path.
 	return &gateway{
 		pool: pool,
 		cfg: config.Gateway{
@@ -55,6 +59,10 @@ func streamTestGateway(upstreamURL string) *gateway {
 		fallback:    fallbackrouter.NewFallbackExecutor(nil, 3, nil),
 		retryPolicy: retry.Policy{MaxAttempts: 1}, // no retry by default in tests
 		log:         slog.Default(),
+		// Preview2 durable accounting: the production constructor wires
+		// NewPGInvocationStore(w.pool); isolated chat fixtures wire the
+		// fake so the fail-closed confirmed start admits.
+		invocations: &fakeInvocationStore{},
 	}
 }
 
@@ -482,8 +490,8 @@ func TestServeStream_GuardCleanBody_ForwardsNormally(t *testing.T) {
 
 // rt06TestResolve resolves via the gateway's checked resolver in tests where
 // a concrete ModelInfo value is needed before calling a handler directly.
-func rt06TestResolve(gw *gateway, name string) resolver.ModelInfo {
-	info, err := gw.res.ResolveChecked(context.Background(), name)
+func rt06TestResolve(ctx context.Context, gw *gateway, name string) resolver.ModelInfo {
+	info, err := gw.res.ResolveChecked(ctx, name)
 	if err != nil {
 		panic("test resolver: " + err.Error())
 	}

@@ -79,11 +79,11 @@ func (s *fix08SeamStore) preflightFiltersSeen() *adminstore.RequestListFilters {
 	return s.preflightFilters
 }
 
-func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
+func (s *fix08SeamStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
 	s.record("consume")
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+	return s.mockStore.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
 }
 
 func (s *fix08SeamStore) StreamRequestExport(ctx context.Context, filters adminstore.RequestListFilters, access adminstore.RequestPayloadAccess, maxRows int, emit func(*adminstore.RequestDetail) error) (int, error) {
@@ -155,8 +155,15 @@ func (s *fix08NoExportStore) ConsumeRequestPayloadGrant(token, orgID, requestID,
 	return s.base.ConsumeRequestPayloadGrant(token, orgID, requestID, rootID, now)
 }
 
-func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope string, now time.Time) error {
-	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rootID, scope, now)
+func (s *fix08NoExportStore) ConsumeRequestPayloadGrantScope(token, orgID, requestID string, rowKey int64, rootID, scope string, now time.Time) (adminstore.RequestPayloadGrant, error) {
+	return s.base.ConsumeRequestPayloadGrantScope(token, orgID, requestID, rowKey, rootID, scope, now)
+}
+
+// PeekRequestPayloadGrantTarget is declared explicitly because the embedded
+// StoreInterface hides mockStore's extra methods: without it the handler's
+// requestPayloadGrantStore assertion fails and even issuance 503s.
+func (s *fix08NoExportStore) PeekRequestPayloadGrantTarget(ctx context.Context, token, orgID, requestID, rootID string, now time.Time) (int64, error) {
+	return s.base.PeekRequestPayloadGrantTarget(ctx, token, orgID, requestID, rootID, now)
 }
 
 func (s *fix08NoExportStore) RevokeRequestPayloadGrant(token, rootID string) error {
@@ -292,10 +299,12 @@ func TestFIX08ExpiredGrantWithDBErrorFailsClosed(t *testing.T) {
 
 		rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token)
 
-		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
-		require.Equal(t, []string{"preflight"}, store.callsSoFar())
+		// Peek denies the expiry BEFORE any preflight store call (0031),
+		// so a failing database cannot turn an expired grant into a 500.
+		require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
+		require.Empty(t, store.callsSoFar())
 		require.True(t, grantAlive(store.mockStore, token),
-			"the expired token was never consumed — the pre-flight failure must not burn it either")
+			"the expired token was never consumed — the peek denial must not burn it either")
 	})
 
 	t.Run("expired grant, healthy store", func(t *testing.T) {
@@ -309,10 +318,27 @@ func TestFIX08ExpiredGrantWithDBErrorFailsClosed(t *testing.T) {
 
 		require.Equal(t, http.StatusForbidden, rec.Code, rec.Body.String())
 		require.NotContains(t, rec.Body.String(), "arguments")
-		require.Equal(t, []string{"preflight", "consume"}, store.callsSoFar(),
-			"the expired grant must stop at the consume seam after the prechecks")
+		require.Empty(t, store.callsSoFar(),
+			"the expired grant is denied at the peek and never reaches the prechecks or the consume")
 		require.True(t, grantAlive(store.mockStore, token),
 			"a failed consume must not delete the grant record (it stays expired, not burned)")
+	})
+
+	// The DB-refusal/no-burn contract itself stays pinned on a VALID grant:
+	// a preflight database failure must answer 500 (a real error, not the
+	// generic grant denial) and leave the healthy token redeemable.
+	t.Run("valid grant, failing preflight", func(t *testing.T) {
+		store := &fix08SeamStore{mockStore: newMockStore(), failPreflight: true}
+		h := New(store, "", "", nil)
+		t.Cleanup(h.Stop)
+		token := issueExportGrant(t, h, `{"ttl_seconds":60,"org_id":"org-1","request_id":"req-1"}`)
+
+		rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token)
+
+		require.Equal(t, http.StatusInternalServerError, rec.Code, rec.Body.String())
+		require.Equal(t, []string{"preflight"}, store.callsSoFar())
+		require.True(t, grantAlive(store.mockStore, token),
+			"the pre-flight failure must not burn a valid grant")
 	})
 }
 
@@ -406,6 +432,64 @@ func TestFIX08MidStreamStoreFailureBurnsGrantAndIsJournalled(t *testing.T) {
 	replay := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token)
 	require.Equal(t, http.StatusForbidden, replay.Code, replay.Body.String())
 	require.NotContains(t, replay.Body.String(), "arguments")
+}
+
+// fix08RetentionRefusedStore models the A7 stale-allow window: the
+// authorize-time preflight sees retention enabled, but the store refuses the
+// disclosure at snapshot time (ErrOriginalRetentionDisabled) — retention was
+// turned off in-flight between the preflight and the disclosure snapshot.
+type fix08RetentionRefusedStore struct {
+	*mockStore
+}
+
+func (s *fix08RetentionRefusedStore) GetOrgOriginalRetention(_ context.Context, orgID string) (*adminstore.OrgOriginalRetention, error) {
+	on := true
+	return &adminstore.OrgOriginalRetention{OrgID: orgID, Enabled: &on, Effective: true}, nil
+}
+
+func (s *fix08RetentionRefusedStore) UpdateOrgOriginalRetention(_ context.Context, _ string, _ *bool) error {
+	return nil
+}
+
+func (s *fix08RetentionRefusedStore) StreamRequestExport(_ context.Context, _ adminstore.RequestListFilters, access adminstore.RequestPayloadAccess, _ int, _ func(*adminstore.RequestDetail) error) (int, error) {
+	if !access.Originals {
+		return 0, errors.New("test: only originals-scoped streams are expected here")
+	}
+	return 0, adminstore.ErrOriginalRetentionDisabled
+}
+
+// A snapshot-time retention refusal is a post-consume final outcome: the
+// disclosure snapshot found retention disabled (the authorize-time preflight
+// had seen it enabled — exactly the stale-allow window), the store fails
+// before any read, and the handler must surface it as a committed 200 with
+// the X-Export-Error: retention_disabled trailer, the
+// original_retention_disabled journal outcome, zero emitted bytes — and the
+// grant stays burned (no refund seam exists after the consume).
+func TestFIX08RetentionDisabledAtSnapshotIsFinal(t *testing.T) {
+	base := newMockStore()
+	store := &fix08RetentionRefusedStore{mockStore: base}
+	h := New(store, "", "", nil)
+	t.Cleanup(h.Stop)
+	token := issueExportGrant(t, h, `{"ttl_seconds":60,"org_id":"org-1","request_id":"req-1","scope":"payload.read_originals"}`)
+
+	rec := runRootExport(h, "/api/organizations/org-1/requests/export?request_id=req-1&payload_grant="+token+"&scope=payload.read_originals")
+
+	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String(), "the refusal happens after the 200 commit")
+	require.Empty(t, rec.Body.String(), "a snapshot-time retention refusal must disclose nothing")
+	require.Equal(t, "retention_disabled", rec.Header().Get("X-Export-Error"))
+	require.False(t, grantAlive(base, token), "post-consume refusals are final: the token stays consumed")
+
+	base.auditMu.Lock()
+	var journalled *adminstore.AuditLogEntryRecord
+	for i := range base.auditRecords {
+		if base.auditRecords[i].Action == "request_export" {
+			journalled = &base.auditRecords[i]
+		}
+	}
+	base.auditMu.Unlock()
+	require.NotNil(t, journalled, "the allowed-but-refused stream attempt must be journalled")
+	require.Contains(t, journalled.Details, `"outcome":"original_retention_disabled"`)
+	require.Contains(t, journalled.Details, `"rows":0`)
 }
 
 // Two concurrent redemptions of one grant must produce at most one payload:

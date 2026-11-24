@@ -152,7 +152,7 @@ func TestRun_ResumesInterruptedApplyWithoutDuplicatesOrLosses(t *testing.T) {
 	// call, over the interrupted position.
 	res, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err, "the resume must complete the interrupted apply")
-	require.Equal(t, int64(27), res.Version,
+	require.Equal(t, int64(jointScenario.headVersion), res.Version,
 		"embedded head moved: re-pin the recovery probes in the same change")
 	require.Equal(t, 1, res.Applied, "the single-row bookkeeping contract must hold after the resume")
 
@@ -167,11 +167,11 @@ func TestRun_ResumesInterruptedApplyWithoutDuplicatesOrLosses(t *testing.T) {
 	// the bookkeeping row stays exactly one.
 	retry, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err, "the retry must be an idempotent no-op")
-	require.Equal(t, int64(27), retry.Version)
+	require.Equal(t, int64(jointScenario.headVersion), retry.Version)
 	require.Equal(t, 1, retry.Applied)
 	requireRowCount(t, ctx, pool, "organizations", 1,
 		"the retry must not duplicate the probe row")
-	requireBookkeeping(t, ctx, pool, 27, false)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 }
 
 // TestRun_RecoversAfterRealFailedMigration — a migration that fails mid-apply
@@ -216,17 +216,17 @@ func TestRun_RecoversAfterRealFailedMigration(t *testing.T) {
 	// Operator recovery: force the bookkeeping back to the true schema
 	// position (the `migrate force 5` step), then resume through the shipped
 	// runner.
-	full := subsetMigrator(t, ctx, dsn, extractEmbeddedSubset(t, 27))
+	full := subsetMigrator(t, ctx, dsn, extractEmbeddedSubset(t, jointScenario.headVersion))
 	require.NoError(t, full.Force(5), "the force recovery must clear the dirty position")
 	requireBookkeeping(t, ctx, pool, 5, false)
 
 	res, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err, "the resume must complete from the recovered position")
-	require.Equal(t, int64(27), res.Version)
+	require.Equal(t, int64(jointScenario.headVersion), res.Version)
 
 	// No duplicates, no losses: exactly one bookkeeping row, the probe row
 	// intact, the previously failing step now completed properly.
-	requireBookkeeping(t, ctx, pool, 27, false)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 	requireRowCount(t, ctx, pool, "organizations", 1,
 		"the probe row must survive the recovery untouched")
 	requireTableExists(t, dsn, "batch_files")
@@ -246,26 +246,26 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 
 	up, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err)
-	require.Equal(t, int64(27), up.Version)
+	require.Equal(t, int64(jointScenario.headVersion), up.Version)
 	_, err = pool.Exec(ctx,
 		`INSERT INTO organizations (name, slug) VALUES ('Revert Org', 'revert-org')`)
 	require.NoError(t, err)
 	requireRowCount(t, ctx, pool, "organizations", 1, "before the interrupted revert")
 
-	// The honest mid-revert crash: the applied number line is 27, 26, 25, 24,
-	// 22, 21, 20, 19, 18, 17, 16, 15, 14 (the embedded set carries the reserved
+	// The honest mid-revert crash: the applied number line is 31, 30, 29, 28, 27, 26, 25,
+	// 24, 22, 21, 20, 19, 18, 17, 16, 15, 14 (the embedded set carries the reserved
 	// gap 0023 as a no-file version — 0024 is present via e03p01b and 0025
 	// via e04p01a — so the revert walks the applied
 	// versions, not the plain number line) — the poisoned 0013
 	// down fails and leaves the driver's dirty record on the failed step's
 	// target position (the driver marks the target dirty before running the
 	// file). The source carries every pair (the revert needs the
-	// 0014/0015/0016/0017/0018/0019/0020/0021/0022, 0024, 0025, 0026 and
-	// 0027 down files) —
+	// 0014/0015/0016/0017/0018/0019/0020/0021/0022, 0024, 0025, 0026, 0027,
+	// 0028, 0029, 0030 and 0031 down files) —
 	// only the 0013 down body is poisoned. The true schema position stays
 	// 13: its down never completed a statement.
 	poisoned := subsetMigrator(t, ctx, dsn,
-		corruptEmbeddedSubsetFile(t, 27, "0013_guard_pack_state.down.sql"))
+		corruptEmbeddedSubsetFile(t, jointScenario.headVersion, "0013_guard_pack_state.down.sql"))
 	require.Error(t, poisoned.Migrate(uint(12)),
 		"the poisoned 0013 down must fail the revert at 13")
 	requireBookkeeping(t, ctx, pool, 12, true,
@@ -283,7 +283,7 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 	// Operator recovery: force the true position (13 — its down never
 	// completed), then retry the revert to the exact target with the real
 	// files.
-	full := subsetMigrator(t, ctx, dsn, extractEmbeddedSubset(t, 27))
+	full := subsetMigrator(t, ctx, dsn, extractEmbeddedSubset(t, jointScenario.headVersion))
 	require.NoError(t, full.Force(13), "the force recovery must clear the dirty position")
 	require.NoError(t, full.Migrate(uint(12)), "the retried revert must land on the target")
 	requireBookkeeping(t, ctx, pool, 12, false)
@@ -295,8 +295,8 @@ func TestDown_ResumesInterruptedRevert(t *testing.T) {
 	// data intact, bookkeeping single-row.
 	res, err := Run(ctx, dsn, "sg")
 	require.NoError(t, err)
-	require.Equal(t, int64(27), res.Version)
-	requireBookkeeping(t, ctx, pool, 27, false)
+	require.Equal(t, int64(jointScenario.headVersion), res.Version)
+	requireBookkeeping(t, ctx, pool, int64(jointScenario.headVersion), false)
 	requireRowCount(t, ctx, pool, "guard_pack_state", 0,
 		"the re-created structure starts empty: deleted data is not restored")
 	requireRowCount(t, ctx, pool, "organizations", 1,

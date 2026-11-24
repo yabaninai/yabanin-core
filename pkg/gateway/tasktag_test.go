@@ -53,12 +53,13 @@ func TestChatCompletions_TaskTagAppliedToTokenBudget(t *testing.T) {
 	// Exhaust the task budget for the fallback tag. A request that does NOT
 	// carry its own X-Yabanin-Task header must be attributed to the fallback
 	// tag — and therefore blocked once that tag's budget is exhausted.
-	gw.tokenBudget.Record(TaskBudgetScope, "", "a142-add-login", 1_000_000)
+	gw.tokenBudget.Record(TaskBudgetScope, "org-test", "a142-add-login", 1_000_000) // same org the stamped request carries
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		bytes.NewReader([]byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	gw.chatCompletions(rec, r)
 
 	require.Equal(t, http.StatusTooManyRequests, rec.Code,
@@ -78,12 +79,13 @@ func TestChatCompletions_TaskTagHeaderWinsOverFallback(t *testing.T) {
 	// Exhaust ONLY the fallback tag's budget. A request carrying its own
 	// X-Yabanin-Task header must be attributed to that header (not the
 	// fallback), so it proceeds despite the fallback tag being exhausted.
-	gw.tokenBudget.Record(TaskBudgetScope, "", "a142-add-login", 1_000_000)
+	gw.tokenBudget.Record(TaskBudgetScope, "org-test", "a142-add-login", 1_000_000) // same org the stamped request carries
 
 	rec := httptest.NewRecorder()
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		bytes.NewReader([]byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	r.Header.Set("X-Yabanin-Task", "override-task")
 	gw.chatCompletions(rec, r)
 
@@ -107,6 +109,7 @@ func TestChatCompletions_NoTaskTag_NoChange(t *testing.T) {
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost, "/v1/chat/completions",
 		bytes.NewReader([]byte(`{"model":"gpt-4o-mini","messages":[{"role":"user","content":"hi"}]}`)))
 	r.Header.Set("Content-Type", "application/json")
+	r.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	gw.chatCompletions(rec, r)
 
 	require.Equal(t, http.StatusOK, rec.Code, "no task tag → zero behavior change: %s", rec.Body.String())

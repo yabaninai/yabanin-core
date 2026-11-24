@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/go-chi/chi/v5"
+	"github.com/reireirei/yabanin/internal/retryclock"
 	"github.com/reireirei/yabanin/pkg/retry"
 	"github.com/reireirei/yabanin/pkg/upstream"
 	"github.com/stretchr/testify/assert"
@@ -21,10 +22,12 @@ import (
 // captured response headers into retry scheduling, so an upstream 429's
 // Retry-After hint (seconds or HTTP-date) takes precedence over the
 // exponential backoff exactly as the pkg/retry boundary corpus pins. The
-// discriminator is deterministic: the request deadline (10ms) sits between
-// the unhinted backoff (5ms) and the clamped hinted delay (20ms = MaxDelay),
-// and retry.Do's sleep is context-aware — a hint reaches the scheduler
-// exactly when the retry stops before the second dial.
+// discriminator is the scheduled delay itself, recorded through the
+// context-carried retryclock sleeper: an unhinted 429 must yield the exact
+// exponential backoff, a hinted one the MaxDelay-clamped hint, and hinted
+// cases cancel the request from inside the pending wait — the deterministic
+// form of a deadline firing mid-sleep. No assertion races wall-clock
+// against machine speed.
 
 // n07rlUpstreamRateLimited answers every dial with 429 (+ optional
 // Retry-After) and counts dials.
@@ -44,7 +47,7 @@ func n07rlUpstreamRateLimited(t *testing.T, hint string) (*httptest.Server, *ato
 }
 
 // n07rlRetryGateway mirrors the n07t08 retry-gateway wiring with a
-// deterministic no-jitter policy tuned for the deadline discriminator.
+// deterministic no-jitter policy tuned for exact scheduled-delay oracles.
 func n07rlRetryGateway(t *testing.T, upstreamURL string) *gateway {
 	t.Helper()
 	gw := n03p6t06ChatGateway(t, upstreamURL)
@@ -58,11 +61,13 @@ func n07rlRetryGateway(t *testing.T, upstreamURL string) *gateway {
 	return gw
 }
 
-func n07rlPostChatWithDeadline(t *testing.T, gw *gateway, body string, deadline time.Duration) *httptest.ResponseRecorder {
+// n07rlPostChat issues the same real chi-router request the production
+// handler serves, with the caller's context so a retryclock sleeper carried
+// on it reaches retry.Do's scheduling.
+func n07rlPostChat(t *testing.T, gw *gateway, body string, ctx context.Context) *httptest.ResponseRecorder {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(t.Context(), deadline)
-	t.Cleanup(cancel)
 	req := httptest.NewRequestWithContext(ctx, http.MethodPost, "/v1/chat/completions", strings.NewReader(body))
+	req.Header.Set("X-Org-Id", "org-test") // durable accounting binds org_id NOT NULL
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -72,42 +77,76 @@ func n07rlPostChatWithDeadline(t *testing.T, gw *gateway, body string, deadline 
 	return rec
 }
 
+// n07rlScheduling records the scheduled delay, then optionally kills the
+// request context from inside the pending wait — the deterministic form of
+// a deadline firing mid-sleep. Cancelling from inside the seam guarantees
+// the first attempt (and its captured headers) fully preceded the abort,
+// which no wall-clock deadline can promise under load.
+func n07rlScheduling(slept *[]time.Duration, cancel context.CancelFunc) retryclock.Sleeper {
+	return func(ctx context.Context, d time.Duration) {
+		*slept = append(*slept, d)
+		if cancel != nil {
+			cancel()
+			<-ctx.Done()
+		}
+	}
+}
+
 func TestRetryAfterWiring_ChatHintFeedsRetryScheduler(t *testing.T) {
-	up, dials := n07rlUpstreamRateLimited(t, "1") // clamped to MaxDelay=20ms > 10ms deadline
+	up, dials := n07rlUpstreamRateLimited(t, "1") // 1s hint clamps to MaxDelay=20ms
 
 	gw := n07rlRetryGateway(t, up.URL)
-	start := time.Now()
-	rec := n07rlPostChatWithDeadline(t, gw, n03p6t06OpenAIPlainBody, 10*time.Millisecond)
-	elapsed := time.Since(start)
+	var slept []time.Duration
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	ctx, guard := context.WithTimeout(ctx, 2*time.Second)
+	t.Cleanup(guard)
+	ctx = retryclock.With(ctx, n07rlScheduling(&slept, cancel))
+	rec := n07rlPostChat(t, gw, n03p6t06OpenAIPlainBody, ctx)
 
+	assert.Equal(t, []time.Duration{20 * time.Millisecond}, slept,
+		"the captured 1s hint clamped to MaxDelay=20ms feeds the scheduler — not the 5ms exponential backoff")
 	assert.Equal(t, int64(1), dials.Load(),
-		"a 1s hint clamped to 20ms exceeds the 10ms deadline: the scheduler must stop before the second dial")
-	assert.GreaterOrEqual(t, elapsed, 9*time.Millisecond,
-		"the deadline governs: the hinted sleep was still pending when it fired")
-	assert.Less(t, elapsed, 2*time.Second, "sanity bound against a wedged scheduler")
+		"the request dies while the hinted sleep is still pending: the scheduler stops before the second dial")
 	assert.NotEqual(t, http.StatusOK, rec.Code, "the request still fails; only scheduling changes")
 }
 
 func TestRetryAfterWiring_ChatNoHintUsesExponentialBackoff(t *testing.T) {
-	up, dials := n07rlUpstreamRateLimited(t, "") // no header: 5ms backoff < 10ms deadline
+	up, dials := n07rlUpstreamRateLimited(t, "") // no header: exponential backoff
 
 	gw := n07rlRetryGateway(t, up.URL)
-	rec := n07rlPostChatWithDeadline(t, gw, n03p6t06OpenAIPlainBody, 10*time.Millisecond)
+	var slept []time.Duration
+	// The timeout is only a wedged-scheduler guard; with the sleeper
+	// carried on the request context no assertion races it.
+	ctx, guard := context.WithTimeout(t.Context(), 2*time.Second)
+	t.Cleanup(guard)
+	ctx = retryclock.With(ctx, n07rlScheduling(&slept, nil))
+	rec := n07rlPostChat(t, gw, n03p6t06OpenAIPlainBody, ctx)
 
+	assert.Equal(t, []time.Duration{5 * time.Millisecond}, slept,
+		"without a captured hint the scheduler must pick the exponential backoff (BaseDelay<<attempt 0), never a Retry-After-derived delay")
 	assert.Equal(t, int64(2), dials.Load(),
-		"without a header the 5ms exponential backoff fits before the deadline: the second dial fires")
+		"the unhinted exponential backoff is the only wait: the second dial fires")
 	assert.NotEqual(t, http.StatusOK, rec.Code)
 }
 
 func TestRetryAfterWiring_StreamHintFeedsRetryScheduler(t *testing.T) {
-	up, dials := n07rlUpstreamRateLimited(t, "1")
+	up, dials := n07rlUpstreamRateLimited(t, "1") // clamped to MaxDelay=20ms
 
 	gw := n07rlRetryGateway(t, up.URL)
 	streamBody := `{"model":"gpt-4o","stream":true,"messages":[{"role":"user","content":"summarize"}]}`
-	rec := n07rlPostChatWithDeadline(t, gw, streamBody, 10*time.Millisecond)
+	var slept []time.Duration
+	ctx, cancel := context.WithCancel(t.Context())
+	t.Cleanup(cancel)
+	ctx, guard := context.WithTimeout(ctx, 2*time.Second)
+	t.Cleanup(guard)
+	ctx = retryclock.With(ctx, n07rlScheduling(&slept, cancel))
+	rec := n07rlPostChat(t, gw, streamBody, ctx)
 
+	assert.Equal(t, []time.Duration{20 * time.Millisecond}, slept,
+		"the stream path must honor the captured hint the same way (1s clamped to MaxDelay=20ms)")
 	assert.Equal(t, int64(1), dials.Load(),
-		"the stream path must honor the captured hint the same way (clamped 20ms > 10ms deadline)")
+		"the stream request dies while the hinted sleep is still pending")
 	assert.Contains(t, rec.Body.String(), "data:",
 		"the connect-phase failure is rendered as an SSE error frame")
 }

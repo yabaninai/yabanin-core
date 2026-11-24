@@ -22,6 +22,12 @@ export interface MeOrganization {
   name: string
   role: string
   permissions: string[]
+  // Additive presentation fields (tenant UI/API parity): authoritative for
+  // exactly the caller's own memberships; omitted when unset in the store
+  // (the client applies USD/UTC defaults then).
+  slug?: string
+  currency?: string
+  timezone?: string
 }
 
 export interface Me {
@@ -43,22 +49,29 @@ export interface Me {
 let cachedMe: Me | null = null
 let meUnavailable = false
 let inflight: Promise<Me | null> | null = null
+// Generation guard: resetMeCache retires every in-flight request. A retired
+// flight (success OR failure) must not repopulate the cache, latch
+// unavailability, clear a newer flight, or resolve with the retired
+// identity's payload — it resolves null (identity unknown) instead.
+let meGeneration = 0
 
 function requestMe(): Promise<Me | null> {
   if (cachedMe) return Promise.resolve(cachedMe)
   if (meUnavailable) return Promise.resolve(null)
   if (!inflight) {
+    const generation = meGeneration
     inflight = fetchJSON<Me>('/me')
       .then(me => {
+        if (generation !== meGeneration) return null
         cachedMe = me
         return me
       })
       .catch(() => {
-        meUnavailable = true // null = endpoint unavailable (distinct from a payload)
+        if (generation === meGeneration) meUnavailable = true
         return null
       })
       .finally(() => {
-        inflight = null
+        if (generation === meGeneration) inflight = null
       })
   }
   return inflight
@@ -71,6 +84,7 @@ function requestMe(): Promise<Me | null> {
 // only called on a confirmed sign-out, so clearing here cannot re-introduce
 // resets.
 export function resetMeCache(): void {
+  meGeneration++
   cachedMe = null
   meUnavailable = false
   inflight = null

@@ -119,6 +119,12 @@ func goldenEvent(t *testing.T, name string, got, want *eventpub.Event, volatile 
 	g, w := *got, *want
 	g.DurationMs, w.DurationMs = 0, 0
 	g.FirstTokenMs, w.FirstTokenMs = 0, 0
+	// TS (wall-clock stamped at the terminal funnel) and InvocationID
+	// (server-minted per-run uuid) are per-run nondeterministics like the
+	// clocks: zeroed on both sides. The invocation accounting contract
+	// itself is asserted by the dedicated review tests.
+	g.TS, w.TS = 0, 0
+	g.InvocationID, w.InvocationID = "", ""
 	if w.Error == "SENTINEL" {
 		// Prefix-shaped errors are asserted in the volatile callback.
 		w.Error = g.Error
@@ -151,7 +157,8 @@ func goldenProcessedFromSSE(t *testing.T, sse, status, reason string) string {
 }
 
 // goldenChatGateway wires the full chat pipeline (streamTestGateway base) to a
-// resolved "gpt-4o" candidate on the given upstream.
+// resolved "gpt-4o" candidate on the given upstream. The base fixture wires
+// the in-memory invocation store; deliberate-refusal tests reset it.
 func goldenChatGateway(t *testing.T, upstreamURL string) *gateway {
 	t.Helper()
 	gw := streamTestGateway(upstreamURL)
@@ -405,6 +412,17 @@ func TestGoldenEvent_ChatJSON_UpstreamFailed(t *testing.T) {
 
 const goldenCachedDoc = `{"id":"cached","object":"chat.completion","model":"gpt-4o","choices":[{"index":0,"message":{"role":"assistant","content":"from-cache"},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}`
 
+func requirePublishableCacheReplay(t *testing.T, ev *eventpub.Event) {
+	t.Helper()
+	fields, err := ev.TerminalAccountingFields()
+	require.NoError(t, err)
+	require.NotEmpty(t, fields["invocation_id"])
+	require.Positive(t, ev.TS)
+	require.Equal(t, "cache_hit", fields["cost_status"])
+	require.Equal(t, "0", fields["estimated_cost_usd"])
+	require.Equal(t, "0", fields["resale_cost_usd"])
+}
+
 func TestGoldenEvent_CacheHit_Exact(t *testing.T) {
 	up := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		t.Error("a cache hit must not reach the provider")
@@ -430,6 +448,7 @@ func TestGoldenEvent_CacheHit_Exact(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "EXACT", rec.Header().Get("X-Cache"))
 	ev := cap.last(t)
+	requirePublishableCacheReplay(t, ev)
 	goldenEvent(t, "cache hit exact", ev, &eventpub.Event{
 		EventType:             "request.completed",
 		Source:                "gateway",
@@ -499,6 +518,7 @@ func TestGoldenEvent_CacheHit_Semantic(t *testing.T) {
 	require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
 	require.Equal(t, "SEMANTIC", rec.Header().Get("X-Cache"))
 	ev := cap.last(t)
+	requirePublishableCacheReplay(t, ev)
 	goldenEvent(t, "cache hit semantic", ev, &eventpub.Event{
 		EventType:             "request.completed",
 		Source:                "gateway",
@@ -587,8 +607,11 @@ func TestGoldenEvent_Chat_UnknownModelReject(t *testing.T) {
 		OrgID:          "org-g1",
 		TeamID:         "team-g1",
 		ModelRequested: "ghost",
-		Error:          `model "ghost" is not available on this gateway`,
-		Labels:         map[string]string{},
+		// Refusal history: the exact wire status is stamped on the event so
+		// the consumer's typed refusal record binds the client-visible 404.
+		StatusCode: http.StatusNotFound,
+		Error:      `model "ghost" is not available on this gateway`,
+		Labels:     map[string]string{},
 	}, nil)
 }
 
@@ -939,8 +962,11 @@ func TestGoldenEvent_Admission_UnknownModelReject_NoChatPath(t *testing.T) {
 		OrgID:          "org-g1",
 		TeamID:         "team-g1",
 		ModelRequested: "ghost",
-		Error:          `model "ghost" is not available on this gateway`,
-		Labels:         map[string]string{},
+		// Refusal history: the exact wire status is stamped on the event so
+		// the consumer's typed refusal record binds the client-visible 404.
+		StatusCode: http.StatusNotFound,
+		Error:      `model "ghost" is not available on this gateway`,
+		Labels:     map[string]string{},
 	}, nil)
 }
 
@@ -1299,6 +1325,7 @@ func TestGoldenEvent_Shadow_ExcludedFromPrimary(t *testing.T) {
 	}.Validate()
 	require.NoError(t, err)
 	gw.cfg.Shadow = sc
+	gw.invocations = &shadowAccountingFixture{}
 	gw.shadow = shadow.NewDispatcher(vcfg, testLogger())
 	gw.shadow.SetPinnedOrgFunc(func(context.Context, string) bool { return false })
 
@@ -1346,7 +1373,13 @@ func TestGoldenEvent_Shadow_ExcludedFromPrimary(t *testing.T) {
 	})
 	require.NoError(t, mErr)
 
+	require.NotEmpty(t, primaryEv.InvocationID)
+	require.NotEmpty(t, shadowEv.InvocationID)
+	require.NotEqual(t, primaryEv.InvocationID, shadowEv.InvocationID)
+	require.Positive(t, shadowEv.TS)
 	goldenEvent(t, "shadow event", shadowEv, &eventpub.Event{
+		InvocationID:     shadowEv.InvocationID,
+		TS:               shadowEv.TS,
 		EventType:        "request.shadow_completed",
 		Source:           "gateway",
 		SessionID:        "sess-g1",
@@ -1539,6 +1572,7 @@ func TestGoldenEvent_ContentProfile_ShadowSanitized(t *testing.T) {
 	}.Validate()
 	require.NoError(t, err)
 	gw.cfg.Shadow = sc
+	gw.invocations = &shadowAccountingFixture{}
 	gw.shadow = shadow.NewDispatcher(vcfg, testLogger())
 	gw.shadow.SetPinnedOrgFunc(func(context.Context, string) bool { return false })
 

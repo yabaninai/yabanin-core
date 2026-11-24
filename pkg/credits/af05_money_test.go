@@ -55,16 +55,25 @@ func ledgerTotals(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID s
 }
 
 // requireReconciled pins the AF-05 invariant for a wallet seeded from a
-// micro-clean state (balance 0, empty ledger): owed micro total derived from
-// the wallet plus its residue equals the exact micro the ledger recorded —
-// owed = (−balance_cents)*10000 + remainder == −SUM(amount_micro_usd).
+// micro-clean state (balance 0, empty ledger); see requireReconciledSeeded
+// for the general seeded form.
 func requireReconciled(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID string) {
+	t.Helper()
+	requireReconciledSeeded(ctx, t, pool, orgID, 0)
+}
+
+// requireReconciledSeeded pins the AF-05 invariant for a wallet seeded with
+// seedCents: prepaid seed cents carry no ledger rows, so every ledger
+// identity is offset by the seed —
+// balance == seed + SUM(amount_cents) and
+// −SUM(amount_micro_usd) == (seed − balance)*10000 + remainder.
+func requireReconciledSeeded(ctx context.Context, t *testing.T, pool *pgxpool.Pool, orgID string, seedCents int64) {
 	t.Helper()
 	balanceCents, remainder := walletRow(ctx, t, pool, orgID)
 	ledgerCents, ledgerMicro, _ := ledgerTotals(ctx, t, pool, orgID)
-	assert.Equal(t, ledgerCents, balanceCents, "wallet cents must equal the cents ledger sum")
-	assert.Equal(t, -balanceCents*int64(money.MicroPerCent)+remainder, -ledgerMicro,
-		"owed µUSD (wallet + residue) must equal the exact µUSD the ledger billed")
+	assert.Equal(t, seedCents+ledgerCents, balanceCents, "wallet cents must equal seed plus the cents ledger sum")
+	assert.Equal(t, (seedCents-balanceCents)*int64(money.MicroPerCent)+remainder, -ledgerMicro,
+		"owed µUSD (seed-offset wallet + residue) must equal the exact µUSD the ledger billed")
 }
 
 // Acceptance: 1000 individual requests at $0.004 bill exactly $4.00, across
@@ -73,7 +82,7 @@ func requireReconciled(ctx context.Context, t *testing.T, pool *pgxpool.Pool, or
 // scenario a pure accumulation (no admission stop at the default −$1 floor).
 func TestDeductMicro_ThousandSubCentRequestsAcrossRestarts(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-thousand"
@@ -106,7 +115,7 @@ func TestDeductMicro_ThousandSubCentRequestsAcrossRestarts(t *testing.T) {
 // Replay of the same request never double-charges — at exact µUSD either.
 func TestDeductMicro_ReplayDoesNotDoubleCharge(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-replay"
@@ -132,7 +141,7 @@ func TestDeductMicro_ReplayDoesNotDoubleCharge(t *testing.T) {
 // atomically in the same transaction.
 func TestDeductMicro_RemainderCarryChargesWholeCent(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-carry"
@@ -164,7 +173,7 @@ func TestDeductMicro_RemainderCarryChargesWholeCent(t *testing.T) {
 // floor is allowed only when it carries no residue.
 func TestDeductMicro_FloorBoundariesWithRemainder(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	cases := []struct {
@@ -232,7 +241,7 @@ func TestDeductMicro_FloorBoundariesWithRemainder(t *testing.T) {
 // admits regardless of residue.
 func TestCheckBalance_FractionalAdmission(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	cases := []struct {
@@ -272,7 +281,7 @@ func TestCheckBalance_FractionalAdmission(t *testing.T) {
 // grace keeps admission out of the picture — this tests exactness.
 func TestDeductMicro_ConcurrentExactTotals(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-concurrent"
@@ -315,7 +324,7 @@ func TestDeductMicro_ConcurrentExactTotals(t *testing.T) {
 // stay consistent with fractional activity on top of them.
 func TestDeductMicro_HistoricalLedgerUntouched(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-historical"
@@ -366,7 +375,7 @@ func TestDeductMicro_HistoricalLedgerUntouched(t *testing.T) {
 // accrued sub-cent residue, and effective balance moves by exactly the cents.
 func TestTopUp_InteractsWithRemainderExactly(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(context.Background(), t, pool)
 
 	orgID := "af05-topup"
@@ -394,7 +403,7 @@ func TestTopUp_InteractsWithRemainderExactly(t *testing.T) {
 // price must never become a zero (or negative) charge.
 func TestDeductMicro_BoundaryRejections(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	orgID := "af05-boundary"
@@ -446,7 +455,7 @@ func TestEffectiveBalance_OverflowFailsClosed(t *testing.T) {
 // is shared, so assertions are scoped to this test's orgs.
 func TestLowBalanceOrgs(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	seedWallet(ctx, t, pool, "af05-low-a", -5)
@@ -472,7 +481,7 @@ func TestLowBalanceOrgs(t *testing.T) {
 // Transaction listing clamps out-of-range limits to the default page.
 func TestGetTransactions_LimitClamped(t *testing.T) {
 	ctx := context.Background()
-	pool := setupTestDB(t)
+	pool := setupFixtureDB(t)
 	setupTestTables(ctx, t, pool)
 
 	orgID := "af05-tx-clamp"

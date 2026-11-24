@@ -1,13 +1,13 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
-import { useHashParam } from '../hooks/useHashParam'
+import { useHashParam, useHashParamValues } from '../hooks/useHashParam'
 import { useInspectParam } from '../hooks/useInspectParam'
 import { useRequestLabelKeys } from '../hooks/useRequestLabelKeys'
 import {
   getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
   type LineageAttestation, type PolicyDecision, type RequestDetail, type RequestListStats, type RequestRow,
 } from '../api/client'
-import { currentHashQuery, relatedListHref } from '../lib/inspectUrl'
+import { currentHashQuery, INSPECT_ROW_PARAM, relatedListHref, selectedRequestRowId } from '../lib/inspectUrl'
 import {
   appendClause, parseYQL, serializeYQL, YQL_FIELDS, type YqlFieldMeta,
 } from '../lib/queryLang'
@@ -841,6 +841,17 @@ export function RequestExplorerPage() {
   const { labelKeys, refreshLabels } = useRequestLabelKeys(org)
   const [inspectParam, setInspectParam] = useInspectParam()
   const inspectId = inspectParam.startsWith('request:') ? inspectParam.slice('request:'.length) : inspectParam
+  // 0028: which physical row of the (possibly shared) correlation the
+  // inspector targets — the list's row_key, kept next to the inspect id so
+  // a deep link reproduces the exact row the link author clicked. Absent
+  // param = '' like the inspect id; back/forward changes it and refetches.
+  // 0028: the row selector must be REACTIVE over its complete ordered value
+  // list. A scalar hook reads .get() (first value), so a same-mounted-page
+  // hash mutation like row_key=12 -> row_key=12&row_key=99 — or absent ->
+  // row_key= — leaves the scalar dependency identical and the previous
+  // successful detail stays shown for a URL the server would reject. The
+  // values hook re-renders on any list change (absent/blank/duplicates).
+  const [inspectRowKeys, setInspectRowKey] = useHashParamValues(INSPECT_ROW_PARAM)
   const [inspectRecord, setInspectRecord] = useState<LineageAttestation | null>(null)
   const [inspectDetail, setInspectDetail] = useState<RequestDetail | null>(null)
   const [inspectorLoading, setInspectorLoading] = useState(false)
@@ -1024,18 +1035,25 @@ export function RequestExplorerPage() {
   // The drawer's data: lineage (signature/region evidence) and the
   // request-log detail (stored response snapshot + prompt_hash) are
   // independent; fetch both and let either resolve. The effect (not a click
-  // handler) is what makes the ?inspect=request:<id> deep link work.
+  // handler) is what makes the ?inspect=request:<id> deep link work. The
+  // detail read forwards the URL's row_key values VERBATIM: one value
+  // selects the physical row of a possibly-shared correlation, while a
+  // blank or duplicated selector reaches the server's strict 400 (the
+  // drawer's honest unknown/failed notice) — the client never collapses
+  // duplicates to the first sibling and never silently falls back to the
+  // ambiguous correlation read.
   useEffect(() => {
     if (!inspectId) return
     let cancelled = false
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectorLoading(true)
+    const rowKeys = inspectRowKeys.length > 0 ? inspectRowKeys : undefined
     const lineage = getLineage(inspectId)
       .then(rec => ({ ok: true as const, rec }))
       .catch(() => ({ ok: false as const, rec: null }))
     const detail = org
-      ? getRequestDetail(org, inspectId)
+      ? getRequestDetail(org, inspectId, undefined, rowKeys)
         .then(rec => ({ ok: true as const, rec }))
         .catch(() => ({ ok: false as const, rec: null }))
       : Promise.resolve({ ok: false as const, rec: null })
@@ -1046,7 +1064,7 @@ export function RequestExplorerPage() {
       setInspectorLoading(false)
     })
     return () => { cancelled = true }
-  }, [inspectId, org])
+  }, [inspectId, org, inspectRowKeys])
 
   // Fetch the decision-log rows for this request. First page
   // only — the drawer shows the freshest evaluations plus a link into the
@@ -1073,17 +1091,26 @@ export function RequestExplorerPage() {
 
   useEffect(() => loadInspectDecisions(), [loadInspectDecisions])
 
-  const openInspector = (requestId: string) => {
+  // Opens the inspector on one physical row: the correlation id plus, when
+  // the row exposes one, its row_key — a click on a shared correlation must
+  // not be retargeted to whichever sibling the server happens to pick. The
+  // selector is cleared for legacy rows so it can never leak stale into the
+  // next inspector.
+  const openInspector = (requestId: string, rowKey?: string) => {
     if (!requestId) return
+    setInspectRowKey(rowKey ?? '')
     setInspectParam(`request:${requestId}`)
   }
   const closeInspector = () => {
     setInspectParam(null)
+    setInspectRowKey('')
     setInspectRecord(null)
     setInspectDetail(null)
     setInspectDecisions(null)
     setInspectDecisionsState('idle')
   }
+
+  const selectedRowId = selectedRequestRowId(inspectId, inspectRowKeys, rows)
 
   // Chips, the add-filter builder, the YQL input with the error
   // highlight and the cheatsheet live in the shared FilterBar. The page
@@ -1131,7 +1158,7 @@ export function RequestExplorerPage() {
       <RowActions
         label={`${t('common.actions')}: ${r.request_id}`}
         items={[
-          { id: 'inspect', label: t('common.inspector'), onSelect: () => openInspector(r.request_id) },
+          { id: 'inspect', label: t('common.inspector'), onSelect: () => openInspector(r.request_id, r.row_key) },
           { id: 'lineage', label: t('explorer.viewLineage'), onSelect: () => { window.location.hash = `#lineage?req=${encodeURIComponent(r.request_id)}` } },
           { id: 'copy', label: t('common.copy'), onSelect: () => { void copyText(r.request_id) } },
           ...sortedLabelEntries(r.labels).slice(0, 3).map(([key, value]) => ({
@@ -1377,7 +1404,7 @@ export function RequestExplorerPage() {
         <section aria-label={t('explorer.requestsHeading')} className="flex flex-col gap-2">
           <BulkActions
             rows={rows}
-            getRowId={r => r.request_id || `${r.created_at}-${r.status_code}`}
+            getRowId={r => r.row_key || r.request_id || `${r.created_at}-${r.status_code}`}
             getRowLabel={r => r.request_id || r.created_at}
             selectedIds={selectedRequestIds}
             onSelectionChange={setSelectedRequestIds}
@@ -1390,7 +1417,7 @@ export function RequestExplorerPage() {
           <DataTable
             columns={columns}
             rows={rows}
-            getRowId={r => r.request_id || `${r.created_at}-${r.status_code}`}
+            getRowId={r => r.row_key || r.request_id || `${r.created_at}-${r.status_code}`}
             selection={{
               selectedRowIds: selectedRequestIds,
               onSelectionChange: setSelectedRequestIds,
@@ -1411,8 +1438,8 @@ export function RequestExplorerPage() {
             emptyAction={{ label: t('explorer.clearModelFilter'), onClick: () => applyQuery('') }}
             density={tablePrefs.density}
             hiddenColumnIds={tablePrefs.hiddenColumnIds}
-            onRowClick={r => openInspector(r.request_id)}
-            selectedId={inspectId || undefined}
+            onRowClick={r => openInspector(r.request_id, r.row_key)}
+            selectedId={selectedRowId}
             renderActions={rowActions}
           />
           <Pagination page={page} pageSize={PAGE_SIZE} total={total} totalPages={totalPages} loading={loading} onChange={setRequestedPage} />

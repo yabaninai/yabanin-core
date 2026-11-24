@@ -19,6 +19,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
@@ -31,7 +32,43 @@ var (
 	ErrInsufficientCredits = errors.New("insufficient credits")
 	// ErrNoWallet means the org has no billing wallet yet.
 	ErrNoWallet = errors.New("no billing wallet found; contact admin to set up credits")
+	// ErrChargeIdentityConflict means a usage row exists under the charged
+	// invocation identity but its org or exact amount disagrees with the
+	// charge: the identity is authoritative and globally unique, so this
+	// is an integrity violation (poison for the settlement worker), never
+	// an idempotent success and never a re-charge.
+	ErrChargeIdentityConflict = errors.New("charge identity conflict")
 )
+
+// invocationColumnProbeQuery reports whether credit_transactions carries the
+// invocation_id column (migration 0028+). column_name is a bind parameter
+// so a probe against an unexpected surface cannot echo a row back as
+// truth. The probe runs on the pool before any transaction is held and
+// only a successful read is cached.
+const invocationColumnProbeQuery = `SELECT count(*) FROM information_schema.columns
+	WHERE table_schema = current_schema() AND table_name = 'credit_transactions' AND column_name = $1`
+
+// creditInvocationColumn resolves (per store) whether the ledger carries
+// the invocation identity column. A transient read failure returns the
+// error — the caller fails the deduction and the settlement worker
+// retries, instead of caching "old schema" forever and mis-keying every
+// subsequent idempotency lookup.
+func (s *Store) creditInvocationColumn(ctx context.Context) (bool, error) {
+	s.ledgerMu.Lock()
+	defer s.ledgerMu.Unlock()
+	if s.ledgerResolved {
+		return s.ledgerHasInvCol, nil
+	}
+	if s.db == nil {
+		return false, nil
+	}
+	var n int
+	if err := s.db.QueryRow(ctx, invocationColumnProbeQuery, "invocation_id").Scan(&n); err != nil {
+		return false, err
+	}
+	s.ledgerResolved, s.ledgerHasInvCol = true, n > 0
+	return s.ledgerHasInvCol, nil
+}
 
 // IsInsufficientCredits returns true if the error indicates insufficient credits (including no wallet).
 func IsInsufficientCredits(err error) bool {
@@ -169,12 +206,23 @@ type Store struct {
 	log   *slog.Logger
 	cache map[string]*cachedBalance
 	mu    sync.RWMutex
+
+	// Ledger schema probe: whether credit_transactions carries the
+	// invocation_id column (migration 0028+). Only a successful probe is
+	// cached — a transient failure propagates and the next deduction
+	// re-probes, never a silent legacy fallback that would mis-key the
+	// idempotency lookup.
+	ledgerMu        sync.Mutex
+	ledgerResolved  bool
+	ledgerHasInvCol bool
 }
 
 type cachedBalance struct {
 	walletCents       int64
 	remainderMicroUSD int64
-	updated           time.Time
+	walletUpdatedAt   time.Time
+	graceFloorCents   *int64 // persisted per-org grace_floor_cents (§8); nil = platform default
+	cachedAt          time.Time
 }
 
 // NewStore creates a credits store backed by the database.
@@ -203,48 +251,112 @@ func NewStoreWithConfig(db *pgxpool.Pool, log *slog.Logger, cfg Config) *Store {
 	}
 }
 
-// GetBalance returns the current balance for an org. The returned value is
-// remainder-aware: BalanceCents is the effective whole-cent balance and
-// BalanceMicroUSD the exact µUSD figure.
-func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) {
+// readWalletRow performs one authoritative wallet snapshot read: raw wallet
+// cents, the sub-cent remainder, the row's updated_at and the persisted
+// per-org grace floor override (nil when the column is NULL). The boolean
+// reports whether a real snapshot exists — no org id, no DB or a missing
+// wallet row yields (nil, ok=false) plus the caller-mapped error, so callers
+// keep their historical zero-balance / no-wallet handling. It never touches
+// the cache; callers decide whether the snapshot fills the display cache.
+func (s *Store) readWalletRow(ctx context.Context, orgID string) (*cachedBalance, bool, error) {
 	if orgID == "" || s.db == nil {
-		return &Balance{OrgID: orgID}, nil // no org or no DB → zero balance
+		return nil, false, nil
+	}
+
+	var walletCents int64
+	var remainder int64
+	var updatedAt time.Time
+	var floorOverride *int64
+	err := s.db.QueryRow(ctx,
+		`SELECT balance_cents, remainder_micro_usd, updated_at, grace_floor_cents FROM org_credits WHERE org_id = $1`,
+		orgID,
+	).Scan(&walletCents, &remainder, &updatedAt, &floorOverride)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, ErrNoWallet
+		}
+		return nil, false, fmt.Errorf("get balance: %w", err)
+	}
+
+	return &cachedBalance{
+		walletCents: walletCents, remainderMicroUSD: remainder,
+		walletUpdatedAt: updatedAt, graceFloorCents: floorOverride,
+	}, true, nil
+}
+
+// loadBalance serves the display view of an org's wallet: cache-first for
+// CacheTTL, refilled from an authoritative readWalletRow on a miss. Only
+// successful reads are cached. Admission must not come through here —
+// CheckBalance reads fresh per decision, so a display snapshot can never
+// gate paid dispatch and a load racing an invalidation can never
+// repopulate a floor that then decides admission.
+func (s *Store) loadBalance(ctx context.Context, orgID string) (*cachedBalance, bool, error) {
+	if orgID == "" || s.db == nil {
+		return nil, false, nil
 	}
 
 	// Try cache first.
 	s.mu.RLock()
-	if cb, ok := s.cache[orgID]; ok && time.Since(cb.updated) < s.cfg.CacheTTL {
+	if cb, ok := s.cache[orgID]; ok && time.Since(cb.cachedAt) < s.cfg.CacheTTL {
 		s.mu.RUnlock()
-		return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.updated)
+		return cb, true, nil
 	}
 	s.mu.RUnlock()
 
-	// Query DB.
-	var walletCents int64
-	var remainder int64
-	var updatedAt time.Time
-	err := s.db.QueryRow(ctx,
-		`SELECT balance_cents, remainder_micro_usd, updated_at FROM org_credits WHERE org_id = $1`,
-		orgID,
-	).Scan(&walletCents, &remainder, &updatedAt)
-	if err != nil {
-		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, ErrNoWallet
-		}
-		return nil, fmt.Errorf("get balance: %w", err)
+	cb, ok, err := s.readWalletRow(ctx, orgID)
+	if err != nil || !ok {
+		return cb, ok, err
 	}
 
-	// Update cache.
+	// Update the display cache.
+	cb.cachedAt = time.Now()
 	s.mu.Lock()
-	s.cache[orgID] = &cachedBalance{walletCents: walletCents, remainderMicroUSD: remainder, updated: time.Now()}
+	s.cache[orgID] = cb
 	s.mu.Unlock()
 
-	return effectiveBalance(orgID, walletCents, remainder, updatedAt)
+	return cb, true, nil
+}
+
+// GetBalance returns the current balance for an org. The returned value is
+// remainder-aware: BalanceCents is the effective whole-cent balance and
+// BalanceMicroUSD the exact µUSD figure.
+func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) {
+	cb, ok, err := s.loadBalance(ctx, orgID)
+	if err != nil {
+		return nil, err
+	}
+	if !ok {
+		return &Balance{OrgID: orgID}, nil // no org or no DB → zero balance
+	}
+
+	return effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
+}
+
+// effectiveFloorCents resolves the admission floor for one wallet snapshot:
+// the persisted per-org grace_floor_cents (ADR-0001 §8) wins when set — an
+// explicit 0 is a real value (no overdraft for that org, AF-01) — and the
+// store-level GracePeriodCents is the platform fallback for NULL.
+func effectiveFloorCents(storeFloorCents int64, override *int64) int64 {
+	if override != nil {
+		return *override
+	}
+	return storeFloorCents
 }
 
 // CheckBalance verifies whether an org can proceed. Returns the current balance.
 // Admission is rejected with ErrInsufficientCredits when the effective balance
-// is at or below the grace period threshold.
+// is at or below the effective grace floor: the org's persisted
+// grace_floor_cents (ADR-0001 §8) wins over the store's GracePeriodCents,
+// NULL falls back to the platform floor.
+//
+// The decision is authoritative: a fresh wallet snapshot (balance plus the
+// persisted §8 floor override) is read per decision and never served from —
+// or written to — the display cache. Gateway and admin hold distinct store
+// instances, and an in-flight display-cache fill could repopulate an
+// evicted entry, so no cached view may gate paid dispatch: a concurrent
+// floor change decides the very next admission. The cost is one
+// primary-key SELECT per admission; GetBalance keeps the CacheTTL display
+// cache and is never consulted on this path.
 //
 // Exact µUSD admission rule: admit iff (walletCents − floor)*10000 >
 // remainder. Because the remainder is always < 10000 µUSD (one cent), this
@@ -252,22 +364,51 @@ func (s *Store) GetBalance(ctx context.Context, orgID string) (*Balance, error) 
 // can never exceed the floor (matching the AF-01 inclusive rejection), and a
 // full cent of headroom always admits regardless of the sub-cent remainder.
 // The check therefore stays in overflow-free cent space — it compares the
-// reconstructed raw wallet cents, not the floored display value, so a
-// pending remainder never rejects a request one cent early.
+// raw wallet cents on the fresh snapshot, not the floored display value, so
+// a pending remainder never rejects a request one cent early.
 func (s *Store) CheckBalance(ctx context.Context, orgID string) (*Balance, error) {
-	balance, err := s.GetBalance(ctx, orgID)
+	cb, ok, err := s.readWalletRow(ctx, orgID)
 	if err != nil {
 		return nil, err
 	}
 
-	// Reconstruct the raw wallet cents from the effective view:
-	// wallet = effCents + ceil(remainder / 10000), ceil ∈ {0, 1}.
-	walletCents := balance.BalanceCents + (balance.RemainderMicroUSD+int64(money.MicroPerCent)-1)/int64(money.MicroPerCent)
-	if walletCents <= s.cfg.GracePeriodCents {
+	floor := s.cfg.GracePeriodCents
+	var balance *Balance
+	var walletCents int64
+	if ok {
+		var ferr error
+		balance, ferr = effectiveBalance(orgID, cb.walletCents, cb.remainderMicroUSD, cb.walletUpdatedAt)
+		if ferr != nil {
+			return nil, ferr
+		}
+		walletCents = cb.walletCents
+		floor = effectiveFloorCents(floor, cb.graceFloorCents)
+	} else {
+		// No wallet row or no DB: keep the historical zero-balance view.
+		balance = &Balance{OrgID: orgID}
+	}
+
+	if walletCents <= floor {
 		return balance, ErrInsufficientCredits
 	}
 
 	return balance, nil
+}
+
+// InvalidateOrg drops the cached display snapshot for orgID so the next
+// GetBalance re-queries org_credits. Writers inside this store invalidate
+// inline; call this after a mutation committed outside the store's write
+// paths — the admin per-org grace floor change (§8) is the current case, so
+// admin balance views show the new state immediately. Admission never reads
+// this cache: CheckBalance reads a fresh snapshot per decision, so this is
+// a display-freshness aid, not a correctness gate for paid dispatch.
+func (s *Store) InvalidateOrg(orgID string) {
+	if orgID == "" {
+		return
+	}
+	s.mu.Lock()
+	delete(s.cache, orgID)
+	s.mu.Unlock()
 }
 
 // TopUp adds credits to an org's wallet. This is a manual admin action.
@@ -335,6 +476,33 @@ func (s *Store) Deduct(ctx context.Context, orgID string, amountCents int64, req
 	return s.DeductMicro(ctx, orgID, amount, requestID, metadata)
 }
 
+// DeductMicroInvocation deducts an exact micro-USD amount keyed by the
+// billed invocation identity (0028+). invocationID is either empty — the
+// legacy request-keyed domain above — or a canonical uuid (nil, URN,
+// braced or re-spelled variants are rejected before touching the database,
+// so a malformed identity can never reach an idempotency key). On 0028+
+// schemas the usage row's idempotency key is the invocation alone
+// (uniq_credit_transactions_invocation), verified against the charged org
+// and the exact signed amount before counting as idempotent: two
+// legitimate invocations from one org sharing a client request id bill
+// independently, while the same identity under another tenant or a
+// different amount is an integrity conflict, never a silent no-op. On a
+// pre-0028 schema the invocation-keyed insert fails loudly (missing
+// column) — retry, then requires_attention — instead of billing under the
+// shared legacy key.
+func (s *Store) DeductMicroInvocation(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}) error {
+	if invocationID != "" {
+		if id, err := uuid.Parse(invocationID); err != nil || id == uuid.Nil || id.String() != invocationID {
+			return fmt.Errorf("deduct: invocation id %q is not a canonical non-nil UUID", invocationID)
+		}
+	}
+	hasInvocationColumn, err := s.creditInvocationColumn(ctx)
+	if err != nil {
+		return fmt.Errorf("deduct: resolve ledger schema: %w", err)
+	}
+	return s.deductMicroKeyed(ctx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
+}
+
 // DeductMicro deducts an exact micro-USD amount for a completed request
 // (AF-05). The amount is applied to the wallet in two durable parts within
 // one serializable transaction: whole cents reduce balance_cents (and are
@@ -351,6 +519,10 @@ func (s *Store) Deduct(ctx context.Context, orgID string, amountCents int64, req
 //
 // Idempotency, retries and error semantics mirror Deduct.
 func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID string, metadata map[string]interface{}) error {
+	return s.DeductMicroInvocation(ctx, orgID, amount, requestID, "", metadata)
+}
+
+func (s *Store) deductMicroKeyed(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
 	if orgID == "" || s.db == nil {
 		return fmt.Errorf("deduct: invalid parameters")
 	}
@@ -360,8 +532,8 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 	}
 
 	var lastErr error
-	for attempt := 0; attempt <= maxDeductRetries; attempt++ {
-		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, metadata)
+	for attempt := 0; ; attempt++ {
+		lastErr = s.deductOnceMicro(ctx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
 		if lastErr == nil {
 			return nil
 		}
@@ -389,7 +561,6 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 		// Non-retryable error or last attempt exhausted — return.
 		return lastErr
 	}
-	return lastErr
 }
 
 // deductOnceMicro performs a single attempt at the exact micro-USD credit
@@ -397,138 +568,48 @@ func (s *Store) DeductMicro(ctx context.Context, orgID string, amount money.Micr
 // instead of serializable retry luck: concurrent writers queue per wallet,
 // so the floor check and the idempotency read are evaluated against a stable
 // wallet state and never race. Serializable conflicts (deadlocks etc.) stay
-// retryable by the caller as a safety net.
-func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID string, metadata map[string]interface{}) error {
+// retryable by the caller as a safety net. Each step below names its own
+// invariant; every pre-commit failure rolls the attempt back.
+func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
 	tx, err := s.db.BeginTx(ctx, pgx.TxOptions{})
 	if err != nil {
 		return fmt.Errorf("deduct begin tx: %w", err)
 	}
+	return s.deductMicroTx(ctx, tx, orgID, amount, requestID, invocationID, metadata, hasInvocationColumn)
+}
 
-	// Step 0: serialize deduction writers for this org. The lock lives for
-	// the transaction; hashtext collisions only add harmless extra
-	// serialization between unrelated orgs. (hashtext is stable within a
-	// cluster, which is all a lock key needs.)
+func (s *Store) deductMicroTx(ctx context.Context, tx pgx.Tx, orgID string, amount money.MicroUSD, requestID, invocationID string, metadata map[string]interface{}, hasInvocationColumn bool) error {
+	// Step 0: serialize deduction writers for this org.
 	if _, err := tx.Exec(ctx, `SELECT pg_advisory_xact_lock(hashtext($1)::bigint)`, orgID); err != nil {
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
+		s.rollbackDeduct(ctx, tx)
 		return fmt.Errorf("deduct advisory lock: %w", err)
 	}
 
-	// Step 1: Idempotency check — is this request_id already deducted?
-	var existingID int64
-	err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage'`, orgID, requestID).Scan(&existingID)
-	if err == nil {
-		// Already deducted — idempotent success (no-op).
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return nil
-	}
-	if err != pgx.ErrNoRows {
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return fmt.Errorf("deduct idempotency check: %w", err)
+	// Step 1: is this charge already applied?
+	applied, err := s.deductAlreadyApplied(ctx, tx, orgID, amount, requestID, invocationID, hasInvocationColumn)
+	if err != nil || applied {
+		s.rollbackDeduct(ctx, tx)
+		return err
 	}
 
-	// Step 2: Charge the exact amount — split into whole cents plus the
-	// sub-cent residue carried by remainder_micro_usd. The residue that
-	// reaches a whole cent is charged immediately (carry), keeping the
-	// invariant: charged µUSD = charged cents*10000 + remainder growth.
-	// The wallet row is rejected (no row → ErrInsufficientCredits) unless
-	// new_wallet_cents > floor, or new_wallet_cents == floor with an exactly
-	// zero new remainder (only an exact floor landing may stand).
-	var newBalance int64
-	var newRemainder int64
-	var chargeCents int64
-	err = tx.QueryRow(ctx, `
-		WITH wallet AS (
-			SELECT balance_cents, remainder_micro_usd
-			FROM org_credits WHERE org_id = $1 FOR UPDATE
-		),
-		parts AS (
-			SELECT w.balance_cents,
-				   w.remainder_micro_usd,
-				   $2::bigint / 10000 AS ded_cents,
-				   $2::bigint % 10000 AS ded_rem
-			FROM wallet w
-		),
-		carry AS (
-			SELECT balance_cents,
-				   ded_cents + (remainder_micro_usd + ded_rem) / 10000 AS charge_cents,
-				   (remainder_micro_usd + ded_rem) % 10000 AS new_remainder
-			FROM parts
-		)
-		SELECT balance_cents - charge_cents AS new_balance,
-			   new_remainder,
-			   charge_cents
-		FROM carry
-		WHERE balance_cents - charge_cents > $3
-		   OR (balance_cents - charge_cents = $3 AND new_remainder = 0)
-	`, orgID, int64(amount), s.cfg.GracePeriodCents).Scan(&newBalance, &newRemainder, &chargeCents)
-
-	if err == pgx.ErrNoRows {
-		// Insufficient credits — rollback and return error.
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return ErrInsufficientCredits
-	}
+	// Steps 2–3: charge the exact amount and update the wallet.
+	newBalance, newRemainder, chargeCents, err := s.applyMicroCharge(ctx, tx, orgID, amount)
 	if err != nil {
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return fmt.Errorf("deduct balance check: %w", err)
+		s.rollbackDeduct(ctx, tx)
+		return err
 	}
 
-	// Step 3: Update the wallet balance and its sub-cent remainder.
-	_, err = tx.Exec(ctx,
-		`UPDATE org_credits SET balance_cents = $2, remainder_micro_usd = $3, updated_at = now() WHERE org_id = $1`,
-		orgID, newBalance, newRemainder)
+	// Step 4: the usage ledger row, then commit.
+	metaBytes, err := usageMetadataJSON(metadata)
 	if err != nil {
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return fmt.Errorf("deduct update balance: %w", err)
+		s.rollbackDeduct(ctx, tx)
+		return err
 	}
-
-	// Step 4: Insert transaction record — whole cents on the legacy column,
-	// the exact amount in micro-USD. Zero-cent rows are legitimate: they
-	// carry a purely fractional charge whose residue is durable on the wallet.
-	var metaBytes []byte
-	if len(metadata) > 0 {
-		b, jerr := json.Marshal(metadata)
-		if jerr != nil {
-			if rerr := tx.Rollback(ctx); rerr != nil {
-				s.log.Warn("deduct rollback failed", "error", rerr)
-			}
-			return fmt.Errorf("deduct marshal metadata: %w", jerr)
-		}
-		metaBytes = b
-	} else {
-		metaBytes = []byte("{}")
+	if err := s.insertUsageTransaction(ctx, tx, orgID, requestID, invocationID, chargeCents, newBalance, amount, metaBytes, hasInvocationColumn); err != nil {
+		s.rollbackDeduct(ctx, tx)
+		return err
 	}
-
-	// Use sql.NullString for request_id — empty string becomes NULL.
-	var reqID sql.NullString
-	if requestID != "" {
-		reqID = sql.NullString{String: requestID, Valid: true}
-	}
-
-	if _, err = tx.Exec(ctx, `
-		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd)
-		VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6)
-	`, orgID, -chargeCents, newBalance, reqID, string(metaBytes), -int64(amount)); err != nil {
-		if rerr := tx.Rollback(ctx); rerr != nil {
-			s.log.Warn("deduct rollback failed", "error", rerr)
-		}
-		return fmt.Errorf("deduct insert transaction: %w", err)
-	}
-
-	// Commit.
-	err = tx.Commit(ctx)
-	if err != nil {
+	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("deduct commit: %w", err)
 	}
 
@@ -544,6 +625,175 @@ func (s *Store) deductOnceMicro(ctx context.Context, orgID string, amount money.
 		"amount_micro_usd", int64(amount),
 		"new_balance", newBalance,
 		"new_remainder_micro_usd", newRemainder)
+	return nil
+}
+
+// rollbackDeduct rolls back a failed deduction attempt. A rollback error is
+// logged, never returned — the original failure is the reportable one.
+func (s *Store) rollbackDeduct(ctx context.Context, tx pgx.Tx) {
+	if rerr := tx.Rollback(ctx); rerr != nil {
+		s.log.Warn("deduct rollback failed", "error", rerr)
+	}
+}
+
+// deductAlreadyApplied resolves the Step 1 idempotency question: is this
+// charge already durable? The key follows the domain of the row being
+// written. An invocation-keyed charge matches the invocation alone
+// (server-minted uuids are globally unique; exactly
+// uniq_credit_transactions_invocation) and must then verify the charged org
+// and the exact signed amount before counting as idempotent — a row under
+// the same identity but another tenant or a different amount is an
+// integrity conflict (ErrChargeIdentityConflict), never a silent no-op. A
+// legacy charge matches the (org, request) pair constrained to the legacy
+// domain (invocation_id IS NULL on 0028+ schemas, exactly
+// uniq_credit_transactions_usage_legacy): an invoked row under the same
+// correlation must never suppress a genuine legacy charge. Pre-0028 schemas
+// keep the original bytes — no invoked rows can exist there.
+func (s *Store) deductAlreadyApplied(ctx context.Context, tx pgx.Tx, orgID string, amount money.MicroUSD, requestID, invocationID string, hasInvocationColumn bool) (bool, error) {
+	var existingID int64
+	var err error
+	if invocationID != "" {
+		var rowOrg string
+		var rowMicro int64
+		err = tx.QueryRow(ctx, `SELECT org_id, amount_micro_usd FROM credit_transactions WHERE invocation_id = $1 AND type = 'usage'`, invocationID).Scan(&rowOrg, &rowMicro)
+		if err == nil {
+			if rowOrg != orgID || rowMicro != -int64(amount) {
+				s.log.Error("usage row found under the charged invocation with a different org or amount — integrity conflict, never idempotent",
+					"org_id", orgID,
+					"invocation_id", invocationID,
+					"row_org_id", rowOrg,
+					"amount_micro_usd", int64(amount),
+					"row_amount_micro_usd", rowMicro,
+				)
+				return false, ErrChargeIdentityConflict
+			}
+			// Already deducted under the authoritative identity.
+			return true, nil
+		}
+	} else if hasInvocationColumn {
+		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage' AND invocation_id IS NULL`, orgID, requestID).Scan(&existingID)
+	} else {
+		err = tx.QueryRow(ctx, `SELECT id FROM credit_transactions WHERE org_id = $1 AND request_id = $2 AND type = 'usage'`, orgID, requestID).Scan(&existingID)
+	}
+	if err == nil {
+		// Already deducted — idempotent success (no-op).
+		return true, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return false, fmt.Errorf("deduct idempotency check: %w", err)
+	}
+	return false, nil
+}
+
+// applyMicroCharge performs Steps 2 and 3: it charges the exact amount —
+// split into whole cents plus the sub-cent residue carried by
+// remainder_micro_usd. The residue that reaches a whole cent is charged
+// immediately (carry), keeping the invariant: charged µUSD = charged
+// cents*10000 + remainder growth. The effective floor is the wallet's own
+// grace_floor_cents override when set, otherwise the store's global grace
+// period — the same resolution the batch executor applies, so the
+// outcome never depends on how many jobs the queue groups. A missing
+// wallet row is ErrNoWallet; an existing wallet below the floor is
+// ErrInsufficientCredits — distinct facts with distinct dispositions.
+// Only new_wallet_cents > floor, or new_wallet_cents == floor with an
+// exactly zero new remainder, may stand (only an exact floor landing).
+func (s *Store) applyMicroCharge(ctx context.Context, tx pgx.Tx, orgID string, amount money.MicroUSD) (newBalance, newRemainder, chargeCents int64, err error) {
+	var allowed bool
+	err = tx.QueryRow(ctx, `
+		WITH wallet AS (
+			SELECT balance_cents, remainder_micro_usd, grace_floor_cents
+			FROM org_credits WHERE org_id = $1 FOR UPDATE
+		),
+		parts AS (
+			SELECT w.balance_cents,
+				   w.remainder_micro_usd,
+				   COALESCE(w.grace_floor_cents, $3::bigint) AS floor_cents,
+				   $2::bigint / 10000 AS ded_cents,
+				   $2::bigint % 10000 AS ded_rem
+			FROM wallet w
+		),
+		carry AS (
+			SELECT balance_cents,
+				   floor_cents,
+				   ded_cents + (remainder_micro_usd + ded_rem) / 10000 AS charge_cents,
+				   (remainder_micro_usd + ded_rem) % 10000 AS new_remainder
+			FROM parts
+		)
+		SELECT balance_cents - charge_cents AS new_balance,
+			   new_remainder,
+			   charge_cents,
+			   (balance_cents - charge_cents > floor_cents
+			    OR (balance_cents - charge_cents = floor_cents AND new_remainder = 0)) AS allowed
+		FROM carry
+	`, orgID, int64(amount), s.cfg.GracePeriodCents).Scan(&newBalance, &newRemainder, &chargeCents, &allowed)
+
+	if errors.Is(err, pgx.ErrNoRows) {
+		// No wallet row: a missing billing wallet, not a floor rejection.
+		return 0, 0, 0, ErrNoWallet
+	}
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("deduct balance check: %w", err)
+	}
+	if !allowed {
+		// The wallet exists but the charge would land below its floor.
+		return 0, 0, 0, ErrInsufficientCredits
+	}
+
+	_, err = tx.Exec(ctx,
+		`UPDATE org_credits SET balance_cents = $2, remainder_micro_usd = $3, updated_at = now() WHERE org_id = $1`,
+		orgID, newBalance, newRemainder)
+	if err != nil {
+		return 0, 0, 0, fmt.Errorf("deduct update balance: %w", err)
+	}
+	return newBalance, newRemainder, chargeCents, nil
+}
+
+// usageMetadataJSON renders the deduction metadata payload, defaulting to
+// an empty object.
+func usageMetadataJSON(metadata map[string]interface{}) ([]byte, error) {
+	if len(metadata) == 0 {
+		return []byte("{}"), nil
+	}
+	b, err := json.Marshal(metadata)
+	if err != nil {
+		return nil, fmt.Errorf("deduct marshal metadata: %w", err)
+	}
+	return b, nil
+}
+
+// insertUsageTransaction writes the Step 4 usage ledger row: whole cents on
+// the legacy amount_cents column, the exact amount in micro-USD. Zero-cent
+// rows are legitimate: they carry a purely fractional charge whose residue
+// is durable on the wallet. The invocation identity column participates
+// whenever the schema has it — an explicit NULL for a legacy-domain row is
+// the same stored value as the omitted column, so both 0028 domains share
+// one statement; only pre-0028 schemas (no column) need the original bytes.
+func (s *Store) insertUsageTransaction(ctx context.Context, tx pgx.Tx, orgID, requestID, invocationID string, chargeCents, newBalance int64, amount money.MicroUSD, metaBytes []byte, hasInvocationColumn bool) error {
+	// Use sql.NullString for request_id — empty string becomes NULL.
+	reqID := sql.NullString{String: requestID, Valid: requestID != ""}
+
+	if invocationID == "" && !hasInvocationColumn {
+		_, err := tx.Exec(ctx, `
+			INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd)
+			VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6)
+		`, orgID, -chargeCents, newBalance, reqID, string(metaBytes), -int64(amount))
+		if err != nil {
+			return fmt.Errorf("deduct insert transaction: %w", err)
+		}
+		return nil
+	}
+
+	var invocationArg any
+	if invocationID != "" {
+		invocationArg = invocationID
+	}
+	_, err := tx.Exec(ctx, `
+		INSERT INTO credit_transactions (org_id, amount_cents, balance_after, type, request_id, metadata, amount_micro_usd, invocation_id)
+		VALUES ($1, $2, $3, 'usage', $4, $5::jsonb, $6, $7)
+	`, orgID, -chargeCents, newBalance, reqID, string(metaBytes), -int64(amount), invocationArg)
+	if err != nil {
+		return fmt.Errorf("deduct insert transaction: %w", err)
+	}
 	return nil
 }
 

@@ -5,9 +5,12 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"time"
+
+	"github.com/reireirei/yabanin/pkg/provider"
 )
 
 // Judge evaluates whether a cheap-model response is sufficient or if a premium model
@@ -48,15 +51,35 @@ func NewJudge(evaluatorURL string, log *slog.Logger) *Judge {
 	return &Judge{
 		evaluatorURL: evaluatorURL,
 		model:        "gpt-4o-mini",
-		client:       &http.Client{Timeout: 10 * time.Second},
-		timeout:      10 * time.Second,
-		log:          log.With("component", "evalgate"),
+		client: &http.Client{
+			Timeout: 10 * time.Second,
+			// An admission covers one request to the configured evaluator.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
+		timeout: 10 * time.Second,
+		log:     log.With("component", "evalgate"),
 	}
 }
 
 // Evaluate compares a cheap and premium model response to the same prompt.
 // Returns a verdict indicating whether the cheap model was sufficient.
 func (j *Judge) Evaluate(ctx context.Context, prompt, cheapResponse, premiumResponse string) (*Verdict, error) {
+	verdict, _, err := j.EvaluateMeasured(ctx, prompt, cheapResponse, premiumResponse, nil)
+	return verdict, err
+}
+
+// JudgeCall records what the evaluator endpoint returned, including usage for
+// responses whose verdict could not be interpreted.
+type JudgeCall struct {
+	Model  string
+	Status int
+	Usage  provider.Usage
+}
+
+// EvaluateMeasured invokes beforeDispatch after building the request and before
+// sending it. A failed admission stops the evaluation before the HTTP call.
+func (j *Judge) EvaluateMeasured(ctx context.Context, prompt, cheapResponse, premiumResponse string, beforeDispatch func(context.Context, string) error) (*Verdict, JudgeCall, error) {
+	call := JudgeCall{Model: j.model}
 	start := time.Now()
 
 	judgePrompt := fmt.Sprintf(`You are evaluating two AI responses to the same user prompt.
@@ -80,23 +103,54 @@ Return ONLY valid JSON with these exact fields:
 
 	req, err := http.NewRequestWithContext(ctx, "POST", j.evaluatorURL+"/v1/chat/completions", bytes.NewReader(body))
 	if err != nil {
-		return nil, fmt.Errorf("create judge request: %w", err)
+		return nil, call, fmt.Errorf("create judge request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if j.apiKey != "" {
 		req.Header.Set("Authorization", "Bearer "+j.apiKey)
 	}
 
+	if beforeDispatch != nil {
+		if err := beforeDispatch(ctx, j.model); err != nil {
+			return nil, call, err
+		}
+	}
 	resp, err := j.client.Do(req)
 	if err != nil {
-		return nil, fmt.Errorf("judge request failed: %w", err)
+		return nil, call, fmt.Errorf("judge request failed: %w", err)
 	}
 	defer func() { _ = resp.Body.Close() }()
 
+	call.Status = resp.StatusCode
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("judge returned status %d", resp.StatusCode)
+		call.Usage = judgeErrorUsage(resp.Body)
+		return nil, call, fmt.Errorf("judge returned status %d", resp.StatusCode)
 	}
 
+	var raw json.RawMessage
+	if err := json.NewDecoder(resp.Body).Decode(&raw); err != nil {
+		return nil, call, fmt.Errorf("parse judge response: %w", err)
+	}
+	call.Usage = provider.OpenAI{}.ParseUsage(raw)
+	verdict, err := parseVerdict(raw)
+	if err == nil {
+		j.log.Debug("judge verdict", "cheap_quality", verdict.CheapQuality, "premium_quality", verdict.PremiumQuality,
+			"should_upgrade", verdict.ShouldUpgrade, "latency_ms", time.Since(start).Milliseconds())
+	}
+	return verdict, call, err
+}
+
+// Error responses may report billable usage even when they have no verdict.
+func judgeErrorUsage(body io.Reader) provider.Usage {
+	const maxErrorBody = 64 << 10
+	raw, err := io.ReadAll(io.LimitReader(body, maxErrorBody+1))
+	if err != nil || len(raw) > maxErrorBody || !json.Valid(raw) {
+		return provider.Usage{}
+	}
+	return provider.OpenAI{}.ParseUsage(raw)
+}
+
+func parseVerdict(raw json.RawMessage) (*Verdict, error) {
 	var judgeOut struct {
 		Choices []struct {
 			Message struct {
@@ -104,25 +158,25 @@ Return ONLY valid JSON with these exact fields:
 			} `json:"message"`
 		} `json:"choices"`
 	}
-	if err := json.NewDecoder(resp.Body).Decode(&judgeOut); err != nil {
+	if err := json.Unmarshal(raw, &judgeOut); err != nil {
 		return nil, fmt.Errorf("parse judge response: %w", err)
 	}
 	if len(judgeOut.Choices) == 0 {
 		return nil, fmt.Errorf("judge returned empty choices")
 	}
 
-	// TP-03: the verdict feeds the calibration refresher, so a malformed or
-	// incomplete verdict must surface as an explicit error instead of being
-	// persisted as a defaulted measurement. The map pass enforces a single
-	// JSON document (trailing garbage is rejected); the typed pass enforces
-	// field types; unknown extra keys stay tolerated.
-	content := []byte(judgeOut.Choices[0].Message.Content)
+	return parseVerdictContent([]byte(judgeOut.Choices[0].Message.Content))
+}
+
+// Reject missing, null and incorrectly typed fields before persisting a
+// calibration measurement. Additional fields are allowed.
+func parseVerdictContent(content []byte) (*Verdict, error) {
 	var fields map[string]json.RawMessage
 	if err := json.Unmarshal(content, &fields); err != nil {
 		return nil, fmt.Errorf("judge returned invalid JSON: %w", err)
 	}
 	for _, field := range [...]string{"cheap_quality", "premium_quality", "should_upgrade", "reason"} {
-		if _, ok := fields[field]; !ok {
+		if value, ok := fields[field]; !ok || bytes.Equal(value, []byte("null")) {
 			return nil, fmt.Errorf("judge verdict missing field %q", field)
 		}
 	}
@@ -143,12 +197,6 @@ Return ONLY valid JSON with these exact fields:
 			return nil, fmt.Errorf("judge verdict %s=%v out of range [0,1]", score.name, score.value)
 		}
 	}
-
-	j.log.Debug("judge verdict",
-		"cheap_quality", verdict.CheapQuality,
-		"premium_quality", verdict.PremiumQuality,
-		"should_upgrade", verdict.ShouldUpgrade,
-		"latency_ms", time.Since(start).Milliseconds())
 
 	return &verdict, nil
 }

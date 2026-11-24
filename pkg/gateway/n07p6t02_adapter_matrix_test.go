@@ -25,9 +25,10 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
-	"strings"
 	"sync/atomic"
 	"testing"
+
+	"github.com/stretchr/testify/require"
 
 	"github.com/reireirei/yabanin/pkg/config"
 	eventpub "github.com/reireirei/yabanin/pkg/eventpublisher"
@@ -107,10 +108,12 @@ func TestN07P6T02_SupportedAdapterMatrix(t *testing.T) {
 			}))
 			defer server.Close()
 
+			store := &fakeInvocationStore{}
 			gw := &gateway{
-				cfg:  config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
-				log:  slog.New(slog.DiscardHandler),
-				auth: NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, nil),
+				cfg:         config.Gateway{AuthMode: "strict", APIKey: "test-key", Provider: server.URL},
+				log:         slog.New(slog.DiscardHandler),
+				auth:        NewAuthMiddleware(config.Gateway{AuthMode: "strict", APIKey: "test-key"}, newTestResolver(testOrg, nil)),
+				invocations: store,
 				res: stubModelResolver{
 					"rr":  {ModelName: "rr-canon", Provider: prov, UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true},
 					"mod": {ModelName: "mod-canon", Provider: prov, UpstreamURL: server.URL, UpstreamAPIKey: "up", Enabled: true},
@@ -124,50 +127,47 @@ func TestN07P6T02_SupportedAdapterMatrix(t *testing.T) {
 			var ev *eventpub.Event
 			gw.eventNote = func(e *eventpub.Event) { ev = e }
 			rec := postR105(t, gw, "/v1/rerank", `{"model":"rr","query":"q","documents":["a","b"]}`, nil)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("rerank status %d %s", rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			if rec.Body.String() != rerankResponse {
+				t.Fatalf("provider response bytes changed: got %q, want %q", rec.Body.String(), rerankResponse)
 			}
-			if strings.TrimSpace(rec.Body.String()) != rerankResponse {
-				t.Fatalf("rerank passthrough %q", rec.Body.String())
-			}
-			if calls := rerankCalls.Load(); calls != 1 {
-				t.Fatalf("rerank upstream calls %d, want 1", calls)
-			}
-			if body, _ := rerankUpstreamBody.Load().(string); !strings.Contains(body, `"model":"rr-canon"`) {
-				t.Fatalf("rerank upstream body %q lacks canonical model", body)
-			}
-			if ev == nil {
-				t.Fatal("rerank: no request.completed event")
-			}
-			if ev.Endpoint != "rerank" || ev.TokensIn != 8 || ev.TokensOut != 2 ||
-				ev.UsageSource != "provider" || ev.CostStatus != "unknown_price" || ev.ModelUsed != "rr-canon" {
-				t.Fatalf("rerank event accounting: %+v", ev)
-			}
+			require.EqualValues(t, 1, rerankCalls.Load())
+			require.JSONEq(t, `{"model":"rr-canon","query":"q","documents":["a","b"]}`, rerankUpstreamBody.Load().(string))
+			require.NotNil(t, ev)
+			require.Equal(t, "rerank", ev.Endpoint)
+			require.EqualValues(t, 8, ev.TokensIn)
+			require.EqualValues(t, 2, ev.TokensOut)
+			require.Equal(t, "provider", ev.UsageSource)
+			require.Equal(t, "unknown_price", ev.CostStatus)
+			require.Equal(t, "rr-canon", ev.ModelUsed)
+			require.Len(t, store.facts, 1)
+			rerankID := store.facts[0].InvocationID
+			require.NotEmpty(t, rerankID)
 
 			// Moderations row: admitted → exactly one upstream call, byte-
 			// honest passthrough, and the no-usage-block contract (none /
 			// no_usage — OpenAI moderations carry no usage).
 			ev = nil
 			rec = postR105(t, gw, "/v1/moderations", `{"model":"mod","input":"classify me"}`, nil)
-			if rec.Code != http.StatusOK {
-				t.Fatalf("moderations status %d %s", rec.Code, rec.Body.String())
+			require.Equal(t, http.StatusOK, rec.Code, rec.Body.String())
+			if rec.Body.String() != moderationsResponse {
+				t.Fatalf("provider response bytes changed: got %q, want %q", rec.Body.String(), moderationsResponse)
 			}
-			if strings.TrimSpace(rec.Body.String()) != moderationsResponse {
-				t.Fatalf("moderations passthrough %q", rec.Body.String())
-			}
-			if calls := moderationsCalls.Load(); calls != 1 {
-				t.Fatalf("moderations upstream calls %d, want 1", calls)
-			}
-			if body, _ := moderationsUpstreamBody.Load().(string); !strings.Contains(body, `"model":"mod-canon"`) {
-				t.Fatalf("moderations upstream body %q lacks canonical model", body)
-			}
-			if ev == nil {
-				t.Fatal("moderations: no request.completed event")
-			}
-			if ev.Endpoint != "moderations" || ev.TokensIn != 0 ||
-				ev.UsageSource != "none" || ev.CostStatus != "no_usage" || ev.ModelUsed != "mod-canon" {
-				t.Fatalf("moderations event accounting: %+v", ev)
-			}
+			require.EqualValues(t, 1, moderationsCalls.Load())
+			require.JSONEq(t, `{"model":"mod-canon","input":"classify me"}`, moderationsUpstreamBody.Load().(string))
+			require.NotNil(t, ev)
+			require.Equal(t, "moderations", ev.Endpoint)
+			require.Zero(t, ev.TokensIn)
+			require.Zero(t, ev.TokensOut)
+			require.Equal(t, "none", ev.UsageSource)
+			require.Equal(t, "no_usage", ev.CostStatus)
+			require.Equal(t, "mod-canon", ev.ModelUsed)
+			require.Len(t, store.admitted, 2)
+			require.Len(t, store.facts, 2)
+			require.NotEqual(t, rerankID, store.facts[1].InvocationID)
+			require.Equal(t, store.admitted[0].InvocationID, rerankID)
+			require.Equal(t, store.admitted[1].InvocationID, store.facts[1].InvocationID)
+
 		})
 	}
 }

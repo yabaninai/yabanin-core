@@ -24,8 +24,11 @@ package handlers
 // FROZEN case registry: every required case ID below must appear exactly
 // once in the Playwright results with a passed verdict; a missing, skipped,
 // duplicate or unknown case FAILS acceptance — a green run with a dropped
-// case is not acceptance. The run receipt (stand-summary.json) binds the
-// verdict to the dist fingerprint + content hash and the repo state.
+// case is not acceptance. Preview 2 UI acceptance is DESKTOP-ONLY: the two
+// archived 390px mobile cases are archived fixtures outside this gate, and
+// an archived case that records an executed verdict also fails the gate. The
+// run receipt (stand-summary.json) binds the verdict to the dist
+// fingerprint + content hash and the repo state.
 //
 // The AC-RACE case uses the stand barrier: while armed, requests under
 // /api/organizations/<orgA>/requests are parked mid-flight and forwarded
@@ -71,14 +74,12 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-// cv02RequiredJourneyCases is the FROZEN browser-acceptance case registry
-// (the ten recorded-journey cases, with AC-NARROW's two 390px tests pinned
-// as individually addressable IDs, plus the AC-RACE delayed-old-tenant-
-// response case). Every listed case ID MUST appear in the Playwright
-// results exactly once with a passed verdict; a missing, skipped,
-// duplicate, unknown or unnamed case FAILS the acceptance. Registry
-// changes are deliberate acceptance-scope decisions, never silent.
-// Registry changes are deliberate acceptance-scope decisions, never silent.
+// cv02RequiredJourneyCases is the FROZEN desktop browser-acceptance case
+// registry (the desktop recorded-journey cases plus the AC-RACE delayed-
+// old-tenant-response case). Every listed case ID MUST appear in the
+// Playwright results exactly once with a passed verdict; a missing, skipped,
+// duplicate, unknown or unnamed case FAILS the acceptance. Registry changes
+// are deliberate acceptance-scope decisions, never silent.
 var cv02RequiredJourneyCases = []string{
 	"AC-RT",
 	"AC-BLK",
@@ -87,10 +88,20 @@ var cv02RequiredJourneyCases = []string{
 	"AC-STALE",
 	"AC-IDOR",
 	"AC-KB",
-	"AC-NARROW-SERVED",
-	"AC-NARROW-BLOCKED",
 	"AC-PERF",
 	"AC-RACE",
+}
+
+// cv02ArchivedJourneyCases is the archived mobile registry: the two 390px
+// narrow-viewport specs, retained as archived fixtures only (Preview 2 UI
+// acceptance is desktop-only). They are NOT required by this gate and must
+// never execute inside it: the registered desktop Playwright config excludes
+// them by token match on these IDs, and cv02ArchivedCaseVerdicts fails
+// the gate if an archived case ever records an executed verdict — including
+// a skipped first occurrence masking another occurrence or attempt that ran.
+var cv02ArchivedJourneyCases = []string{
+	"AC-NARROW-SERVED",
+	"AC-NARROW-BLOCKED",
 }
 
 // cv02Oracle is the raw request_logs column set the browser suite asserts
@@ -536,10 +547,7 @@ func cv02SpecVerdict(spec cv02PWSpec) string {
 	return verdict
 }
 
-// cv02EnforceCaseRegistry applies the FROZEN registry to the parsed
-// results: every required ID exactly once and passed; no unknown, unnamed
-// or duplicate case IDs. Any violation fails the mandatory acceptance.
-// cv02CaseVerdicts enforces the frozen case registry over the flattened
+// cv02CaseVerdicts enforces the frozen DESKTOP registry over the flattened
 // specs: every required case exactly once and passed. Problems are returned
 // (not raised) so the caller can write the run receipt FIRST and fail
 // afterwards — a failing run keeps its evidence.
@@ -577,6 +585,12 @@ func cv02CaseVerdicts(specs []cv02FlatSpec) (cases []cv02CaseResult, problems []
 		}
 		delete(byID, id)
 	}
+	// Archived/mobile IDs are known to the registry but excluded from the
+	// desktop gate; their verdicts are cv02ArchivedCaseVerdicts's job, so
+	// their (skipped) presence must not surface here as unknown cases.
+	for _, id := range cv02ArchivedJourneyCases {
+		delete(byID, id)
+	}
 	if len(byID) > 0 {
 		ids := make([]string, 0, len(byID))
 		for id := range byID {
@@ -587,6 +601,60 @@ func cv02CaseVerdicts(specs []cv02FlatSpec) (cases []cv02CaseResult, problems []
 			"extend the registry deliberately, never by silent addition", ids))
 	}
 	return cases, problems
+}
+
+// cv02ArchivedCaseVerdicts applies the archived mobile registry: the 390px
+// specs are archived fixtures and must never EXECUTE inside the desktop
+// gate. Absent or skipped/not-run presence is the expected (default) state
+// and is reported (visible, not silent); an executed verdict anywhere —
+// across every occurrence and attempt — is a problem, so a skipped first
+// observation cannot mask another one that actually ran.
+func cv02ArchivedCaseVerdicts(specs []cv02FlatSpec) (cases []cv02CaseResult, problems []string) {
+	byID := make(map[string][]cv02FlatSpec)
+	for _, fs := range specs {
+		id := cv02CaseID(fs.Spec.Title)
+		if id != "" {
+			byID[id] = append(byID[id], fs)
+		}
+	}
+	for _, id := range cv02ArchivedJourneyCases {
+		got := byID[id]
+		if len(got) == 0 {
+			cases = append(cases, cv02CaseResult{ID: id, Status: "archived-not-collected"})
+			continue
+		}
+		if executed := cv02ArchivedExecutedStatus(got); executed != "" {
+			cases = append(cases, cv02CaseResult{ID: id, Title: got[0].Spec.Title, Status: "executed:" + executed})
+			problems = append(problems, fmt.Sprintf("archived/mobile case %s ran inside the desktop gate "+
+				"(executed status %q across %d collected observation(s)) — the 390px specs are archived "+
+				"fixtures excluded by the registered desktop config and Preview 2 acceptance is desktop-only",
+				id, executed, len(got)))
+			continue
+		}
+		cases = append(cases, cv02CaseResult{ID: id, Title: got[0].Spec.Title, Status: "archived-skipped"})
+	}
+	return cases, problems
+}
+
+// cv02ArchivedExecutedStatus scans EVERY observation of an archived case —
+// each occurrence and each recorded attempt — and returns the first executed
+// result status, or "" when every observation is absent, skipped or not-run.
+func cv02ArchivedExecutedStatus(got []cv02FlatSpec) string {
+	for _, fs := range got {
+		for _, test := range fs.Spec.Tests {
+			for _, res := range test.Results {
+				switch res.Status {
+				case "skipped", "not-run":
+					continue
+				case "":
+					return "missing-status"
+				default:
+					return res.Status
+				}
+			}
+		}
+	}
+	return ""
 }
 
 // cv02ExtractJSONObject finds the Playwright JSON report inside captured
@@ -649,6 +717,7 @@ type cv02StandSummary struct {
 	GitDirty      bool             `json:"git_dirty"`
 	Dist          cv02DistEvidence `json:"dist"`
 	RequiredCases []string         `json:"required_cases"`
+	ArchivedCases []cv02CaseResult `json:"archived_cases,omitempty"`
 	Cases         []cv02CaseResult `json:"cases"`
 	Stats         cv02PWStats      `json:"stats"`
 	Barrier       struct {
@@ -934,18 +1003,27 @@ func TestCV02RequestJourneyBrowserAcceptance(t *testing.T) {
 	require.NoError(t, os.MkdirAll(artifacts, 0o755))
 
 	// Registered command + frozen-registry enforcement:
-	// a green run missing a required case is not acceptance.
+	// a green run missing a required case is not acceptance; an archived
+	// mobile case that executed is not acceptance either.
 	report, suiteErr, out := cv02RunPlaywright(t, repoRoot, srv.URL, fixturePath, artifacts)
 	specs := cv02FlattenSpecs(report.Suites, "", nil)
 	cases, problems := cv02CaseVerdicts(specs)
 	for _, c := range cases {
 		t.Logf("cv02 case %s: %s", c.ID, c.Status)
 	}
+	// Archived/mobile registry stays visible in the log and the receipt
+	// (never a silent pass-through); an executed archived case fails below.
+	archivedCases, archivedProblems := cv02ArchivedCaseVerdicts(specs)
+	for _, c := range archivedCases {
+		t.Logf("cv02 archived/mobile case %s: %s (archived fixture, outside the desktop gate)", c.ID, c.Status)
+	}
+	problems = append(problems, archivedProblems...)
 	held, released := barrier.counters()
 	summary := cv02StandSummary{
 		RunID: run, StartedUTC: started.Format(time.RFC3339),
 		Dist: distEv, RequiredCases: cv02RequiredJourneyCases,
-		Cases: cases, Stats: report.Stats,
+		ArchivedCases: archivedCases,
+		Cases:         cases, Stats: report.Stats,
 	}
 	summary.Barrier.Held, summary.Barrier.Released = held, released
 	t.Logf("cv02 stand receipt: %s", cv02WriteStandSummary(t, artifacts, summary))

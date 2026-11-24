@@ -160,7 +160,7 @@ func TestN03P3T08_ClientCancel_NoRawLeakAndWellFormedTermination(t *testing.T) {
 	gw.res = stubModelResolver{
 		"m1": {ModelName: "m1", Provider: "openai", UpstreamURL: gw.cfg.Provider, Enabled: true},
 	}
-	info := rt06TestResolve(gw, "m1")
+	info := rt06TestResolve(t.Context(), gw, "m1")
 	r := httptest.NewRequestWithContext(context.Background(), http.MethodPost,
 		"/v1/chat/completions", strings.NewReader(streamRequestBody))
 	ctx, cancel := context.WithCancel(withReservationGate(r.Context(), &reservationGate{

@@ -2,7 +2,7 @@
 // (same contract as tableUrl.test.ts — the encode/decode a reload uses).
 import assert from 'node:assert/strict'
 import { test } from 'node:test'
-import { readInspectParam, relatedListHref, writeInspectParam } from './inspectUrl.ts'
+import { readInspectParam, readInspectRowKeys, relatedListHref, selectedRequestRowId, writeInspectParam } from './inspectUrl.ts'
 
 test('readInspectParam: present, absent, blank and unparsable values', () => {
   assert.equal(readInspectParam('inspect=org-9'), 'org-9')
@@ -37,6 +37,24 @@ test('writeInspectParam: set, replace and remove keep other params intact', () =
   assert.equal(blank.get('inspect'), 'org-1')
 })
 
+test('readInspectRowKeys: raw selector values, never collapsed', () => {
+  // One selector: the normal deep link after a row click.
+  assert.deepEqual(readInspectRowKeys('inspect=request%3Areq-1&row_key=9007199254740993'), ['9007199254740993'])
+  // Absent param is null (legacy link: no selector, no guessing).
+  assert.equal(readInspectRowKeys('inspect=request%3Areq-1'), null)
+  assert.equal(readInspectRowKeys(''), null)
+  // Blank-present is ['']: presence is intent — the server's strict 400
+  // must decide, not a silent fallback.
+  assert.deepEqual(readInspectRowKeys('row_key='), [''])
+  // A duplicated selector surfaces as TWO values. Collapsing to the first
+  // sibling (URLSearchParams.get) would silently inspect a row the URL
+  // never named.
+  assert.deepEqual(readInspectRowKeys('row_key=1&row_key=2'), ['1', '2'])
+  assert.deepEqual(readInspectRowKeys('row_key=1&row_key=1'), ['1', '1'])
+  // A URLSearchParams instance works the same as a raw string.
+  assert.deepEqual(readInspectRowKeys(new URLSearchParams('inspect=request%3Areq-1&row_key=7')), ['7'])
+})
+
 test('relatedListHref: strips inspect, keeps scope params, applies extras', () => {
   assert.equal(relatedListHref('keys', 'inspect=org-9'), '#keys')
   assert.equal(
@@ -53,4 +71,20 @@ test('relatedListHref: strips inspect, keeps scope params, applies extras', () =
     relatedListHref('rules', 'org=acme&inspect=a', { model: 'gpt-4' }),
     '#rules?org=acme&model=gpt-4',
   )
+  // The row selector belongs to this correlation only: it must not leak
+  // into a related list page and retarget a future inspector there.
+  assert.equal(
+    relatedListHref('requests-explorer', 'org=acme&inspect=request%3Areq-1&row_key=7'),
+    '#requests-explorer?org=acme',
+  )
+})
+
+test('a malformed or mismatched selector highlights no sibling', () => {
+  const rows = [{ request_id: 'shared', row_key: '12' }, { request_id: 'shared', row_key: '9007199254740993' }, { request_id: 'other', row_key: '13' }]
+  for (const keys of [['12', '99'], [''], ['bad'], ['0'], ['13']]) {
+    assert.equal(selectedRequestRowId('shared', keys, rows), undefined)
+  }
+  assert.equal(selectedRequestRowId('shared', ['9007199254740993'], rows), '9007199254740993')
+  assert.equal(selectedRequestRowId('shared', ['+0012'], rows), '12')
+  assert.equal(selectedRequestRowId('shared', [], rows), '12')
 })
