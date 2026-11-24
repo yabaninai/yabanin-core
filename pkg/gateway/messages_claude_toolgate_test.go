@@ -181,7 +181,7 @@ var (
 // ccSSEBody posts a streaming native request and returns the client stream.
 func ccSSEBody(t *testing.T, gw *gateway, body string) string {
 	t.Helper()
-	req := httptest.NewRequest(http.MethodPost, "/v1/messages", strings.NewReader(body))
+	req := httptest.NewRequestWithContext(t.Context(), http.MethodPost, "/v1/messages", strings.NewReader(body))
 	req.Header.Set("Authorization", "Bearer test-key")
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
@@ -1001,6 +1001,27 @@ func TestMessagesNative_ToolGateReaderDecodeFailSwallowed(t *testing.T) {
 			t.Fatalf("the discarded run must release nothing:\n%s", out)
 		}
 		ccAssertDecodeFailSwallowed(t, out, "DECODEFAIL-MARKER")
+	})
+
+	t.Run("negative index hold", func(t *testing.T) {
+		// blockStart accepts signed indices, so a held run's rawIdx can
+		// be negative — the swallow decision must key on the hold being
+		// open, never on the index's sign.
+		engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("zsh")}}, time.Minute)
+		bashStart := ccFrame("content_block_start", `{"type":"content_block_start","index":-3,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}`)
+		bad := ccFrame("content_block_delta", `{"type":"content_block_delta","index":-3,"delta":{"type":5},"note":"NEGIDX-MARKER"}`)
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(
+			ccMsgStartFrame+bashStart+bad+
+				ccFrame("content_block_stop", `{"type":"content_block_stop","index":-3}`)+
+				ccDeltaFrame+ccStopFrame), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if strings.Contains(string(out), "bash") || strings.Contains(string(out), "toolu_1") {
+			t.Fatalf("the discarded run must release nothing:\n%s", out)
+		}
+		ccAssertDecodeFailSwallowed(t, out, "NEGIDX-MARKER")
 	})
 
 	t.Run("unparseable payload", func(t *testing.T) {

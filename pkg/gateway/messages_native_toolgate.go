@@ -450,12 +450,9 @@ func (g *nativeToolGateReader) protocolViolation(frame []byte, payload []byte) {
 	if g.quarantinedJunk(payload) {
 		return
 	}
-	heldIdx := -1 // the held run's wire index, saved before the discard drops the hold
-	if g.hold != nil {
-		heldIdx = g.hold.rawIdx
-	}
+	held := g.hold != nil // captured before the discard drops the hold; the raw index itself is signed, so it cannot double as an open-flag
 	g.discardHold()
-	if heldIdx >= 0 {
+	if held {
 		return // the triggering frame swallows whole with the run it broke
 	}
 	g.emitShifted(frame, payload)
