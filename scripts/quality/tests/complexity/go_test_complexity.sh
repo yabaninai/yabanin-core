@@ -20,7 +20,9 @@
 # extracted from the product Makefile and driven through make, covering
 # >15 without receipt, invalid receipts (same-model over 15, stale over
 # 11-15), untouched-debt pass, valid 11-15 receipt via
-# GO_COMPLEXITY_RECEIPT and a docs-only diff.
+# GO_COMPLEXITY_RECEIPT and a docs-only diff. The commit-date-utc control
+# pins UTC normalization of the committer timestamp before the receipt
+# staleness comparison (local-zone commits must not shift the date).
 set -uo pipefail
 
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/../../../.." && pwd)
@@ -634,6 +636,137 @@ PY
 }
 
 # ---------------------------------------------------------------------------
+scenario_commit_date_utc() {
+    # QG-C01-02 staleness binding: %cI reports the committer date in the
+    # committer's local timezone, while receipt review_date values are UTC
+    # calendar dates. A commit made early in the UTC day from a zone ahead
+    # of UTC carries a local calendar date one day later; the analyzer must
+    # normalize the timezone-aware timestamp to UTC before taking the date,
+    # or a valid same-UTC-day receipt is wrongly rejected as stale. The
+    # staleness policy itself must not relax (an earlier UTC day is still
+    # stale) and malformed git output must keep its precise AnalyzerError.
+    export GIT_AUTHOR_DATE="2026-11-06T01:30:00+05:00" \
+           GIT_COMMITTER_DATE="2026-11-06T01:30:00+05:00"
+    local repo
+    repo=$(new_repo utcdate)
+    local base
+    base=$(build_base "$repo")
+    build_head "$repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
+    local head
+    head=$(git -C "$repo" rev-parse HEAD)
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+    python3 - "$repo" "$head" "$ROOT" <<'PY'
+import datetime
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+repo, head, root = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+gate = root / "scripts/quality/complexity/go/go_complexity.py"
+spec = importlib.util.spec_from_file_location("gate", gate)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+raw = subprocess.run(
+    ["git", "-C", str(repo), "show", "-s", "--format=%cI", head],
+    check=True, capture_output=True).stdout.decode().strip()
+failures = []
+
+
+def check(name, condition, detail=""):
+    print(("PASS" if condition else "FAIL") + f" [commit-date-utc] {name}"
+          + ("" if condition or not detail else f": {detail}"))
+    if not condition:
+        failures.append(name)
+
+
+# Real git fixture: the committer zone (+05:00) puts the local calendar
+# date one day ahead of the UTC date of the same instant.
+check("fixture-local-date-differs-utc",
+      raw == "2026-11-06T01:30:00+05:00", raw)
+utc_date = module.commit_date(repo, head)
+check("commit-date-normalized-utc",
+      utc_date == datetime.date(2026, 11, 5), str(utc_date))
+
+# Malformed git output keeps the precise AnalyzerError.
+original_run_git = module.run_git
+module.run_git = lambda *args, **kwargs: b"not-a-timestamp"
+raised = None
+try:
+    try:
+        module.commit_date(repo, head)
+    except module.AnalyzerError as error:
+        raised = error
+    check("malformed-raw-rejected",
+          raised is not None and "not-a-timestamp" in str(raised),
+          str(raised))
+finally:
+    module.run_git = original_run_git
+
+sys.exit(1 if failures else 0)
+PY
+    local unit_rc=$?
+
+    run_analyzer "$repo" "$base" "$WORK/utc-scan.json"
+    local body_sha
+    body_sha=$(report_body_sha256 "$WORK/utc-scan.json" sample.go BorderlineFn)
+    [ -n "$body_sha" ] || { printf 'FAIL [commit-date-utc] body-hash-extract\n'; }
+
+    # Receipt dated the commit's UTC day (2026-11-05) is same-day fresh;
+    # before UTC normalization the raw %cI prefix was the committer-local
+    # date 2026-11-06 and this receipt was wrongly rejected as stale.
+    make_receipt "$WORK/utc-ok.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$body_sha\"}]"
+    run_analyzer "$repo" "$base" "$WORK/utc-ok-run.json" --receipt "$WORK/utc-ok.json"
+    python3 - "$RC" "$WORK/utc-ok-run.json" <<'PY'
+import json
+import sys
+
+rc, report_path = int(sys.argv[1]), sys.argv[2]
+report = json.load(open(report_path))
+receipt = report.get("receipt") or {}
+condition = (rc == 0
+             and report["run"].get("head_commit_date") == "2026-11-05"
+             and receipt.get("status") == "accepted")
+print(("PASS" if condition else "FAIL")
+      + f" [commit-date-utc] utc-day-receipt-accepted: rc={rc} "
+        f"head_commit_date={report['run'].get('head_commit_date')} "
+        f"receipt={receipt}")
+sys.exit(0 if condition else 1)
+PY
+    local ok_rc=$?
+
+    # One UTC day before the commit date is still stale: normalization
+    # must not relax the staleness policy.
+    make_receipt "$WORK/utc-stale.json" "$head" "$base" fixture-senior \
+        fixture-impl 2026-11-04 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$body_sha\"}]"
+    run_analyzer "$repo" "$base" "$WORK/utc-stale-run.json" --receipt "$WORK/utc-stale.json"
+    local stale_ok=1
+    if [ "$RC" -eq 1 ] && grep -q "stale receipt" "$WORK/out.txt"; then
+        printf 'PASS [commit-date-utc] pre-utc-day-receipt-still-stale\n'
+    else
+        printf 'FAIL [commit-date-utc] pre-utc-day-receipt-still-stale: rc=%s out=%s\n' \
+            "$RC" "$(head -c 300 "$WORK/out.txt")"
+        stale_ok=0
+    fi
+
+    local total=$((unit_rc + ok_rc + (1 - stale_ok)))
+    if [ "$total" -ne 0 ]; then
+        scenario_failed=$((scenario_failed + 1))
+        total_failed=$((total_failed + 1))
+        printf 'scenario %-18s FAILED\n\n' commit-date-utc
+    else
+        printf 'scenario %-18s OK\n\n' commit-date-utc
+    fi
+    # scenario_duplicate_over_15 relies on its predecessor leaving a clean
+    # scenario_failed; keep the established contract.
+    scenario_failed=0
+}
+
+# ---------------------------------------------------------------------------
 scenario_duplicate_over_15() {
     # QG-C01-02 free-duplicate loophole: a content-identical copy of a >15
     # base function, with the original still at head, must be measured as
@@ -1108,6 +1241,7 @@ scenario_clean_pass
 scenario_block_over_15
 scenario_receipt_band
 scenario_receipt_validation
+scenario_commit_date_utc
 scenario_duplicate_over_15
 scenario_moved_debt_carry
 scenario_formatting_only

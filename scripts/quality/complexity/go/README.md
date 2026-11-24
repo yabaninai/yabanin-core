@@ -94,8 +94,8 @@ Validation rejects any receipt with a precise, named reason (exit 1):
   mismatch: …`);
 - `review_date` not ISO `YYYY-MM-DD`;
 - stale receipt: `review_date` strictly earlier than the source commit's
-  committer date (same-day review is fresh; the receipt must not predate
-  the reviewed source);
+  committer date normalized to UTC (same UTC-day review is fresh; the
+  receipt must not predate the reviewed source);
 - `reviewer_model` equal to `implementer_model` (self-review), either model
   absent from the configured strength ordering, or the reviewer not
   strictly stronger than the implementer;
