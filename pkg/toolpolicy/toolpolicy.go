@@ -532,3 +532,30 @@ func (e *Engine) HasDenyPolicies(ctx context.Context, orgID string) bool {
 	}
 	return false
 }
+
+// HasResponseGates reports whether the org defines any enabled policy
+// that gates a response surface: a deny row, a row whose rules failed to
+// compile (fail-closed defense in depth), or a row carrying
+// declared-args checks (schema, max_bytes, deny_regex — these live on
+// allow rows, which HasDenyPolicies does not see). The native Messages
+// gate consults it as the hot-path fast skip, so a deny row is not
+// required for gating to activate. A loader outage reports no gates:
+// the surface fails open exactly like every other engine read path.
+func (e *Engine) HasResponseGates(ctx context.Context, orgID string) bool {
+	cached, err := e.load(ctx, orgID)
+	if err != nil {
+		return false
+	}
+	for i := range cached.policies {
+		if cached.policies[i].Action == ActionDeny {
+			return true
+		}
+		// compiled[i] is zero-valued for a row without rules (plain
+		// allow/deny): only a non-nil compile ERROR marks the fail-closed
+		// row, and a compiled Rules carries the args checks.
+		if cr := cached.compiled[i]; cr.err != nil || (cr.rules != nil && cr.rules.hasArgsChecks()) {
+			return true
+		}
+	}
+	return false
+}

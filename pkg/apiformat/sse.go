@@ -135,6 +135,26 @@ func cutSSERest(rest []byte) (line, tail []byte) {
 	return rest[:i+1], rest[i+1:]
 }
 
+// SSERecordLines splits one complete frame blob into its record lines,
+// each with its original terminator (LF, CRLF or a lone CR), in order. A
+// final line without a terminator is included whole, so a caller
+// re-emitting the lines preserves the frame's byte style.
+func SSERecordLines(blob []byte) [][]byte {
+	var lines [][]byte
+	for len(blob) > 0 {
+		line, tail := cutSSERest(blob)
+		lines = append(lines, line)
+		blob = tail
+	}
+	return lines
+}
+
+// SSELineContent strips one line terminator ('\n', '\r\n', or a lone
+// '\r') from a complete line, returning the field content. It is the
+// exported form of the package-internal line normalization, for framing
+// layers outside the package that walk SSERecordLines output.
+func SSELineContent(line []byte) []byte { return sseLineContent(line) }
+
 // SSEParser accepts arbitrary byte chunks and yields complete events.
 // Line splitting shares SSELineSplitter's terminator rules, so CR-only
 // streams dispatch events mid-stream exactly like LF ones. A trailing

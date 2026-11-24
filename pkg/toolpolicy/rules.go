@@ -202,6 +202,14 @@ type Rules struct {
 // or CredentialModeDelegated.
 func (r *Rules) CredentialMode() string { return r.credentialMode }
 
+// hasArgsChecks reports whether the compiled rules carry any
+// declared-args gate (schema, max_bytes or deny_regex): an allow row that
+// gates nothing else is still a response-surface gate, because
+// GuardDeclaredArgs runs on it (HasResponseGates).
+func (r *Rules) hasArgsChecks() bool {
+	return r.argsSchema != nil || r.argsMaxBytes > 0 || len(r.argsDeny) > 0
+}
+
 // ValidateRulesJSON bounds and compiles a rules document without keeping the
 // compiled form (admin CRUD write path). A nil/empty doc is valid (no rules).
 func ValidateRulesJSON(raw json.RawMessage) error {
