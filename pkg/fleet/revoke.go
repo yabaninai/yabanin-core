@@ -115,16 +115,24 @@ func (r *Registry) Lookup(deploymentID string) (Installation, bool) {
 //     coupling it to issuance here would pre-empt W04's window policy —
 //     disclosed in the card record, decided where the window lives.
 func (r *Registry) AuthorizeSecretIssuance(deploymentID string) error {
+	_, _, err := r.authorizeIssuanceSnapshot(deploymentID)
+	return err
+}
+
+// authorizeIssuanceSnapshot returns the issuance verdict and the snapshot
+// it was judged against from ONE mutex hold, so no interleaving can pair
+// an allow verdict with a revoked snapshot.
+func (r *Registry) authorizeIssuanceSnapshot(deploymentID string) (Installation, bool, error) {
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	r.ensureLocked()
 	ins, ok := r.installations[deploymentID]
 	if !ok {
-		return fmt.Errorf("%w: %q", ErrNotEnrolled, deploymentID)
+		return Installation{}, false, fmt.Errorf("%w: %q", ErrNotEnrolled, deploymentID)
 	}
 	if ins.State == StateRevoked {
-		return fmt.Errorf("%w: secret issuance refused for %q (revoked %s: %s)",
+		return *ins, true, fmt.Errorf("%w: secret issuance refused for %q (revoked %s: %s)",
 			ErrRevoked, deploymentID, ins.RevokedAt.Format(time.RFC3339Nano), ins.RevocationReason)
 	}
-	return nil
+	return *ins, true, nil
 }

@@ -1,6 +1,7 @@
 package trcli
 
 import (
+	"bytes"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -8,9 +9,41 @@ import (
 	"testing"
 	"time"
 
+	audit "github.com/reireirei/yabanin/pkg/costsim"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestAuditInputAccounting(t *testing.T) {
+	const log = `{"model":"gpt-4o","messages":[{"content":"alpha"}]}
+{broken}
+{"model":"gpt-4o","messages":[{"content":"beta"}]}
+{"model":"gpt-4o","messages":[{"content":"alpha"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}
+{"model_used":"gpt-4o","tokens_in":700}
+{"model_used":"gpt-4o","tokens_in":900}
+`
+	file := filepath.Join(t.TempDir(), "requests.jsonl")
+	require.NoError(t, os.WriteFile(file, []byte(log), 0o600))
+	for _, input := range []string{file, "-"} {
+		for _, redact := range []string{"--no-prompts=false", "--no-prompts"} {
+			cmd := RootCommand()
+			var out bytes.Buffer
+			cmd.SetOut(&out)
+			cmd.SetIn(strings.NewReader(log))
+			cmd.SetArgs([]string{"audit", input, "-f", "json", redact, "--provider", "local-pricer"})
+			require.NoError(t, cmd.ExecuteContext(t.Context()))
+			var report audit.AuditReport
+			require.NoError(t, json.Unmarshal(out.Bytes(), &report))
+			require.Equal(t, 5, report.S1.Requests)
+			require.Equal(t, 6, report.S5.Denominator)
+			require.Equal(t, 1, report.S5.Skipped)
+			require.Len(t, report.S1.TopProviders, 1)
+			require.Equal(t, "local-pricer", report.S1.TopProviders[0].Name)
+			require.InDelta(t, 20.0, report.S3.HitRatePct, 1e-9)
+			require.Equal(t, 11, report.S3.TokensAvoided)
+		}
+	}
+}
 
 // writeAuditFixture writes a small deterministic OpenAI-style JSONL log to a temp
 // file and returns its path. The content exercises multiple models, repeats

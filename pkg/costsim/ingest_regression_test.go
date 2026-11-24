@@ -5,8 +5,8 @@ import (
 	"testing"
 )
 
-// A04: ingestion regression — the report must always account for every input
-// line: parsed + skipped = denominator, and the cap that bounds parsed.
+// Ingestion regression invariant: the report must always account for every
+// input line: parsed + skipped = denominator, and the cap that bounds parsed.
 
 func TestIngest_CapFieldSet(t *testing.T) {
 	path := writeFile(t, "cap.jsonl",
@@ -20,6 +20,18 @@ func TestIngest_CapFieldSet(t *testing.T) {
 	_, statsDef := ingest(t, path, IngestOptions{Format: "openai-jsonl"})
 	if statsDef.Cap != DefaultMaxRecords {
 		t.Errorf("default Cap = %d, want %d", statsDef.Cap, DefaultMaxRecords)
+	}
+}
+
+func TestStreamedCSVHeaderLongFieldAndCap(t *testing.T) {
+	text := strings.Repeat("x", 9000) + "\nsecond line"
+	input := "\nmodel,prompt,provider\ngpt-4o,\"" + text + "\",local\ngpt-4o,next,local\n"
+	rows, stats, err := IngestReader(t.Context(), strings.NewReader(input), "", IngestOptions{MaxRecords: 1, Provider: "override"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != 1 || !stats.WasTruncated || rows[0].Prompt != text || rows[0].Provider != "override" {
+		t.Fatal("CSV sniff, buffering, cap or override mismatch")
 	}
 }
 
@@ -103,5 +115,65 @@ func TestNoPrompts_StillCountsDenominator(t *testing.T) {
 	}
 	if stats.Parsed+stats.ParseErrorCount != 2 {
 		t.Errorf("denominator = %d, want 2 even with NoPrompts", stats.Parsed+stats.ParseErrorCount)
+	}
+}
+
+func TestIngest_JSONLExtensionParsesGatewayLines(t *testing.T) {
+	// A .jsonl-named gateway export (model_used/tokens_in, no OpenAI fields)
+	// must parse instead of counting every line as a parse error: the unified
+	// reader falls back from the OpenAI shape to the gateway shape per line.
+	path := writeFile(t, "gateway.jsonl",
+		`{"model_used":"gpt-4o","tokens_in":700,"tokens_out":40}`+"\n"+
+			`{"model_used":"gpt-4o-mini","tokens_in":100,"tokens_out":20}`+"\n")
+	recs, stats := ingest(t, path, IngestOptions{}) // auto, selected by extension
+	if len(recs) != 2 || stats.ParseErrorCount != 0 {
+		t.Fatalf("parsed=%d errors=%d, want 2 parsed / 0 skipped", len(recs), stats.ParseErrorCount)
+	}
+	if recs[0].Model != "gpt-4o" || recs[0].PromptTokens != 700 || recs[0].CompletionTokens != 40 || recs[0].Prompt != "" {
+		t.Fatalf("gateway row misparsed: %+v", recs[0])
+	}
+	if stats.RealTokenCount != 2 {
+		t.Errorf("RealTokenCount = %d, want 2 (gateway counts are real)", stats.RealTokenCount)
+	}
+}
+
+func TestExact_PromptlessRecordsAreMisses(t *testing.T) {
+	// request_logs-style rows carry no prompt text. exactKey must treat an
+	// unavailable prompt as a miss, not a shared identity: prompt-less calls
+	// to the same model must not manufacture cache hits from each other.
+	recs := []Record{
+		{Model: "gpt-4o", PromptTokens: 700, CompletionTokens: 40},
+		{Model: "gpt-4o", PromptTokens: 700, CompletionTokens: 40},
+	}
+	res, err := SimulateCache(recs, SimCacheOptions{Mode: ModeExact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests != 2 || res.Hits != 0 || res.TokensAvoided != 0 {
+		t.Fatalf("requests=%d hits=%d avoided=%d, want 2/0/0",
+			res.Requests, res.Hits, res.TokensAvoided)
+	}
+}
+
+func TestNoPrompts_KeepsExactHits(t *testing.T) {
+	// --no-prompts drops the raw text but must keep the exact-cache identity
+	// computed before the drop: repeated prompts still count as hits.
+	const row = `{"model":"gpt-4o","messages":[{"role":"user","content":"alpha"}],"usage":{"prompt_tokens":8,"completion_tokens":3}}`
+	path := writeFile(t, "noprompt-hit.jsonl", row+"\n"+row+"\n")
+	recs, stats := ingest(t, path, IngestOptions{Format: "openai-jsonl", NoPrompts: true})
+	if len(recs) != 2 || recs[0].Prompt != "" || recs[1].Prompt != "" {
+		t.Fatalf("recs=%d prompts=%q/%q, want 2 records with dropped text",
+			len(recs), recs[0].Prompt, recs[1].Prompt)
+	}
+	if stats.Parsed+stats.ParseErrorCount != 2 {
+		t.Errorf("denominator = %d, want 2", stats.Parsed+stats.ParseErrorCount)
+	}
+	res, err := SimulateCache(recs, SimCacheOptions{Mode: ModeExact})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.Requests != 2 || res.Hits != 1 || res.TokensAvoided != 11 {
+		t.Fatalf("requests=%d hits=%d avoided=%d, want 2/1/11",
+			res.Requests, res.Hits, res.TokensAvoided)
 	}
 }

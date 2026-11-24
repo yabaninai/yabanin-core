@@ -2,7 +2,6 @@ package trcli
 
 import (
 	"fmt"
-	"io"
 	"os"
 
 	"github.com/spf13/cobra"
@@ -21,8 +20,8 @@ func auditCmd() *cobra.Command {
 		Long: `Audit a customer's LLM request log offline.
 
 The command ingests a request log (OpenAI-style JSONL, CSV, or this gateway's
-format), computes what was actually spent, and simulates what semantic caching
-plus tier-routing would have saved. It renders the report as markdown (default),
+format), estimates spend from usage and prices, and simulates exact-cache reuse
+and tier routing. It renders the report as markdown (default),
 JSON, or self-contained HTML. It makes no network calls and needs no gateway,
 admin URL, key, or organization.
 
@@ -52,17 +51,7 @@ Input is a single file path, or '-' to read stdin.`,
 				return fmt.Errorf("semantic audit is unavailable in this CLI: no embedder is configured; use --cache-mode exact or off")
 			}
 
-			// Resolve input: a path, or stdin copied to a temp file (Ingest reads
-			// a file path).
-			resolved, tmp, err := resolveAuditInput(input)
-			if err != nil {
-				return err
-			}
-			if tmp != "" {
-				defer func() { _ = os.Remove(tmp) }() // best-effort temp cleanup
-			}
-
-			recs, stats, err := audit.Ingest(cmd.Context(), resolved, audit.IngestOptions{
+			recs, stats, err := readAuditInput(cmd, input, audit.IngestOptions{
 				MaxRecords: maxRecords,
 				NoPrompts:  noPrompts,
 				Provider:   provider,
@@ -76,9 +65,9 @@ Input is a single file path, or '-' to read stdin.`,
 
 			report := audit.GenerateReport(recs, mode)
 			report.Source = input
-			// A04: ingestion regression account — parsed / skipped / cap and
-			// the denominator (parsed + skipped) so a report always shows how
-			// many input lines produced records.
+			// Ingestion account: parsed / skipped / cap and the denominator
+			// (parsed + skipped), so the report always shows how many input
+			// lines produced records.
 			report.S5.Skipped = stats.ParseErrorCount
 			report.S5.Cap = stats.Cap
 			report.S5.Denominator = stats.Parsed + stats.ParseErrorCount
@@ -138,25 +127,11 @@ func renderAuditReport(report audit.AuditReport, format string, lang string) (st
 	}
 }
 
-// resolveAuditInput returns the file path to ingest. If input is "-" it copies
-// stdin to a temp file and returns that path plus the temp path to clean up.
-func resolveAuditInput(input string) (path, tmp string, err error) {
-	if input != "-" {
-		return input, "", nil
+// readAuditInput streams the audit input: a file path, or stdin ("-") read in
+// place, with no temporary copy of raw prompt text.
+func readAuditInput(cmd *cobra.Command, input string, opts audit.IngestOptions) ([]audit.Record, audit.IngestStats, error) {
+	if input == "-" {
+		return audit.IngestReader(cmd.Context(), cmd.InOrStdin(), "", opts)
 	}
-	tmpFile, err := os.CreateTemp("", "tr-audit-*.tmp")
-	if err != nil {
-		return "", "", fmt.Errorf("create temp file for stdin: %w", err)
-	}
-	tmp = tmpFile.Name()
-	if _, err := io.Copy(tmpFile, os.Stdin); err != nil {
-		_ = tmpFile.Close() // best-effort cleanup on failure path
-		_ = os.Remove(tmp)
-		return "", "", fmt.Errorf("read stdin: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		_ = os.Remove(tmp)
-		return "", "", err
-	}
-	return tmp, tmp, nil
+	return audit.Ingest(cmd.Context(), input, opts)
 }

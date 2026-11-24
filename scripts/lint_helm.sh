@@ -25,4 +25,5 @@ for chart in deploy/helm/*/; do
   done
 done
 python3 scripts/helm_mcp_contract_test.py || fail=1
+python3 scripts/helm_operator_sa_contract_test.py || fail=1
 exit $fail

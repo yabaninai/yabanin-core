@@ -257,10 +257,11 @@ func TestAdversarial_ClockRollbackDoesNotRevive(t *testing.T) {
 // AuthorizeSecretIssuance never open a window where a revoked installation
 // is issuable or an identity enrolls twice (the registry mutex is the
 // single serialization point; this battery is what -race actually loads).
-// The race phase asserts only TRUE invariants (exactly one enrollment
-// success; no revoked-but-allowed observation); which interleaving wins is
-// deliberately free, so terminality is re-asserted deterministically after
-// the join.
+// Every issuance probe is one atomic decision+snapshot observation, so an
+// allow can never pair with a snapshot that is already revoked. The race
+// asserts only TRUE invariants (exactly one enrollment success; no
+// revoked-but-allowed observation); terminality is re-asserted after the
+// join.
 func TestAdversarial_ConcurrencyNoWindowOpens(t *testing.T) {
 	pub, _ := advKeyPair()
 	reg := NewRegistry()
@@ -280,17 +281,16 @@ func TestAdversarial_ConcurrencyNoWindowOpens(t *testing.T) {
 			}
 		}()
 	}
-	// The other half revokes concurrently and probes the gate; every probe
-	// must see either a refusal or a pre-revocation allow — never a
-	// revoked-but-allowed inconsistency.
+	// The other half revokes concurrently and probes the gate; the probe
+	// is atomic, so a revoke serializes wholly before or wholly after it —
+	// never a revoked-but-allowed inconsistency.
 	for i := 0; i < routines; i++ {
 		go func() {
 			defer func() { done <- struct{}{} }()
 			_ = reg.Revoke("deploy-acme-prod-01", "concurrent revocation", advNow.Add(time.Hour))
-			if err := reg.AuthorizeSecretIssuance("deploy-acme-prod-01"); err == nil {
-				if ins, ok := reg.Lookup("deploy-acme-prod-01"); ok && ins.State == StateRevoked {
-					t.Error("issuance allowed while state is revoked")
-				}
+			ins, ok, err := reg.authorizeIssuanceSnapshot("deploy-acme-prod-01")
+			if revokedAllowObserved(err, ins, ok) {
+				t.Error("issuance allowed while state is revoked")
 			}
 		}()
 	}
@@ -305,4 +305,31 @@ func TestAdversarial_ConcurrencyNoWindowOpens(t *testing.T) {
 	require.NoError(t, reg.Revoke("deploy-acme-prod-01", "post-race revocation", advNow.Add(2*time.Hour)))
 	assert.True(t, reg.IsRevoked("deploy-acme-prod-01"), "the revocation won")
 	require.ErrorIs(t, reg.AuthorizeSecretIssuance("deploy-acme-prod-01"), ErrRevoked)
+}
+
+// revokedAllowObserved is the concurrency oracle's invariant: an issuance
+// ALLOW verdict may never accompany a revoked snapshot.
+func revokedAllowObserved(err error, ins Installation, ok bool) bool {
+	return err == nil && ok && ins.State == StateRevoked
+}
+
+// TestNegativeControl_RevokedAllowMutantIsCaught pins the predicate to a
+// fabricated allow-with-revoked-snapshot observation; the real isolated
+// source-mutant evidence lives in the review manifest, not here.
+func TestNegativeControl_RevokedAllowMutantIsCaught(t *testing.T) {
+	pub, _ := advKeyPair()
+	reg := NewRegistry()
+	token := advIssue(t, "deploy-acme-prod-01", "org-acme", "adv-nonce-0008", advNow)
+	_, err := reg.ApplyEnrollment(token, pub, "org-acme", advNow, DefaultEnrollmentWindow)
+	require.NoError(t, err)
+	require.NoError(t, reg.Revoke("deploy-acme-prod-01", "mutant fixture", advNow.Add(time.Hour)))
+
+	// Mutant: unconditional success, revoked snapshot passed through.
+	mutant := func(ins Installation, ok bool, _ error) (Installation, bool, error) {
+		return ins, ok, nil
+	}
+	ins, ok, err := mutant(reg.authorizeIssuanceSnapshot("deploy-acme-prod-01"))
+	require.True(t, ok)
+	assert.True(t, revokedAllowObserved(err, ins, ok),
+		"negative control: the named assertion must fail for a success-with-revoked-snapshot mutant")
 }
