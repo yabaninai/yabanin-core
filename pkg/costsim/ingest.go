@@ -8,7 +8,6 @@ import (
 	"fmt"
 	"io"
 	"os"
-	"path/filepath"
 	"strconv"
 	"strings"
 	"time"
@@ -16,8 +15,10 @@ import (
 
 // IngestOptions controls how a file is read into records.
 type IngestOptions struct {
-	// Format is "auto", "openai-jsonl", "csv", or "yabanin" (the native spend
-	// export; the legacy alias "tokenrouter" is still accepted).
+	// Format selects the parser: "auto" (default), "openai-jsonl", "jsonl"
+	// (OpenAI shape with gateway-line fallback), "csv", "yabanin"/"tokenrouter"
+	// (native export; sniffed CSV or JSONL), or the explicit "yabanin-csv" /
+	// "tokenrouter-csv". Empty means "auto".
 	Format string
 	// MaxRecords caps the number of records ingested (default DefaultMaxRecords).
 	MaxRecords int
@@ -64,16 +65,6 @@ type IngestStats struct {
 // such lines increment ParseErrorCount and are skipped. The whole file is
 // never read into memory at once — it is streamed line by line.
 func Ingest(ctx context.Context, path string, opts IngestOptions) ([]Record, IngestStats, error) {
-	if opts.MaxRecords <= 0 {
-		opts.MaxRecords = DefaultMaxRecords
-	}
-	if opts.Format == "" {
-		opts.Format = "auto"
-	}
-
-	// Lstat (not Stat) so a symlinked input is reported rather than silently
-	// followed. Stat follows the link and would report the target's mode.
-	// Captured separately because the parser returns its own IngestStats.
 	var wasSymlink bool
 	if info, err := os.Lstat(path); err == nil {
 		wasSymlink = info.Mode()&os.ModeSymlink != 0
@@ -85,175 +76,35 @@ func Ingest(ctx context.Context, path string, opts IngestOptions) ([]Record, Ing
 	}
 	defer f.Close()
 
-	// Enlarge the scanner buffer for long prompt lines.
-	scanner := bufio.NewScanner(f)
-	scanner.Buffer(make([]byte, 0, 64*1024), 4*1024*1024)
-
-	// Determine the concrete format up front (auto sniffs extension + first
-	// non-empty line, rewinding the stream to 0), then parse uniformly from the
-	// start of the file.
-	format, err := detectFormat(opts.Format, f, scanner)
+	records, stats, err := IngestReader(ctx, f, path, opts)
 	if err != nil {
 		return nil, IngestStats{}, err
 	}
 
-	var records []Record
-	var stats IngestStats
-	addRecord := func(r Record) {
-		if opts.Provider != "" {
-			r.Provider = opts.Provider
-		}
-		records = append(records, r)
-	}
-
-	switch format {
-	case "csv", "yabanin-csv", "tokenrouter-csv":
-		records, stats, err = ingestCSV(scanner, format != "csv", opts, addRecord, ctx)
-	case "openai-jsonl", "yabanin", "tokenrouter":
-		records, stats, err = ingestJSONL(scanner, format != "openai-jsonl", opts, addRecord, ctx)
-	default:
-		return nil, IngestStats{}, fmt.Errorf("unsupported format %q", format)
-	}
-	if err != nil {
-		return nil, IngestStats{}, err
-	}
-
-	// The parser returns a fresh IngestStats; re-attach the symlink flag we
-	// captured before parsing and the effective cap used for the run.
 	stats.WasSymlink = wasSymlink
-	stats.Cap = opts.MaxRecords
-
-	if opts.NoPrompts {
-		for i := range records {
-			records[i].Prompt = ""
-		}
-	}
-
-	stats.Parsed = len(records)
 	return records, stats, nil
-}
-
-// detectFormat resolves the concrete format. It leaves the file positioned at
-// offset 0 (rewinding after any sniff) so the parser reads the whole file from
-// the start.
-func detectFormat(format string, f *os.File, scanner *bufio.Scanner) (string, error) {
-	if format != "auto" {
-		if format == "tokenrouter" {
-			// tokenrouter may be CSV or JSONL; sniff the first line.
-			if sniffTokenRouterKind(f, scanner) == "csv" {
-				return "tokenrouter-csv", nil
-			}
-			return "tokenrouter", nil
-		}
-		return format, nil
-	}
-
-	// auto: sniff by extension first, then by first non-empty line.
-	ext := strings.ToLower(filepath.Ext(f.Name()))
-	switch ext {
-	case ".csv":
-		return "csv", nil
-	case ".jsonl", ".json", ".ndjson":
-		return "openai-jsonl", nil
-	}
-	// No telling extension: sniff the first non-empty line (stream rewound).
-	first, err := firstNonEmptyLine(f, scanner)
-	if err != nil {
-		return "", err
-	}
-	if strings.HasPrefix(strings.TrimSpace(first), "{") {
-		return "openai-jsonl", nil
-	}
-	return "csv", nil
-}
-
-// sniffTokenRouterKind reports whether a tokenrouter export is CSV ("csv") or
-// JSONL ("jsonl"). It reads the first non-empty line without consuming the
-// stream for the parser.
-func sniffTokenRouterKind(f *os.File, scanner *bufio.Scanner) string {
-	first, _ := firstNonEmptyLine(f, scanner)
-	if strings.HasPrefix(strings.TrimSpace(first), "{") {
-		return "jsonl"
-	}
-	return "csv"
-}
-
-// firstNonEmptyLine reads the first non-empty line, then rewinds the file to
-// offset 0 so the caller can re-read it with the scanner.
-func firstNonEmptyLine(f *os.File, scanner *bufio.Scanner) (string, error) {
-	for scanner.Scan() {
-		if line := scanner.Text(); strings.TrimSpace(line) != "" {
-			if _, err := f.Seek(0, io.SeekStart); err != nil {
-				return "", fmt.Errorf("rewind input: %w", err)
-			}
-			return line, nil
-		}
-	}
-	if _, err := f.Seek(0, io.SeekStart); err != nil {
-		return "", fmt.Errorf("rewind input: %w", err)
-	}
-	if err := scanner.Err(); err != nil {
-		return "", err
-	}
-	return "", nil
 }
 
 // --- JSONL (openai-jsonl and tokenrouter) ---------------------------------
 
-func ingestJSONL(scanner *bufio.Scanner, tokenRouter bool, opts IngestOptions, add func(Record), ctx context.Context) ([]Record, IngestStats, error) {
-	var records []Record
-	var stats IngestStats
+func (b *ingestBatch) readJSONL(ctx context.Context, scanner *bufio.Scanner, parse func(string) (Record, error)) error {
 	for scanner.Scan() {
 		if ctx.Err() != nil {
-			return nil, stats, ctx.Err()
+			return ctx.Err()
 		}
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {
 			continue
 		}
-		var r Record
-		var parseErr error
-		if tokenRouter {
-			r, parseErr = parseTokenRouterLine(line)
-		} else {
-			r, parseErr = parseOpenAIJSONLLine(line)
-		}
-		if parseErr != nil {
-			stats.ParseErrorCount++
-			if len(stats.ParseErrorExamples) < maxReportedParseErrors {
-				stats.ParseErrorExamples = append(stats.ParseErrorExamples, parseErr.Error())
-			}
-			continue
-		}
-		if r.Model == "" && r.Prompt == "" && r.PromptTokens == 0 && r.CompletionTokens == 0 {
-			// A line that produced no usable signal is treated as unparseable
-			// rather than a zero-valued record.
-			stats.ParseErrorCount++
-			if len(stats.ParseErrorExamples) < maxReportedParseErrors {
-				stats.ParseErrorExamples = append(stats.ParseErrorExamples, "line carried no model, prompt, or token counts")
-			}
-			continue
-		}
-		if r.Provider == "" {
-			r.Provider = InferProvider(r.Model)
-		}
-		if !r.TokensEstimated && (r.PromptTokens > 0 || r.CompletionTokens > 0) {
-			stats.RealTokenCount++
-		}
-		if !r.Timestamp.IsZero() {
-			stats.TimestampedCount++
-		}
-		add(r)
-		records = append(records, r)
-		if len(records) >= opts.MaxRecords {
-			stats.WasTruncated = true
+		b.add(parse(line))
+		if b.stats.WasTruncated {
 			break
 		}
 	}
 	if err := scanner.Err(); err != nil {
-		return nil, stats, fmt.Errorf("read input: %w", err)
+		return fmt.Errorf("read input: %w", err)
 	}
-	return records, stats, nil
+	return nil
 }
 
 // openAIRequest is the subset of an OpenAI chat-completions body we read.
@@ -431,16 +282,13 @@ var knownCSVColumns = map[string]string{
 	"created_at":        "timestamp",
 }
 
-func ingestCSV(scanner *bufio.Scanner, _ bool, opts IngestOptions, add func(Record), ctx context.Context) ([]Record, IngestStats, error) {
-	var records []Record
-	var stats IngestStats
-
-	reader := csv.NewReader(lineReader{scanner})
+func (b *ingestBatch) readCSV(ctx context.Context, scanner *bufio.Scanner, prefix string) error {
+	reader := csv.NewReader(&lineReader{s: scanner, pending: prefix})
 	reader.FieldsPerRecord = -1 // header-driven; allow variable column counts
 
 	header, err := reader.Read()
 	if err != nil {
-		return nil, stats, fmt.Errorf("read csv header: %w", err)
+		return fmt.Errorf("read csv header: %w", err)
 	}
 	colIndex := map[string]int{}
 	for i, name := range header {
@@ -449,49 +297,26 @@ func ingestCSV(scanner *bufio.Scanner, _ bool, opts IngestOptions, add func(Reco
 		}
 	}
 	if _, ok := colIndex["model"]; !ok {
-		return nil, stats, fmt.Errorf("csv has no recognized model column (got %q)", header)
+		return fmt.Errorf("csv has no recognized model column (got %q)", header)
 	}
 
 	for {
 		if ctx.Err() != nil {
-			return nil, stats, ctx.Err()
+			return ctx.Err()
 		}
 		row, err := reader.Read()
 		if err == io.EOF {
 			break
 		}
 		if err != nil {
-			return nil, stats, fmt.Errorf("read csv row: %w", err)
+			return fmt.Errorf("read csv row: %w", err)
 		}
-		r, parseErr := csvRowToRecord(row, colIndex)
-		if parseErr != nil {
-			stats.ParseErrorCount++
-			if len(stats.ParseErrorExamples) < maxReportedParseErrors {
-				stats.ParseErrorExamples = append(stats.ParseErrorExamples, parseErr.Error())
-			}
-			continue
-		}
-		if r.Model == "" && r.Prompt == "" && r.PromptTokens == 0 && r.CompletionTokens == 0 {
-			stats.ParseErrorCount++
-			continue
-		}
-		if r.Provider == "" {
-			r.Provider = InferProvider(r.Model)
-		}
-		if !r.TokensEstimated && (r.PromptTokens > 0 || r.CompletionTokens > 0) {
-			stats.RealTokenCount++
-		}
-		if !r.Timestamp.IsZero() {
-			stats.TimestampedCount++
-		}
-		add(r)
-		records = append(records, r)
-		if len(records) >= opts.MaxRecords {
-			stats.WasTruncated = true
+		b.add(csvRowToRecord(row, colIndex))
+		if b.stats.WasTruncated {
 			break
 		}
 	}
-	return records, stats, nil
+	return nil
 }
 
 // csvRowToRecord maps a CSV row (via the resolved column index) to a Record.
@@ -550,20 +375,24 @@ func csvRowToRecord(row []string, idx map[string]int) (Record, error) {
 }
 
 // lineReader adapts a *bufio.Scanner to io.Reader so csv.NewReader can consume
-// the remaining lines after the manually-read header.
-type lineReader struct{ s *bufio.Scanner }
+// the remaining lines after the manually-read header. pending replays the line
+// consumed by auto-format sniffing so the header is not lost.
+type lineReader struct {
+	s       *bufio.Scanner
+	pending string
+}
 
-func (l lineReader) Read(p []byte) (int, error) {
-	if !l.s.Scan() {
-		if err := l.s.Err(); err != nil {
-			return 0, err
+func (l *lineReader) Read(p []byte) (int, error) {
+	if l.pending == "" {
+		if !l.s.Scan() {
+			if err := l.s.Err(); err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
 		}
-		return 0, io.EOF
+		l.pending = l.s.Text() + "\n"
 	}
-	line := l.s.Text() + "\n"
-	if len(p) < len(line) {
-		return 0, fmt.Errorf("buffer too small")
-	}
-	copy(p, line)
-	return len(line), nil
+	n := copy(p, l.pending)
+	l.pending = l.pending[n:]
+	return n, nil
 }

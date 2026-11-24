@@ -2,9 +2,11 @@ package audit
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"math"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/reireirei/yabanin/pkg/cache"
@@ -311,6 +313,12 @@ func evictOldest(m map[string]*lruEntry) {
 // exactKey computes the production prompt hash over a reconstructed request
 // body, so the simulation matches production keying rather than an ad-hoc hash.
 func exactKey(r Record) (string, error) {
+	if r.exactCacheKey != "" {
+		return r.exactCacheKey, nil
+	}
+	if strings.TrimSpace(r.Prompt) == "" {
+		return "", errors.New("prompt unavailable for exact replay")
+	}
 	body := map[string]interface{}{
 		"model": r.Model,
 		"messages": []map[string]string{

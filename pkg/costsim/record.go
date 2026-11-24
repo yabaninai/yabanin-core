@@ -30,7 +30,8 @@ type Record struct {
 	Model            string
 	Provider         string // inferred if absent
 	Prompt           string // concatenated message content; may be empty
-	PromptHash       string // filled by the analyzer, not the parser
+	PromptHash       string // normalized prompt identity for clustering
+	exactCacheKey    string // exact replay identity retained when raw text is discarded
 	PromptTokens     int
 	CompletionTokens int
 	TokensEstimated  bool // true when counts were derived from text length
