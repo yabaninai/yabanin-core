@@ -305,7 +305,8 @@ func (g *nativeToolGateReader) pull() error {
 // salvage rule, mirrored so a denial decided at the stream's last instant
 // still holds (the relay would have dispatched that frame un-gated). Then
 // a cancelled context fails open (D-15): an allowed run's frames release
-// verbatim, decided denials stay dropped. A clean end inside an
+// through the shifted path (a release after earlier removals stays
+// renumbered), decided denials stay dropped. A clean end inside an
 // unresolved run discards it fail-closed and delivers nothing held; the
 // trailing partial forwards raw in every other case (the relay owns
 // torn-tail withholding and terminal synthesis).
@@ -316,9 +317,7 @@ func (g *nativeToolGateReader) endStream(trailing []byte, err error) {
 	}
 	if g.ctx.Err() != nil {
 		if g.hold != nil {
-			for _, frame := range g.hold.frames {
-				g.forward(frame) // D-15: held allowed frames release verbatim
-			}
+			g.releaseRun(g.hold) // D-15: held allowed frames release, index-mapped
 		}
 		g.hold = nil
 		g.pendingDeny = nil
@@ -339,6 +338,14 @@ func (g *nativeToolGateReader) nextFrame() ([]byte, error) {
 	for {
 		line, err := g.src.ReadLine()
 		if err == nil {
+			if apiformat.SSECommentLine(line) {
+				// Keepalive comments ride no event: forward immediately
+				// (relay deliverLine parity) so a heartbeat never waits
+				// on a frame boundary, and a trailing comment survives a
+				// clean end instead of dying in the frame buffer.
+				g.forward(line)
+				continue
+			}
 			blank, overflow := g.frames.Add(line, apiformat.SSEStreamLineLimit)
 			if overflow {
 				g.frames.Take() // drop the oversized held frame
@@ -367,11 +374,26 @@ func (g *nativeToolGateReader) route(frame []byte) {
 	if !g.active {
 		if !hasData || !declaresNativeToolUse([]byte(ev.Data)) || !g.applicable() {
 			g.forward(frame)
+			if hasData {
+				g.countDeliveredStart([]byte(ev.Data))
+			}
 			return
 		}
 		g.active = true
 	}
 	g.gateFrame(frame, nativeEventName(ev), []byte(ev.Data))
+}
+
+// countDeliveredStart keeps call accounting truthful for frames that
+// streamed past an inactive gate: a tool_use start forwarded verbatim is
+// a call the client really received, so a later denial of another call
+// must not strand the tool loop with a rewritten end_turn.
+func (g *nativeToolGateReader) countDeliveredStart(payload []byte) {
+	var doc nativeBlockStart
+	if json.Unmarshal(payload, &doc) != nil || doc.Block.Type != "tool_use" {
+		return
+	}
+	g.keptCnt++
 }
 
 // applicable reports whether the org's policy state gates this stream.
@@ -516,9 +538,11 @@ type nativeBlockDelta struct {
 // blockDelta accumulates one input_json_delta of the held run, swallows
 // the deltas of a quarantined deny run, and forwards deltas of ordinary
 // blocks with the visible index. Anything else arriving mid-run
-// violates the protocol and resolves the run fail-closed. A delta that
-// would cross the bounded-hold caps discards the run fail-closed instead
-// of growing the hold without limit.
+// violates the protocol and resolves the run fail-closed — a frame
+// aimed at the discarded run's own index swallows with it (its start
+// was never visible), while another block's frame still forwards. A
+// delta that would cross the bounded-hold caps discards the run
+// fail-closed instead of growing the hold without limit.
 func (g *nativeToolGateReader) blockDelta(frame []byte, payload []byte) {
 	var doc nativeBlockDelta
 	if json.Unmarshal(payload, &doc) != nil {
@@ -532,9 +556,16 @@ func (g *nativeToolGateReader) blockDelta(frame []byte, payload []byte) {
 		g.emitShifted(frame, payload)
 		return
 	}
-	if doc.Index != g.hold.rawIdx || doc.Delta.Type != "input_json_delta" {
+	if doc.Index != g.hold.rawIdx {
+		g.discardHold()               // overlapping runs violate the protocol: fail closed
+		g.emitShifted(frame, payload) // another block's delta: its start was visible or quarantined
+		return
+	}
+	if doc.Delta.Type != "input_json_delta" {
+		// The violating frame belongs to the run now discarded: its start
+		// was never visible, so it swallows with the run — a mismatched
+		// delta must not surface headless under another block's index.
 		g.discardHold()
-		g.emitShifted(frame, payload)
 		return
 	}
 	if !g.holdAccepts(len(doc.Delta.PartialJSON), len(frame)) {
@@ -603,6 +634,15 @@ func (g *nativeToolGateReader) resolveHold() {
 		return
 	}
 	g.keptCnt++
+	g.releaseRun(run)
+}
+
+// releaseRun forwards a held run's buffered frames through the normal
+// shifted path: a release after earlier removals renumbers indices
+// exactly like a resolved keep, so neither a resolved keep nor a D-15
+// fail-open release ever exposes a raw wire index the client cannot
+// reconcile with the visible sequence.
+func (g *nativeToolGateReader) releaseRun(run *nativeToolRun) {
 	for _, frame := range run.frames {
 		ev, _ := parseNativeSSEFrame(frame)
 		g.emitShifted(frame, []byte(ev.Data))

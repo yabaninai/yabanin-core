@@ -739,7 +739,7 @@ func TestMessagesNative_ToolPolicySSEDataOnlyFrames(t *testing.T) {
 // index shifts, and the forwarded frames keep the CR byte style.
 func TestMessagesNative_ToolPolicySSECRTerminators(t *testing.T) {
 	ccCR := func(event, data string) string {
-		return "event: " + event + "\r\ndata: " + data + "\r\n\r\n"
+		return "event: " + event + "\rdata: " + data + "\r\r"
 	}
 	chunks := []string{strings.Join([]string{
 		ccCR("message_start", `{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}`),
@@ -771,8 +771,8 @@ func TestMessagesNative_ToolPolicySSECRTerminators(t *testing.T) {
 	if !strings.Contains(body, `"stop_reason":"tool_use"`) {
 		t.Fatalf("a survivor keeps tool_use:\n%s", body)
 	}
-	if !strings.Contains(body, "\r\n") {
-		t.Fatalf("forwarded frames must keep the CR byte style:\n%s", body)
+	if !strings.Contains(body, "\r") || strings.Contains(body, "\n") {
+		t.Fatalf("forwarded frames must keep the lone-CR byte style (no LF anywhere):\n%s", body)
 	}
 }
 
@@ -810,21 +810,105 @@ func TestMessagesNative_ToolPolicySSESalvageTail(t *testing.T) {
 }
 
 // TestMessagesNative_ToolGateReaderCancelTailFailOpen pins D-15 at the
-// tail: with the context already cancelled, a held ALLOWED run releases
-// verbatim at the upstream end (the surface fails open — the chat SSE
-// gate's canon).
+// tail: an idle-watchdog or client-side cancellation mid-hold releases
+// the held ALLOWED run through the shifted path — the surface fails open
+// (the chat SSE gate's canon) without exposing a raw wire index when an
+// earlier block was already removed.
 func TestMessagesNative_ToolGateReaderCancelTailFailOpen(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("shell")}}, time.Minute)
-	g := newNativeToolGateReader(ctx, strings.NewReader(ccMsgStartFrame+ccCalcStartFrame), engine, "org-1", "*")
+	defer cancel()
+	engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
+	src := make(ccChanReader, 4)
+	g := newNativeToolGateReader(ctx, src, engine, "org-1", "*")
+
+	src <- []byte(ccMsgStartFrame)
+	src <- []byte(ccBashStartFrame)                   // denied at declaration: shift 1
+	src <- []byte(ccCalcStartFrame)                   // allowed: held
+	src <- []byte(ccFrame("ping", `{"type":"ping"}`)) // observable: every earlier frame is settled
+	first := ccReadGateUntil(t, g, `"type":"ping"`)
+	if strings.Contains(first, "bash") || strings.Contains(first, "toolu_1") {
+		t.Fatalf("the denied run must deliver nothing:\n%s", first)
+	}
+
+	cancel() // the idle-watchdog path: the client is still attached
+	close(src)
 	out, err := io.ReadAll(g)
 	if err != nil {
 		t.Fatalf("read: %v", err)
 	}
-	if !strings.Contains(string(out), "calculator") || !strings.Contains(string(out), "message_start") {
-		t.Fatalf("a cancelled context must release the held allowed frames verbatim:\n%s", out)
+	if !strings.Contains(string(out), "calculator") {
+		t.Fatalf("a cancelled context must release the held allowed run:\n%s", out)
 	}
+	if strings.Contains(string(out), `"index":2`) {
+		t.Fatalf("a release after a removal must map the held run's index (raw 2 -> visible 1):\n%s", out)
+	}
+	if !strings.Contains(string(out), `"index":1`) {
+		t.Fatalf("the released start must carry the mapped visible index:\n%s", out)
+	}
+}
+
+// TestMessagesNative_ToolGateReaderMismatchDeltaSwallowed pins the
+// violating-frame rule: a delta aimed at the held run's own index whose
+// type the run does not accept is the frame that CAUSES the fail-closed
+// discard — its own content must swallow with the run, never surface
+// headless under an index another block will own.
+func TestMessagesNative_ToolGateReaderMismatchDeltaSwallowed(t *testing.T) {
+	engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{
+		sseArgsDenyRow("calculator", "NEVER-MATCHES-QQ7"),
+	}}, time.Minute)
+	violation := ccFrame("content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":"text_delta","text":"VIOLFRAME-MARKER"}}`)
+	g := newNativeToolGateReader(context.Background(), strings.NewReader(
+		ccMsgStartFrame+ccCalcStartFrame+violation+
+			ccFrame("content_block_stop", `{"type":"content_block_stop","index":2}`)+
+			ccDeltaFrame+ccStopFrame), engine, "org-1", "*")
+	out, err := io.ReadAll(g)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(out), "VIOLFRAME-MARKER") {
+		t.Fatalf("the frame that caused the discard must not surface:\n%s", out)
+	}
+	if strings.Contains(string(out), "calculator") || strings.Contains(string(out), "input_json_delta") {
+		t.Fatalf("the discarded run must release nothing:\n%s", out)
+	}
+	if !strings.Contains(string(out), `"stop_reason":"end_turn"`) {
+		t.Fatalf("a fail-closed discard must strand no tool loop (end_turn rewrite):\n%s", out)
+	}
+}
+
+// TestMessagesNative_ToolGateReaderCommentParity pins keepalive comment
+// parity with the relay: ':' lines ride no event and forward immediately
+// — byte-identically around a resolved run, and alive even when a
+// trailing comment is all that follows an unresolved (discarded) run.
+func TestMessagesNative_ToolGateReaderCommentParity(t *testing.T) {
+	engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
+
+	t.Run("byte identity", func(t *testing.T) {
+		input := ": opening\n\n" + ccMsgStartFrame + ccCalcStartFrame + ccCalcDeltaFrame + ccCalcStopFrame + ": done\n"
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(input), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(out) != input {
+			t.Fatalf("comments must forward immediately and byte-identically\ngot:\n%q\nwant:\n%q", out, input)
+		}
+	})
+
+	t.Run("trailing comment survives unresolved run", func(t *testing.T) {
+		input := ccMsgStartFrame + ccCalcStartFrame + ": done\n"
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(input), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if !strings.Contains(string(out), ": done") {
+			t.Fatalf("a trailing comment must not die in the frame buffer:\n%q", out)
+		}
+		if strings.Contains(string(out), "calculator") {
+			t.Fatalf("the unresolved run still discards fail-closed:\n%s", out)
+		}
+	})
 }
 
 // TestMessagesNative_ToolPolicySSEPingMidRun pins the ping contract: a
@@ -934,6 +1018,7 @@ func TestMessagesNative_ToolGateReaderRecheckPerDeclaration(t *testing.T) {
 
 	src <- []byte(ccBashStopFrame) // close the first (allowed) run cleanly
 	src <- []byte(ccBashStartFrame)
+	src <- []byte(ccDeltaFrame) // the finish must see the delivered first call
 	src <- []byte(ccStopFrame)
 	out := ccReadGateUntil(t, g, "message_stop")
 
@@ -945,6 +1030,9 @@ func TestMessagesNative_ToolGateReaderRecheckPerDeclaration(t *testing.T) {
 	}
 	if !strings.Contains(out, "message_stop") {
 		t.Fatalf("the stream must close normally:\n%s", out)
+	}
+	if !strings.Contains(out, `"stop_reason":"tool_use"`) || strings.Contains(out, `"stop_reason":"end_turn"`) {
+		t.Fatalf("the pre-activation delivered call must keep the tool loop alive:\n%s", out)
 	}
 }
 
@@ -1009,6 +1097,25 @@ func TestMessagesNative_ToolPolicySSENamelessStopRepair(t *testing.T) {
 // allowed run whose delta accumulation crosses the frame-count or total
 // bytes cap discards fail-closed — nothing of the run releases and the
 // gateway never buffers it without limit.
+// ccHoldCapRun streams a capped-run body through a fresh gate and pins
+// the fail-closed contract every bounded-hold cap shares: nothing of the
+// held run may release and the finish must rewrite to end_turn (a cap
+// discard is a removal).
+func ccHoldCapRun(t *testing.T, engine *toolpolicy.Engine, body string) {
+	t.Helper()
+	g := newNativeToolGateReader(context.Background(), strings.NewReader(body), engine, "org-1", "*")
+	out, err := io.ReadAll(g)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if strings.Contains(string(out), "calculator") || strings.Contains(string(out), "input_json_delta") {
+		t.Fatalf("a run over a bounded-hold cap must release nothing:\n%s", out)
+	}
+	if !strings.Contains(string(out), `"stop_reason":"end_turn"`) {
+		t.Fatalf("a cap discard must count as a removal and rewrite the finish:\n%s", out)
+	}
+}
+
 func TestMessagesNative_ToolGateReaderHoldCaps(t *testing.T) {
 	ccCalcDelta := func(partial string) string {
 		return ccFrame("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":"`+partial+`"}}`)
@@ -1032,28 +1139,26 @@ func TestMessagesNative_ToolGateReaderHoldCaps(t *testing.T) {
 		for i := 0; i < 4096; i++ {
 			deltas = append(deltas, ccCalcDelta(`{\"n\":`+strconv.Itoa(i)+`}`))
 		}
-		g := newNativeToolGateReader(context.Background(), strings.NewReader(ccStream(deltas)), engine, "org-1", "*")
-		out, err := io.ReadAll(g)
-		if err != nil {
-			t.Fatalf("read: %v", err)
-		}
-		if strings.Contains(string(out), "calculator") || strings.Contains(string(out), "input_json_delta") {
-			t.Fatalf("a run over the frame-count cap must release nothing:\n%s", out)
-		}
+		ccHoldCapRun(t, engine, ccStream(deltas))
+	})
+
+	t.Run("args bytes cap", func(t *testing.T) {
+		big := strings.Repeat("a", 5<<20) // two of these cross the 8 MiB args cap
+		ccHoldCapRun(t, engine, ccStream([]string{ccCalcDelta(big), ccCalcDelta(big)}))
 	})
 
 	t.Run("frame bytes cap", func(t *testing.T) {
-		big := strings.Repeat("a", 5<<20) // two of these cross the 8 MiB args cap
-		g := newNativeToolGateReader(context.Background(), strings.NewReader(ccStream([]string{
-			ccCalcDelta(big), ccCalcDelta(big),
-		})), engine, "org-1", "*")
-		out, err := io.ReadAll(g)
-		if err != nil {
-			t.Fatalf("read: %v", err)
+		// ~100 KiB of padding per delta with ~10-byte args fragments:
+		// the buffered frame bytes alone cross the 16 MiB frames cap
+		// while total args stay far under the 8 MiB args cap and the
+		// frame count under its own cap — only the frames dimension
+		// trips.
+		pad := strings.Repeat("p", 100<<10)
+		deltas := make([]string, 0, 200)
+		for i := 0; i < 200; i++ {
+			deltas = append(deltas, ccFrame("content_block_delta", `{"type":"content_block_delta","index":0,"z":"`+pad+`","delta":{"type":"input_json_delta","partial_json":"{\"n\":`+strconv.Itoa(i)+`}"}}`))
 		}
-		if strings.Contains(string(out), "calculator") || strings.Contains(string(out), "input_json_delta") {
-			t.Fatalf("a run over the bytes cap must release nothing:\n%s", out)
-		}
+		ccHoldCapRun(t, engine, ccStream(deltas))
 	})
 }
 
