@@ -709,9 +709,14 @@ PY
     local unit_rc=$?
 
     run_analyzer "$repo" "$base" "$WORK/utc-scan.json"
-    local body_sha
+    local body_sha guard_ok=1
     body_sha=$(report_body_sha256 "$WORK/utc-scan.json" sample.go BorderlineFn)
-    [ -n "$body_sha" ] || { printf 'FAIL [commit-date-utc] body-hash-extract\n'; }
+    if [ -n "$body_sha" ]; then
+        printf 'PASS [commit-date-utc] body-hash-extract\n'
+    else
+        printf 'FAIL [commit-date-utc] body-hash-extract\n'
+        guard_ok=0
+    fi
 
     # Receipt dated the commit's UTC day (2026-11-05) is same-day fresh;
     # before UTC normalization the raw %cI prefix was the committer-local
@@ -753,7 +758,94 @@ PY
         stale_ok=0
     fi
 
-    local total=$((unit_rc + ok_rc + (1 - stale_ok)))
+    # Mirrored fixture: a zone BEHIND UTC (-05:00) makes the UTC date one
+    # day LATER than the committer-local date. The pre-fix local-prefix
+    # slicing reported 2026-11-05 and wrongly accepted a receipt dated the
+    # local day; under UTC normalization that receipt is stale and only the
+    # true UTC day (2026-11-06) is fresh.
+    export GIT_AUTHOR_DATE="2026-11-05T20:30:00-05:00" \
+           GIT_COMMITTER_DATE="2026-11-05T20:30:00-05:00"
+    local neg_repo
+    neg_repo=$(new_repo utcdateneg)
+    local neg_base
+    neg_base=$(build_base "$neg_repo")
+    build_head "$neg_repo" go_fn_legacy.go.frag go_fn_borderline_head.go.frag
+    local neg_head
+    neg_head=$(git -C "$neg_repo" rev-parse HEAD)
+    unset GIT_AUTHOR_DATE GIT_COMMITTER_DATE
+
+    python3 - "$neg_repo" "$neg_head" "$ROOT" <<'PY'
+import datetime
+import importlib.util
+import subprocess
+import sys
+from pathlib import Path
+
+repo, head, root = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3])
+gate = root / "scripts/quality/complexity/go/go_complexity.py"
+spec = importlib.util.spec_from_file_location("gate", gate)
+module = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(module)
+raw = subprocess.run(
+    ["git", "-C", str(repo), "show", "-s", "--format=%cI", head],
+    check=True, capture_output=True).stdout.decode().strip()
+condition = (raw == "2026-11-05T20:30:00-05:00"
+             and module.commit_date(repo, head) == datetime.date(2026, 11, 6))
+print(("PASS" if condition else "FAIL")
+      + f" [commit-date-utc] negative-offset-normalized-forward: raw={raw} "
+        f"commit_date={module.commit_date(repo, head)}")
+sys.exit(0 if condition else 1)
+PY
+    local neg_unit_rc=$?
+
+    run_analyzer "$neg_repo" "$neg_base" "$WORK/utc-neg-scan.json"
+    local neg_sha neg_guard_ok=1
+    neg_sha=$(report_body_sha256 "$WORK/utc-neg-scan.json" sample.go BorderlineFn)
+    if [ -n "$neg_sha" ]; then
+        printf 'PASS [commit-date-utc] neg-body-hash-extract\n'
+    else
+        printf 'FAIL [commit-date-utc] neg-body-hash-extract\n'
+        neg_guard_ok=0
+    fi
+    make_receipt "$WORK/utc-neg-local.json" "$neg_head" "$neg_base" fixture-senior \
+        fixture-impl 2026-11-05 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$neg_sha\"}]"
+    run_analyzer "$neg_repo" "$neg_base" "$WORK/utc-neg-local-run.json" \
+        --receipt "$WORK/utc-neg-local.json"
+    local neg_stale_ok=1
+    if [ "$RC" -eq 1 ] && grep -q "stale receipt" "$WORK/out.txt"; then
+        printf 'PASS [commit-date-utc] neg-local-day-receipt-stale\n'
+    else
+        printf 'FAIL [commit-date-utc] neg-local-day-receipt-stale: rc=%s out=%s\n' \
+            "$RC" "$(head -c 300 "$WORK/out.txt")"
+        neg_stale_ok=0
+    fi
+    make_receipt "$WORK/utc-neg-ok.json" "$neg_head" "$neg_base" fixture-senior \
+        fixture-impl 2026-11-06 approve-exception \
+        "[{\"function\": \"sample.go:BorderlineFn\", \"body_sha256\": \"$neg_sha\"}]"
+    run_analyzer "$neg_repo" "$neg_base" "$WORK/utc-neg-ok-run.json" \
+        --receipt "$WORK/utc-neg-ok.json"
+    python3 - "$RC" "$WORK/utc-neg-ok-run.json" <<'PY'
+import json
+import sys
+
+rc, report_path = int(sys.argv[1]), sys.argv[2]
+report = json.load(open(report_path))
+receipt = report.get("receipt") or {}
+condition = (rc == 0
+             and report["run"].get("head_commit_date") == "2026-11-06"
+             and receipt.get("status") == "accepted")
+print(("PASS" if condition else "FAIL")
+      + f" [commit-date-utc] neg-utc-day-receipt-accepted: rc={rc} "
+        f"head_commit_date={report['run'].get('head_commit_date')} "
+        f"receipt={receipt}")
+sys.exit(0 if condition else 1)
+PY
+    local neg_ok_rc=$?
+
+    local total=$((unit_rc + ok_rc + (1 - stale_ok) + (1 - guard_ok)
+                   + neg_unit_rc + neg_ok_rc + (1 - neg_stale_ok)
+                   + (1 - neg_guard_ok)))
     if [ "$total" -ne 0 ]; then
         scenario_failed=$((scenario_failed + 1))
         total_failed=$((total_failed + 1))
