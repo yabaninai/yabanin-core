@@ -911,6 +911,159 @@ func TestMessagesNative_ToolGateReaderCommentParity(t *testing.T) {
 	})
 }
 
+// TestMessagesNative_ToolGateReaderCommentDelivery pins delivery, not
+// just order: a completed comment line reaches the client while the
+// upstream is still open and silent (no complete frame behind it), the
+// buffer never accumulates a comment-only stretch, and a trailing
+// comment at EOF still delivers exactly once.
+func TestMessagesNative_ToolGateReaderCommentDelivery(t *testing.T) {
+	engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
+
+	t.Run("delivers while upstream stalls", func(t *testing.T) {
+		src := make(ccChanReader, 1)
+		g := newNativeToolGateReader(context.Background(), src, engine, "org-1", "*")
+		src <- []byte(": ka\n") // one complete comment; nothing more, channel OPEN
+
+		type readResult struct {
+			out string
+			err error
+		}
+		done := make(chan readResult, 1)
+		go func() {
+			buf := make([]byte, 64)
+			n, err := g.Read(buf)
+			done <- readResult{string(buf[:n]), err}
+		}()
+		select {
+		case r := <-done:
+			if r.err != nil || r.out != ": ka\n" {
+				t.Fatalf("a completed comment must deliver while the upstream is open, got %q err=%v", r.out, r.err)
+			}
+		case <-time.After(2 * time.Second):
+			t.Fatalf("Read blocked on the next upstream line instead of returning the completed comment")
+		}
+
+		close(src) // then the stream ends cleanly; no duplicate delivery
+		rest, err := io.ReadAll(g)
+		if err != nil || len(rest) != 0 {
+			t.Fatalf("the comment must not repeat at the stream end, got %q err=%v", rest, err)
+		}
+	})
+
+	t.Run("comment-only stream delivers once", func(t *testing.T) {
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(": only\n"), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if string(out) != ": only\n" || strings.Count(string(out), ": only") != 1 {
+			t.Fatalf("a trailing comment must deliver exactly once, got %q", out)
+		}
+	})
+}
+
+// TestMessagesNative_ToolGateReaderDecodeFailSwallowed pins the
+// violating-frame rule at its hardest cases: a frame whose TYPED decode
+// fails (or whose payload is truncated outright) while an allowed run is
+// held forces that run's fail-closed discard — and then swallows whole
+// with the run it broke. Its marker must never surface, index-mapped or
+// not; only the end_turn rewrite of the discarded run remains.
+// ccAssertDecodeFailSwallowed pins the shared fail-closed contract of a
+// discard that swallowed its own triggering frame: the frame's marker
+// never surfaces, no run byte leaks, and the finish rewrites to end_turn
+// so the tool loop is not stranded.
+func ccAssertDecodeFailSwallowed(t *testing.T, out []byte, marker string) {
+	t.Helper()
+	if strings.Contains(string(out), marker) {
+		t.Fatalf("the decode-fail frame that caused the discard must not surface:\n%s", out)
+	}
+	if strings.Contains(string(out), "input_json_delta") {
+		t.Fatalf("the discarded run must release nothing:\n%s", out)
+	}
+	if !strings.Contains(string(out), `"stop_reason":"end_turn"`) {
+		t.Fatalf("a fail-closed discard must strand no tool loop:\n%s", out)
+	}
+}
+
+func TestMessagesNative_ToolGateReaderDecodeFailSwallowed(t *testing.T) {
+	t.Run("typed decode fail", func(t *testing.T) {
+		engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
+		bad := ccFrame("content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":5},"note":"DECODEFAIL-MARKER"}`)
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(
+			ccMsgStartFrame+ccBashStartFrame+ccCalcStartFrame+bad+
+				ccFrame("content_block_stop", `{"type":"content_block_stop","index":2}`)+
+				ccDeltaFrame+ccStopFrame), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if strings.Contains(string(out), "calculator") {
+			t.Fatalf("the discarded run must release nothing:\n%s", out)
+		}
+		ccAssertDecodeFailSwallowed(t, out, "DECODEFAIL-MARKER")
+	})
+
+	t.Run("unparseable payload", func(t *testing.T) {
+		// deny zsh: the bash declaration activates the gate but stays
+		// allowed (held), and the quarantine stays empty — the truncated
+		// stop then exercises the held-run swallow, not the quarantine.
+		engine := toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("zsh")}}, time.Minute)
+		bad := ccFrame("content_block_stop", `{"type":"content_block_stop","x":"PARSEFAIL-MARKER","index":1`)
+		g := newNativeToolGateReader(context.Background(), strings.NewReader(
+			ccMsgStartFrame+ccBashStartFrame+bad+
+				ccFrame("content_block_stop", `{"type":"content_block_stop","index":1}`)+
+				ccDeltaFrame+ccStopFrame), engine, "org-1", "*")
+		out, err := io.ReadAll(g)
+		if err != nil {
+			t.Fatalf("read: %v", err)
+		}
+		if strings.Contains(string(out), "bash") || strings.Contains(string(out), "toolu_1") {
+			t.Fatalf("the discarded run must release nothing:\n%s", out)
+		}
+		ccAssertDecodeFailSwallowed(t, out, "PARSEFAIL-MARKER")
+	})
+}
+
+// TestMessagesNative_ToolPolicySSECRLFTerminators pins the CRLF byte
+// style through an ACTIVE gate: terminators survive the splice and
+// rewrite paths under a removal shift exactly like the lone-CR stream
+// does.
+func TestMessagesNative_ToolPolicySSECRLFTerminators(t *testing.T) {
+	ccCRLF := func(event, data string) string {
+		return "event: " + event + "\r\ndata: " + data + "\r\n\r\n"
+	}
+	chunks := []string{strings.Join([]string{
+		ccCRLF("message_start", `{"type":"message_start","message":{"usage":{"input_tokens":5,"output_tokens":0}}}`),
+		ccCRLF("content_block_start", `{"type":"content_block_start","index":1,"content_block":{"type":"tool_use","id":"toolu_1","name":"bash","input":{}}}`),
+		ccCRLF("content_block_delta", `{"type":"content_block_delta","index":1,"delta":{"type":"input_json_delta","partial_json":"{\"cmd\":\"ls\"}"}}`),
+		ccCRLF("content_block_stop", `{"type":"content_block_stop","index":1}`),
+		ccCRLF("content_block_start", `{"type":"content_block_start","index":2,"content_block":{"type":"tool_use","id":"toolu_2","name":"calculator","input":{}}}`),
+		ccCRLF("content_block_delta", `{"type":"content_block_delta","index":2,"delta":{"type":"input_json_delta","partial_json":"{\"expr\":\"2+2\"}"}}`),
+		ccCRLF("content_block_stop", `{"type":"content_block_stop","index":2}`),
+		ccCRLF("message_delta", `{"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}}`),
+		ccCRLF("message_stop", `{"type":"message_stop"}`),
+	}, "")}
+	server := ccRawSSEUpstream(t, chunks)
+	defer server.Close()
+
+	gw := nativeMessagesGateway(t, server.URL)
+	gw.toolPolicies = toolpolicy.NewEngine(&memLoader{policies: []toolpolicy.Policy{denyTool("bash")}}, time.Minute)
+
+	body := ccSSEBody(t, gw, `{"model":"claude-3-5-sonnet","max_tokens":8,"messages":[{"role":"user","content":"Hi"}],"stream":true}`)
+	if strings.Contains(body, "bash") || strings.Contains(body, "toolu_1") || strings.Contains(body, `"cmd"`) {
+		t.Fatalf("denied tool_use must not reach the CRLF stream:\n%s", body)
+	}
+	if !strings.Contains(body, `"name":"calculator"`) || !strings.Contains(body, `\"expr\":\"2+2\"`) {
+		t.Fatalf("the allowed tool must survive the CRLF stream:\n%s", body)
+	}
+	if !strings.Contains(body, `"index":1`) {
+		t.Fatalf("the calculator must shift to the contiguous index 1:\n%s", body)
+	}
+	if !strings.Contains(body, "\r\n") {
+		t.Fatalf("forwarded frames must keep the CRLF byte style:\n%s", body)
+	}
+}
+
 // TestMessagesNative_ToolPolicySSEPingMidRun pins the ping contract: a
 // ping inside an open allowed run is a keepalive, not a protocol event —
 // the hold survives and the run still resolves at its stop with its

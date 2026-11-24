@@ -8,7 +8,8 @@ package cli
 //   - JSON surface (messagesNativeJSON): denied tool_use blocks are
 //     removed from content, and a "tool_use" stop_reason whose every call
 //     was denied or dropped is rewritten to "end_turn" so a client tool
-//     loop is never stranded. Nothing removed → byte identity.
+//     loop is never stranded. Nothing removed → byte identity, up to the
+//     SSE surface's immediate comment delivery noted below.
 //   - SSE surface (messagesNativeStream): a frame-level gate sits between
 //     the upstream body and the terminal-hold relay. A denied block's
 //     frames are suppressed whole (the client never sees one byte), the
@@ -19,7 +20,10 @@ package cli
 //     its accumulated input runs through the same args guard as the chat
 //     path (GuardDeclaredArgs) before a single frame is released; a
 //     start frame that declares a complete input member is guarded at
-//     the declaration itself.
+//     the declaration itself. Keepalive comment lines deliver
+//     immediately (relay parity), so a comment inside a held allowed run
+//     reaches the client before that run's later release — byte identity
+//     holds for the frame sequence, not for interleaved comments.
 //
 // Frame decoding shares the relay's parser rules (apiformat: LF, CRLF and
 // lone-CR terminators; the event name falls back to the data payload's
@@ -32,12 +36,15 @@ package cli
 // request — chat activateForFrame parity.
 //
 // The engine decides lazily: until a frame actually declares a tool_use,
-// bytes pass through untouched (no gates → zero parsing, byte identity).
+// frames pass through after the light declaration scan and delivered-call
+// accounting (no gates → no gating; byte identity apart from comment
+// timing).
 // Failure modes mirror the chat canon: malformed or interleaved frames
 // inside an unresolved run DISCARD the run fail-closed (never released
 // unchecked, never converted into an allowed call), a truncated stream
 // discards the unresolved run, and a cancelled context fails open (D-15)
-// — held allowed frames release verbatim, decided denials stay dropped.
+// — held allowed frames release through the shifted path (a release after
+// earlier removals stays renumbered), decided denials stay dropped.
 // Ping and unknown event types touch no state: they cannot orphan a held
 // run or slip past a decided denial. Usage accounting is untouched by
 // design: the relay's usage comes from message_start/message_delta,
@@ -289,10 +296,15 @@ func (g *nativeToolGateReader) Read(p []byte) (int, error) {
 // pull reads and routes one upstream frame, or ends the stream: a clean
 // end or a cut propagates the reader's error to the relay (which owns the
 // torn-tail and terminal synthesis), after the gate settles its hold and
-// tail.
+// tail. A nil frame with a nil error is a comment line that already
+// forwarded itself — pull returns without routing so Read can flush the
+// fresh bytes instead of blocking on the next upstream line.
 func (g *nativeToolGateReader) pull() error {
 	frame, err := g.nextFrame()
 	if err == nil {
+		if frame == nil {
+			return nil // comment yielded: Read flushes g.out now
+		}
 		g.route(frame)
 		return nil
 	}
@@ -330,7 +342,9 @@ func (g *nativeToolGateReader) endStream(trailing []byte, err error) {
 }
 
 // nextFrame assembles the next complete upstream event (verbatim lines
-// plus the separator). At the stream's end the held frame lines stay
+// plus the separator); a comment line forwards itself and reports a nil
+// frame so the caller yields to Read at once. At the stream's end the
+// held frame lines stay
 // buffered for the tail router's salvage probe, and only the unterminated
 // trailing partial is reported, so the gate can tell a boundary-aligned
 // end (empty partial) from a cut mid-line.
@@ -339,12 +353,14 @@ func (g *nativeToolGateReader) nextFrame() ([]byte, error) {
 		line, err := g.src.ReadLine()
 		if err == nil {
 			if apiformat.SSECommentLine(line) {
-				// Keepalive comments ride no event: forward immediately
-				// (relay deliverLine parity) so a heartbeat never waits
-				// on a frame boundary, and a trailing comment survives a
-				// clean end instead of dying in the frame buffer.
+				// Keepalive comments ride no event: forward and yield at
+				// once (relay deliverLine parity) — a completed comment
+				// reaches the client even while the upstream stalls
+				// before its next line, a trailing comment survives a
+				// clean end, and g.out stays bounded because control
+				// returns to Read after every comment line.
 				g.forward(line)
-				continue
+				return nil, nil
 			}
 			blank, overflow := g.frames.Add(line, apiformat.SSEStreamLineLimit)
 			if overflow {
@@ -422,15 +438,26 @@ func (g *nativeToolGateReader) gateFrame(frame []byte, name string, payload []by
 }
 
 // protocolViolation handles a block-protocol frame whose payload does
-// not parse: an open run resolves fail-closed first (nothing unguarded
-// escapes around the hold), then the frame forwards with the visible
-// index. A live quarantine swallows first — a decided deny's trailing
-// frames may not ride a parse failure past the decision.
+// not parse. A live quarantine swallows first — a decided deny's
+// trailing frames may not ride a parse failure past the decision. With
+// an open held run the frame has just forced that run's fail-closed
+// discard, so it swallows with the run it broke: its own decode failed,
+// so neither its index nor its payload is trustworthy, and surfacing it
+// headless (index-mapped or not) could only desynchronize the client's
+// block sequence. Only a violation with nothing held forwards, the way
+// the relay would have delivered it.
 func (g *nativeToolGateReader) protocolViolation(frame []byte, payload []byte) {
 	if g.quarantinedJunk(payload) {
 		return
 	}
+	heldIdx := -1 // the held run's wire index, saved before the discard drops the hold
+	if g.hold != nil {
+		heldIdx = g.hold.rawIdx
+	}
 	g.discardHold()
+	if heldIdx >= 0 {
+		return // the triggering frame swallows whole with the run it broke
+	}
 	g.emitShifted(frame, payload)
 }
 
@@ -558,7 +585,7 @@ func (g *nativeToolGateReader) blockDelta(frame []byte, payload []byte) {
 	}
 	if doc.Index != g.hold.rawIdx {
 		g.discardHold()               // overlapping runs violate the protocol: fail closed
-		g.emitShifted(frame, payload) // another block's delta: its start was visible or quarantined
+		g.emitShifted(frame, payload) // another block's delta: its start was visible, quarantined, or not yet declared
 		return
 	}
 	if doc.Delta.Type != "input_json_delta" {
