@@ -493,14 +493,12 @@ quickstart-smoke: ## Quickstart: smoke check (usage: make quickstart-smoke KEY=.
 quickstart-down: ## Quickstart: compose down --remove-orphans
 	$(QUICKSTART_COMPOSE) down --remove-orphans
 
-migrate-up: ## Apply migrations via psql (or docker compose fallback)
-	@if command -v psql &>/dev/null; then \
-		echo "Running migrations via psql..."; \
-		for f in migrations/*.sql; do case "$$f" in *.down.sql) continue;; esac; psql $(YABANIN_PG_URI) -f "$$f"; done; \
-	else \
-		echo "psql not found, running migrations via docker compose..."; \
-		docker compose -f deploy/docker-compose.yml run --rm gateway /app/yabanin migrate; \
-	fi
+# Ledger invariant: apply pending migrations only; a failed run exits nonzero
+# before any later step and a repeat run on an applied chain is a no-op.
+migrate-up: build-migrate ## Apply pending migrations via the ledger-aware yabanin-migrate runner (requires YABANIN_REGION; repeat is a no-op)
+	YABANIN_PG_URI="$(or $(YABANIN_PG_URI),postgres://yabanin:yabanin@localhost/yabanin?sslmode=disable)" \
+	YABANIN_REGION="$(YABANIN_REGION)" \
+	./yabanin-migrate
 
 migrate-region: build-migrate ## Region-aware migration runner (usage: make migrate-region REGION=sg)
 	@if [ -z "$(REGION)" ]; then echo "error: REGION is required (e.g. make migrate-region REGION=sg)"; exit 1; fi

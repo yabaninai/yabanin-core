@@ -37,7 +37,7 @@ spec:
       labels:
         app: yabinin-mcp
     spec:
-      serviceAccountName: {{ .Release.Name }}-yabinin
+      serviceAccountName: {{ .Release.Name }}-yabanin
       containers:
         - name: mcp
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

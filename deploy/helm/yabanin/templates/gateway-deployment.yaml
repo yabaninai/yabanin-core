@@ -44,18 +44,23 @@ spec:
         app: yabinin-gateway
         region: {{ .Values.gateway.region | default "sg" }}
     spec:
-      serviceAccountName: {{ .Release.Name }}-yabinin
+      serviceAccountName: {{ .Release.Name }}-yabanin
       securityContext:
         runAsNonRoot: true
         fsGroup: 1000
       initContainers:
+        # The migration runner reads YABANIN_PG_URI/YABANIN_REGION only; bind
+        # the secret's pg_uri key explicitly (envFrom would import keys under
+        # their literal names). A failed init container keeps the pod unready.
         - name: migrate
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
           args: ["migrate"]
-          envFrom:
-            - secretRef:
-                name: {{ .Release.Name }}-secrets
           env:
+            - name: YABANIN_PG_URI
+              valueFrom:
+                secretKeyRef:
+                  name: {{ .Release.Name }}-secrets
+                  key: pg_uri
             - name: YABANIN_REGION
               value: {{ .Values.gateway.region | default "sg" }}
       containers:
@@ -202,7 +207,7 @@ spec:
       labels:
         app: yabinin-admin
     spec:
-      serviceAccountName: {{ .Release.Name }}-yabinin
+      serviceAccountName: {{ .Release.Name }}-yabanin
       containers:
         - name: admin
           image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"

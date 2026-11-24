@@ -163,9 +163,11 @@ applying a new schema. A dirty migration state requires investigation; do not
 force a version or replay arbitrary SQL to hide a failure.
 
 **Never execute `migrations/*.sql` in a shell loop.** The directory also contains
-down migrations, which can remove data or schema. Do not use `make migrate-up`
-as a substitute for this embedded runner: the legacy helper can apply SQL
-directly without the same ledger behavior.
+down migrations, which can remove data or schema. `make migrate-up` wraps the
+same ledger-aware runner (`cmd/yabanin-migrate`): it applies only pending
+migrations, records them in `schema_migrations`, and exits nonzero on the first
+failure. It still requires `YABANIN_REGION` (and `YABANIN_PG_URI`, defaulting
+to the local development database).
 
 When adding a migration:
 
