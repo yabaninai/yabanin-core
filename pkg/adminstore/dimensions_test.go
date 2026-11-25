@@ -12,6 +12,12 @@ package adminstore
 //   - The INSERT binds the org scope first, canonical decimal text for
 //     quantity/bounds (nil stays nil; explicit zero is "0"), and the empty
 //     coverage array for non-coverage rows.
+//   - Instants travel as int64 nanoseconds (UnixNano ⇄ time.Unix(0, n)):
+//     the sub-microsecond fixture times bind and scan exactly, and instants
+//     outside the int64 nanosecond range refuse before any statement.
+//   - The canonical-text oracle rejects a float-carried 2^53+1 literal;
+//     every frozen fixture decimal survives a shortest-text float
+//     roundtrip, so only this independent literal proves float rejection.
 //   - A statement failure rolls back the whole batch; a replayed delivery
 //     fails loudly on the unique key (23505) instead of deduplicating
 //     (dedup semantics are CM-00-03).
@@ -54,41 +60,41 @@ const dimensionalFrozenJSON = `[
   {"component_id":"comp-usd-fee","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"usage.cost","unit":"USD","quantity":"0.02",
    "source_kind":"gateway","source_ref":"resp-body","method":"provider-report",
-   "factor_version":"tariff-2026-11","event_time":"2026-11-24T10:15:30.123456Z",
-   "effective_time":"2026-11-24T10:15:30.123456Z","boundary":"measurement",
+   "factor_version":"tariff-2026-11","event_time":"2026-11-24T10:15:30.123456789Z",
+   "effective_time":"2026-11-24T10:15:30.123456789Z","boundary":"measurement",
    "precision":"exact","lifecycle":"provisional"},
   {"component_id":"comp-credits-3","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"usage.credits","unit":"credits","quantity":"3",
    "source_kind":"internal","source_ref":"credit-ledger","method":"internal-meter",
-   "factor_version":"ledger-v1","event_time":"2026-11-24T10:15:30.123456Z",
-   "effective_time":"2026-11-24T10:15:30.123456Z",
+   "factor_version":"ledger-v1","event_time":"2026-11-24T10:15:30.123456789Z",
+   "effective_time":"2026-11-24T10:15:30.123456789Z",
    "boundary":"measurement","precision":"exact","lifecycle":"provisional"},
   {"component_id":"comp-energy-range","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"energy.grid","unit":"Wh",
    "bounds":{"lower":"0.4","upper":"0.6"},
    "source_kind":"estimate","source_ref":"cpu-seconds","method":"allocation-share",
    "formula":"cpu_seconds*0.8","factor_version":"ef-v4",
-   "event_time":"2026-11-24T10:15:30.123456Z","effective_time":"2026-11-24T10:15:30.123456Z",
+   "event_time":"2026-11-24T10:15:30.123456789Z","effective_time":"2026-11-24T10:15:30.123456789Z",
    "boundary":"allocation","allocation_basis":"cpu-seconds",
    "precision":"estimated","lifecycle":"provisional"},
   {"component_id":"comp-co2-unknown","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"emissions.co2e","unit":"gCO2e",
    "source_kind":"estimate","source_ref":"grid-mix","method":"factor-lookup",
    "corrects_component_id":"comp-co2-prior","coverage_meters":["emissions.co2e"],
-   "event_time":"2026-11-24T10:15:30.123456Z","effective_time":"2026-11-24T10:15:30.123456Z",
+   "event_time":"2026-11-24T10:15:30.123456789Z","effective_time":"2026-11-24T10:15:30.123456789Z",
    "boundary":"allocation","precision":"unknown","lifecycle":"corrected"},
   {"component_id":"comp-energy-point","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"energy.grid","unit":"Wh","quantity":"0.5",
    "bounds":{"lower":"0.4","upper":"0.6"},
    "source_kind":"estimate","source_ref":"cpu-seconds","method":"meter-interpolation",
-   "factor_version":"ef-v4","event_time":"2026-11-24T10:15:30.123456Z",
-   "effective_time":"2026-11-24T10:15:30.123456Z","boundary":"allocation",
+   "factor_version":"ef-v4","event_time":"2026-11-24T10:15:30.123456789Z",
+   "effective_time":"2026-11-24T10:15:30.123456789Z","boundary":"allocation",
    "allocation_basis":"cpu-seconds","precision":"estimated","lifecycle":"provisional"},
   {"component_id":"comp-credits-zero","event_id":"evt-frozen-1","request_id":"req-frozen-1",
    "tenant_id":"tenant-frozen","meter":"usage.credits","unit":"credits","quantity":"0",
    "source_kind":"internal","source_ref":"credit-ledger","method":"internal-meter",
-   "factor_version":"ledger-v1","event_time":"2026-11-24T10:15:30.123456Z",
-   "effective_time":"2026-11-24T10:15:30.123456Z",
+   "factor_version":"ledger-v1","event_time":"2026-11-24T10:15:30.123456789Z",
+   "effective_time":"2026-11-24T10:15:30.123456789Z",
    "boundary":"measurement","precision":"exact","lifecycle":"provisional"}
 ]`
 
@@ -112,6 +118,69 @@ func dimensionalInsertExecs(tx *policyTxDouble) []policyExecRecord {
 		}
 	}
 	return inserts
+}
+
+// TestKnownRed_FloatCarriedLargeIntegerFailsCanonicalOracle: 2^53+1 has no
+// exact float64 carrier — ParseFloat rounds it to 2^53 and the shortest
+// float text differs from the canonical decimal. Every decimal in the
+// frozen fixture survives a shortest-text float roundtrip ("0.02", "3",
+// "0.5"), which is exactly why the store-level control needs this
+// independent literal: the canonical-text oracle must reject a
+// float-carried value, not only drifted float addition.
+func TestKnownRed_FloatCarriedLargeIntegerFailsCanonicalOracle(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		want         string
+		floatCarries string
+	}{
+		{"quantity 2^53+1", "9007199254740993", "9007199254740992"},
+		{"bounds upper 2^53+3", "9007199254740995", "9007199254740996"},
+	} {
+		f, err := strconv.ParseFloat(tc.want, 64)
+		require.NoError(t, err)
+		require.Equal(t, tc.floatCarries, strconv.FormatFloat(f, 'f', -1, 64),
+			"%s: pinned float64 carrier", tc.name)
+		want, err := dimensions.ParseDecimal(tc.want)
+		require.NoError(t, err)
+		require.Equal(t, tc.want, want.String(),
+			"%s: the store oracle roundtrips the canonical text", tc.name)
+		carried, err := dimensions.ParseDecimal(tc.floatCarries)
+		require.NoError(t, err)
+		require.NotEqual(t, tc.want, carried.String(),
+			"%s: the store oracle must reject the float-carried text", tc.name)
+	}
+
+	// Control: 2^53-1 is exactly representable, so this bound edge cannot
+	// catch a float carrier by itself — it exists to keep the DB roundtrip
+	// bounds valid around the breaking literals.
+	f, err := strconv.ParseFloat("9007199254740991", 64)
+	require.NoError(t, err)
+	require.Equal(t, "9007199254740991", strconv.FormatFloat(f, 'f', -1, 64),
+		"the float-exact bound edge must stay exact under the carrier")
+}
+
+// TestStoreDimensionalComponents_RejectsInstantOutOfRange: the int64
+// nanosecond carrier wraps silently outside roughly the years 1678-2262,
+// so batch validation must refuse an out-of-range instant before any
+// statement instead of persisting a wrapped instant as plausible data.
+func TestStoreDimensionalComponents_RejectsInstantOutOfRange(t *testing.T) {
+	comps := dimensionalFrozenComponents(t)[:1]
+	comps[0].EventTime = time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)
+
+	var execs int
+	tx := &policyTxDouble{execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
+		execs++
+		return pgconn.NewCommandTag("INSERT 0 1"), nil
+	}}
+	store := newForTest(&mockDB{beginAuditTxFn: func(context.Context) (auditTx, error) {
+		return tx, nil
+	}}, newTestLogger(), nil)
+
+	err := store.StoreDimensionalComponents(context.Background(), "org-1", comps)
+
+	require.Error(t, err)
+	require.Contains(t, err.Error(), "outside the int64 nanosecond range")
+	require.Zero(t, execs, "the refusal must precede every statement, the GUC included")
 }
 
 // TestStoreDimensionalComponents_RefusesMalformedBeforeAnyStatement: the
@@ -189,6 +258,12 @@ func TestStoreDimensionalComponents_BindsOrgScopeAndCanonicalDecimals(t *testing
 	// Non-coverage rows carry the empty array; the coverage row binds meters.
 	require.Equal(t, []string{}, inserts[0].args[23], "absent coverage binds the empty array, never nil")
 	require.Equal(t, []string{"emissions.co2e"}, inserts[3].args[23].([]string))
+
+	// Instant carrier regression guard: int64 nanoseconds bind exactly, so
+	// the sub-microsecond fixture instants reach the statement untouched
+	// (a timestamptz carrier would truncate them at the column).
+	require.Equal(t, comps[0].EventTime.UnixNano(), inserts[0].args[16])
+	require.Equal(t, comps[0].EffectiveTime.UnixNano(), inserts[0].args[17])
 }
 
 // TestStoreDimensionalComponents_StatementFailureRollsBackBatch: a failure
@@ -377,8 +452,8 @@ func dimensionalScanCell(dest, cell any) error {
 			return err
 		}
 		*d = coverage
-	case *time.Time:
-		*d = cell.(time.Time)
+	case *int64:
+		*d = cell.(int64)
 	default:
 		return fmt.Errorf("unsupported scan dest %T", dest)
 	}
@@ -425,6 +500,10 @@ func dimensionalCellCoverage(cell any) ([]string, error) {
 	return m, nil
 }
 
+// dimensionalFrozenInstant is the fake rows' shared instant, deliberately
+// non-microsecond-aligned so a truncating carrier cannot pass by accident.
+var dimensionalFrozenInstant = time.Date(2026, 11, 24, 10, 15, 30, 123456789, time.UTC)
+
 // dimensionalFakeRow builds one fake result row in the explicit
 // dimensionalComponentColumns order (hand-written literals, no fixtures
 // shared with the write path). lifecycle/corrects/coverage shape the row's
@@ -443,8 +522,7 @@ func dimensionalFakeRow(quantity, lower, upper *string, precision dimensions.Pre
 		"tenant-frozen", "evt-frozen-1", "comp-r", "req-frozen-1", "",
 		"usage.cost", "USD", text(quantity), text(lower), text(upper),
 		"gateway", "resp-body", "provider-report", "", "tariff-2026-11",
-		time.Date(2026, 11, 24, 10, 15, 30, 123456000, time.UTC),
-		time.Date(2026, 11, 24, 10, 15, 30, 123456000, time.UTC),
+		dimensionalFrozenInstant.UnixNano(), dimensionalFrozenInstant.UnixNano(),
 		"measurement", "", string(precision), string(lifecycle), corrects, coverage,
 	}
 }
@@ -482,6 +560,9 @@ func TestListDimensionalComponents_ScanRoundtripPreservesAbsence(t *testing.T) {
 	require.Nil(t, absent.Bounds)
 	require.Nil(t, absent.CoverageMeters, "empty coverage reads back absent")
 	require.Equal(t, dimensions.PrecisionUnknown, absent.Precision)
+	require.True(t, absent.EventTime.Equal(dimensionalFrozenInstant),
+		"the int64 nanosecond instant cell reconstructs the exact instant")
+	require.True(t, absent.EffectiveTime.Equal(dimensionalFrozenInstant))
 
 	require.Nil(t, ranged.Quantity, "bounds-only stays quantity-absent")
 	require.NotNil(t, ranged.Bounds)

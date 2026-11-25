@@ -118,7 +118,7 @@ func seedDimensionalAndMoneyRow(t *testing.T, ctx context.Context, p *pgxpool.Po
 			 event_time, effective_time, boundary, precision_kind, lifecycle)
 		VALUES ($1::uuid, 'tenant-cycle', 'evt-cycle', 'comp-cycle', 'req-cycle', 'usage.cost', 'USD',
 			 '0.02', 'gateway', 'resp-body', 'provider-report', 'tariff-2026-11',
-			 '2026-11-24T10:15:30.123456Z', '2026-11-24T10:15:30.123456Z',
+			 1795515330123456789, 1795515330123456789,
 			 'measurement', 'exact', 'provisional')`, orgID)
 	require.NoError(t, err)
 	_, err = p.Exec(ctx, `

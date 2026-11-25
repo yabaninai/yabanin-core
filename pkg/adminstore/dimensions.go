@@ -23,6 +23,12 @@ package adminstore
 // read as zero; an explicit zero is stored as '0'. No float ever touches
 // the path.
 //
+// Instant carrier policy: event_time and effective_time persist as int64
+// nanoseconds since the Unix epoch (UnixNano ⇄ time.Unix(0, n)), because
+// timestamptz truncates at microsecond precision while the contract's
+// time.Time instants keep nanoseconds. Instants outside the int64 nanosecond
+// range fail batch validation instead of silently overflowing the carrier.
+//
 // Replay policy: the (org_id, tenant_id, event_id, component_id) primary
 // key makes delivery identity stable, so a duplicate delivery fails loudly
 // on the unique key instead of double-counting. Silent dedup semantics are
@@ -31,6 +37,7 @@ package adminstore
 import (
 	"context"
 	"fmt"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 
@@ -142,15 +149,37 @@ func coverageOrEmpty(m []string) []string {
 	return m
 }
 
+// dimensionalInstantsInRange rejects instants the int64 nanosecond carrier
+// cannot represent exactly: UnixNano silently wraps outside roughly the
+// years 1678-2262, and a wrapped instant must fail validation instead of
+// persisting as plausible data.
+func dimensionalInstantsInRange(c dimensions.Component) error {
+	for _, field := range []struct {
+		name string
+		t    time.Time
+	}{
+		{"event_time", c.EventTime},
+		{"effective_time", c.EffectiveTime},
+	} {
+		nanos := field.t.UnixNano()
+		if !time.Unix(0, nanos).Equal(field.t) {
+			return fmt.Errorf("%s %s is outside the int64 nanosecond range",
+				field.name, field.t.Format(time.RFC3339Nano))
+		}
+	}
+	return nil
+}
+
 // dimensionalInsertArgs binds the org scope followed by the validated
-// fields, in the INSERT statement's column order.
+// fields, in the INSERT statement's column order. The instants are
+// pre-validated by dimensionalInstantsInRange, so UnixNano here is exact.
 func dimensionalInsertArgs(orgID string, c dimensions.Component) []any {
 	return []any{
 		orgID, c.TenantID, c.EventID, c.ComponentID, c.RequestID, c.TaskID,
 		c.Meter, c.Unit, decimalToText(c.Quantity),
 		dimensionalBoundText(c.Bounds, true), dimensionalBoundText(c.Bounds, false),
 		c.SourceKind, c.SourceRef, c.Method, c.Formula, c.FactorVersion,
-		c.EventTime, c.EffectiveTime, c.Boundary, c.AllocationBasis,
+		c.EventTime.UnixNano(), c.EffectiveTime.UnixNano(), c.Boundary, c.AllocationBasis,
 		c.Precision, c.Lifecycle, c.CorrectsComponentID, coverageOrEmpty(c.CoverageMeters),
 	}
 }
@@ -195,6 +224,9 @@ func (s *Store) StoreDimensionalComponents(ctx context.Context, orgID string, co
 	}
 	for i := range components {
 		if err := components[i].Validate(); err != nil {
+			return fmt.Errorf("component %d: %w", i, err)
+		}
+		if err := dimensionalInstantsInRange(components[i]); err != nil {
 			return fmt.Errorf("component %d: %w", i, err)
 		}
 	}
@@ -275,19 +307,23 @@ func collectDimensionalComponents(rows pgx.Rows, out *[]dimensions.Component) er
 }
 
 // scanDimensionalComponent reconstructs a component from the explicit
-// column list; absent quantity/bounds stay nil and coverage normalizes the
-// empty array back to nil so the roundtrip preserves absence.
+// column list; absent quantity/bounds stay nil, coverage normalizes the
+// empty array back to nil so the roundtrip preserves absence, and the int64
+// nanosecond instants rebuild the exact time.Time instants.
 func scanDimensionalComponent(row pgx.Row) (dimensions.Component, error) {
 	var c dimensions.Component
 	var quantity, lower, upper *string
 	var coverage []string
+	var eventNanos, effectiveNanos int64
 	if err := row.Scan(&c.TenantID, &c.EventID, &c.ComponentID, &c.RequestID, &c.TaskID,
 		&c.Meter, &c.Unit, &quantity, &lower, &upper,
 		&c.SourceKind, &c.SourceRef, &c.Method, &c.Formula, &c.FactorVersion,
-		&c.EventTime, &c.EffectiveTime, &c.Boundary, &c.AllocationBasis,
+		&eventNanos, &effectiveNanos, &c.Boundary, &c.AllocationBasis,
 		&c.Precision, &c.Lifecycle, &c.CorrectsComponentID, &coverage); err != nil {
 		return dimensions.Component{}, fmt.Errorf("scan dimensional component: %w", err)
 	}
+	c.EventTime = time.Unix(0, eventNanos).UTC()
+	c.EffectiveTime = time.Unix(0, effectiveNanos).UTC()
 	return buildDimensionalComponent(c, quantity, lower, upper, coverage)
 }
 

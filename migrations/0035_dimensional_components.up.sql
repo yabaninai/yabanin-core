@@ -11,6 +11,14 @@
 -- path, and the fractional/significant-digit working limits live in the
 -- validated contract, not in SQL rounding.
 --
+-- Instant carrier: event_time and effective_time are int64 nanoseconds since
+-- the Unix epoch (time.Time.UnixNano ⇄ time.Unix(0, n)). Go's time.Time keeps
+-- nanosecond precision while timestamptz keeps only microseconds, so a
+-- timestamptz column would silently truncate the contract's sub-microsecond
+-- instants; the bigint axis preserves the instant exactly and keeps the
+-- (event_time DESC) page ordering monotonic. The store refuses instants
+-- outside the int64 nanosecond range before any statement runs.
+--
 -- Legacy treatment: pure additive — a new table only. request_logs, its
 -- monetary columns and every existing read keep their exact previous shape;
 -- explicit reader SELECT lists elsewhere are unaffected.
@@ -41,8 +49,8 @@ CREATE TABLE public.dimensional_components (
     method                text        NOT NULL,
     formula               text        NOT NULL DEFAULT '',
     factor_version        text        NOT NULL DEFAULT '',
-    event_time            timestamptz NOT NULL,
-    effective_time        timestamptz NOT NULL,
+    event_time            bigint      NOT NULL,
+    effective_time        bigint      NOT NULL,
     boundary              text        NOT NULL,
     allocation_basis      text        NOT NULL DEFAULT '',
     precision_kind        text        NOT NULL,
