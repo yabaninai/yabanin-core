@@ -11,13 +11,16 @@
 -- path, and the fractional/significant-digit working limits live in the
 -- validated contract, not in SQL rounding.
 --
--- Instant carrier: event_time and effective_time are int64 nanoseconds since
--- the Unix epoch (time.Time.UnixNano ⇄ time.Unix(0, n)). Go's time.Time keeps
--- nanosecond precision while timestamptz keeps only microseconds, so a
--- timestamptz column would silently truncate the contract's sub-microsecond
--- instants; the bigint axis preserves the instant exactly and keeps the
--- (event_time DESC) page ordering monotonic. The store refuses instants
--- outside the int64 nanosecond range before any statement runs.
+-- Instant carrier: the contract's time.Time instants keep nanosecond
+-- precision and carry no range restriction, while timestamptz keeps only
+-- microseconds and a single int64-nanosecond column would silently wrap for
+-- contract-valid instants (any year past ~2262). Each instant therefore
+-- splits into epoch seconds (bigint, time.Time.Unix) plus a nanosecond
+-- fraction (integer, 0..999999999, time.Time.Nanosecond), and
+-- time.Unix(sec, frac) rebuilds the exact instant for every validated
+-- component — far-future and pre-epoch included. The composite
+-- (event_time_unix DESC, event_time_nanos DESC) page ordering is the exact
+-- instant order on this axis.
 --
 -- Legacy treatment: pure additive — a new table only. request_logs, its
 -- monetary columns and every existing read keep their exact previous shape;
@@ -49,8 +52,10 @@ CREATE TABLE public.dimensional_components (
     method                text        NOT NULL,
     formula               text        NOT NULL DEFAULT '',
     factor_version        text        NOT NULL DEFAULT '',
-    event_time            bigint      NOT NULL,
-    effective_time        bigint      NOT NULL,
+    event_time_unix       bigint      NOT NULL,
+    event_time_nanos      integer     NOT NULL,
+    effective_time_unix   bigint      NOT NULL,
+    effective_time_nanos  integer     NOT NULL,
     boundary              text        NOT NULL,
     allocation_basis      text        NOT NULL DEFAULT '',
     precision_kind        text        NOT NULL,

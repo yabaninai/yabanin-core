@@ -115,10 +115,11 @@ func seedDimensionalAndMoneyRow(t *testing.T, ctx context.Context, p *pgxpool.Po
 		INSERT INTO dimensional_components
 			(org_id, tenant_id, event_id, component_id, request_id, meter, unit,
 			 quantity_text, source_kind, source_ref, method, factor_version,
-			 event_time, effective_time, boundary, precision_kind, lifecycle)
+			 event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos,
+			 boundary, precision_kind, lifecycle)
 		VALUES ($1::uuid, 'tenant-cycle', 'evt-cycle', 'comp-cycle', 'req-cycle', 'usage.cost', 'USD',
 			 '0.02', 'gateway', 'resp-body', 'provider-report', 'tariff-2026-11',
-			 1795515330123456789, 1795515330123456789,
+			 1795515330, 123456789, 1795515330, 123456789,
 			 'measurement', 'exact', 'provisional')`, orgID)
 	require.NoError(t, err)
 	_, err = p.Exec(ctx, `

@@ -23,11 +23,13 @@ package adminstore
 // read as zero; an explicit zero is stored as '0'. No float ever touches
 // the path.
 //
-// Instant carrier policy: event_time and effective_time persist as int64
-// nanoseconds since the Unix epoch (UnixNano ⇄ time.Unix(0, n)), because
-// timestamptz truncates at microsecond precision while the contract's
-// time.Time instants keep nanoseconds. Instants outside the int64 nanosecond
-// range fail batch validation instead of silently overflowing the carrier.
+// Instant carrier policy: every instant splits into epoch seconds plus a
+// nanosecond fraction (Unix/Nanosecond ⇄ time.Unix(sec, frac)), an exact,
+// unbounded carrier: timestamptz would truncate at microseconds, and a
+// single int64-nanosecond column would wrap for contract-valid instants
+// such as year 2300. The store accepts every validated component's
+// instants; the composite (seconds DESC, fraction DESC) page ordering is
+// the exact instant order.
 //
 // Replay policy: the (org_id, tenant_id, event_id, component_id) primary
 // key makes delivery identity stable, so a duplicate delivery fails loudly
@@ -72,7 +74,8 @@ func (f DimensionalComponentFilters) withDefaultPage() DimensionalComponentFilte
 const dimensionalComponentColumns = `tenant_id, event_id, component_id, request_id, task_id,
 	meter, unit, quantity_text, bounds_lower_text, bounds_upper_text,
 	source_kind, source_ref, method, formula, factor_version,
-	event_time, effective_time, boundary, allocation_basis,
+	event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos,
+	boundary, allocation_basis,
 	precision_kind, lifecycle, corrects_component_id, coverage_meters`
 
 // dimensionalInsertSQL binds one validated component row, org scope first.
@@ -80,10 +83,11 @@ const dimensionalInsertSQL = `INSERT INTO dimensional_components (
 	org_id, tenant_id, event_id, component_id, request_id, task_id,
 	meter, unit, quantity_text, bounds_lower_text, bounds_upper_text,
 	source_kind, source_ref, method, formula, factor_version,
-	event_time, effective_time, boundary, allocation_basis,
+	event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos,
+	boundary, allocation_basis,
 	precision_kind, lifecycle, corrects_component_id, coverage_meters
 ) VALUES ($1::uuid, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-	$15, $16, $17, $18, $19, $20, $21, $22, $23, $24)`
+	$15, $16, $17, $18, $19, $20, $21, $22, $23, $24, $25, $26)`
 
 // decimalToText maps a component decimal to its stored canonical text; nil
 // stays nil (absent/unknown), an explicit zero becomes '0'.
@@ -149,37 +153,26 @@ func coverageOrEmpty(m []string) []string {
 	return m
 }
 
-// dimensionalInstantsInRange rejects instants the int64 nanosecond carrier
-// cannot represent exactly: UnixNano silently wraps outside roughly the
-// years 1678-2262, and a wrapped instant must fail validation instead of
-// persisting as plausible data.
-func dimensionalInstantsInRange(c dimensions.Component) error {
-	for _, field := range []struct {
-		name string
-		t    time.Time
-	}{
-		{"event_time", c.EventTime},
-		{"effective_time", c.EffectiveTime},
-	} {
-		nanos := field.t.UnixNano()
-		if !time.Unix(0, nanos).Equal(field.t) {
-			return fmt.Errorf("%s %s is outside the int64 nanosecond range",
-				field.name, field.t.Format(time.RFC3339Nano))
-		}
-	}
-	return nil
+// dimensionalInstantArgs splits one instant into its (epoch seconds,
+// nanosecond fraction) carrier. The split is exact for every time.Time —
+// Go normalizes pre-epoch instants onto a non-negative fraction with a
+// floored second — and time.Unix(sec, frac) reconstructs the instant
+// exactly, so no range guard exists on this path.
+func dimensionalInstantArgs(t time.Time) (int64, int32) {
+	return t.Unix(), int32(t.Nanosecond())
 }
 
 // dimensionalInsertArgs binds the org scope followed by the validated
-// fields, in the INSERT statement's column order. The instants are
-// pre-validated by dimensionalInstantsInRange, so UnixNano here is exact.
+// fields, in the INSERT statement's column order.
 func dimensionalInsertArgs(orgID string, c dimensions.Component) []any {
+	eventSec, eventNanos := dimensionalInstantArgs(c.EventTime)
+	effectiveSec, effectiveNanos := dimensionalInstantArgs(c.EffectiveTime)
 	return []any{
 		orgID, c.TenantID, c.EventID, c.ComponentID, c.RequestID, c.TaskID,
 		c.Meter, c.Unit, decimalToText(c.Quantity),
 		dimensionalBoundText(c.Bounds, true), dimensionalBoundText(c.Bounds, false),
 		c.SourceKind, c.SourceRef, c.Method, c.Formula, c.FactorVersion,
-		c.EventTime.UnixNano(), c.EffectiveTime.UnixNano(), c.Boundary, c.AllocationBasis,
+		eventSec, eventNanos, effectiveSec, effectiveNanos, c.Boundary, c.AllocationBasis,
 		c.Precision, c.Lifecycle, c.CorrectsComponentID, coverageOrEmpty(c.CoverageMeters),
 	}
 }
@@ -224,9 +217,6 @@ func (s *Store) StoreDimensionalComponents(ctx context.Context, orgID string, co
 	}
 	for i := range components {
 		if err := components[i].Validate(); err != nil {
-			return fmt.Errorf("component %d: %w", i, err)
-		}
-		if err := dimensionalInstantsInRange(components[i]); err != nil {
 			return fmt.Errorf("component %d: %w", i, err)
 		}
 	}
@@ -285,11 +275,13 @@ func listDimensionalComponents(ctx context.Context, tx auditTx, where string, ar
 }
 
 // dimensionalListSQL renders the explicit-column page query; the ORDER BY
-// completes the in-scope primary key so page boundaries are deterministic,
-// and the LIMIT and OFFSET placeholders follow the bound filter args.
+// pairs the exact instant order (epoch seconds, nanosecond fraction) with
+// the remaining in-scope primary-key columns so page boundaries are
+// deterministic, and the LIMIT and OFFSET placeholders follow the bound
+// filter args.
 func dimensionalListSQL(where string, boundArgs int) string {
 	return `SELECT ` + dimensionalComponentColumns + ` FROM dimensional_components` + where +
-		` ORDER BY event_time DESC, event_id DESC, component_id DESC LIMIT $` + fmt.Sprint(boundArgs+1) +
+		` ORDER BY event_time_unix DESC, event_time_nanos DESC, event_id DESC, component_id DESC LIMIT $` + fmt.Sprint(boundArgs+1) +
 		` OFFSET $` + fmt.Sprint(boundArgs+2)
 }
 
@@ -308,22 +300,23 @@ func collectDimensionalComponents(rows pgx.Rows, out *[]dimensions.Component) er
 
 // scanDimensionalComponent reconstructs a component from the explicit
 // column list; absent quantity/bounds stay nil, coverage normalizes the
-// empty array back to nil so the roundtrip preserves absence, and the int64
-// nanosecond instants rebuild the exact time.Time instants.
+// empty array back to nil so the roundtrip preserves absence, and the
+// (epoch seconds, nanosecond fraction) pairs rebuild the exact instants.
 func scanDimensionalComponent(row pgx.Row) (dimensions.Component, error) {
 	var c dimensions.Component
 	var quantity, lower, upper *string
 	var coverage []string
-	var eventNanos, effectiveNanos int64
+	var eventSec, effectiveSec int64
+	var eventNanos, effectiveNanos int32
 	if err := row.Scan(&c.TenantID, &c.EventID, &c.ComponentID, &c.RequestID, &c.TaskID,
 		&c.Meter, &c.Unit, &quantity, &lower, &upper,
 		&c.SourceKind, &c.SourceRef, &c.Method, &c.Formula, &c.FactorVersion,
-		&eventNanos, &effectiveNanos, &c.Boundary, &c.AllocationBasis,
+		&eventSec, &eventNanos, &effectiveSec, &effectiveNanos, &c.Boundary, &c.AllocationBasis,
 		&c.Precision, &c.Lifecycle, &c.CorrectsComponentID, &coverage); err != nil {
 		return dimensions.Component{}, fmt.Errorf("scan dimensional component: %w", err)
 	}
-	c.EventTime = time.Unix(0, eventNanos).UTC()
-	c.EffectiveTime = time.Unix(0, effectiveNanos).UTC()
+	c.EventTime = time.Unix(eventSec, int64(eventNanos)).UTC()
+	c.EffectiveTime = time.Unix(effectiveSec, int64(effectiveNanos)).UTC()
 	return buildDimensionalComponent(c, quantity, lower, upper, coverage)
 }
 

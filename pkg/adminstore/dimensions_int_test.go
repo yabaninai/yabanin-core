@@ -23,10 +23,11 @@ package adminstore
 //   - Legacy monetary reads (SpendToday, request_logs rows) are untouched
 //     by a dimensional write to the same org.
 //   - A fresh pool (restart posture) reads the persisted rows back exactly.
-//   - Sub-microsecond instants survive the int64 nanosecond carrier exactly
-//     (a timestamptz column would truncate them), and large-integer decimals
-//     that break under a float64 carrier roundtrip as exact text through the
-//     real store (write AND read, SQL-level carrier included).
+//   - Instants survive the (epoch seconds, nanosecond fraction) carrier
+//     exactly — sub-microsecond fixtures, far-future year-2300 controls and
+//     pre-epoch rows included — and large-integer decimals that break under
+//     a float64 carrier roundtrip as exact text through the real store
+//     (write AND read, SQL-level carrier included).
 //   - Rows tied on (event_time, component_id) page deterministically on the
 //     event_id tiebreak: no repeat, no skip across OFFSET page boundaries.
 
@@ -193,10 +194,11 @@ func TestDimensionalComponents_TenantScopeDenial_Integration(t *testing.T) {
 		INSERT INTO dimensional_components
 			(org_id, tenant_id, event_id, component_id, request_id, meter, unit,
 			 quantity_text, source_kind, source_ref, method, factor_version,
-			 event_time, effective_time, boundary, precision_kind, lifecycle)
+			 event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos,
+			 boundary, precision_kind, lifecycle)
 		VALUES ($1::uuid, $2, 'evt-orgb', 'comp-orgb', 'req-orgb', 'usage.cost', 'USD',
 			 '1.25', 'gateway', 'resp-body', 'provider-report', 'tariff-2026-11',
-			 '2026-11-24T10:15:30.123456Z', '2026-11-24T10:15:30.123456Z',
+			 1795515330, 123456789, 1795515330, 123456789,
 			 'measurement', 'exact', 'provisional')`, orgB, tenant)
 	require.NoError(t, err)
 
@@ -312,10 +314,11 @@ func TestDimensionalComponents_MalformedRefusal_Integration(t *testing.T) {
 		INSERT INTO dimensional_components
 			(org_id, tenant_id, event_id, component_id, request_id, meter, unit,
 			 quantity_text, source_kind, source_ref, method, factor_version,
-			 event_time, effective_time, boundary, precision_kind, lifecycle)
+			 event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos,
+			 boundary, precision_kind, lifecycle)
 		VALUES ($1::uuid, $2, 'evt-check', 'comp-check', 'req-check', 'usage.cost', 'USD',
 			 '1.00', 'gateway', 'resp-body', 'provider-report', 'tariff-2026-11',
-			 1795515330123456789, 1795515330123456789,
+			 1795515330, 123456789, 1795515330, 123456789,
 			 'measurement', 'ballpark', 'provisional')`, orgA, tenant)
 	require.Error(t, err, "unknown precision_kind must violate the CHECK constraint")
 	var pgCode string
@@ -403,7 +406,8 @@ func TestDimensionalComponents_RestartReadBack_Integration(t *testing.T) {
 // TestDimensionalComponents_SubMicrosecondInstantsRoundtrip_Integration:
 // regression guard for the timestamptz truncation found in review — the
 // contract's time.Time instants keep nanoseconds, so distinct
-// non-microsecond-aligned event/effective instants must read back exactly.
+// non-microsecond-aligned event/effective instants must read back exactly
+// through the split carrier.
 func TestDimensionalComponents_SubMicrosecondInstantsRoundtrip_Integration(t *testing.T) {
 	pool := openAdminTestPool(t)
 	store := New(pool, slog.New(slog.DiscardHandler), nil)
@@ -428,21 +432,85 @@ func TestDimensionalComponents_SubMicrosecondInstantsRoundtrip_Integration(t *te
 	require.EqualValues(t, 1, total)
 	require.Len(t, got, 1)
 	require.Equal(t, event.UnixNano(), got[0].EventTime.UnixNano(),
-		"the event instant must survive the int64 nanosecond carrier exactly")
+		"the event instant must survive the seconds+fraction carrier exactly")
 	require.Equal(t, effective.UnixNano(), got[0].EffectiveTime.UnixNano(),
-		"the effective instant must survive the int64 nanosecond carrier exactly")
+		"the effective instant must survive the seconds+fraction carrier exactly")
 	require.True(t, got[0].EventTime.Equal(event))
 	require.True(t, got[0].EffectiveTime.Equal(effective))
 
-	// SQL-level carrier oracle: the column stores the raw nanosecond
-	// integer, independent of any Go reconstruction.
-	var storedEvent, storedEffective int64
+	// SQL-level carrier oracle: the raw (epoch seconds, nanosecond fraction)
+	// pairs match the instants, independent of any Go reconstruction.
+	var storedEventSec int64
+	var storedEventNanos int32
+	var storedEffectiveSec int64
+	var storedEffectiveNanos int32
 	require.NoError(t, pool.QueryRow(ctx,
-		`SELECT event_time, effective_time FROM dimensional_components
+		`SELECT event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos
+		 FROM dimensional_components
 		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-submicro'`,
-		orgA).Scan(&storedEvent, &storedEffective))
-	require.Equal(t, event.UnixNano(), storedEvent)
-	require.Equal(t, effective.UnixNano(), storedEffective)
+		orgA).Scan(&storedEventSec, &storedEventNanos, &storedEffectiveSec, &storedEffectiveNanos))
+	require.Equal(t, event.Unix(), storedEventSec)
+	require.Equal(t, int32(event.Nanosecond()), storedEventNanos)
+	require.Equal(t, effective.Unix(), storedEffectiveSec)
+	require.Equal(t, int32(effective.Nanosecond()), storedEffectiveNanos)
+}
+
+// TestDimensionalComponents_FarFutureAndPreEpochRoundtrip_Integration: the
+// r2-review controls — a contract-valid year-2300 instant (which a single
+// int64-nanosecond carrier would silently wrap) and a pre-epoch instant
+// (negative epoch seconds, normalized onto a non-negative fraction) roundtrip
+// exactly through the real store, and the composite instant ordering places
+// the far-future row first.
+func TestDimensionalComponents_FarFutureAndPreEpochRoundtrip_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration: requires the adminstore database")
+	}
+	pool := openAdminTestPool(t)
+	store := New(pool, slog.New(slog.DiscardHandler), nil)
+	ctx := context.Background()
+	orgA, _ := dimensionalTestOrgs(t, ctx, pool)
+
+	future := time.Date(2300, 1, 1, 0, 0, 0, 500000000, time.UTC)
+	pre := time.Date(1969, 12, 31, 23, 59, 59, 500000000, time.UTC)
+
+	base := dimensionalFrozenComponents(t)[:1]
+	far, old := base[0], base[0]
+	far.EventID, old.EventID = "evt-year-2300", "evt-pre-epoch"
+	far.EventTime, far.EffectiveTime = future, future
+	old.EventTime, old.EffectiveTime = pre, pre
+	require.NoError(t, store.StoreDimensionalComponents(ctx, orgA, []dimensions.Component{far, old}),
+		"the store must accept every contract-validated instant, year 2300 included")
+
+	all, total, err := store.ListDimensionalComponents(ctx, orgA, "tenant-frozen", DimensionalComponentFilters{})
+	require.NoError(t, err)
+	require.EqualValues(t, 2, total)
+	require.Len(t, all, 2)
+	// Composite instant order: epoch seconds descending puts 2300 first.
+	require.Equal(t, "evt-year-2300", all[0].EventID)
+	require.Equal(t, "evt-pre-epoch", all[1].EventID)
+	require.True(t, all[0].EventTime.Equal(future), "the year-2300 instant must roundtrip exactly")
+	require.True(t, all[0].EffectiveTime.Equal(future))
+	require.True(t, all[1].EventTime.Equal(pre), "the pre-epoch instant must roundtrip exactly")
+	require.True(t, all[1].EffectiveTime.Equal(pre))
+
+	// SQL-level carrier oracle for both rows: exact raw seconds and fractions.
+	var farSec int64
+	var farNanos int32
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT event_time_unix, event_time_nanos FROM dimensional_components
+		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-year-2300'`,
+		orgA).Scan(&farSec, &farNanos))
+	require.Equal(t, int64(10413792000), farSec, "year-2300 epoch seconds stored exactly")
+	require.Equal(t, int32(500000000), farNanos, "the nanosecond fraction stored exactly")
+
+	var preSec int64
+	var preNanos int32
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT event_time_unix, event_time_nanos FROM dimensional_components
+		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-pre-epoch'`,
+		orgA).Scan(&preSec, &preNanos))
+	require.Equal(t, int64(-1), preSec, "pre-epoch seconds store negative (floored)")
+	require.Equal(t, int32(500000000), preNanos, "pre-epoch fractions stay non-negative (normalized)")
 }
 
 // TestDimensionalComponents_LargeIntegerDecimalRoundtrip_Integration:

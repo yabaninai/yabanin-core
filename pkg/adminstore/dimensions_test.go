@@ -12,9 +12,11 @@ package adminstore
 //   - The INSERT binds the org scope first, canonical decimal text for
 //     quantity/bounds (nil stays nil; explicit zero is "0"), and the empty
 //     coverage array for non-coverage rows.
-//   - Instants travel as int64 nanoseconds (UnixNano ⇄ time.Unix(0, n)):
-//     the sub-microsecond fixture times bind and scan exactly, and instants
-//     outside the int64 nanosecond range refuse before any statement.
+//   - Instants travel as (epoch seconds, nanosecond fraction) — an exact,
+//     unbounded carrier: the sub-microsecond fixture times bind and scan
+//     exactly, far-future instants such as year 2300 store instead of
+//     wrapping, and pre-epoch instants roundtrip through the normalized
+//     split.
 //   - The canonical-text oracle rejects a float-carried 2^53+1 literal;
 //     every frozen fixture decimal survives a shortest-text float
 //     roundtrip, so only this independent literal proves float rejection.
@@ -159,28 +161,29 @@ func TestKnownRed_FloatCarriedLargeIntegerFailsCanonicalOracle(t *testing.T) {
 		"the float-exact bound edge must stay exact under the carrier")
 }
 
-// TestStoreDimensionalComponents_RejectsInstantOutOfRange: the int64
-// nanosecond carrier wraps silently outside roughly the years 1678-2262,
-// so batch validation must refuse an out-of-range instant before any
-// statement instead of persisting a wrapped instant as plausible data.
-func TestStoreDimensionalComponents_RejectsInstantOutOfRange(t *testing.T) {
+// TestStoreDimensionalComponents_BindsFarFutureInstants: the r2-review
+// control — a contract-valid year-2300 instant (which a single
+// int64-nanosecond carrier would silently wrap) must store, binding as the
+// exact (epoch seconds, nanosecond fraction) pair. No range guard exists:
+// the split carrier accepts every validated component's instants.
+func TestStoreDimensionalComponents_BindsFarFutureInstants(t *testing.T) {
 	comps := dimensionalFrozenComponents(t)[:1]
-	comps[0].EventTime = time.Date(2300, 1, 1, 0, 0, 0, 0, time.UTC)
+	comps[0].EventTime = time.Date(2300, 1, 1, 0, 0, 0, 500000000, time.UTC)
+	comps[0].EffectiveTime = comps[0].EventTime
 
-	var execs int
-	tx := &policyTxDouble{execFn: func(context.Context, string, ...any) (pgconn.CommandTag, error) {
-		execs++
-		return pgconn.NewCommandTag("INSERT 0 1"), nil
-	}}
+	tx := &policyTxDouble{}
 	store := newForTest(&mockDB{beginAuditTxFn: func(context.Context) (auditTx, error) {
 		return tx, nil
 	}}, newTestLogger(), nil)
 
-	err := store.StoreDimensionalComponents(context.Background(), "org-1", comps)
+	require.NoError(t, store.StoreDimensionalComponents(context.Background(), "org-1", comps))
 
-	require.Error(t, err)
-	require.Contains(t, err.Error(), "outside the int64 nanosecond range")
-	require.Zero(t, execs, "the refusal must precede every statement, the GUC included")
+	inserts := dimensionalInsertExecs(tx)
+	require.Len(t, inserts, 1, "a contract-valid far-future instant must store")
+	require.Equal(t, int64(10413792000), inserts[0].args[16], "year-2300 epoch seconds bind exactly")
+	require.Equal(t, int32(500000000), inserts[0].args[17], "the nanosecond fraction binds exactly")
+	require.Equal(t, int64(10413792000), inserts[0].args[18])
+	require.Equal(t, int32(500000000), inserts[0].args[19])
 }
 
 // TestStoreDimensionalComponents_RefusesMalformedBeforeAnyStatement: the
@@ -256,14 +259,16 @@ func TestStoreDimensionalComponents_BindsOrgScopeAndCanonicalDecimals(t *testing
 	require.Nil(t, inserts[3].args[10])
 
 	// Non-coverage rows carry the empty array; the coverage row binds meters.
-	require.Equal(t, []string{}, inserts[0].args[23], "absent coverage binds the empty array, never nil")
-	require.Equal(t, []string{"emissions.co2e"}, inserts[3].args[23].([]string))
+	require.Equal(t, []string{}, inserts[0].args[25], "absent coverage binds the empty array, never nil")
+	require.Equal(t, []string{"emissions.co2e"}, inserts[3].args[25].([]string))
 
-	// Instant carrier regression guard: int64 nanoseconds bind exactly, so
-	// the sub-microsecond fixture instants reach the statement untouched
-	// (a timestamptz carrier would truncate them at the column).
-	require.Equal(t, comps[0].EventTime.UnixNano(), inserts[0].args[16])
-	require.Equal(t, comps[0].EffectiveTime.UnixNano(), inserts[0].args[17])
+	// Instant carrier regression guard: (epoch seconds, nanosecond fraction)
+	// pairs bind exactly — no truncating timestamptz, no wrapping int64 —
+	// so the sub-microsecond fixture instants reach the statement untouched.
+	require.Equal(t, comps[0].EventTime.Unix(), inserts[0].args[16])
+	require.Equal(t, int32(comps[0].EventTime.Nanosecond()), inserts[0].args[17])
+	require.Equal(t, comps[0].EffectiveTime.Unix(), inserts[0].args[18])
+	require.Equal(t, int32(comps[0].EffectiveTime.Nanosecond()), inserts[0].args[19])
 }
 
 // TestStoreDimensionalComponents_StatementFailureRollsBackBatch: a failure
@@ -454,6 +459,8 @@ func dimensionalScanCell(dest, cell any) error {
 		*d = coverage
 	case *int64:
 		*d = cell.(int64)
+	case *int32:
+		*d = cell.(int32)
 	default:
 		return fmt.Errorf("unsupported scan dest %T", dest)
 	}
@@ -522,7 +529,8 @@ func dimensionalFakeRow(quantity, lower, upper *string, precision dimensions.Pre
 		"tenant-frozen", "evt-frozen-1", "comp-r", "req-frozen-1", "",
 		"usage.cost", "USD", text(quantity), text(lower), text(upper),
 		"gateway", "resp-body", "provider-report", "", "tariff-2026-11",
-		dimensionalFrozenInstant.UnixNano(), dimensionalFrozenInstant.UnixNano(),
+		dimensionalFrozenInstant.Unix(), int32(dimensionalFrozenInstant.Nanosecond()),
+		dimensionalFrozenInstant.Unix(), int32(dimensionalFrozenInstant.Nanosecond()),
 		"measurement", "", string(precision), string(lifecycle), corrects, coverage,
 	}
 }
@@ -561,7 +569,7 @@ func TestListDimensionalComponents_ScanRoundtripPreservesAbsence(t *testing.T) {
 	require.Nil(t, absent.CoverageMeters, "empty coverage reads back absent")
 	require.Equal(t, dimensions.PrecisionUnknown, absent.Precision)
 	require.True(t, absent.EventTime.Equal(dimensionalFrozenInstant),
-		"the int64 nanosecond instant cell reconstructs the exact instant")
+		"the seconds+fraction instant cells reconstruct the exact instant")
 	require.True(t, absent.EffectiveTime.Equal(dimensionalFrozenInstant))
 
 	require.Nil(t, ranged.Quantity, "bounds-only stays quantity-absent")
