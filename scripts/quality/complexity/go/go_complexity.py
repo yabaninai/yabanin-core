@@ -689,12 +689,19 @@ def parse_args(argv):
 
 
 def commit_date(root: Path, commit: str) -> datetime.date:
+    # %cI reports the committer date in the committer's local timezone,
+    # while receipt review_date values are UTC calendar dates; slicing the
+    # raw prefix takes the committer-local day, so a commit made early in
+    # the UTC day from a zone ahead of UTC shifts the date forward and
+    # wrongly rejects same-UTC-day receipts as stale. Normalize the
+    # timezone-aware timestamp to UTC before taking the calendar date.
     raw = run_git(root, "show", "-s", "--format=%cI", commit).decode().strip()
     try:
-        return datetime.date.fromisoformat(raw[:10])
+        timestamp = datetime.datetime.fromisoformat(raw)
     except ValueError as error:
         raise AnalyzerError(
             f"cannot determine commit date of {commit}: {raw!r}") from error
+    return timestamp.astimezone(datetime.timezone.utc).date()
 
 
 def main(argv=None) -> int:
