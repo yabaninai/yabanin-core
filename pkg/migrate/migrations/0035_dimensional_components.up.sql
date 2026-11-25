@@ -12,13 +12,20 @@
 -- validated contract, not in SQL rounding.
 --
 -- Instant carrier: the contract's time.Time instants keep nanosecond
--- precision and carry no range restriction, while timestamptz keeps only
--- microseconds and a single int64-nanosecond column would silently wrap for
--- contract-valid instants (any year past ~2262). Each instant therefore
--- splits into epoch seconds (bigint, time.Time.Unix) plus a nanosecond
--- fraction (integer, 0..999999999, time.Time.Nanosecond), and
--- time.Unix(sec, frac) rebuilds the exact instant for every validated
--- component — far-future and pre-epoch included. The composite
+-- precision and carry no range restriction. Timestamptz keeps only
+-- microseconds; a single int64-nanosecond column wraps for contract-valid
+-- instants (any year past ~2262); and even a bigint epoch-seconds column
+-- is NOT chronologically monotonic: time.Time can represent seconds below
+-- the int64 seconds floor (internal int64 seconds reach further down), and
+-- time.Time.Unix silently wraps mod 2^64 there — one second before
+-- time.Unix(math.MinInt64, 0) reads back as math.MaxInt64, so that older
+-- instant would sort as the newest row. Each instant therefore splits into
+-- its TRUE mathematical second — stored as arbitrary-precision numeric,
+-- corrected by -2^64 when Unix wrapped — plus a nanosecond fraction
+-- (integer, 0..999999999, time.Time.Nanosecond, which never wraps). The
+-- numeric keys order exactly chronologically; reading back wraps the
+-- second into the int64 congruence class and time.Unix(sec, frac)
+-- reconstructs the exact original instant, wrap included. The composite
 -- (event_time_unix DESC, event_time_nanos DESC) page ordering is the exact
 -- instant order on this axis.
 --
@@ -52,9 +59,9 @@ CREATE TABLE public.dimensional_components (
     method                text        NOT NULL,
     formula               text        NOT NULL DEFAULT '',
     factor_version        text        NOT NULL DEFAULT '',
-    event_time_unix       bigint      NOT NULL,
+    event_time_unix       numeric     NOT NULL,
     event_time_nanos      integer     NOT NULL,
-    effective_time_unix   bigint      NOT NULL,
+    effective_time_unix   numeric     NOT NULL,
     effective_time_nanos  integer     NOT NULL,
     boundary              text        NOT NULL,
     allocation_basis      text        NOT NULL DEFAULT '',

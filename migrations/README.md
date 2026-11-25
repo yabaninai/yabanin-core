@@ -49,7 +49,7 @@ The later additions include:
 | `0032` | Tenant-safe session attribution (expand): org-scoped registry conflict target `UNIQUE (org_id, client_session)` on `sessions` |
 | `0033` | Removal of the superseded bare `client_session` conflict target (contract of `0032`) |
 | `0034` | Durable policy-decision identity: `invocation_id` on `policy_decisions` (legacy rows stay `''`, bound probes never match them) |
-| `0035` | Per-request dimensional cost-component storage (expand): org-scoped `dimensional_components` rows keyed by `(org_id, tenant_id, event_id, component_id)` with exact decimal text and (epoch seconds, nanosecond fraction) instants — an exact, unbounded carrier where timestamptz would truncate sub-microsecond contract times; `request_logs` untouched |
+| `0035` | Per-request dimensional cost-component storage (expand): org-scoped `dimensional_components` rows keyed by `(org_id, tenant_id, event_id, component_id)` with exact decimal text and (numeric true-second, integer fraction) instants — exact roundtrip and chronologically monotonic ordering for every contract-valid instant, wrap-corrected where bigint Unix seconds would alias (timestamptz would truncate sub-microsecond times); `request_logs` untouched |
 
 A schema object's presence does not by itself establish that a feature is
 configured, enabled or exposed by a particular deployment. Consult the SQL

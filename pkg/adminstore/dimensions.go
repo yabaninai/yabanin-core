@@ -23,13 +23,18 @@ package adminstore
 // read as zero; an explicit zero is stored as '0'. No float ever touches
 // the path.
 //
-// Instant carrier policy: every instant splits into epoch seconds plus a
-// nanosecond fraction (Unix/Nanosecond ⇄ time.Unix(sec, frac)), an exact,
-// unbounded carrier: timestamptz would truncate at microseconds, and a
-// single int64-nanosecond column would wrap for contract-valid instants
-// such as year 2300. The store accepts every validated component's
-// instants; the composite (seconds DESC, fraction DESC) page ordering is
-// the exact instant order.
+// Instant carrier policy: every instant splits into its true mathematical
+// Unix second plus a nanosecond fraction, both of which carry exactly:
+// timestamptz would truncate at microseconds; an int64-nanosecond column
+// wraps for instants past ~year 2262; and even a bigint seconds column
+// aliases mod 2^64 — time.Time can represent seconds below the int64
+// seconds floor, where time.Time.Unix silently wraps (one second before
+// time.Unix(math.MinInt64, 0) reads back as math.MaxInt64), so the stored
+// second is corrected to the true value and kept as arbitrary-precision
+// numeric to stay chronologically monotonic. The fraction never wraps.
+// Reading back wraps the second into its int64 congruence class and
+// time.Unix(sec, frac) reconstructs the exact instant; the composite
+// (seconds DESC, fraction DESC) page ordering is the exact instant order.
 //
 // Replay policy: the (org_id, tenant_id, event_id, component_id) primary
 // key makes delivery identity stable, so a duplicate delivery fails loudly
@@ -39,6 +44,9 @@ package adminstore
 import (
 	"context"
 	"fmt"
+	"math"
+	"math/big"
+	"strconv"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -153,13 +161,46 @@ func coverageOrEmpty(m []string) []string {
 	return m
 }
 
-// dimensionalInstantArgs splits one instant into its (epoch seconds,
-// nanosecond fraction) carrier. The split is exact for every time.Time —
-// Go normalizes pre-epoch instants onto a non-negative fraction with a
-// floored second — and time.Unix(sec, frac) reconstructs the instant
-// exactly, so no range guard exists on this path.
-func dimensionalInstantArgs(t time.Time) (int64, int32) {
-	return t.Unix(), int32(t.Nanosecond())
+// dimensionalSecondsPerWrap is 2^64: time.Time.Unix silently wraps by this
+// period for instants whose true second falls below the int64 seconds floor
+// (the internal second counter reaches further down than Unix seconds).
+var dimensionalSecondsPerWrap = new(big.Int).Lsh(big.NewInt(1), 64)
+
+// dimensionalSecondFloor is the oldest instant whose Unix second still fits
+// int64 exactly; anything Before it aliases mod 2^64 in time.Time.Unix.
+var dimensionalSecondFloor = time.Unix(math.MinInt64, 0).UTC()
+
+// dimensionalInstantArgs splits one instant into its (true second as
+// numeric text, nanosecond fraction) carrier. The fraction is exact for
+// every time.Time (Go normalizes pre-epoch instants onto a floored second
+// with a non-negative fraction) and never wraps; the second is corrected
+// by -2^64 exactly when Unix wrapped, so the stored key is the true
+// mathematical second and numeric ordering stays chronological.
+func dimensionalInstantArgs(t time.Time) (string, int32) {
+	sec := t.Unix()
+	if t.Before(dimensionalSecondFloor) {
+		corrected := new(big.Int).Sub(big.NewInt(sec), dimensionalSecondsPerWrap)
+		return corrected.String(), int32(t.Nanosecond())
+	}
+	return strconv.FormatInt(sec, 10), int32(t.Nanosecond())
+}
+
+// dimensionalInstantFromCarrier rebuilds the instant from its stored
+// (numeric seconds text, integer fraction). Seconds beyond int64 wrap back
+// into their int64 congruence class: time.Unix reconstructs the exact
+// original instant from the wrapped second (the split is exact mod 2^64),
+// while the numeric key kept the chronological order. A stored value that
+// no longer parses is a corrupted-row error, never a silent zero.
+func dimensionalInstantFromCarrier(secText string, frac int32) (time.Time, error) {
+	sec, ok := new(big.Int).SetString(secText, 10)
+	if !ok {
+		return time.Time{}, fmt.Errorf("stored second %q is not a numeric instant key", secText)
+	}
+	wrapped := new(big.Int).Mod(sec, dimensionalSecondsPerWrap)
+	if wrapped.Bit(63) == 1 {
+		wrapped.Sub(wrapped, dimensionalSecondsPerWrap)
+	}
+	return time.Unix(wrapped.Int64(), int64(frac)).UTC(), nil
 }
 
 // dimensionalInsertArgs binds the org scope followed by the validated
@@ -275,10 +316,10 @@ func listDimensionalComponents(ctx context.Context, tx auditTx, where string, ar
 }
 
 // dimensionalListSQL renders the explicit-column page query; the ORDER BY
-// pairs the exact instant order (epoch seconds, nanosecond fraction) with
-// the remaining in-scope primary-key columns so page boundaries are
-// deterministic, and the LIMIT and OFFSET placeholders follow the bound
-// filter args.
+// pairs the chronologically exact instant order (numeric true second,
+// integer fraction) with the remaining in-scope primary-key columns so
+// page boundaries are deterministic, and the LIMIT and OFFSET placeholders
+// follow the bound filter args.
 func dimensionalListSQL(where string, boundArgs int) string {
 	return `SELECT ` + dimensionalComponentColumns + ` FROM dimensional_components` + where +
 		` ORDER BY event_time_unix DESC, event_time_nanos DESC, event_id DESC, component_id DESC LIMIT $` + fmt.Sprint(boundArgs+1) +
@@ -301,22 +342,30 @@ func collectDimensionalComponents(rows pgx.Rows, out *[]dimensions.Component) er
 // scanDimensionalComponent reconstructs a component from the explicit
 // column list; absent quantity/bounds stay nil, coverage normalizes the
 // empty array back to nil so the roundtrip preserves absence, and the
-// (epoch seconds, nanosecond fraction) pairs rebuild the exact instants.
+// (numeric true second, integer fraction) pairs rebuild the exact instants.
 func scanDimensionalComponent(row pgx.Row) (dimensions.Component, error) {
 	var c dimensions.Component
 	var quantity, lower, upper *string
 	var coverage []string
-	var eventSec, effectiveSec int64
+	var eventSecText, effectiveSecText string
 	var eventNanos, effectiveNanos int32
 	if err := row.Scan(&c.TenantID, &c.EventID, &c.ComponentID, &c.RequestID, &c.TaskID,
 		&c.Meter, &c.Unit, &quantity, &lower, &upper,
 		&c.SourceKind, &c.SourceRef, &c.Method, &c.Formula, &c.FactorVersion,
-		&eventSec, &eventNanos, &effectiveSec, &effectiveNanos, &c.Boundary, &c.AllocationBasis,
+		&eventSecText, &eventNanos, &effectiveSecText, &effectiveNanos, &c.Boundary, &c.AllocationBasis,
 		&c.Precision, &c.Lifecycle, &c.CorrectsComponentID, &coverage); err != nil {
 		return dimensions.Component{}, fmt.Errorf("scan dimensional component: %w", err)
 	}
-	c.EventTime = time.Unix(eventSec, int64(eventNanos)).UTC()
-	c.EffectiveTime = time.Unix(effectiveSec, int64(effectiveNanos)).UTC()
+	if eventTime, err := dimensionalInstantFromCarrier(eventSecText, eventNanos); err != nil {
+		return dimensions.Component{}, fmt.Errorf("scan dimensional component: %w", err)
+	} else {
+		c.EventTime = eventTime
+	}
+	if effectiveTime, err := dimensionalInstantFromCarrier(effectiveSecText, effectiveNanos); err != nil {
+		return dimensions.Component{}, fmt.Errorf("scan dimensional component: %w", err)
+	} else {
+		c.EffectiveTime = effectiveTime
+	}
 	return buildDimensionalComponent(c, quantity, lower, upper, coverage)
 }
 

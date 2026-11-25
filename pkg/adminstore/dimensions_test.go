@@ -12,11 +12,13 @@ package adminstore
 //   - The INSERT binds the org scope first, canonical decimal text for
 //     quantity/bounds (nil stays nil; explicit zero is "0"), and the empty
 //     coverage array for non-coverage rows.
-//   - Instants travel as (epoch seconds, nanosecond fraction) — an exact,
-//     unbounded carrier: the sub-microsecond fixture times bind and scan
-//     exactly, far-future instants such as year 2300 store instead of
-//     wrapping, and pre-epoch instants roundtrip through the normalized
-//     split.
+//   - Instants travel as (true second as numeric text, nanosecond
+//     fraction) — an exact, unbounded, chronologically monotonic carrier:
+//     the sub-microsecond fixture times bind and scan exactly, far-future
+//     instants such as year 2300 store instead of wrapping, pre-epoch
+//     instants roundtrip through the normalized split, and seconds below
+//     the int64 floor store the true mathematical value instead of the
+//     mod-2^64 Unix alias.
 //   - The canonical-text oracle rejects a float-carried 2^53+1 literal;
 //     every frozen fixture decimal survives a shortest-text float
 //     roundtrip, so only this independent literal proves float rejection.
@@ -36,6 +38,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
 	"strconv"
 	"strings"
 	"testing"
@@ -180,10 +183,47 @@ func TestStoreDimensionalComponents_BindsFarFutureInstants(t *testing.T) {
 
 	inserts := dimensionalInsertExecs(tx)
 	require.Len(t, inserts, 1, "a contract-valid far-future instant must store")
-	require.Equal(t, int64(10413792000), inserts[0].args[16], "year-2300 epoch seconds bind exactly")
+	require.Equal(t, "10413792000", inserts[0].args[16], "year-2300 seconds bind as exact numeric text")
 	require.Equal(t, int32(500000000), inserts[0].args[17], "the nanosecond fraction binds exactly")
-	require.Equal(t, int64(10413792000), inserts[0].args[18])
+	require.Equal(t, "10413792000", inserts[0].args[18])
 	require.Equal(t, int32(500000000), inserts[0].args[19])
+}
+
+// TestStoreDimensionalComponents_CorrectsWrappedSecondAlias: the r3-review
+// control — time.Time.Unix silently wraps mod 2^64 below the int64 seconds
+// floor: time.Unix(math.MinInt64, 0).Add(-time.Second) is one second OLDER
+// than the floor, yet its raw Unix() alias reads math.MaxInt64, the key
+// that would sort as the newest row. The store must persist the TRUE
+// mathematical second as numeric text. (The instant itself roundtrips from
+// the aliased second — time.Unix is exact mod 2^64 — so the aliasing is
+// order-visible only; correcting the stored key is what keeps paging
+// chronological.)
+func TestStoreDimensionalComponents_CorrectsWrappedSecondAlias(t *testing.T) {
+	wrapped := time.Unix(math.MinInt64, 0).Add(-time.Second)
+	require.Equal(t, int64(math.MaxInt64), wrapped.Unix(),
+		"premise: the raw Unix second of this instant aliases to the int64 maximum")
+	require.True(t, wrapped.Before(time.Unix(math.MinInt64, 0)),
+		"premise: the instant is chronologically below the int64 seconds floor")
+
+	comps := dimensionalFrozenComponents(t)[:1]
+	comps[0].EventTime = wrapped
+	comps[0].EffectiveTime = wrapped
+
+	tx := &policyTxDouble{}
+	store := newForTest(&mockDB{beginAuditTxFn: func(context.Context) (auditTx, error) {
+		return tx, nil
+	}}, newTestLogger(), nil)
+
+	require.NoError(t, store.StoreDimensionalComponents(context.Background(), "org-1", comps))
+
+	inserts := dimensionalInsertExecs(tx)
+	require.Len(t, inserts, 1)
+	require.Equal(t, "-9223372036854775809", inserts[0].args[16],
+		"the stored event second must be the true mathematical value, not the MaxInt64 alias")
+	require.Equal(t, int32(0), inserts[0].args[17])
+	require.Equal(t, "-9223372036854775809", inserts[0].args[18],
+		"the stored effective second must be the true mathematical value, not the MaxInt64 alias")
+	require.Equal(t, int32(0), inserts[0].args[19])
 }
 
 // TestStoreDimensionalComponents_RefusesMalformedBeforeAnyStatement: the
@@ -262,12 +302,13 @@ func TestStoreDimensionalComponents_BindsOrgScopeAndCanonicalDecimals(t *testing
 	require.Equal(t, []string{}, inserts[0].args[25], "absent coverage binds the empty array, never nil")
 	require.Equal(t, []string{"emissions.co2e"}, inserts[3].args[25].([]string))
 
-	// Instant carrier regression guard: (epoch seconds, nanosecond fraction)
-	// pairs bind exactly — no truncating timestamptz, no wrapping int64 —
-	// so the sub-microsecond fixture instants reach the statement untouched.
-	require.Equal(t, comps[0].EventTime.Unix(), inserts[0].args[16])
+	// Instant carrier regression guard: (true second as numeric text,
+	// nanosecond fraction) pairs bind exactly — no truncating timestamptz,
+	// no wrapping int64, no mod-2^64 aliasing — so the sub-microsecond
+	// fixture instants reach the statement untouched.
+	require.Equal(t, strconv.FormatInt(comps[0].EventTime.Unix(), 10), inserts[0].args[16])
 	require.Equal(t, int32(comps[0].EventTime.Nanosecond()), inserts[0].args[17])
-	require.Equal(t, comps[0].EffectiveTime.Unix(), inserts[0].args[18])
+	require.Equal(t, strconv.FormatInt(comps[0].EffectiveTime.Unix(), 10), inserts[0].args[18])
 	require.Equal(t, int32(comps[0].EffectiveTime.Nanosecond()), inserts[0].args[19])
 }
 
@@ -529,8 +570,8 @@ func dimensionalFakeRow(quantity, lower, upper *string, precision dimensions.Pre
 		"tenant-frozen", "evt-frozen-1", "comp-r", "req-frozen-1", "",
 		"usage.cost", "USD", text(quantity), text(lower), text(upper),
 		"gateway", "resp-body", "provider-report", "", "tariff-2026-11",
-		dimensionalFrozenInstant.Unix(), int32(dimensionalFrozenInstant.Nanosecond()),
-		dimensionalFrozenInstant.Unix(), int32(dimensionalFrozenInstant.Nanosecond()),
+		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), int32(dimensionalFrozenInstant.Nanosecond()),
+		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), int32(dimensionalFrozenInstant.Nanosecond()),
 		"measurement", "", string(precision), string(lifecycle), corrects, coverage,
 	}
 }

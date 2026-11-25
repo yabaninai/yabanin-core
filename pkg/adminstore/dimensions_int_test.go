@@ -23,10 +23,12 @@ package adminstore
 //   - Legacy monetary reads (SpendToday, request_logs rows) are untouched
 //     by a dimensional write to the same org.
 //   - A fresh pool (restart posture) reads the persisted rows back exactly.
-//   - Instants survive the (epoch seconds, nanosecond fraction) carrier
-//     exactly — sub-microsecond fixtures, far-future year-2300 controls and
-//     pre-epoch rows included — and large-integer decimals that break under
-//     a float64 carrier roundtrip as exact text through the real store
+//   - Instants survive the (numeric true second, integer fraction) carrier
+//     exactly — sub-microsecond fixtures, far-future year-2300 controls,
+//     pre-epoch rows and int64-boundary rows whose raw Unix seconds alias
+//     mod 2^64 included, with chronological paging across that boundary in
+//     both directions — and large-integer decimals that break under a
+//     float64 carrier roundtrip as exact text through the real store
 //     (write AND read, SQL-level carrier included).
 //   - Rows tied on (event_time, component_id) page deterministically on the
 //     event_id tiebreak: no repeat, no skip across OFFSET page boundaries.
@@ -36,6 +38,8 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
+	"strconv"
 	"testing"
 	"time"
 
@@ -438,20 +442,21 @@ func TestDimensionalComponents_SubMicrosecondInstantsRoundtrip_Integration(t *te
 	require.True(t, got[0].EventTime.Equal(event))
 	require.True(t, got[0].EffectiveTime.Equal(effective))
 
-	// SQL-level carrier oracle: the raw (epoch seconds, nanosecond fraction)
-	// pairs match the instants, independent of any Go reconstruction.
-	var storedEventSec int64
+	// SQL-level carrier oracle: the raw (numeric true second, integer
+	// fraction) pairs match the instants, independent of any Go
+	// reconstruction.
+	var storedEventSecText string
 	var storedEventNanos int32
-	var storedEffectiveSec int64
+	var storedEffectiveSecText string
 	var storedEffectiveNanos int32
 	require.NoError(t, pool.QueryRow(ctx,
 		`SELECT event_time_unix, event_time_nanos, effective_time_unix, effective_time_nanos
 		 FROM dimensional_components
 		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-submicro'`,
-		orgA).Scan(&storedEventSec, &storedEventNanos, &storedEffectiveSec, &storedEffectiveNanos))
-	require.Equal(t, event.Unix(), storedEventSec)
+		orgA).Scan(&storedEventSecText, &storedEventNanos, &storedEffectiveSecText, &storedEffectiveNanos))
+	require.Equal(t, strconv.FormatInt(event.Unix(), 10), storedEventSecText)
 	require.Equal(t, int32(event.Nanosecond()), storedEventNanos)
-	require.Equal(t, effective.Unix(), storedEffectiveSec)
+	require.Equal(t, strconv.FormatInt(effective.Unix(), 10), storedEffectiveSecText)
 	require.Equal(t, int32(effective.Nanosecond()), storedEffectiveNanos)
 }
 
@@ -511,6 +516,100 @@ func TestDimensionalComponents_FarFutureAndPreEpochRoundtrip_Integration(t *test
 		orgA).Scan(&preSec, &preNanos))
 	require.Equal(t, int64(-1), preSec, "pre-epoch seconds store negative (floored)")
 	require.Equal(t, int32(500000000), preNanos, "pre-epoch fractions stay non-negative (normalized)")
+}
+
+// TestDimensionalComponents_WrappedSecondBoundaryPaging_Integration: the
+// r3-review control — a bigint Unix-seconds key is not chronologically
+// monotonic: time.Unix(math.MinInt64, 0).Add(-time.Second) is the OLDEST
+// row here yet its raw Unix() alias reads math.MaxInt64, the key that
+// would sort as the newest. With the numeric true-second key, descending
+// pages must cross the int64 boundary chronologically (alias last), the
+// wrapped instant must roundtrip exactly, the stored second must be the
+// corrected true value, and the raw ascending ordering must mirror the
+// descending walk.
+func TestDimensionalComponents_WrappedSecondBoundaryPaging_Integration(t *testing.T) {
+	if testing.Short() {
+		t.Skip("integration: requires the adminstore database")
+	}
+	pool := openAdminTestPool(t)
+	store := New(pool, slog.New(slog.DiscardHandler), nil)
+	ctx := context.Background()
+	orgA, _ := dimensionalTestOrgs(t, ctx, pool)
+
+	// The newest second a time.Time can represent: the internal second
+	// counter reaches math.MaxInt64, offset back to Unix seconds from the
+	// year-1 epoch (computed, not a magic constant).
+	internalEpochOffset := -time.Date(1, 1, 1, 0, 0, 0, 0, time.UTC).Unix()
+	newest := time.Unix(math.MaxInt64-internalEpochOffset, 500000000)
+	floor := time.Unix(math.MinInt64, 123456789)
+	wrapped := time.Unix(math.MinInt64, 0).Add(-time.Second)
+	require.Equal(t, int64(math.MaxInt64), wrapped.Unix(),
+		"premise: the oldest row's raw Unix second aliases to the int64 maximum")
+	require.True(t, wrapped.Before(floor), "premise: the wrapped instant is chronologically oldest")
+
+	base := dimensionalFrozenComponents(t)[:1]
+	hi, mid, lo, old := base[0], base[0], base[0], base[0]
+	hi.EventID, hi.EventTime, hi.EffectiveTime = "evt-hi-boundary", newest, newest
+	mid.EventID, mid.EventTime, mid.EffectiveTime = "evt-mid-frozen", dimensionalFrozenInstant, dimensionalFrozenInstant
+	lo.EventID, lo.EventTime, lo.EffectiveTime = "evt-lo-floor", floor, floor
+	old.EventID, old.EventTime, old.EffectiveTime = "evt-wrapped-alias", wrapped, wrapped
+	require.NoError(t, store.StoreDimensionalComponents(ctx, orgA, []dimensions.Component{hi, mid, lo, old}),
+		"the store must accept every contract-validated instant, int64-boundary rows included")
+
+	// Descending page walk across the boundary: newest first, alias last,
+	// pageTotal stable and the page past the walk empty.
+	var order []string
+	byID := map[string]dimensions.Component{}
+	for page := 1; page <= 5; page++ {
+		got, total, err := store.ListDimensionalComponents(ctx, orgA, "tenant-frozen",
+			DimensionalComponentFilters{PageFilter: NewPageFilter(page, 1)})
+		require.NoError(t, err)
+		require.EqualValues(t, 4, total, "the boundary rows must all count, on every page")
+		if page > 4 {
+			require.Empty(t, got, "the page past the boundary walk must be empty")
+			continue
+		}
+		order = append(order, got[0].EventID)
+		byID[got[0].EventID] = got[0]
+	}
+	require.Equal(t,
+		[]string{"evt-hi-boundary", "evt-mid-frozen", "evt-lo-floor", "evt-wrapped-alias"}, order,
+		"descending pages must be chronological — the MaxInt64 Unix alias must not sort as newest")
+	require.True(t, byID["evt-wrapped-alias"].EventTime.Equal(wrapped),
+		"the wrapped instant must roundtrip exactly")
+	require.True(t, byID["evt-hi-boundary"].EventTime.Equal(newest),
+		"the top-of-range instant must roundtrip exactly")
+
+	// Raw-carrier oracle: the alias row stores the TRUE second (below the
+	// int64 floor), never its MaxInt64 alias.
+	var wrappedSecText string
+	var wrappedNanos int32
+	require.NoError(t, pool.QueryRow(ctx,
+		`SELECT event_time_unix, event_time_nanos FROM dimensional_components
+		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-wrapped-alias'`,
+		orgA).Scan(&wrappedSecText, &wrappedNanos))
+	require.Equal(t, "-9223372036854775809", wrappedSecText,
+		"the stored second must be the corrected true mathematical value")
+	require.Equal(t, int32(0), wrappedNanos)
+
+	// Both directions: the raw ascending numeric ordering mirrors the walk.
+	rows, err := pool.Query(ctx,
+		`SELECT event_id FROM dimensional_components
+		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen'
+		   AND event_id IN ('evt-hi-boundary','evt-mid-frozen','evt-lo-floor','evt-wrapped-alias')
+		 ORDER BY event_time_unix ASC, event_time_nanos ASC, event_id ASC`, orgA)
+	require.NoError(t, err)
+	defer rows.Close()
+	var ascOrder []string
+	for rows.Next() {
+		var id string
+		require.NoError(t, rows.Scan(&id))
+		ascOrder = append(ascOrder, id)
+	}
+	require.NoError(t, rows.Err())
+	require.Equal(t,
+		[]string{"evt-wrapped-alias", "evt-lo-floor", "evt-mid-frozen", "evt-hi-boundary"}, ascOrder,
+		"ascending numeric ordering must mirror the descending walk across the boundary")
 }
 
 // TestDimensionalComponents_LargeIntegerDecimalRoundtrip_Integration:
