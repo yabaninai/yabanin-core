@@ -151,7 +151,7 @@ func schemaHeadVersion(t *testing.T) int64 {
 	require.NotNil(t, m, "migrations/README.md must state the embedded head (Current embedded head: **NNNN** (`stem`))")
 	ver, err := strconv.ParseInt(m[1], 10, 64)
 	require.NoError(t, err, "README head pin must be numeric: %s", m[1])
-	require.Greater(t, ver, int64(0), "README head pin must be positive")
+	require.Positive(t, ver, "README head pin must be positive")
 	return ver
 }
 
@@ -160,7 +160,7 @@ func TestCheckMetricsViews_ReadyAfterMigrateRun_Integration(t *testing.T) {
 	_, dsn := dedicatedDB(t)
 
 	res := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, schemaHeadVersion(t), res.Version,
+	assert.Equal(t, schemaHeadVersion(t), res.Version,
 		"first-up boundary must land exactly at the schema head")
 
 	missing, unreadable, err := feedback.CheckMetricsViews(ctx, appPoolOn(t, dsn))
@@ -180,10 +180,10 @@ func TestMigrateRunFirstUpProvisionsViews_Integration(t *testing.T) {
 	// restart shape.
 	first := runLogged(t, ctx, dsn)
 	assert.GreaterOrEqual(t, first.Applied, 1, "fresh first-up must apply the consolidated baseline")
-	assert.EqualValues(t, schemaHeadVersion(t), first.Version,
+	assert.Equal(t, schemaHeadVersion(t), first.Version,
 		"fresh first-up must converge to the schema head")
 	second := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, schemaHeadVersion(t), second.Version,
+	assert.Equal(t, schemaHeadVersion(t), second.Version,
 		"the retained-volume restart generation stays at the schema head")
 
 	var n int

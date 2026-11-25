@@ -340,7 +340,7 @@ func pgErrorCode(err error) (string, error) {
 	if errors.As(err, &pgErr) {
 		return pgErr.SQLState(), nil
 	}
-	return "", fmt.Errorf("error %v carries no SQLSTATE", err)
+	return "", fmt.Errorf("error %w carries no SQLSTATE", err)
 }
 
 // TestDimensionalComponents_LegacyMoneyUnchanged_Integration: a dimensional

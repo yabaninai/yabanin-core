@@ -64,7 +64,7 @@ func probeHeadVersion(t *testing.T) int64 {
 	require.NotNil(t, m, "migrations/README.md must state the embedded head (Current embedded head: **NNNN** (`stem`))")
 	ver, err := strconv.ParseInt(m[1], 10, 64)
 	require.NoError(t, err, "README head pin must be numeric: %s", m[1])
-	require.Greater(t, ver, int64(0), "README head pin must be positive")
+	require.Positive(t, ver, "README head pin must be positive")
 	return ver
 }
 
@@ -120,7 +120,7 @@ func TestMigrateRunProvisionsAppReadableViews_Raw_Integration(t *testing.T) {
 		}
 		require.NoError(t, rerr, "migrate generation %d", gen)
 		require.NotNil(t, res)
-		assert.EqualValues(t, probeHeadVersion(t), res.Version,
+		assert.Equal(t, probeHeadVersion(t), res.Version,
 			"generation %d: views are not migrations (the head moves for the numbered contract migrations, 0032–0035 today, never for views)", gen)
 	}
 
