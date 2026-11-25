@@ -36,7 +36,7 @@ type jointScenarioWalk struct {
 }
 
 var jointScenario = jointScenarioWalk{
-	headVersion:      34, // 0034_policy_decision_invocation; 0023 is the reserved gap (0022 present via e02p01a, 0024 present via e03p01b, 0025 present via e04p01a)
+	headVersion:      35, // 0035_dimensional_components; 0023 is the reserved gap (0022 present via e02p01a, 0024 present via e03p01b, 0025 present via e04p01a)
 	cohortStamp:      1,
 	downTarget:       12,
 	belowTargetVer:   12,

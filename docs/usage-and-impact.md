@@ -82,3 +82,23 @@ response alone does not mean the data is complete.
 For local workload scenarios without a running gateway, use the
 [offline spend audit](audit.md). Its routing and cache projections remain
 simulations, separate from recorded usage and invoice charges.
+
+## Multidimensional cost components (persistence only)
+
+Preview3 adds storage for per-request dimensional cost components (USD
+fees, internal credits, energy, emissions or other configured units)
+alongside the monetary request log. The `dimensional_components` table
+persists every validated field of the component contract with exact decimal
+text: a quantity never passes through a float, a missing quantity stays
+unknown instead of reading as zero, and an explicit zero is stored as a
+real zero. Provenance (method, source, factor version), measurement
+boundary, precision, optional bounds, lifecycle and correction references
+are stored per component, keyed by organization, tenant, event and
+component identity. Reads are organization-scoped and return only the
+requested tenant's rows.
+
+Limitation: this is persistence only. Nothing writes these components yet —
+there is no gateway ingestion, no replay deduplication, no correction
+lineage application, no Units & spend surface change, and no analytics or
+budget use. The cards and tables above therefore do not include these
+components, and monetary request-log reads and writes are unchanged.
