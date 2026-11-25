@@ -252,11 +252,12 @@ func listDimensionalComponents(ctx context.Context, tx auditTx, where string, ar
 	return collectDimensionalComponents(rows, out)
 }
 
-// dimensionalListSQL renders the explicit-column page query; the LIMIT and
-// OFFSET placeholders follow the bound filter args.
+// dimensionalListSQL renders the explicit-column page query; the ORDER BY
+// completes the in-scope primary key so page boundaries are deterministic,
+// and the LIMIT and OFFSET placeholders follow the bound filter args.
 func dimensionalListSQL(where string, boundArgs int) string {
 	return `SELECT ` + dimensionalComponentColumns + ` FROM dimensional_components` + where +
-		` ORDER BY event_time DESC, component_id DESC LIMIT $` + fmt.Sprint(boundArgs+1) +
+		` ORDER BY event_time DESC, event_id DESC, component_id DESC LIMIT $` + fmt.Sprint(boundArgs+1) +
 		` OFFSET $` + fmt.Sprint(boundArgs+2)
 }
 

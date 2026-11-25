@@ -187,7 +187,7 @@ func TestStoreDimensionalComponents_BindsOrgScopeAndCanonicalDecimals(t *testing
 	require.Nil(t, inserts[3].args[10])
 
 	// Non-coverage rows carry the empty array; the coverage row binds meters.
-	require.NotNil(t, inserts[0].args[23])
+	require.Equal(t, []string{}, inserts[0].args[23], "absent coverage binds the empty array, never nil")
 	require.Equal(t, []string{"emissions.co2e"}, inserts[3].args[23].([]string))
 }
 
