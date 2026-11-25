@@ -108,17 +108,18 @@ func decimalToText(d *dimensions.Decimal) *string {
 }
 
 // decimalFromText parses stored canonical text back into an exact Decimal.
-// A nil column is absent/unknown; a stored value that no longer parses is a
-// corrupted-row error, never a silent zero.
-func decimalFromText(s *string) (*dimensions.Decimal, error) {
+// The bool reports presence: a nil column is absent/unknown — (nil, false,
+// nil), never an error and never a silent zero; a stored value that no
+// longer parses is a corrupted-row error.
+func decimalFromText(s *string) (*dimensions.Decimal, bool, error) {
 	if s == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	d, err := dimensions.ParseDecimal(*s)
 	if err != nil {
-		return nil, fmt.Errorf("stored decimal %q: %w", *s, err)
+		return nil, false, fmt.Errorf("stored decimal %q: %w", *s, err)
 	}
-	return &d, nil
+	return &d, true, nil
 }
 
 // dimensionalBoundText extracts one side of the validated bounds; nil bounds
@@ -133,23 +134,24 @@ func dimensionalBoundText(b *dimensions.Bounds, lower bool) *string {
 	return decimalToText(b.Upper)
 }
 
-// dimensionalBounds maps the stored bound texts back. Validated rows always
+// dimensionalBounds maps the stored bound texts back, reporting presence the
+// same way as decimalFromText. Validated rows always
 // carry both sides, so a one-sided stored row surfaces as a one-sided bounds
 // value that the component contract's Validate rejects at the end of the
 // scan, instead of reading as a silent range.
-func dimensionalBounds(lo, hi *string) (*dimensions.Bounds, error) {
+func dimensionalBounds(lo, hi *string) (*dimensions.Bounds, bool, error) {
 	if lo == nil && hi == nil {
-		return nil, nil
+		return nil, false, nil
 	}
-	lower, err := decimalFromText(lo)
+	lower, _, err := decimalFromText(lo)
 	if err != nil {
-		return nil, fmt.Errorf("bounds lower: %w", err)
+		return nil, false, fmt.Errorf("bounds lower: %w", err)
 	}
-	upper, err := decimalFromText(hi)
+	upper, _, err := decimalFromText(hi)
 	if err != nil {
-		return nil, fmt.Errorf("bounds upper: %w", err)
+		return nil, false, fmt.Errorf("bounds upper: %w", err)
 	}
-	return &dimensions.Bounds{Lower: lower, Upper: upper}, nil
+	return &dimensions.Bounds{Lower: lower, Upper: upper}, true, nil
 }
 
 // coverageOrEmpty maps nil/empty coverage onto the empty-array carrier so a
@@ -170,6 +172,20 @@ var dimensionalSecondsPerWrap = new(big.Int).Lsh(big.NewInt(1), 64)
 // int64 exactly; anything Before it aliases mod 2^64 in time.Time.Unix.
 var dimensionalSecondFloor = time.Unix(math.MinInt64, 0).UTC()
 
+// dimensionalFractionNanos narrows the time package's nanosecond fraction
+// onto the stored int32 carrier. Nanosecond() is documented to return the
+// sub-second fraction in [0, 999999999] — inside int32 for every instant —
+// so the conversion is exact and never changes precision; the guard is
+// unreachable defense that refuses to truncate if the documented range
+// were ever violated.
+func dimensionalFractionNanos(t time.Time) int32 {
+	n := t.Nanosecond()
+	if n < 0 || n > math.MaxInt32 {
+		panic(fmt.Sprintf("time fraction %d is outside the documented [0,999999999] range", n))
+	}
+	return int32(n)
+}
+
 // dimensionalInstantArgs splits one instant into its (true second as
 // numeric text, nanosecond fraction) carrier. The fraction is exact for
 // every time.Time (Go normalizes pre-epoch instants onto a floored second
@@ -180,9 +196,9 @@ func dimensionalInstantArgs(t time.Time) (string, int32) {
 	sec := t.Unix()
 	if t.Before(dimensionalSecondFloor) {
 		corrected := new(big.Int).Sub(big.NewInt(sec), dimensionalSecondsPerWrap)
-		return corrected.String(), int32(t.Nanosecond())
+		return corrected.String(), dimensionalFractionNanos(t)
 	}
-	return strconv.FormatInt(sec, 10), int32(t.Nanosecond())
+	return strconv.FormatInt(sec, 10), dimensionalFractionNanos(t)
 }
 
 // dimensionalInstantFromCarrier rebuilds the instant from its stored
@@ -307,7 +323,13 @@ func (s *Store) ListDimensionalComponents(ctx context.Context, orgID, tenantID s
 
 // listDimensionalComponents pages through the scoped rows in stable order.
 func listDimensionalComponents(ctx context.Context, tx auditTx, where string, args []any, filters DimensionalComponentFilters, out *[]dimensions.Component) error {
-	listArgs := append(append([]any{}, args...), filters.PageSize, filters.Offset()) //nolint:gocritic // appendCombine: bound filter args stay last by contract
+	// The bound filter args stay last by contract: the page LIMIT/OFFSET
+	// placeholders follow them (dimensionalListSQL), so the carrier is
+	// allocated at exact capacity and the bounds are appended after the
+	// caller's args, never merged into the copy expression.
+	listArgs := make([]any, 0, len(args)+2)
+	listArgs = append(listArgs, args...)
+	listArgs = append(listArgs, filters.PageSize, filters.Offset())
 	rows, err := tx.Query(ctx, dimensionalListSQL(where, len(args)), listArgs...)
 	if err != nil {
 		return fmt.Errorf("list dimensional components: %w", err)
@@ -374,16 +396,20 @@ func scanDimensionalComponent(row pgx.Row) (dimensions.Component, error) {
 // that no longer parses (or a corrupted closed-set value) surfaces as a
 // named integrity error instead of reading as a plausible component.
 func buildDimensionalComponent(c dimensions.Component, quantity, lower, upper *string, coverage []string) (dimensions.Component, error) {
-	q, err := decimalFromText(quantity)
+	q, qPresent, err := decimalFromText(quantity)
 	if err != nil {
 		return dimensions.Component{}, err
 	}
-	c.Quantity = q
-	bounds, err := dimensionalBounds(lower, upper)
+	if qPresent {
+		c.Quantity = q
+	}
+	bounds, boundsPresent, err := dimensionalBounds(lower, upper)
 	if err != nil {
 		return dimensions.Component{}, err
 	}
-	c.Bounds = bounds
+	if boundsPresent {
+		c.Bounds = bounds
+	}
 	if len(coverage) == 0 {
 		coverage = nil
 	}

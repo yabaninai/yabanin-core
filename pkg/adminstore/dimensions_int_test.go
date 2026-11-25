@@ -62,7 +62,7 @@ func dimensionalTestOrgs(t *testing.T, ctx context.Context, pool *pgxpool.Pool) 
 		"INSERT INTO organizations (name, slug) VALUES ($1, $2) RETURNING id::text",
 		fmt.Sprintf("dim-ix-b-%d", suffix), fmt.Sprintf("dim-ix-b-%d", suffix)).Scan(&orgB))
 	t.Cleanup(func() {
-		_, _ = pool.Exec(context.Background(),
+		_, _ = pool.Exec(ctx,
 			"DELETE FROM organizations WHERE id::text = ANY($1)", []string{orgA, orgB})
 	})
 	return orgA, orgB
@@ -371,7 +371,7 @@ func TestDimensionalComponents_LegacyMoneyUnchanged_Integration(t *testing.T) {
 
 	afterRows, afterSpend := moneySnapshot()
 	require.Equal(t, beforeRows, afterRows, "request_logs rows must be untouched")
-	require.Equal(t, beforeSpend, afterSpend, "SpendToday must be untouched")
+	require.InDelta(t, beforeSpend, afterSpend, 0, "SpendToday must be untouched")
 }
 
 // TestDimensionalComponents_RestartReadBack_Integration: rows written by
@@ -455,9 +455,9 @@ func TestDimensionalComponents_SubMicrosecondInstantsRoundtrip_Integration(t *te
 		 WHERE org_id = $1::uuid AND tenant_id = 'tenant-frozen' AND event_id = 'evt-submicro'`,
 		orgA).Scan(&storedEventSecText, &storedEventNanos, &storedEffectiveSecText, &storedEffectiveNanos))
 	require.Equal(t, strconv.FormatInt(event.Unix(), 10), storedEventSecText)
-	require.Equal(t, int32(event.Nanosecond()), storedEventNanos)
+	require.Equal(t, event.Nanosecond(), int(storedEventNanos))
 	require.Equal(t, strconv.FormatInt(effective.Unix(), 10), storedEffectiveSecText)
-	require.Equal(t, int32(effective.Nanosecond()), storedEffectiveNanos)
+	require.Equal(t, effective.Nanosecond(), int(storedEffectiveNanos))
 }
 
 // TestDimensionalComponents_FarFutureAndPreEpochRoundtrip_Integration: the
@@ -682,7 +682,7 @@ func TestDimensionalComponents_TiedTimesStableAcrossPages_Integration(t *testing
 	require.NoError(t, store.StoreDimensionalComponents(ctx, orgA, []dimensions.Component{a, b}))
 
 	expected := []string{"evt-tied-b", "evt-tied-a"} // string-DESC on the event ids
-	require.True(t, expected[0] > expected[1], "the expected order must itself be event_id-descending")
+	require.Greater(t, expected[0], expected[1], "the expected order must itself be event_id-descending")
 
 	var err error
 	collected := []string{}

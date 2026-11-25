@@ -307,9 +307,9 @@ func TestStoreDimensionalComponents_BindsOrgScopeAndCanonicalDecimals(t *testing
 	// no wrapping int64, no mod-2^64 aliasing — so the sub-microsecond
 	// fixture instants reach the statement untouched.
 	require.Equal(t, strconv.FormatInt(comps[0].EventTime.Unix(), 10), inserts[0].args[16])
-	require.Equal(t, int32(comps[0].EventTime.Nanosecond()), inserts[0].args[17])
+	require.Equal(t, dimensionalFractionNanos(comps[0].EventTime), inserts[0].args[17])
 	require.Equal(t, strconv.FormatInt(comps[0].EffectiveTime.Unix(), 10), inserts[0].args[18])
-	require.Equal(t, int32(comps[0].EffectiveTime.Nanosecond()), inserts[0].args[19])
+	require.Equal(t, dimensionalFractionNanos(comps[0].EffectiveTime), inserts[0].args[19])
 }
 
 // TestStoreDimensionalComponents_StatementFailureRollsBackBatch: a failure
@@ -487,7 +487,7 @@ func dimensionalScanCell(dest, cell any) error {
 	case *string:
 		*d = cell.(string)
 	case **string:
-		text, err := dimensionalCellText(cell)
+		text, _, err := dimensionalCellText(cell)
 		if err != nil {
 			return err
 		}
@@ -524,16 +524,17 @@ func dimensionalEnumScan(dest, cell any) bool {
 	return true
 }
 
-// dimensionalCellText maps a nullable text cell (nil or string).
-func dimensionalCellText(cell any) (*string, error) {
+// dimensionalCellText maps a nullable text cell (nil or string); the bool
+// reports presence — an absent cell is (nil, false, nil), never an error.
+func dimensionalCellText(cell any) (*string, bool, error) {
 	if cell == nil {
-		return nil, nil
+		return nil, false, nil
 	}
 	s, ok := cell.(string)
 	if !ok {
-		return nil, fmt.Errorf("nullable text cell %v is not a string", cell)
+		return nil, false, fmt.Errorf("nullable text cell %v is not a string", cell)
 	}
-	return &s, nil
+	return &s, true, nil
 }
 
 // dimensionalCellCoverage maps a nullable coverage cell (nil or []string).
@@ -570,8 +571,8 @@ func dimensionalFakeRow(quantity, lower, upper *string, precision dimensions.Pre
 		"tenant-frozen", "evt-frozen-1", "comp-r", "req-frozen-1", "",
 		"usage.cost", "USD", text(quantity), text(lower), text(upper),
 		"gateway", "resp-body", "provider-report", "", "tariff-2026-11",
-		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), int32(dimensionalFrozenInstant.Nanosecond()),
-		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), int32(dimensionalFrozenInstant.Nanosecond()),
+		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), dimensionalFractionNanos(dimensionalFrozenInstant),
+		strconv.FormatInt(dimensionalFrozenInstant.Unix(), 10), dimensionalFractionNanos(dimensionalFrozenInstant),
 		"measurement", "", string(precision), string(lifecycle), corrects, coverage,
 	}
 }
