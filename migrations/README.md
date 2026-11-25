@@ -8,11 +8,11 @@ beside an existing binary does not change its embedded migration set.
 
 ## Current schema and numbering
 
-- Current embedded head: **0034** (`policy_decision_invocation`). A successful
-  migration to this release records `version = 34` and `dirty = false`.
-- Next available migration number: **0035**.
-- The shipped set contains **33 up/down pairs**: `0001` through `0022`, then
-  `0024` through `0034`. Version **0023 is permanently reserved and unused**;
+- Current embedded head: **0035** (`dimensional_components`). A successful
+  migration to this release records `version = 35` and `dirty = false`.
+- Next available migration number: **0036**.
+- The shipped set contains **34 up/down pairs**: `0001` through `0022`, then
+  `0024` through `0035`. Version **0023 is permanently reserved and unused**;
   do not create a replacement file for it or renumber later migrations.
 - Files use the format `NNNN_name.up.sql` and `NNNN_name.down.sql`, with a
   four-digit version and a lowercase descriptive name. Each version has exactly
@@ -49,6 +49,7 @@ The later additions include:
 | `0032` | Tenant-safe session attribution (expand): org-scoped registry conflict target `UNIQUE (org_id, client_session)` on `sessions` |
 | `0033` | Removal of the superseded bare `client_session` conflict target (contract of `0032`) |
 | `0034` | Durable policy-decision identity: `invocation_id` on `policy_decisions` (legacy rows stay `''`, bound probes never match them) |
+| `0035` | Per-request dimensional cost-component storage (expand): org-scoped `dimensional_components` rows keyed by `(org_id, tenant_id, event_id, component_id)` with exact decimal text; `request_logs` untouched |
 
 A schema object's presence does not by itself establish that a feature is
 configured, enabled or exposed by a particular deployment. Consult the SQL
