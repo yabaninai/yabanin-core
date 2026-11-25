@@ -16,6 +16,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"testing"
 	"time"
 
@@ -40,6 +44,28 @@ var probeViews = []string{
 	"beta_provider_distribution",
 	"beta_provider_errors",
 	"beta_requests_daily",
+}
+
+// probeHeadRe matches the migrations/README.md head pin — the numbering
+// contract anchor the package-migrate numbering test enforces against the
+// embedded set.
+var probeHeadRe = regexp.MustCompile(`Current embedded head: \*\*(\d{4})\*\* \(\x60([a-z0-9_]+)\x60`)
+
+// probeHeadVersion returns the schema head the shipped runner converges to,
+// read from the migrations/README.md head pin. The probe tracks the live
+// contract instead of a frozen number — views are not migrations, the head
+// moves for the numbered contract migrations, never for views — so it stays
+// truthful on any checkout it is copied into, whatever the current head is.
+func probeHeadVersion(t *testing.T) int64 {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "migrations", "README.md"))
+	require.NoError(t, err, "canonical migrations/README.md head pin must be readable at the repo root")
+	m := probeHeadRe.FindStringSubmatch(string(data))
+	require.NotNil(t, m, "migrations/README.md must state the embedded head (Current embedded head: **NNNN** (`stem`))")
+	ver, err := strconv.ParseInt(m[1], 10, 64)
+	require.NoError(t, err, "README head pin must be numeric: %s", m[1])
+	require.Greater(t, ver, int64(0), "README head pin must be positive")
+	return ver
 }
 
 func TestMigrateRunProvisionsAppReadableViews_Raw_Integration(t *testing.T) {
@@ -94,8 +120,8 @@ func TestMigrateRunProvisionsAppReadableViews_Raw_Integration(t *testing.T) {
 		}
 		require.NoError(t, rerr, "migrate generation %d", gen)
 		require.NotNil(t, res)
-		assert.EqualValues(t, 34, res.Version,
-			"generation %d: views are not migrations (the head moved for the 0032–0034 contract migrations, not for views)", gen)
+		assert.EqualValues(t, probeHeadVersion(t), res.Version,
+			"generation %d: views are not migrations (the head moves for the numbered contract migrations, 0032–0035 today, never for views)", gen)
 	}
 
 	// Raw catalog truth: exactly the seven views exist after Run.

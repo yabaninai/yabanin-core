@@ -12,6 +12,10 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"os"
+	"path/filepath"
+	"regexp"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -129,12 +133,35 @@ func appPoolOn(t *testing.T, dsn string) *pgxpool.Pool {
 	return pool
 }
 
+// schemaHeadRe matches the migrations/README.md head pin — the numbering
+// contract anchor the package-migrate numbering test enforces against the
+// embedded set (and the same value jointScenario.headVersion pins there).
+var schemaHeadRe = regexp.MustCompile(`Current embedded head: \*\*(\d{4})\*\* \(\x60([a-z0-9_]+)\x60`)
+
+// schemaHeadVersion returns the current schema head from the
+// migrations/README.md pin. The readiness surface tracks the live contract
+// instead of a frozen number: views are not migrations, so the head moves
+// for the numbered contract migrations, never for views — a new 00NN must
+// not have to edit this file to keep it truthful.
+func schemaHeadVersion(t *testing.T) int64 {
+	t.Helper()
+	data, err := os.ReadFile(filepath.Join("..", "..", "migrations", "README.md"))
+	require.NoError(t, err, "canonical migrations/README.md head pin must be readable at the repo root")
+	m := schemaHeadRe.FindStringSubmatch(string(data))
+	require.NotNil(t, m, "migrations/README.md must state the embedded head (Current embedded head: **NNNN** (`stem`))")
+	ver, err := strconv.ParseInt(m[1], 10, 64)
+	require.NoError(t, err, "README head pin must be numeric: %s", m[1])
+	require.Greater(t, ver, int64(0), "README head pin must be positive")
+	return ver
+}
+
 func TestCheckMetricsViews_ReadyAfterMigrateRun_Integration(t *testing.T) {
 	ctx := context.Background()
 	_, dsn := dedicatedDB(t)
 
 	res := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 34, res.Version)
+	assert.EqualValues(t, schemaHeadVersion(t), res.Version,
+		"first-up boundary must land exactly at the schema head")
 
 	missing, unreadable, err := feedback.CheckMetricsViews(ctx, appPoolOn(t, dsn))
 	require.NoError(t, err)
@@ -153,9 +180,11 @@ func TestMigrateRunFirstUpProvisionsViews_Integration(t *testing.T) {
 	// restart shape.
 	first := runLogged(t, ctx, dsn)
 	assert.GreaterOrEqual(t, first.Applied, 1, "fresh first-up must apply the consolidated baseline")
-	assert.EqualValues(t, 34, first.Version)
+	assert.EqualValues(t, schemaHeadVersion(t), first.Version,
+		"fresh first-up must converge to the schema head")
 	second := runLogged(t, ctx, dsn)
-	assert.EqualValues(t, 34, second.Version)
+	assert.EqualValues(t, schemaHeadVersion(t), second.Version,
+		"the retained-volume restart generation stays at the schema head")
 
 	var n int
 	require.NoError(t, owner.QueryRow(ctx,
