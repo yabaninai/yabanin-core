@@ -184,12 +184,12 @@ on_disk = set()
 for dp, _, fns in os.walk(release):
     for f in fns:
         on_disk.add(os.path.relpath(os.path.join(dp, f), release))
+directly_signed = {"SHA256SUMS-FULL", "delivered-inventory/sbom-handoff.json"}
 excluded = set()
 excluded_report = []
 for rel in sorted(on_disk):
     is_sidecar = rel.endswith(SIDECAR_EXTS)
-    if rel in ("SHA256SUMS-FULL", "delivered-inventory/sbom-handoff.json",
-               "delivered-inventory/signature-composition.json") or \
+    if rel in directly_signed or rel == "delivered-inventory/signature-composition.json" or \
        rel == out_rel or is_sidecar:
         excluded.add(rel)
         if rel in full:
@@ -285,8 +285,8 @@ if sig_dir:
             fail("sidecar target missing in release set: %s" % t)
             side_report["targets"].append({**entry, "ok": False})
             continue
-        # The root manifest is authenticated by its own signature below.
-        if t != "SHA256SUMS-FULL" and (t not in full or fsha(blob) != full[t]):
+        # The checksum manifest and SBOM handoff are signed after assembly.
+        if t not in directly_signed and (t not in full or fsha(blob) != full[t]):
             fail("sidecar target not digest-covered by SHA256SUMS-FULL: %s" % t)
         sigp = os.path.join(sig_dir, t + ".sig")
         bundp = os.path.join(sig_dir, t + ".bundle")

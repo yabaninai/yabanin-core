@@ -47,9 +47,12 @@ class SignedChecksumManifestTest(unittest.TestCase):
                             "-noout", "-out", "fixture.key"], cwd=root, check=True)
             subprocess.run(["openssl", "pkey", "-in", "fixture.key", "-pubout",
                             "-out", "fixture.pub"], cwd=root, check=True)
+            (signatures / "delivered-inventory").mkdir()
             signature = signatures / "SHA256SUMS-FULL.sig"
-            subprocess.run(["openssl", "dgst", "-sha256", "-sign", "fixture.key",
-                            "-out", signature, manifest], cwd=root, check=True)
+            for target in (manifest, inventory / "sbom-handoff.json"):
+                sidecar = signatures / (str(target.relative_to(release)) + ".sig")
+                subprocess.run(["openssl", "dgst", "-sha256", "-sign", "fixture.key",
+                                "-out", sidecar, target], cwd=root, check=True)
             tool = root / "cosign"
             tool.write_text('#!/bin/sh\nset -eu\n'
                             'test "$1" = verify-blob && test "$2" = --key && '
