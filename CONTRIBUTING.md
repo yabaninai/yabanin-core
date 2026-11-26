@@ -18,15 +18,9 @@ Report vulnerabilities through [SECURITY.md](SECURITY.md), not a public issue.
 
 ## Contribution rights and attribution
 
-Sign off every commit under the [Developer Certificate of Origin](DCO):
-
-```text
-Signed-off-by: Your Name <your-email@example.com>
-```
-
-Use `git commit -s` to add the trailer. It records your confirmation that you
-have the right to submit the contribution; it is separate from a cryptographic
-Git signature. Use your real name and email address.
+Core accepts commits with or without a `Signed-off-by` trailer. To sign off
+under the [Developer Certificate of Origin](DCO), use `git commit -s` with
+your real name and email address.
 
 Disclose any employer, contractor, or third-party restrictions. If an employer
 owns the contribution, provide its written permission. Preserve copyright and
@@ -34,6 +28,6 @@ license notices for copied material and identify its origin. Maintainers cannot
 accept contributions whose rights remain unresolved.
 
 Accepted contributions are distributed under Apache-2.0. No separate CLA is
-required. Maintainers preserve the original author and sign-off when importing
+required. Maintainers preserve the original author and any existing sign-offs when importing
 or exporting accepted work. A contributor may withdraw a pull request before
 it is accepted.

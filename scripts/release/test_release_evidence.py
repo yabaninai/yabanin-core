@@ -2524,7 +2524,7 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
                                              "re-derived from build info")
                                 for f in fails), fails)
 
-    def bind_provenance_fixture(self):
+    def bind_provenance_fixture(self, signoff=True):
         root = Path(self.enterContext(tempfile.TemporaryDirectory()))
         def git(*args):
             return subprocess.check_output(["git", "-C", root, *args]).strip().decode()
@@ -2539,11 +2539,12 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
         odd_path = "line\rbreak.txt"
         (root / odd_path).write_text("second fixture input\n")
         git("add", "--all")
-        git("-c", "commit.gpgsign=false", "commit", "-q", "-s", "-m", "fixture inputs")
+        git("-c", "commit.gpgsign=false", "commit", "-q", *(["-s"] if signoff else []),
+            "-m", "fixture inputs")
         self.enterContext(patch.multiple(re_ev, ROOT=root, TASK_BASE=base))
         expected = {"commit": git("rev-parse", "HEAD"), "author": "Fixture Author",
-                    "email": "fixture@example.invalid", "dco_present": True,
-                    "signed_off_by": ["Fixture Author <fixture@example.invalid>"]}
+                    "email": "fixture@example.invalid", "dco_present": signoff,
+                    "signed_off_by": ["Fixture Author <fixture@example.invalid>"] if signoff else []}
         rows = [dict(expected, path=path) for path in (re_ev.REQUIRED_ADDED[0], odd_path)]
         self.assertEqual(re_ev.provenance_failures({"provenance": {"added": rows}}), [])
         return rows
@@ -2561,6 +2562,13 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
             with self.subTest(code=code), self.assertRaisesRegex(ValueError, "malformed"):
                 re_ev._porcelain_entry(code + " file")
 
+    def test_unsigned_commit_accepts_only_accurate_provenance(self):
+        rows = self.bind_provenance_fixture(signoff=False)
+        forged = dict(rows[0], signed_off_by=["Fixture Author <fixture@example.invalid>"],
+                      dco_present=True)
+        failures = re_ev.provenance_failures({"provenance": {"added": [forged, rows[1]]}})
+        self.assertTrue(any("drifted" in f for f in failures), failures)
+
     def test_provenance_signers_require_a_string_list(self):
         rows = self.bind_provenance_fixture()
         for value in ({"Fixture Author <fixture@example.invalid>": False}, None, [7]):
@@ -2572,7 +2580,6 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
     def test_current_repository_provenance_matches_git(self):
         rows = re_ev.provenance_added()
         self.assertIn(re_ev.REQUIRED_ADDED[0], {row["path"] for row in rows})
-        expected = []
         for commit in {row["commit"] for row in rows}:
             author = re_ev.git_out("show", "-s", "--format=%an <%ae>", commit).strip()
             message = re_ev.git_bytes("show", "-s", "--format=%B", commit)
@@ -2583,10 +2590,7 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
             for row in (row for row in rows if row["commit"] == commit):
                 self.assertEqual(row["signed_off_by"], signers)
                 self.assertEqual(row["dco_present"], author in signers)
-                if author not in signers:
-                    expected.append(f"provenance: {row['path']}: no exact DCO signoff matching "
-                                    f"author {author} (recorded fact; rights assessment is separate)")
-        self.assertCountEqual(re_ev.provenance_failures({"provenance": {"added": rows}}), expected)
+        self.assertEqual(re_ev.provenance_failures({"provenance": {"added": rows}}), [])
 
     def test_provenance_recorded_trailer_list_compared(self):
         # R3: the evidence's signed_off_by list is compared to the commit's
@@ -2615,7 +2619,6 @@ class ReleaseEvidenceNegativeControls(unittest.TestCase):
         fails = re_ev.provenance_failures({"provenance": {"added": rows}})
         self.assertTrue(any("non-added/stale row" in f for f in fails))
         self.assertFalse([f for f in fails if "missing from evidence" in f
-                          or "no exact DCO signoff" in f
                           or "duplicate row" in f], fails)
         self.assertTrue(any(r["path"] == re_ev.REQUIRED_ADDED[0] for r in rows))
 
