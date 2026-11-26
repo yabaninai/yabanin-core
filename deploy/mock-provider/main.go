@@ -167,7 +167,16 @@ func buildResponse(req ChatCompletionRequest) ChatCompletionResponse {
 	}
 }
 
+// requestLogEnabled reports whether MOCK_REQUEST_LOG=1 requested per-request
+// observation logging. Default off; wire behavior is unchanged either way.
+func requestLogEnabled() bool { return os.Getenv("MOCK_REQUEST_LOG") == "1" }
+
 func chatCompletions(w http.ResponseWriter, r *http.Request) {
+	if requestLogEnabled() {
+		// Test observation boundary: exactly one entry per received provider
+		// request, method and path only — never headers, bodies or secrets.
+		log.Printf("mock-request %s %s", r.Method, r.URL.Path)
+	}
 	if r.Method != http.MethodPost {
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
