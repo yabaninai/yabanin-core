@@ -107,3 +107,27 @@ regexes = [
   '''^yag_9f2c1a4b7e8d30f6a5c9b2d1e4f7a8c3$''',
   '''^flag/mask/deny$''',
 ]
+
+[[allowlists]]
+description = "Accounting test environment list: the multiline match captures the region assignment following a runtime-generated encryption key"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)tests/integration/accounting/(harness|wallet_admission_http)_test\.go$''']
+regexTarget = "secret"
+regexes = ['''^YABANIN_REGION=test$''']
+
+[[allowlists]]
+description = "Quickstart Compose render regression: synthetic string used by docker compose config"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)scripts/quickstart/regression\.sh$''']
+regexTarget = "secret"
+regexes = ['''^s12-synthetic-render-nonsecret$''']
+
+[[allowlists]]
+description = "SHA-256 of the Alpine baselayout passwd file in the mock provider source companion"
+targetRules = ["generic-api-key"]
+condition = "AND"
+paths = ['''(^|/)deploy/mock-provider/legal/MANIFEST\.json$''']
+regexTarget = "secret"
+regexes = ['''^31a94f06f17bc3b9085fccab1d0fa6ee9e79c4a1e4d91f617fa5de95863be015$''']
