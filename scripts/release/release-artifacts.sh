@@ -396,6 +396,12 @@ else
     echo "go-version-m buildinfo fallback (syft not installed; NOT a full SPDX SBOM)" > "$RELEASE_DIR/sbom.source"
 fi
 echo "assembling NOTICE materials"
+# Provenance also binds the Go toolchain and module records to each delivered binary.
+if [ -s "$RELEASE_DIR/sbom.spdx.json" ]; then
+    for entry in $UNIFIED $SERVICES; do
+        write_buildinfo "$RELEASE_DIR/${entry%%=*}" || exit 1
+    done
+fi
 if bash scripts/release/notice_bundle.sh --audit "$LICENSE_AUDIT" --out "$RELEASE_DIR/THIRD-PARTY-NOTICES.md"; then
     cp NOTICE "$RELEASE_DIR/NOTICE" 2>/dev/null || echo "notice: root NOTICE missing (non-fatal)"
     cp pkg/pricing/NOTICE-litellm.txt "$RELEASE_DIR/NOTICE-litellm.txt" 2>/dev/null || echo "notice: pkg/pricing/NOTICE-litellm.txt missing (non-fatal)"
