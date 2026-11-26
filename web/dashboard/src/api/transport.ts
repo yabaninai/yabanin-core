@@ -47,6 +47,7 @@ export interface RequestOptions {
   signal?: AbortSignal
   timeoutMs?: number
   headers?: Record<string, string>
+  cache?: RequestCache
 }
 
 /** Documented default read timeout — armed even when no options are passed. */
@@ -240,7 +241,7 @@ function mutationTimeout(opts?: RequestOptions): number | undefined {
 export async function readJSON<T>(url: string, opts?: RequestOptions): Promise<T> {
   const scope = createScope(opts?.signal, readTimeout(opts))
   try {
-    const res = await fetch(url, { credentials: 'include', headers: opts?.headers, signal: scope.signal })
+    const res = await fetch(url, { credentials: 'include', headers: opts?.headers, signal: scope.signal, cache: opts?.cache })
     if (res.status === 401) throw unauthorized()
     if (!res.ok) throw await toApiError(res)
     return (await res.json()) as T

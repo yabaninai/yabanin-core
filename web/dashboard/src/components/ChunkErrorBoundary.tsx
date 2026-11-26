@@ -3,15 +3,13 @@ import { withTranslation, WithTranslation } from 'react-i18next'
 
 // Astra app shell (ASTR-06): an error boundary around lazy page chunks.
 // A failed chunk (network hiccup, deploy race) shows a recoverable notice
-// instead of a blank screen; the page can be re-attempted without a full
-// browser reload of the shell.
+// instead of a blank screen. Retry needs a fresh document: React.lazy caches
+// rejected imports and an old shell still points at pre-deploy asset URLs.
 //
 // keeps `withTranslation` because error boundaries cannot use hooks.
 
 interface Props extends WithTranslation {
   children: ReactNode
-  /** Changing this key remounts the boundary (retry without page reload). */
-  retryKey?: number
 }
 
 interface State {
@@ -23,13 +21,6 @@ class ChunkErrorBoundaryBase extends Component<Props, State> {
 
   static getDerivedStateFromError(error: Error): State {
     return { error }
-  }
-
-  componentDidUpdate(prev: Props) {
-    // A retry (new key) clears the previous failure.
-    if (prev.retryKey !== this.props.retryKey && this.state.error) {
-      this.setState({ error: null })
-    }
   }
 
   componentDidCatch(error: Error) {
@@ -52,7 +43,7 @@ class ChunkErrorBoundaryBase extends Component<Props, State> {
           <div className="mt-3 flex gap-2">
             <button
               type="button"
-              onClick={() => this.setState({ error: null })}
+              onClick={() => window.location.reload()}
               className="btn-primary"
             >
               {t('chunkError.retry')}
