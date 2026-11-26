@@ -1519,7 +1519,8 @@ func (gw *gateway) policyPreUpstream(w http.ResponseWriter, r *http.Request, end
 	q := policyQuery{endpoint: endpoint, hook: pipeline.HookPreUpstream, model: model, keyLabels: principalKeyLabels(r.Context())}
 	// a recorded hint rides the request context to the routing call sites.
 	sink := &routehint.Sink{}
-	decisions, mutated, denied := rt.evaluateWithOutcome(routehint.WithSink(r.Context(), sink), orgID, q, policyRequestPayload(endpoint, body, meta))
+	original := policyRequestPayload(endpoint, body, meta)
+	decisions, mutated, denied := rt.evaluateWithOutcome(routehint.WithSink(r.Context(), sink), orgID, q, original)
 	payloadJSON := marshalPolicyDecisions(decisions)
 
 	if denied {
@@ -1533,11 +1534,65 @@ func (gw *gateway) policyPreUpstream(w http.ResponseWriter, r *http.Request, end
 	}
 	if mutated != nil {
 		body = mutated.Body
+		if !slices.Equal(original.Messages, mutated.Messages) {
+			var err error
+			body, err = mergePolicyMessageContent(body, original.Messages, mutated.Messages)
+			if err != nil {
+				apierrors.WriteWithCode(w, http.StatusBadRequest, apierrors.ErrorCodeInvalidRequest, "cannot apply message policy", policyDenyErrorCode)
+				return nil, payloadJSON, false
+			}
+		}
 	}
 	if hint := sink.Hint(); hint != "" {
 		*r = *r.WithContext(routehint.WithHint(r.Context(), hint))
 	}
 	return body, payloadJSON, true
+}
+
+// Text mutators edit the projection, not the wire body. Patch only changed
+// strings into the final body so tool calls and provider-specific fields survive.
+func mergePolicyMessageContent(body []byte, before, after []pipeline.Message) ([]byte, error) {
+	var doc map[string]json.RawMessage
+	var messages []json.RawMessage
+	if json.Unmarshal(body, &doc) != nil || json.Unmarshal(doc["messages"], &messages) != nil ||
+		len(messages) != len(before) || len(after) != len(before) {
+		return nil, errors.New("inconsistent message policy projection")
+	}
+	// The projection decoder matches struct fields case-insensitively. Do
+	// not forward a second spelling alongside the array we actually patch.
+	for key := range doc {
+		if key != "messages" && strings.EqualFold(key, "messages") {
+			return nil, errors.New("ambiguous message array")
+		}
+	}
+	for i, msg := range after {
+		if msg == before[i] {
+			continue
+		}
+		var entry map[string]json.RawMessage
+		var content *string
+		var role string
+		if msg.Role != before[i].Role || json.Unmarshal(messages[i], &entry) != nil ||
+			json.Unmarshal(entry["role"], &role) != nil || role != msg.Role ||
+			json.Unmarshal(entry["content"], &content) != nil || content == nil || *content != before[i].Content {
+			return nil, errors.New("message no longer matches policy projection")
+		}
+		for key := range entry {
+			if key != "content" && strings.EqualFold(key, "content") {
+				return nil, errors.New("ambiguous message content")
+			}
+		}
+		entry["content"], _ = json.Marshal(msg.Content) // a string is always encodable
+		var err error
+		if messages[i], err = json.Marshal(entry); err != nil {
+			return nil, err
+		}
+	}
+	var err error
+	if doc["messages"], err = json.Marshal(messages); err != nil {
+		return nil, err
+	}
+	return json.Marshal(doc)
 }
 
 // policyPostUpstream is the shared post-upstream hook over a non-streaming
