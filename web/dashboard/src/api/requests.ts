@@ -1,6 +1,6 @@
 // aggregate (extracted from client.ts unchanged).
 
-import { fetchJSON, type Paginated, type RequestOptions } from './http.ts'
+import { fetchJSON, postJSON, type Paginated, type RequestOptions } from './http.ts'
 
 // ===== Unified request list (ASTR-09 debt fix) =====
 
@@ -207,6 +207,19 @@ export async function getRequestDetail(
     `/organizations/${encodeURIComponent(orgId)}/requests/${encodeURIComponent(requestId)}${query ? `?${query}` : ''}`,
     opts,
   )
+}
+
+// Single-use disclosure: never put the grant in a URL, browser storage or logs.
+export async function revealExchange(org: string, id: string, rowKeys: string[], signal: AbortSignal) {
+  const scope = 'payload.read_originals'
+  const grant = await postJSON<{payload_grant: string}>('/root/payload-grants', {
+    org_id: org, request_id: id, scope, ttl_seconds: 60,
+  }, 'POST', { signal })
+  const q = new URLSearchParams({ scope })
+  for (const key of rowKeys) q.append('row_key', key)
+  return fetchJSON<RequestDetail>(`/organizations/${encodeURIComponent(org)}/requests/${encodeURIComponent(id)}?${q}`, {
+    signal, cache: 'no-store', headers: { 'X-Request-Payload-Grant': grant.payload_grant },
+  })
 }
 
 export async function listRequests(params: RequestListParams, opts?: RequestOptions): Promise<Paginated<RequestRow>> {

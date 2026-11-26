@@ -5,7 +5,7 @@ import {
   ONBOARDING_CLIENTS, budgetsLink, clientConfigBlock, gatewayKeysLink, providerKeysLink,
   type OnboardingClient, type OnboardingSignals,
 } from '../../lib/onboarding'
-import { FirstTeamBudget } from '../budgets/FirstTeamBudget'
+import { FirstTeamBudget } from '../budgets/FirstTeamBudget.tsx'
 import { StepHeader } from './StepHeader'
 
 // The first three welcome steps (org-scoped reads, visible to every

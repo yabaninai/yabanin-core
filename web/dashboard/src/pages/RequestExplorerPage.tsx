@@ -2,6 +2,8 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import { useTranslation } from 'react-i18next'
 import { useHashParam, useHashParamValues } from '../hooks/useHashParam'
 import { useInspectParam } from '../hooks/useInspectParam'
+import { usePermissions } from '../hooks/usePermissions'
+import { RequestExchange } from './RequestExchange'
 import { useRequestLabelKeys } from '../hooks/useRequestLabelKeys'
 import {
   getLineage, getRequestDetail, isRequestListStats, listRequests, listPolicyDecisions, requestStats, fetchSavingsReport,
@@ -467,16 +469,11 @@ function buildDetailFields(
           }</pre>
         : <span className="text-[color:var(--astra-text-muted)]">{t('explorer.detailNoResponse')}</span>,
   })
-  fields.push({
-    label: t('explorer.detailBodyNote'),
-    value: t('explorer.detailBodyNoteText'),
-    mono: false,
-  })
   // What ACTUALLY went to the model (post model-override / effort injection)
   // and what the model answered. When the sent model differs from the
   // client's, the block is prefixed with a visible marker — the routing
   // trail above explains why (user finding 2026-09-15).
-  if (d.upstream_request && d.upstream_request !== 'null') {
+  if (!privacy && d.upstream_request && d.upstream_request !== 'null') {
     const sentText = typeof d.upstream_request === 'string' ? d.upstream_request : JSON.stringify(d.upstream_request, null, 2)
     const changedModel = extractJSONModel(d.response) !== extractJSONModel(d.upstream_request)
     fields.push({
@@ -485,7 +482,7 @@ function buildDetailFields(
       value: <pre className="max-h-72 overflow-auto whitespace-pre-wrap break-all rounded-[length:var(--astra-radius-control)] bg-[color:var(--astra-surface-muted)] p-3 text-xs">{(changedModel ? '⚠ ' : '') + sentText}</pre>,
     })
   }
-  if (d.upstream_response && d.upstream_response !== 'null') {
+  if (!privacy && d.upstream_response && d.upstream_response !== 'null') {
     const respText = typeof d.upstream_response === 'string' ? d.upstream_response : JSON.stringify(d.upstream_response, null, 2)
     fields.push({
       label: t('explorer.detailModelResponse'),
@@ -756,6 +753,7 @@ export function RequestExplorerPage() {
   // is a shareable link and survives reload/back-forward.
   const gs = useGlobalScope()
   const org = gs.org.trim()
+  const perms = usePermissions(org || undefined)
   // links (?model= / ?task= from Models/Tasks screens) are folded into it as
   // clauses once at mount and their params are then dropped from the hash,
   // so a reload can never resurrect a removed chip.
@@ -1455,7 +1453,13 @@ export function RequestExplorerPage() {
           variant="drawer"
           loading={inspectorLoading}
           record={inspectorRecord(t, inspectId, inspectorLoading, inspectRecord, inspectDetail, privacy)}
-          fields={buildDetailFields(t, inspectDetail, privacy, (key, value) => addLabelClause(key, value))}
+          fields={[
+            ...(!privacy && perms.me?.is_root && inspectDetail?.request_id === inspectId && inspectDetail.org_id === org ? [{
+              label: t('explorer.detailBodyNote'), value: <RequestExchange key={JSON.stringify([org, inspectId, inspectRowKeys])}
+                org={org} id={inspectId} rowKeys={inspectRowKeys} />,
+            }] : []),
+            ...buildDetailFields(t, inspectDetail, privacy, (key, value) => addLabelClause(key, value)),
+          ]}
           costProvenance={costProvenanceNode(t, inspectDetail)}
           routeTimeline={inspectorTimeline(t, inspectorLoading, inspectDetail, inspectorDecisionsNode)}
           links={[

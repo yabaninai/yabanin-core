@@ -34,6 +34,15 @@ The default state is under `~/.local/share/yabanin/quickstart/<compose-project>`
 or the equivalent `XDG_DATA_HOME` path. Retain this directory with the
 database volume and the quickstart environment file.
 
+### Inspect a stored request
+
+In Requests Explorer, open a request as a root operator. With Privacy mode off,
+choose **Show request body and response (audited)**. This uses a single-use,
+one-minute grant to display the stored request sent to the model *after*
+routing and policies, not the original client HTTP body. If no upstream body
+was captured (for example, on an exact cache hit), the inspector says so.
+Close the drawer to dismiss the disclosed content.
+
 ## A useful demonstration sequence
 
 1. Complete the quickstart through its smoke check. Keep the gateway API key
