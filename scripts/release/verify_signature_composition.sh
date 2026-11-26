@@ -285,7 +285,8 @@ if sig_dir:
             fail("sidecar target missing in release set: %s" % t)
             side_report["targets"].append({**entry, "ok": False})
             continue
-        if t not in full or fsha(blob) != full[t]:
+        # The root manifest is authenticated by its own signature below.
+        if t != "SHA256SUMS-FULL" and (t not in full or fsha(blob) != full[t]):
             fail("sidecar target not digest-covered by SHA256SUMS-FULL: %s" % t)
         sigp = os.path.join(sig_dir, t + ".sig")
         bundp = os.path.join(sig_dir, t + ".bundle")
