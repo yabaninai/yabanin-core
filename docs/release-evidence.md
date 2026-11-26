@@ -43,9 +43,9 @@ file resolution disabled. It requires no daemon, running containers or pull.
   emitted CSS, with exactly one recorded minifier equivalence
   (`--astra-duration: 140ms` emitted as `.14s`); no broad value waiver.
 - **Provenance**: every path added since the frozen task base is bound to
-  its introducing commit, author and DCO signoff, two-way (missing and
-  stale/phantom rows both fail). DCO signoff presence is recorded as a fact
-  and is explicitly not proof of employer rights.
+  its introducing commit, author and actual Git trailers. A commit with no
+  sign-off has `signed_off_by: []` and `dco_present: false` and passes this
+  check. Missing rows, extra rows and inaccurate sign-off data fail.
 - **Distribution**: the five release binaries are bound through
   `dist/release/SHA256SUMS`, and each binary's `image-notices` payload is
   verified exhaustively via its `inventory.json`: the recorded

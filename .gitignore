@@ -63,6 +63,7 @@ dist/
 # Web dashboard build artifacts
 web/dashboard/node_modules/
 web/dashboard/dist/
+web/dashboard/dist-sourcemaps/
 sdks/node/node_modules/
 artifacts/
 

@@ -1,5 +1,30 @@
-import { defineConfig } from 'vite'
+import { readFile } from 'node:fs/promises'
+import { dirname, resolve } from 'node:path'
+import { fileURLToPath } from 'node:url'
+import { defineConfig, transformWithEsbuild, type Plugin } from 'vite'
 import react from '@vitejs/plugin-react'
+
+// Vite's default JSON transform emits empty maps for standalone locale chunks.
+function localeSourceMaps(): Plugin {
+  const entry = fileURLToPath(new URL('./src/i18n/index.ts', import.meta.url))
+  const suffix = '.json.mjs'
+  return {
+    name: 'locale-source-maps',
+    enforce: 'pre',
+    apply: 'build',
+    resolveId(source, importer) {
+      if (importer === entry && source !== './en.json' && /^\.\/[a-z]{2}(?:-[A-Z]{2})?\.json$/.test(source)) {
+        return resolve(dirname(entry), source + '.mjs')
+      }
+    },
+    async load(id) {
+      if (dirname(id) !== dirname(entry) || !id.endsWith(suffix)) return
+      const file = id.slice(0, -'.mjs'.length)
+      this.addWatchFile(file)
+      return transformWithEsbuild(await readFile(file, 'utf8'), file, { loader: 'json', format: 'esm', sourcemap: true })
+    },
+  }
+}
 
 function stripSecureCookies(proxy: { on: (event: string, fn: (...args: never[]) => void) => void }) {
   proxy.on('proxyRes', (proxyRes: { headers: { [key: string]: unknown } }) => {
@@ -45,7 +70,7 @@ function vendorChunk(id: string): string | undefined {
 }
 
 export default defineConfig({
-  plugins: [react()],
+  plugins: [localeSourceMaps(), react()],
   build: {
     rollupOptions: {
       output: {

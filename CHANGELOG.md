@@ -4,11 +4,20 @@ Notable changes to Yabanin Core between developer previews, written for both
 engineering and product readers. Each entry names the code range it covers;
 release artifacts are tagged and published separately with their own evidence.
 
-## Preview 2 — 2026-11-24
+## Preview 2 (in preparation)
 
-Everything merged to `main` between Preview 1 ([v0.1.0-preview.1], source
-`7b85b18`) and merge commit `6c8156f` (qualified candidate `5cce324`, delivered
-through [#98] and [#109]; ~600 commits, ~115k insertions).
+This candidate includes changes since Preview 1 ([v0.1.0-preview.1], source
+`7b85b18`) through `fe5fef4` on main. The initial installation and recovery
+work landed in [#98] and [#109]. Subsequent changes include:
+
+- `yb audit` streams offline input. Helm uses the chart's service account and
+  passes the database configuration to the migration init container.
+- Fleet issuance checks read the decision and installation state together
+  during concurrent revocation.
+- Migration 0035 adds storage for dimensional components with exact decimal
+  quantities and scoped reads.
+- Core accepts commits with or without a `Signed-off-by` trailer and checks
+  recorded provenance against Git.
 
 Preview 2 is the **dependable installation and first request** milestone:
 install Core cleanly, connect a provider, send a request, inspect what was
@@ -79,7 +88,7 @@ actually recorded, and recover the installation.
 
 ### Recovery
 
-- Same-version backup and restore verified against data created by this build:
+- The earlier installation milestone verified same-version backup and restore:
   request chain, wallet, teams and row census all match after restore.
 - Restore refuses to run against a populated target; the refusal itself is
   tested, not just the happy path.
@@ -122,9 +131,9 @@ actually recorded, and recover the installation.
 - UI acceptance is desktop-only; narrower mobile viewports are unverified.
 - Clean install only: no Preview 1 migration or rollback.
 
-### Verification snapshot
+### Verification of the earlier installation milestone
 
-Full evidence and discussion are in [#98] and [#109].
+The following results cover the tree merged at `6c8156f` in [#109].
 
 - Full local quality profile: **PASS, all 29 gates** on the merged tree
   (manifest `20261124T010850Z-19a6863b`), covering race-enabled Go tests,

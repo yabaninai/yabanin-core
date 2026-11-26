@@ -2,6 +2,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime/debug"
@@ -71,6 +72,7 @@ func fixture(t *testing.T) (string, string, string, []*debug.Module) {
 	put(t, source, "scripts/release/image-os-notices/notices/empty-LICENSE", "")
 	put(t, goroot, "src/vendor/example/LICENSE", "stdlib vendor original license")
 	put(t, cache, "example.org/!fork@v1.2.0/LICENSE", "replacement license")
+	put(t, cache, "example.org/!fork@v1.2.0/.github/workflows/license-check.yml", "name: Check license metadata")
 	put(t, cache, "example.org/!fork@v1.2.0/nested/NOTICE.txt", "retained upstream attribution")
 	put(t, cache, "example.org/!fork@v1.2.0/PATENTS", "original patent text")
 	put(t, cache, "example.org/!fork@v1.2.0/source.go", "not shipped in legal payload")
@@ -91,6 +93,15 @@ func TestDeterministicExactLinkedPayload(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	checkNoticeInventory(t, first, source, cache, goroot)
+	checkNoticeTrees(t, first, second)
+	if err := collect(source, cache, goroot, first, modules, "go1.27.3", "binary-hash", 1234567890); err == nil {
+		t.Fatal("existing output accepted")
+	}
+}
+
+func checkNoticeInventory(t *testing.T, first string, privatePaths ...string) {
+	t.Helper()
 	var inv inventory
 	data, err := readRegular(filepath.Join(first, "inventory.json"))
 	if err != nil {
@@ -99,16 +110,41 @@ func TestDeterministicExactLinkedPayload(t *testing.T) {
 	if err = json.Unmarshal(data, &inv); err != nil {
 		t.Fatal(err)
 	}
-	if strings.Contains(string(data), source) || strings.Contains(string(data), cache) || strings.Contains(string(data), goroot) {
-		t.Fatal("host path leaked")
+	for _, path := range privatePaths {
+		if strings.Contains(string(data), path) {
+			t.Fatal("host path leaked")
+		}
 	}
 	if len(inv.Modules) != 1 || inv.Modules[0].SourcePath != "example.org/Fork" {
 		t.Fatalf("wrong modules: %#v", inv.Modules)
 	}
-	if len(inv.Files) != 12 {
+	if len(inv.Files) != 13 {
 		t.Fatalf("unexpected inventory: %#v", inv.Files)
 	}
-	if err = filepath.Walk(first, func(path string, info os.FileInfo, walkErr error) error {
+}
+
+func compareNoticeFile(t *testing.T, first, other string) error {
+	t.Helper()
+	a, readErr := readRegular(first)
+	if readErr != nil {
+		return readErr
+	}
+	b, readErr := readRegular(other)
+	if readErr != nil {
+		return readErr
+	}
+	if string(a) != string(b) {
+		t.Errorf("nondeterministic bytes: %s", first)
+	}
+	if strings.Contains(string(a), "WRONG original") || strings.Contains(string(a), "UNLINKED") || strings.Contains(string(a), "not shipped") {
+		t.Errorf("unselected input copied: %s", first)
+	}
+	return nil
+}
+
+func checkNoticeTrees(t *testing.T, first, second string) {
+	t.Helper()
+	if err := filepath.Walk(first, func(path string, info os.FileInfo, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
 		}
@@ -122,26 +158,9 @@ func TestDeterministicExactLinkedPayload(t *testing.T) {
 		if info.IsDir() {
 			return nil
 		}
-		a, readErr := readRegular(path)
-		if readErr != nil {
-			return readErr
-		}
-		b, readErr := readRegular(filepath.Join(second, rel))
-		if readErr != nil {
-			return readErr
-		}
-		if string(a) != string(b) {
-			t.Errorf("nondeterministic bytes: %s", rel)
-		}
-		if strings.Contains(string(a), "WRONG original") || strings.Contains(string(a), "UNLINKED") || strings.Contains(string(a), "not shipped") {
-			t.Errorf("unselected input copied: %s", rel)
-		}
-		return nil
+		return compareNoticeFile(t, path, filepath.Join(second, rel))
 	}); err != nil {
 		t.Fatal(err)
-	}
-	if err = collect(source, cache, goroot, first, modules, "go1.27.3", "binary-hash", 1234567890); err == nil {
-		t.Fatal("existing output accepted")
 	}
 }
 
@@ -167,5 +186,22 @@ func TestMissingOrUnsafeLegalInputs(t *testing.T) {
 				t.Fatal("invalid legal input accepted")
 			}
 		})
+	}
+}
+
+func TestProjectNoticeAtImageRoot(t *testing.T) {
+	source, cache, goroot, modules := fixture(t)
+	out := filepath.Join(t.TempDir(), "out")
+	if err := collect(source, cache, goroot, out, modules, "go1.27.3", "binary-hash", 123); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{"NOTICE", "project/NOTICE"} {
+		got, err := readRegular(filepath.Join(out, path))
+		if err != nil || string(got) != "project text NOTICE" {
+			t.Fatalf("unexpected %s: %q, %v", path, got, err)
+		}
+	}
+	if _, err := os.Stat(filepath.Join(out, "modules/example.org/!fork@v1.2.0/.github/workflows/license-check.yml")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("unexpected workflow file: %v", err)
 	}
 }

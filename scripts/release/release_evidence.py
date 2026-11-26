@@ -1714,11 +1714,6 @@ def provenance_failures(ev: dict) -> list:
         if row not in actual:
             fails.append(f"provenance: evidence lists non-added/stale row: {row[0]} "
                          f"at {str(row[1])[:12]}")
-    for path, commit, author, email, dco, _trailers in actual:
-        if not dco:
-            fails.append(f"provenance: {path}: no exact DCO signoff matching author "
-                         f"{author} <{email}> (recorded fact; rights assessment "
-                         "is separate)")
     if REQUIRED_ADDED[0] not in {r[0] for r in actual}:
         fails.append(f"provenance: required path {REQUIRED_ADDED[0]} unbound")
     return fails

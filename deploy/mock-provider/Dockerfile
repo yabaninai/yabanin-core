@@ -10,7 +10,7 @@ RUN --mount=type=cache,target=/go/pkg/mod \
     CGO_ENABLED=0 GOOS=linux go build -o mock-provider .
 
 # alpine:3.21 digest-pinned 2026-10-25 via `docker buildx imagetools inspect`
-FROM alpine:3.21@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
+FROM alpine:3.21.10@sha256:bc21487101ae47172509130ee1092cc273a831968d64b617776d1f69c81e42ab
 RUN apk --no-cache add wget ca-certificates
 COPY --from=builder /app/mock-provider /usr/local/bin/
 COPY legal/ /usr/share/licenses/yabanin/

@@ -138,6 +138,59 @@ func isLegalText(name string) bool {
 	return legalName.MatchString(name)
 }
 
+// License directories may use SPDX identifiers as filenames. Workflow YAML is
+// executable configuration even when its filename starts with "license".
+func legalSelection(rel string) (selected, license bool) {
+	name := filepath.Base(rel)
+	dir := filepath.ToSlash(filepath.Dir(rel))
+	if dir == ".github/workflows" {
+		switch strings.ToLower(filepath.Ext(name)) {
+		case ".yaml", ".yml":
+			return false, false
+		}
+	}
+	for _, part := range strings.Split(strings.ToLower(dir), "/") {
+		if part == "licenses" || part == "licences" {
+			return true, true
+		}
+	}
+	if !isLegalText(name) {
+		return false, false
+	}
+	lower := strings.ToLower(name)
+	return true, strings.HasPrefix(lower, "license") || strings.HasPrefix(lower, "licence") || strings.HasPrefix(lower, "copying")
+}
+
+type legalFileWalk struct {
+	all        bool
+	hasLicense bool
+	files      []string
+}
+
+func (w *legalFileWalk) visit(rel string, entry fs.DirEntry, walkErr error) error {
+	if walkErr != nil {
+		return walkErr
+	}
+	if entry.IsDir() {
+		return nil
+	}
+	if !entry.Type().IsRegular() {
+		return errors.New("nonregular entry in legal source")
+	}
+	selected, license := legalSelection(rel)
+	if license {
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		w.hasLicense = w.hasLicense || info.Size() > 0
+	}
+	if w.all || selected {
+		w.files = append(w.files, rel)
+	}
+	return nil
+}
+
 func legalFiles(root string, all bool) ([]string, error) {
 	info, err := os.Lstat(root)
 	if err != nil {
@@ -146,63 +199,14 @@ func legalFiles(root string, all bool) ([]string, error) {
 	if !info.IsDir() {
 		return nil, errors.New("legal source must be a real directory")
 	}
-	var found []string
-	hasLicense := all
-	err = filepath.WalkDir(root, func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		if entry.IsDir() {
-			return nil
-		}
-		if !entry.Type().IsRegular() {
-			return errors.New("nonregular entry in legal source")
-		}
-		rel, relErr := filepath.Rel(root, path)
-		if relErr != nil {
-			return relErr
-		}
-		selected := all || isLegalText(entry.Name())
-		// A source package named copyright is not a directory of license texts.
-		// LICENSES directories can contain SPDX-named texts such as BSD-3-Clause.txt.
-		parts := strings.Split(filepath.ToSlash(rel), "/")
-		for _, part := range parts[:len(parts)-1] {
-			lower := strings.ToLower(part)
-			if lower == "licenses" || lower == "licences" {
-				selected = true
-				info, infoErr := entry.Info()
-				if infoErr != nil {
-					return infoErr
-				}
-				if info.Size() > 0 {
-					hasLicense = true
-				}
-			}
-		}
-		if isLegalText(entry.Name()) {
-			lower := strings.ToLower(entry.Name())
-			if strings.HasPrefix(lower, "license") || strings.HasPrefix(lower, "licence") || strings.HasPrefix(lower, "copying") {
-				info, infoErr := entry.Info()
-				if infoErr != nil {
-					return infoErr
-				}
-				if info.Size() > 0 {
-					hasLicense = true
-				}
-			}
-		}
-		if selected {
-			found = append(found, rel)
-		}
-		return nil
-	})
-	if err != nil {
+	walk := legalFileWalk{all: all, hasLicense: all}
+	if err := fs.WalkDir(os.DirFS(root), ".", walk.visit); err != nil {
 		return nil, err
 	}
-	if len(found) == 0 || !hasLicense {
+	if len(walk.files) == 0 || !walk.hasLicense {
 		return nil, errors.New("no legal texts found for linked component")
 	}
-	return found, nil
+	return walk.files, nil
 }
 
 func readRegular(path string) (data []byte, err error) {
@@ -263,30 +267,22 @@ func collectTree(root, output, prefix string, all bool) ([]fileRecord, error) {
 	return files, nil
 }
 
-func collect(source, cache, goroot, output string, modules []*debug.Module, goVersion, binaryHash string, epoch int64) (resultErr error) {
-	if _, err := os.Lstat(output); !errors.Is(err, os.ErrNotExist) {
-		return errors.New("output directory must not already exist")
-	}
-	if err := os.MkdirAll(output, 0755); err != nil { // #nosec G301 -- public image legal payload must be traversable.
-		return err
-	}
-	inv := inventory{SchemaVersion: 1, BinarySHA256: binaryHash, GoVersion: goVersion, Modules: []moduleRecord{}, Files: []fileRecord{}}
-	for _, name := range []string{"LICENSE", "NOTICE", "LICENSING.md", "pkg/pricing/NOTICE-litellm.txt"} {
-		item, err := copyFile(filepath.Join(source, name), output, filepath.Join("project", filepath.Base(name)))
+func (inv *inventory) addProjectNotices(source, output string) error {
+	for _, file := range []struct{ source, dest string }{
+		{"LICENSE", "project/LICENSE"}, {"NOTICE", "project/NOTICE"},
+		{"LICENSING.md", "project/LICENSING.md"}, {"pkg/pricing/NOTICE-litellm.txt", "project/NOTICE-litellm.txt"},
+		{"NOTICE", "NOTICE"},
+	} {
+		item, err := copyFile(filepath.Join(source, file.source), output, file.dest)
 		if err != nil {
 			return err
 		}
 		inv.Files = append(inv.Files, item)
 	}
-	// Preserve the Go license and nested standard-library/vendor legal texts.
-	files, err := collectTree(goroot, output, "go-toolchain", false)
-	if err != nil {
-		return err
-	}
-	if _, err = os.Stat(filepath.Join(output, "go-toolchain", "LICENSE")); err != nil {
-		return errors.New("go toolchain LICENSE absent")
-	}
-	inv.Files = append(inv.Files, files...)
+	return nil
+}
+
+func (inv *inventory) addModuleNotices(cache, output string, modules []*debug.Module) error {
 	sort.Slice(modules, func(i, j int) bool { return modules[i].Path < modules[j].Path })
 	seen := map[string]bool{}
 	for _, m := range modules {
@@ -299,17 +295,16 @@ func collect(source, cache, goroot, output string, modules []*debug.Module, goVe
 			continue
 		}
 		seen[key] = true
-		files, err = collectTree(filepath.Join(cache, key), output, filepath.Join("modules", key), false)
+		files, err := collectTree(filepath.Join(cache, key), output, filepath.Join("modules", key), false)
 		if err != nil {
 			return fmt.Errorf("module %s@%s: %w", record.SourcePath, record.SourceVersion, err)
 		}
 		inv.Files = append(inv.Files, files...)
 	}
-	files, err = collectTree(filepath.Join(source, "scripts/release/image-os-notices"), output, "os", true)
-	if err != nil {
-		return err
-	}
-	inv.Files = append(inv.Files, files...)
+	return nil
+}
+
+func (inv *inventory) write(output string, epoch int64) (resultErr error) {
 	sort.Slice(inv.Files, func(i, j int) bool { return inv.Files[i].Path < inv.Files[j].Path })
 	data, err := json.MarshalIndent(inv, "", "  ")
 	if err != nil {
@@ -341,6 +336,37 @@ func collect(source, cache, goroot, output string, modules []*debug.Module, goVe
 		}
 		return root.Chtimes(rel, stamp, stamp)
 	})
+}
+
+func collect(source, cache, goroot, output string, modules []*debug.Module, goVersion, binaryHash string, epoch int64) error {
+	if _, err := os.Lstat(output); !errors.Is(err, os.ErrNotExist) {
+		return errors.New("output directory must not already exist")
+	}
+	if err := os.MkdirAll(output, 0755); err != nil { // #nosec G301 -- public image legal payload must be traversable.
+		return err
+	}
+	inv := inventory{SchemaVersion: 1, BinarySHA256: binaryHash, GoVersion: goVersion, Modules: []moduleRecord{}, Files: []fileRecord{}}
+	if err := inv.addProjectNotices(source, output); err != nil {
+		return err
+	}
+	// Preserve the Go license and nested standard-library/vendor legal texts.
+	files, err := collectTree(goroot, output, "go-toolchain", false)
+	if err != nil {
+		return err
+	}
+	if _, err = os.Stat(filepath.Join(output, "go-toolchain", "LICENSE")); err != nil {
+		return errors.New("go toolchain LICENSE absent")
+	}
+	inv.Files = append(inv.Files, files...)
+	if err := inv.addModuleNotices(cache, output, modules); err != nil {
+		return err
+	}
+	files, err = collectTree(filepath.Join(source, "scripts/release/image-os-notices"), output, "os", true)
+	if err != nil {
+		return err
+	}
+	inv.Files = append(inv.Files, files...)
+	return inv.write(output, epoch)
 }
 
 func run(binary, source, output, epochText string) error {
