@@ -125,6 +125,13 @@ func (gw *gateway) messagesNativeJSON(w http.ResponseWriter, r *http.Request, rc
 		}
 		limited = masked
 	}
+	// TOOL-02 native twin: strip tool_use blocks the org policy denies
+	// before the client (or the terminal facts) see them. Usage above was
+	// parsed from the ORIGINAL body — the tokens were consumed — so the
+	// accounting stays truthful regardless of what the gate removes.
+	var deniedNative []string
+	limited, deniedNative = gw.gateNativeToolUseJSON(rctx, admitted.OrgID, agentSubject(r), limited)
+	nativeDeniedWarn(l, admitted.OrgID, deniedNative)
 	if ferr := gw.finishNativeMessages(w, rctx, admitted, usage, upstreamURL, http.StatusOK, started, resp, "request.completed", ""); ferr != nil {
 		// Central binding: usage was dispatched but its durable record did
 		// not commit — the client must not see the upstream body as a
@@ -172,6 +179,13 @@ func (gw *gateway) messagesNativeStream(w http.ResponseWriter, r *http.Request, 
 		idle := newIdleReader(resp.Body, gw.streamIdleTimeout, cancelStream)
 		defer idle.Stop()
 		body = idle
+	}
+	// TOOL-02 native twin (SSE): the frame gate transforms the stream the
+	// relay consumes — denied tool_use blocks are suppressed whole, indices
+	// stay contiguous, and a stranded stop_reason is repaired. Activation
+	// is lazy: without deny policies the frames pass byte-identically.
+	if gw.toolPolicies != nil {
+		body = newNativeToolGateReader(streamCtx, body, gw.toolPolicies, admitted.OrgID, agentSubject(r))
 	}
 	// The success terminal is ordered after the terminal-facts commit
 	// (Preview2 central binding): the relay writes through the terminal

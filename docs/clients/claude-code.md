@@ -41,8 +41,21 @@ Discovered ids must contain `claude`. Register aliases such as
 ## Endpoint
 
 `POST /v1/messages`. `provider=anthropic` is forwarded as-is, including
-`cache_control`. Any other provider is translated into chat completions.
-Token estimates are `POST /v1/messages/count_tokens`.
+`cache_control` and request fields the gateway does not model (such as
+`thinking`). A successful non-stream reply that organization policy leaves
+unmodified is forwarded byte-identically; post-upstream policy may instead
+mask the reply or refuse it with 400. Any other provider is translated
+into chat completions. `POST /v1/messages/count_tokens` forwards to the
+provider for `anthropic` models; other models get a bytes/4 estimate
+announced by the `X-Yabanin-Estimated: true` response header.
+
+Native Anthropic forwarding sends `anthropic-version` upstream (`2023-06-01`
+when your request omits it), forwards `anthropic-beta` and
+`anthropic-workspace-id` when set, and sends no beta header otherwise. On a
+successful reply it relays the provider `request-id`, `retry-after`,
+`x-should-retry` and `anthropic-ratelimit-unified-*` headers; on an
+upstream error it additionally relays the provider `Content-Type`. Other
+provider response headers are not relayed.
 
 ## Bring your own provider key (BYOK)
 
@@ -54,7 +67,11 @@ gateway key above and the gateway authenticates upstream with the org key.
 ## Limits
 
 - Translation drops `thinking`, hosted tools, and `cache_control`.
-- Native Anthropic mode does not apply tool gating.
+- Org tool policies gate the model's tool calls on both routes: deny
+  policies strip denied calls on the translated route, and native Anthropic
+  mode strips denied `tool_use` blocks from the reply (buffered and
+  streaming) while keeping the surviving call indices contiguous and
+  rewriting a stranded `tool_use` finish to `end_turn`.
 - Fixture coverage is not a live Claude Code run.
 
 ## Check
